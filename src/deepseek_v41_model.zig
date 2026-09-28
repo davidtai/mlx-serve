@@ -637,3 +637,23 @@ test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
     // 8e9 // (6 x 5120 x 4): the whole 16,384-token prompt is one routed call.
     try testing.expectEqual(@as(u64, 65104), moeRowCap(&c, kvc.default_chunk_target_bytes));
 }
+
+/// The model over MLX with the checkpoint's weights map and the routed
+/// stand-in: referenced (never called) by the test below so the MLX
+/// instantiation is analysed on the host.
+fn mlxSmoke(gpa: std.mem.Allocator, g: *ops.MlxOps, c: v41.Config, tier: routes.Tier, w: *const @import("model.zig").Weights, src: ?*const eng.RowSource, routed: graph.StandIn(ops.MlxOps)) !void {
+    const M = Model(ops.MlxOps);
+    const m = try M.init(gpa, g, c, tier, w, src);
+    defer m.deinit(g);
+    var st = try m.newState();
+    defer st.deinit(g, gpa);
+    _ = try m.forward(g, &st, &.{ 1, 2, 3 }, .{ .logits = .last, .main_hidden = true }, routed, graph.NoProbe{});
+    try m.trim(g, &st, 1);
+    const mk = try m.mark(gpa, &st);
+    defer gpa.free(mk.layers);
+    try m.rollback(g, &st, mk);
+}
+
+test "dsv41 model: the MLX instantiation of the model analyses (host, nothing runs)" {
+    try testing.expect(@TypeOf(&mlxSmoke) != void);
+}
