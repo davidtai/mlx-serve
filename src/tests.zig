@@ -50,6 +50,8 @@ test {
     _ = @import("deepseek_v41_model.zig");
     _ = @import("deepseek_v41_dspark.zig");
     _ = @import("deepseek_v41_parity.zig");
+    _ = @import("deepseek_v41_experts.zig");
+    _ = @import("deepseek_v41_ar.zig");
     _ = @import("expert_bank.zig");
     _ = @import("expert_io.zig");
     _ = @import("expert_lookahead.zig");

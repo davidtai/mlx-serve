@@ -705,6 +705,59 @@ pub const MlxOps = struct {
         return g.applyUnary(g.softplus_fn, x);
     }
 
+    /// `mx.hadamard_transform(x, scale)` over the last axis.
+    pub fn hadamard(g: *MlxOps, x: T, scale: f32) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_hadamard_transform(&r, x, mlx.mlx_optional_float.some(scale), g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    /// `mx.async_eval(xs)`: the GPU starts on `xs`; nothing waits.
+    pub fn asyncEval(_: *MlxOps, xs: []const T) !void {
+        const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+    }
+
+    /// The routing barrier (`mx.eval(indices, indices.reshape(-1))` + `tolist`):
+    /// evaluates the integer ids `x` and copies them, row-major, into `out`
+    /// (x's size).
+    pub fn hostIds(g: *MlxOps, x: T, out: []u16) ![]const u16 {
+        const flat = try g.reshape(x, &.{-1});
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const n = mlx.mlx_array_size(flat);
+        if (n != out.len) return error.HostIdsSize;
+        switch (mlx.mlx_array_dtype(flat)) {
+            .int32 => {
+                const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
+                for (out, p[0..n]) |*o, v| o.* = @intCast(v);
+            },
+            .uint32 => {
+                const p = mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData;
+                for (out, p[0..n]) |*o, v| o.* = @intCast(v);
+            },
+            else => return error.HostIdsDtype,
+        }
+        return out;
+    }
+
+    /// Greedy pick: `mx.argmax` over every logit of `x` (one row), evaluated and read.
+    pub fn hostArgmax(g: *MlxOps, x: T) !u32 {
+        const flat = try g.reshape(x, &.{-1});
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_argmax_axis(&r, flat, 0, false, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        const am = try g.track(r);
+        try mlx.check(mlx.mlx_array_eval(am));
+        const p = mlx.mlx_array_data_uint32(am) orelse return error.MlxNoData;
+        return p[0];
+    }
+
     fn compileUnary(comptime body: fn (mlx.mlx_array, mlx.mlx_stream) ?mlx.mlx_array, box: *mlx.mlx_stream) !mlx.mlx_closure {
         const Cb = struct {
             fn call(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
@@ -829,14 +882,26 @@ pub const Op = enum {
     quantize,
     tape_begin,
     tape_end,
+    hadamard,
+    async_eval,
+    host_read,
+    kernel,
 };
 
 pub const TraceOps = struct {
     pub const T = u32;
     pub const Node = struct { op: Op, dtype: Dtype, shape: Shape };
+    /// What a host read returns on the trace backend (a test's script): the
+    /// routed ids of each routing barrier and each greedy pick.
+    pub const HostValues = struct {
+        ctx: *anyopaque,
+        ids: *const fn (ctx: *anyopaque, out: []u16) anyerror!void,
+        argmax: *const fn (ctx: *anyopaque) anyerror!u32,
+    };
 
     gpa: std.mem.Allocator,
     nodes: std.ArrayList(Node) = .empty,
+    host_values: ?HostValues = null,
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
         return .{ .gpa = gpa };
@@ -1091,6 +1156,46 @@ pub const TraceOps = struct {
         if (g.dtypeOf(c) != .bool_) return error.WhereCondition;
         const s = try broadcast(try broadcast(g.shapeOf(c), g.shapeOf(x)), g.shapeOf(y));
         return g.push(.where, promote(g.dtypeOf(x), g.dtypeOf(y)), s);
+    }
+
+    /// MLX takes n = m * 2^k (m in 1, 12, 20, 28) on the last axis.
+    pub fn hadamard(g: *TraceOps, x: T, _: f32) !T {
+        const sh = g.shapeOf(x);
+        if (sh.n == 0) return error.HadamardSize;
+        var n: c_int = sh.d[sh.n - 1];
+        if (n <= 0) return error.HadamardSize;
+        for ([_]c_int{ 12, 20, 28 }) |m| {
+            if (@rem(n, m) == 0 and std.math.isPowerOfTwo(@divExact(n, m))) n = @divExact(n, m);
+        }
+        if (!std.math.isPowerOfTwo(n)) return error.HadamardSize;
+        if (!isFloat(g.dtypeOf(x))) return error.HadamardDtype;
+        return g.push(.hadamard, g.dtypeOf(x), sh);
+    }
+
+    /// A marker: the GPU would start on the arrays here.
+    pub fn asyncEval(g: *TraceOps, _: []const T) !void {
+        _ = try g.push(.async_eval, .bool_, .{});
+    }
+
+    /// The routing barrier: a marker, then the script's next ids.
+    pub fn hostIds(g: *TraceOps, x: T, out: []u16) ![]const u16 {
+        _ = try g.push(.host_read, .bool_, .{});
+        if (g.shapeOf(x).numel() != @as(i64, @intCast(out.len))) return error.HostIdsSize;
+        const hv = g.host_values orelse return error.NoHostValues;
+        try hv.ids(hv.ctx, out);
+        return out;
+    }
+
+    /// A greedy pick: a marker, then the script's next token.
+    pub fn hostArgmax(g: *TraceOps, _: T) !u32 {
+        _ = try g.push(.host_read, .bool_, .{});
+        const hv = g.host_values orelse return error.NoHostValues;
+        return hv.argmax(hv.ctx);
+    }
+
+    /// A custom kernel's output (the shape and dtype its launch declares).
+    pub fn kernel(g: *TraceOps, shape: []const c_int, dt: Dtype) !T {
+        return g.push(.kernel, dt, Shape.of(shape));
     }
 
     pub fn clip(g: *TraceOps, x: T, lo: T, hi: T) !T {

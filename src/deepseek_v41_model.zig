@@ -250,7 +250,7 @@ pub fn Model(comptime G: type) type {
                     mains[n_main] = try mainOf(g, h);
                     n_main += 1;
                 }
-                const out = try Tr.layer(g, probe, c, rt, li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed);
+                const out = try Tr.layer(g, probe, c, rt, li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
                 h = out.h;
                 pm = out.pre_mix;
             }
@@ -261,7 +261,7 @@ pub fn Model(comptime G: type) type {
         }
 
         /// The arrays a span fence settles: every lane's backing plus `extra`.
-        fn fence(g: *G, st: *State, extra: []const T) !void {
+        pub fn fence(g: *G, st: *State, extra: []const T) !void {
             var list: [512]T = undefined;
             var k: usize = 0;
             for (extra) |x| {
@@ -338,6 +338,40 @@ pub fn Model(comptime G: type) type {
             return res;
         }
 
+        /// Greedy AR (the M3 token-parity run): the prompt in forwards of at
+        /// most `chunk` rows, then one token per forward; `out[0]` is the
+        /// prompt's pick. `ex` is the routed-experts executor (`at`, `flush`),
+        /// flushed after each forward's eval; `observer` (or `{}`) gets each
+        /// evaluated logits row (`step(g, logits)`).
+        pub fn greedy(self: *Self, g: *G, st: *State, prompt: []const u32, chunk: u32, ex: anytype, out: []u32, observer: anytype) !void {
+            std.debug.assert(prompt.len > 0 and chunk > 0 and out.len > 0);
+            var i: usize = 0;
+            var next: u32 = 0;
+            while (i < prompt.len) {
+                const end = @min(i + chunk, prompt.len);
+                const last = end == prompt.len;
+                const r = try self.forward(g, st, prompt[i..end], .{ .logits = if (last) .last else .none }, ex, graph.NoProbe{});
+                try fence(g, st, &.{if (last) r.logits.? else r.hidden});
+                try ex.flush();
+                if (last) {
+                    if (@TypeOf(observer) != void) try observer.step(g, r.logits.?);
+                    next = try g.hostArgmax(r.logits.?);
+                }
+                g.reset();
+                i = end;
+            }
+            for (out, 0..) |*o, t| {
+                o.* = next;
+                if (t + 1 == out.len) break;
+                const r = try self.forward(g, st, &.{next}, .{ .logits = .last }, ex, graph.NoProbe{});
+                try fence(g, st, &.{r.logits.?});
+                try ex.flush();
+                if (@TypeOf(observer) != void) try observer.step(g, r.logits.?);
+                next = try g.hostArgmax(r.logits.?);
+                g.reset();
+            }
+        }
+
         /// K16 `_forward_layer_major`: every layer over all chunks before the next;
         /// the gate and shared expert per chunk, the routed call batched across
         /// chunks (row-capped), the ffn combine the compiled `_PREFILL_HC_POST`.
@@ -396,7 +430,7 @@ pub fn Model(comptime G: type) type {
                     const idxs = try a.alloc(T, j - i);
                     for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
                     const cat_idx = if (j - i == 1) routes_[i].indices else try g.concat(idxs, 0);
-                    const ro = try routed.routed(g, cat_xf, cat_idx);
+                    const ro = try routed.at(@intCast(l)).routed(g, cat_xf, cat_idx);
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         const nk = g.shapeOf(xfs[k]).dim(0);
@@ -519,6 +553,10 @@ fn stToDtype(d: v41.StDtype) ops.Dtype {
 
 /// The routed stand-in's shape: unweighted `[n, k, dim]` f32.
 const TraceRouted = struct {
+    pub fn at(self: TraceRouted, _: u32) TraceRouted {
+        return self;
+    }
+
     pub fn routed(_: TraceRouted, g: *TraceOps, xf: u32, indices: u32) !u32 {
         return g.input(&.{ g.shapeOf(xf).dim(0), g.shapeOf(indices).dim(1), g.shapeOf(xf).dim(1) }, .float32);
     }
@@ -628,6 +666,75 @@ test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one
     try testing.expectEqual(@as(u32, 10), st.layers[1].compress.rows());
     // The engram needs its row source; a model without it refuses at construction.
     try testing.expectError(error.EngramSourceRequired, TM.init(testing.allocator, &g, m.c, tier, &lookup, null));
+}
+
+test "dsv41 model: the AR dry path routes every layer call of every forward through the expert source" {
+    const xp = @import("deepseek_v41_experts.zig");
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{}, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    // The harness's source: no prefill rows, grown before the first forward
+    // (every call a decode route), all four experts resident after growth.
+    const nl = m.c.n_layers;
+    var rows0: [8]u32 = @splat(0);
+    var rows1: [8]u32 = @splat(4);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
+    defer src.deinit();
+    const Ex = xp.Experts(TraceOps, xp.FakeSource, xp.TraceMath);
+    var ex = try Ex.init(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c);
+    defer ex.deinit();
+    try ex.grow(&g, rows1[0..nl]);
+    const Host = struct {
+        rng: std.Random.DefaultPrng,
+        n: u16,
+        picks: u32 = 0,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out) |*o| o.* = h.rng.random().uintLessThan(u16, h.n);
+        }
+        fn argmax(ctx: *anyopaque) anyerror!u32 {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.picks += 1;
+            return (h.picks * 5 + 1) % 64;
+        }
+    };
+    var host: Host = .{ .rng = std.Random.DefaultPrng.init(20260928), .n = @intCast(m.c.n_routed_experts) };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    var out: [4]u32 = undefined;
+    // 20 prompt tokens in forwards of 8, 8, 4 rows; then 3 one-token forwards.
+    try model_.greedy(&g, &st, &prompt, 8, &ex, &out, {});
+    try testing.expectEqualSlices(u32, &.{ 6, 11, 16, 21 }, &out);
+    try testing.expectEqual(@as(u32, 23), st.offset);
+    const forwards = 3 + 3;
+    try testing.expectEqual(@as(u64, forwards * nl), src.stats().route_calls);
+    try testing.expectEqual(@as(usize, 0), src.liveCalls());
+    // Per forward: every layer routes and releases its call once, in layer order.
+    var n_route: usize = 0;
+    var n_release: usize = 0;
+    var layer_next: u32 = 0;
+    for (src.log.items) |e| switch (e.kind) {
+        .route => {
+            try testing.expectEqual(layer_next, e.layer);
+            layer_next = (layer_next + 1) % nl;
+            n_route += 1;
+        },
+        .release => n_release += 1,
+        .wait_gu, .wait_down => try testing.expectEqual((layer_next + nl - 1) % nl, e.layer),
+        .flush, .grow => {},
+    };
+    try testing.expectEqual(n_route, n_release);
+    try testing.expectEqual(@as(u32, 4), host.picks);
+    // A prompt forward wider than the decode lane (top-2 x 25 rows > 48 ids) is refused by route.
+    try testing.expectError(error.PrefillLaneNotPorted, model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {}));
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {

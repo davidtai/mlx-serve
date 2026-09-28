@@ -1060,6 +1060,11 @@ pub fn StandIn(comptime G: type) type {
             for (buf, 0..) |*v, e| v.* = 1.0 + @as(f32, @floatFromInt(e)) / n;
         }
 
+        /// The same stand-in on every layer.
+        pub fn at(self: @This(), _: u32) @This() {
+            return self;
+        }
+
         pub fn routed(self: @This(), g: *G, xf: G.T, indices: G.T) !G.T {
             const xs = try g.expandDims(try g.astype(xf, .float32), 1);
             return g.mul(xs, try g.expandDims(try g.take(self.scale, indices, 0), -1));
