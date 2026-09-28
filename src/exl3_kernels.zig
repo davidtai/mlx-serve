@@ -56,8 +56,8 @@ pub const Kernel = enum {
 /// Header texts shared by several kernels (file header_<tag>.metal).
 pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail };
 
-pub const n_kernels = @typeInfo(Kernel).@"enum".fields.len;
-pub const n_headers = @typeInfo(Header).@"enum".fields.len;
+pub const n_kernels = std.meta.fieldNames(Kernel).len;
+pub const n_headers = std.meta.fieldNames(Header).len;
 
 /// The manifest and every text, as `Registry.init` reads them.
 pub const Texts = struct {
@@ -72,10 +72,10 @@ pub const embedded: Texts = .{
     .headers = embedAll(Header, "header_"),
 };
 
-fn embedAll(comptime E: type, comptime prefix: []const u8) [@typeInfo(E).@"enum".fields.len][:0]const u8 {
-    const fields = @typeInfo(E).@"enum".fields;
-    var out: [fields.len][:0]const u8 = undefined;
-    inline for (fields, 0..) |f, i| out[i] = @embedFile(dir ++ prefix ++ f.name ++ ".metal");
+fn embedAll(comptime E: type, comptime prefix: []const u8) [std.meta.fieldNames(E).len][:0]const u8 {
+    const names = std.meta.fieldNames(E);
+    var out: [names.len][:0]const u8 = undefined;
+    inline for (names, 0..) |name, i| out[i] = @embedFile(dir ++ prefix ++ name ++ ".metal");
     return out;
 }
 
@@ -544,7 +544,7 @@ fn adoptTemplate(a: Allocator, js: []const JTemplate, k: Kernel, diag: ?*Diag) (
     const out = try a.alloc(TemplateArg, js.len);
     for (js, out) |j, *t| {
         const value: TemplateValue = if (j.int) |v| .{ .int = std.math.cast(i32, v) orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: template {s} = {d}", .{ k, j.name, v }) } else if (j.dtype) |dt| .{ .dtype = try parseDtype(dt, k, diag) } else return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: template {s} has no value", .{ k, j.name });
-        t.* = .{ .name = try a.dupeZ(u8, j.name), .value = value };
+        t.* = .{ .name = try a.dupeSentinel(u8, j.name, 0), .value = value };
     }
     return out;
 }
@@ -556,7 +556,7 @@ fn adoptArgs(a: Allocator, js: []const JArg, k: Kernel, diag: ?*Diag) (Refusal |
         for (js[0..i]) |prev| if (std.mem.eql(u8, prev.name, j.name)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: argument {s} twice", .{ k, j.name });
         const dom = j.domain orelse JDomain{ .kind = "bits" };
         arg.* = .{
-            .name = try a.dupeZ(u8, j.name),
+            .name = try a.dupeSentinel(u8, j.name, 0),
             .dtype = try parseDtype(j.dtype, k, diag),
             .shape = try adoptDims(a, j.shape, k, diag),
             .role = std.meta.stringToEnum(Role, j.role orelse "rows") orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: role \"{s}\"", .{ k, j.role.? }),
@@ -824,7 +824,7 @@ test "dsv41 kernels: a tampered source or header text is refused, by name" {
     const a = testing.allocator;
     var texts = embedded;
     const k = Kernel.dsv41_exl3_mul1h_k3_2304;
-    const bad = try a.dupeZ(u8, embedded.sources[@backingInt(k)]);
+    const bad = try a.dupeSentinel(u8, embedded.sources[@backingInt(k)], 0);
     defer a.free(bad);
     bad[bad.len / 2] ^= 0x20;
     texts.sources[@backingInt(k)] = bad;
@@ -834,7 +834,7 @@ test "dsv41 kernels: a tampered source or header text is refused, by name" {
 
     texts = embedded;
     const h = Header.dig_mul1h_k3;
-    const bad_h = try a.dupeZ(u8, embedded.headers[@backingInt(h)]);
+    const bad_h = try a.dupeSentinel(u8, embedded.headers[@backingInt(h)], 0);
     defer a.free(bad_h);
     bad_h[0] ^= 0x01;
     texts.headers[@backingInt(h)] = bad_h;
