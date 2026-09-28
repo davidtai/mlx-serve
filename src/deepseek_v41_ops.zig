@@ -16,6 +16,8 @@ const model = @import("model.zig");
 
 pub const Dtype = mlx.mlx_dtype;
 pub const max_dims = 8;
+/// Inputs / outputs of one compiled trunk region.
+pub const max_tape_io = 24;
 
 pub const Shape = struct {
     n: u8 = 0,
@@ -113,6 +115,18 @@ pub const MlxOps = struct {
     silu_fn: mlx.mlx_closure = .{},
     softplus_fn: mlx.mlx_closure = .{},
     stream_box: *mlx.mlx_stream,
+    /// Compiled trunk regions, one per (region type, construction context).
+    tapes: std.ArrayList(TapeEntry) = .empty,
+    /// A region's tracing context: borrows the owner's stream and closures.
+    is_child: bool = false,
+
+    const TapeEntry = struct {
+        key: usize,
+        ctx: *const anyopaque,
+        compiled: mlx.mlx_closure,
+        payload: *anyopaque,
+        free: *const fn (*anyopaque, std.mem.Allocator) void,
+    };
 
     pub fn init(gpa: std.mem.Allocator, s: mlx.mlx_stream) !MlxOps {
         const box = try gpa.create(mlx.mlx_stream);
@@ -128,9 +142,82 @@ pub const MlxOps = struct {
     pub fn deinit(g: *MlxOps) void {
         g.reset();
         g.live.deinit(g.gpa);
+        if (g.is_child) return;
+        for (g.tapes.items) |t| {
+            _ = mlx.mlx_closure_free(t.compiled);
+            t.free(t.payload, g.gpa);
+        }
+        g.tapes.deinit(g.gpa);
         _ = mlx.mlx_closure_free(g.silu_fn);
         _ = mlx.mlx_closure_free(g.softplus_fn);
         g.gpa.destroy(g.stream_box);
+    }
+
+    fn child(g: *const MlxOps) MlxOps {
+        return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .stream_box = g.stream_box, .is_child = true };
+    }
+
+    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
+    /// once per input signature, replayed after. `ctx` carries the region's
+    /// structural constants and must outlive the backend.
+    pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
+        const key = @intFromPtr(@typeName(Body).ptr);
+        const compiled = for (g.tapes.items) |t| {
+            if (t.key == key and t.ctx == @as(*const anyopaque, ctx)) break t.compiled;
+        } else try g.buildTape(Body, ctx, key);
+        const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+        defer _ = mlx.mlx_vector_array_free(in_vec);
+        var out_vec = mlx.mlx_vector_array{ .ctx = null };
+        try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+        defer _ = mlx.mlx_vector_array_free(out_vec);
+        if (mlx.mlx_vector_array_size(out_vec) != out.len) return error.TapeOutputs;
+        for (out, 0..) |*o, i| {
+            var r = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_vector_array_get(&r, out_vec, i)) catch |e| {
+                _ = mlx.mlx_array_free(r);
+                return e;
+            };
+            o.* = try g.track(r);
+        }
+    }
+
+    fn buildTape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, key: usize) !mlx.mlx_closure {
+        const Payload = struct { proto: MlxOps, ctx: *const Body.Ctx };
+        const Cb = struct {
+            fn call(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+                const p: *const Payload = @ptrCast(@alignCast(payload.?));
+                var c = p.proto;
+                defer c.deinit();
+                const n = mlx.mlx_vector_array_size(input);
+                var ins: [max_tape_io]T = undefined;
+                if (n > ins.len) return -1;
+                for (0..n) |i| {
+                    var x = mlx.mlx_array_new();
+                    if (mlx.mlx_vector_array_get(&x, input, i) != 0) {
+                        _ = mlx.mlx_array_free(x);
+                        return -1;
+                    }
+                    ins[i] = c.track(x) catch return -1;
+                }
+                var outs: [max_tape_io]T = undefined;
+                Body.run(&c, p.ctx, ins[0..n], outs[0..Body.n_out]) catch return -1;
+                res.* = mlx.mlx_vector_array_new_data(&outs, Body.n_out);
+                return 0;
+            }
+            fn free(pp: *anyopaque, gpa: std.mem.Allocator) void {
+                gpa.destroy(@as(*Payload, @ptrCast(@alignCast(pp))));
+            }
+        };
+        const payload = try g.gpa.create(Payload);
+        errdefer g.gpa.destroy(payload);
+        payload.* = .{ .proto = g.child(), .ctx = ctx };
+        const raw = mlx.mlx_closure_new_func_payload(&Cb.call, payload, null);
+        defer _ = mlx.mlx_closure_free(raw);
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        try mlx.check(mlx.mlx_compile(&compiled, raw, false));
+        errdefer _ = mlx.mlx_closure_free(compiled);
+        try g.tapes.append(g.gpa, .{ .key = key, .ctx = ctx, .compiled = compiled, .payload = payload, .free = &Cb.free });
+        return compiled;
     }
 
     /// Free every intermediate built since the last reset.
@@ -303,6 +390,9 @@ pub const MlxOps = struct {
     pub fn equal(g: *MlxOps, a: T, b: T) !T {
         return g.op2(mlx.mlx_equal, a, b);
     }
+    pub fn greaterEqual(g: *MlxOps, a: T, b: T) !T {
+        return g.op2(mlx.mlx_greater_equal, a, b);
+    }
     pub fn logicalAnd(g: *MlxOps, a: T, b: T) !T {
         return g.op2(mlx.mlx_logical_and, a, b);
     }
@@ -392,6 +482,25 @@ pub const MlxOps = struct {
             return e;
         };
         return g.track(r);
+    }
+
+    /// `mx.quantize(w, group, bits, mode)` of an fp mode: packed words + scales.
+    pub fn quantize(g: *MlxOps, w: T, mode: model.QuantMode) !struct { w: T, s: T } {
+        var vec = mlx.mlx_vector_array{ .ctx = null };
+        try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), .{}, g.s));
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var q = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_vector_array_get(&q, vec, 0)) catch |e| {
+            _ = mlx.mlx_array_free(q);
+            return e;
+        };
+        const qw = try g.track(q);
+        var sc = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_vector_array_get(&sc, vec, 1)) catch |e| {
+            _ = mlx.mlx_array_free(sc);
+            return e;
+        };
+        return .{ .w = qw, .s = try g.track(sc) };
     }
 
     pub fn reshape(g: *MlxOps, x: T, shape: []const c_int) !T {
@@ -709,6 +818,10 @@ pub const Op = enum {
     repeat,
     silu,
     softplus,
+    greater_equal,
+    quantize,
+    tape_begin,
+    tape_end,
 };
 
 pub const TraceOps = struct {
@@ -856,6 +969,28 @@ pub const TraceOps = struct {
     }
     pub fn logicalAnd(g: *TraceOps, a: T, b: T) !T {
         return g.compare(.logical_and, a, b);
+    }
+    pub fn greaterEqual(g: *TraceOps, a: T, b: T) !T {
+        return g.compare(.greater_equal, a, b);
+    }
+
+    /// The region runs inline between two markers (a test pins its boundary).
+    pub fn tape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
+        _ = try g.push(.tape_begin, .bool_, .{});
+        try Body.run(g, ctx, inputs, out);
+        _ = try g.push(.tape_end, .bool_, .{});
+    }
+
+    /// fp-mode `mx.quantize`: `[out, in]` -> words `[out, in * bits / 32]` u32 + scales `[out, in / group]` u8.
+    pub fn quantize(g: *TraceOps, w: T, mode: model.QuantMode) !struct { w: T, s: T } {
+        const sh = g.shapeOf(w);
+        const in_dim = sh.dim(-1);
+        var ws = sh;
+        ws.d[ws.n - 1] = @divExact(in_dim * @as(c_int, @intCast(quantBits(mode))), 32);
+        var ss = sh;
+        ss.d[ss.n - 1] = @divExact(in_dim, @as(c_int, @intCast(quantGroup(mode))));
+        const qw = try g.push(.quantize, .uint32, ws);
+        return .{ .w = qw, .s = try g.push(.quantize, .uint8, ss) };
     }
     pub fn logicalOr(g: *TraceOps, a: T, b: T) !T {
         return g.compare(.logical_or, a, b);

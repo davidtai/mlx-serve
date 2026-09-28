@@ -397,6 +397,7 @@ pub const Runner = struct {
         var g = try ops.MlxOps.init(gpa, s);
         defer g.deinit();
         const Tr = graph.Trunk(ops.MlxOps);
+        const rt: graph.Routes = .{};
 
         // The layer shards through mlx-serve's loader (lazy arrays, CPU stream).
         var weights = model.Weights.init(gpa);
@@ -493,7 +494,7 @@ pub const Runner = struct {
                 const h = try self.dumpArray(&g, &dump, pre, "in.h");
                 const pm = try self.dumpArray(&g, &dump, pre, "in.pre_mix");
                 const routed: DumpRouted = .{ .arr = try self.dumpArray(&g, &dump, pre, "moe.routed") };
-                _ = try Tr.layer(&g, &probe, &c, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
+                _ = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
                 const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));
@@ -529,7 +530,7 @@ pub const Runner = struct {
                     break :blk buf;
                 };
                 const head_w = try g.adopt(try arrayFrom(hbytes, sub));
-                try self.check(&g, &dump, head_key, try Tr.head(&g, try self.dumpArray(&g, &dump, "", fin_key), head_w));
+                try self.check(&g, &dump, head_key, try Tr.head(&g, &rt, try self.dumpArray(&g, &dump, "", fin_key), .{ .dense = head_w }));
             }
         }
         // Stages the dump holds that the Zig trunk never reported (inputs excepted).
@@ -601,6 +602,7 @@ pub const Runner = struct {
         var g = try ops.MlxOps.init(gpa, s);
         defer g.deinit();
         const Tr = graph.Trunk(ops.MlxOps);
+        const rt: graph.Routes = .{};
 
         var weights = model.Weights.init(gpa);
         defer weights.deinit();
@@ -706,7 +708,7 @@ pub const Runner = struct {
                 };
                 try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "{s}in.h", .{pre}), cur.h);
                 try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "{s}in.pre_mix", .{pre}), cur.pre_mix);
-                const out = try Tr.layer(&g, &probe, &c, c.layers[l], &lws[i], inv[i], cur.h, cur.pre_mix, pos, &caches[i], &shared, stand_in);
+                const out = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], cur.h, cur.pre_mix, pos, &caches[i], &shared, stand_in);
                 const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));
@@ -726,7 +728,7 @@ pub const Runner = struct {
             const fin = try Tr.finalNorm(&g, &c, cur.h, cur.pre_mix, norm_w);
             try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "p{d}.final.h", .{p}), fin);
             const head_w = try g.adopt(try arrayFrom(head_bytes, head_sub));
-            try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "p{d}.head.logits", .{p}), try Tr.head(&g, fin, head_w));
+            try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "p{d}.head.logits", .{p}), try Tr.head(&g, &rt, fin, .{ .dense = head_w }));
             for (caches) |*cc| cc.advance(@intCast(s_len));
             tok += s_len;
         }

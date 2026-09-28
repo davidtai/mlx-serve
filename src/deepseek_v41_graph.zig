@@ -44,6 +44,8 @@ pub fn LayerW(comptime T: type) type {
         idx_k: ?struct { wk: T, k_norm: T } = null,
         /// index sources: the indexer queries and head weights.
         idx_q: ?struct { wq_b: Q(T), weights_proj: T } = null,
+        /// W97: the grouped wo_a dequantized once to f32 `[g, rank, in]`.
+        wo_a_dense: ?T = null,
         gate_w: T,
         gate_bias: T,
         sh_w1: Q(T),
@@ -64,6 +66,8 @@ pub fn Shared(comptime T: type) type {
         index_k: ?T = null,
         topk_mask: ?T = null,
         candidates: ?T = null,
+        /// K30: the index source's selection as `[b, s, k]` row indices (-1 pads).
+        selected_idx: ?T = null,
         /// The window attend mask, identical for every layer of one forward
         /// (same positions, window rows and drop offset: K24's memo).
         win_mask: ?T = null,
@@ -71,6 +75,36 @@ pub fn Shared(comptime T: type) type {
         win_drop: u32 = 0,
     };
 }
+
+/// The trunk's construction-time routes: the Python `MTPLX_DSV41_*` levers
+/// that are pure MLX. The default is the stock eager path (every lever off);
+/// kernel levers are refused where the routes are built (`deepseek_v41_routes.zig`).
+pub const Routes = struct {
+    /// K30: each query gathers its window rows and the selected compressed rows.
+    selected_keys: bool = false,
+    /// W97: the K30 core compiled at rows <= 8, the selection padded to index_topk.
+    attn_core_compile: bool = false,
+    /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
+    lean_prefill_score: bool = false,
+    /// K22: attention qkv / out prep, gate prefix and MoE combine compiled at rows <= 32.
+    attn_compile: bool = false,
+    /// K4: the Hyper-Connection prep and combine compiled at rows <= 7.
+    hc_compile: bool = false,
+    /// K35: the layer's small stages as three compiled segments at rows <= 7.
+    small_stages: bool = false,
+    /// W97: wo_a dequantized to f32 once at binding (byte-identical).
+    wo_a_f32: bool = false,
+    head: Head = .f32,
+
+    /// `MTPLX_DSV41_HEAD_MODE`: unset = `head(x.astype(f32))`; bf16 = a bf16
+    /// GEMV cast to f32 after; mxfp8 = the head quantized once, `quantized_matmul`.
+    pub const Head = enum { f32, bf16, mxfp8 };
+};
+
+pub const attn_compile_max_rows = 32;
+pub const core_compile_max_rows = 8;
+pub const hc_compile_max_rows = 7;
+pub const small_stages_max_rows = 7;
 
 /// A probe that records nothing (serving).
 pub const NoProbe = struct {
@@ -278,9 +312,27 @@ pub fn Trunk(comptime G: type) type {
             return rmsnorm(g, try g.astype(y, g.dtypeOf(h)), norm_w, c.rms_norm_eps);
         }
 
-        /// `Model._apply_head` default codec: `head(x.astype(f32))`.
-        pub fn head(g: *G, x: T, head_w: T) !T {
-            return linear(g, try g.astype(x, .float32), head_w);
+        pub const HeadW = union(enum) { dense: T, mxfp8: Q(T) };
+
+        /// `Model._apply_head` under the head route.
+        pub fn head(g: *G, rt: *const Routes, x: T, hw: HeadW) !T {
+            return switch (rt.head) {
+                .f32 => linear(g, try g.astype(x, .float32), hw.dense),
+                .bf16 => g.astype(try linear(g, try g.astype(x, g.dtypeOf(hw.dense)), hw.dense), .float32),
+                .mxfp8 => g.astype(try qlinear(g, try g.astype(x, .float32), hw.mxfp8), .float32),
+            };
+        }
+
+        /// `_MXFP8Head.__init__`: the dense head quantized once (mxfp8 gs32).
+        pub fn quantizeHead(g: *G, head_w: T) !Q(T) {
+            const q = try g.quantize(head_w, .mxfp8);
+            return .{ .w = q.w, .s = q.s, .mode = .mxfp8 };
+        }
+
+        /// W97 `_o_lora_dense_weight` cached: dequantize, reshape, f32.
+        pub fn woaDenseF32(g: *G, c: *const v41.Config, wo_a: Q(T)) !T {
+            const d = try g.reshape(try g.dequantize(wo_a.w, wo_a.s, wo_a.mode), &.{ @intCast(c.o_groups), @intCast(c.o_lora_rank), -1 });
+            return g.astype(d, .float32);
         }
 
         /// `Attention._window_attend`: view row j is absolute position `drop + j`.
@@ -413,8 +465,9 @@ pub fn Trunk(comptime G: type) type {
 
         const Compressed = struct { kv: T, mask: T };
 
-        /// `Attention._compressed`: the CSA2 mode dispatch.
-        fn compressed(g: *G, p: anytype, c: *const v41.Config, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, qr: T, positions: T, cs: CosSin, cache: *Cache, shared: *Share) !?Compressed {
+        /// `Attention._compressed`: the CSA2 mode dispatch. Under K30 an index
+        /// source also publishes its selection as gather indices.
+        fn compressed(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, qr: T, positions: T, cs: CosSin, cache: *Cache, shared: *Share) !?Compressed {
             if (li.kv_source) try publishCompressed(g, p, c, li, w, inv_freq, x, cache, shared);
             const ckv = shared.compress_kv orelse return null;
             const n_comp = g.shapeOf(ckv).dim(1);
@@ -426,6 +479,11 @@ pub fn Trunk(comptime G: type) type {
                 shared.topk_mask = sel.mask;
                 if (li.candidate_source) shared.candidates = sel.cand;
                 mask = sel.mask;
+                if (rt.selected_keys) {
+                    // A fixed-shape core pads the selection to index_topk.
+                    const k: c_int = if (rt.attn_core_compile) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
+                    shared.selected_idx = try maskToTopkIdx(g, mask, k);
+                }
             } else {
                 // The config refuses a reuse layer with no index source before it.
                 mask = shared.topk_mask.?;
@@ -436,66 +494,266 @@ pub fn Trunk(comptime G: type) type {
 
         /// `Attention._sparse_attend_oneshot` (f32 score path): one softmax over
         /// window + compressed rows with the per-head value-0 sink column.
-        fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, kv: T, attend: T) !T {
+        fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
             const qs = g.shapeOf(q);
             const H: c_int = qs.d[2];
-            const tk = g.shapeOf(kv).dim(1);
+            const tk = g.shapeOf(keys).dim(1);
             const scale = std.math.pow(f64, @floatFromInt(c.head_dim), -0.5);
-            var scores = try g.einsum("bshd,btd->bsht", &.{ try g.astype(q, .float32), try g.astype(kv, .float32) });
+            var scores = try g.einsum("bshd,btd->bsht", &.{ try g.astype(q, .float32), try g.astype(keys, .float32) });
             scores = try g.mul(scores, try sf(g, scale, scores));
             scores = try g.where(try g.expandDims(attend, 2), scores, try sf(g, -std.math.inf(f64), scores));
             const sink = try g.reshape(try g.astype(w.attn_sink, .float32), &.{ 1, 1, H, 1 });
             const sink_b = try g.broadcastTo(sink, &.{ qs.d[0], qs.d[1], H, 1 });
             const full = try g.concat(&.{ scores, sink_b }, -1);
             const wts = try sliceLast(g, try g.softmax(full, -1), 0, tk);
-            return g.einsum("bsht,btd->bshd", &.{ wts, try g.astype(kv, .float32) });
+            return g.einsum("bsht,btd->bshd", &.{ wts, try g.astype(keys, .float32) });
         }
 
-        /// `Attention._attend`, stock eager path (masked-full attention, no
-        /// compile tapes, no fused projections).
-        pub fn attention(g: *G, p: anytype, c: *const v41.Config, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, positions: T, cache: *Cache, shared: *Share) !T {
+        /// The value-0 sink softmax with the sink folded into the denominator
+        /// (reference `_k_sparse_attn`): `scores` are scaled and masked f32.
+        fn sinkSoftmaxPv(g: *G, w: *const W, scores: T, values: T, pv: [:0]const u8) !T {
+            const H = g.shapeOf(scores).dim(2);
+            const sink = try g.reshape(try g.astype(w.attn_sink, .float32), &.{ 1, 1, H, 1 });
+            const m = try g.maximum(try g.max(scores, -1, true), sink);
+            const ex = try g.exp(try g.sub(scores, m));
+            const denom = try g.add(try g.sum(ex, -1, true), try g.exp(try g.sub(sink, m)));
+            return g.div(try g.einsum(pv, &.{ ex, values }), denom);
+        }
+
+        /// W50 lean prefill score (`fuse_scale`, `fold_sink`): the scale folded
+        /// into q, no sink column. Reassociation-class vs `sparseAttend`.
+        fn sparseAttendLean(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
+            const scale = std.math.pow(f64, @floatFromInt(c.head_dim), -0.5);
+            const qd = try g.mul(q, try sf(g, scale, q));
+            var scores = try g.einsum("bshd,btd->bsht", &.{ try g.astype(qd, .float32), try g.astype(keys, .float32) });
+            scores = try g.where(try g.expandDims(attend, 2), scores, try sf(g, -std.math.inf(f64), scores));
+            return sinkSoftmaxPv(g, w, scores, try g.astype(keys, .float32), "bsht,btd->bshd");
+        }
+
+        /// `_window_selected_idx`: each query's window rows as view indices
+        /// `[s, W]` (absolute minus `drop`) and their validity.
+        fn windowSelectedIdx(g: *G, c: *const v41.Config, positions: T, t_len: c_int, drop: u32) !struct { idx: T, valid: T } {
+            const W_: c_int = @intCast(c.window);
+            const qp = try g.reshape(positions, &.{ -1, 1 });
+            const base = try g.maximum(try g.sub(qp, try g.scalar(@floatFromInt(W_ - 1), .int32)), try g.scalar(0, .int32));
+            const idx = try g.add(base, try g.reshape(try g.arange(0, @floatFromInt(W_), 1, .int32), &.{ 1, W_ }));
+            const logical: f64 = @floatFromInt(@as(i64, drop) + t_len);
+            const d: f64 = @floatFromInt(drop);
+            const valid = try g.logicalAnd(try g.logicalAnd(try g.lessEqual(idx, qp), try g.less(idx, try g.scalar(logical, .int32))), try g.greaterEqual(idx, try g.scalar(d, .int32)));
+            return .{ .idx = try g.astype(try g.sub(idx, try g.scalar(d, .int32)), .int32), .valid = valid };
+        }
+
+        /// `_mask_to_topk_idx`: the True positions of each row, ascending,
+        /// padded with -1 to `k` columns.
+        fn maskToTopkIdx(g: *G, mask: T, k: c_int) !T {
+            const sh = g.shapeOf(mask);
+            const n = sh.d[2];
+            const ar = try g.arange(0, @floatFromInt(n), 1, .int32);
+            const keys = try g.where(mask, try g.reshape(ar, &.{ 1, 1, n }), try g.reshape(try g.add(try g.scalar(@floatFromInt(n), .int32), ar), &.{ 1, 1, n }));
+            var order = try g.astype(try g.argsort(keys, -1), .int32);
+            if (k <= n) {
+                order = try sliceLast(g, order, 0, k);
+            } else {
+                order = try g.concat(&.{ order, try g.full(&.{ sh.d[0], sh.d[1], k - n }, try g.scalar(-1, .int32), .int32) }, -1);
+            }
+            const count = try g.sum(try g.astype(mask, .int32), -1, true);
+            const valid = try g.less(try g.reshape(try g.arange(0, @floatFromInt(k), 1, .int32), &.{ 1, 1, k }), count);
+            return g.where(valid, order, try g.scalar(-1, .int32));
+        }
+
+        /// `_gather_rows`: `source[b, idx]` as `[b, s, k, d]` (pads read row 0).
+        fn gatherRows(g: *G, source: T, idx: T, valid: T) !T {
+            const ss = g.shapeOf(source);
+            const is = g.shapeOf(idx);
+            const b = ss.d[0];
+            const n = ss.d[1];
+            const idx_c = try g.where(valid, idx, try g.scalar(0, .int32));
+            const offs = try g.reshape(try g.mul(try g.arange(0, @floatFromInt(b), 1, .int32), try g.scalar(@floatFromInt(n), .int32)), &.{ b, 1, 1 });
+            const flat = try g.reshape(try g.add(idx_c, offs), &.{-1});
+            const rows = try g.take(try g.reshape(source, &.{ b * n, ss.d[2] }), flat, 0);
+            return g.reshape(rows, &.{ b, is.d[1], is.d[2], ss.d[2] });
+        }
+
+        /// K30 `_sparse_attend_selected`: gather each query's window rows and
+        /// selected compressed rows, one sink softmax over them (lean casts).
+        fn sparseAttendSelected(g: *G, c: *const v41.Config, rt: *const Routes, w: *const W, q: T, window: T, drop: u32, comp_kv: ?T, comp_idx: ?T, positions: T) !T {
+            const qs = g.shapeOf(q);
+            const b = qs.d[0];
+            const s = qs.d[1];
+            const W_: c_int = @intCast(c.window);
+            const sel = try windowSelectedIdx(g, c, positions, g.shapeOf(window).dim(1), drop);
+            const win_idx = try g.broadcastTo(try g.expandDims(sel.idx, 0), &.{ b, s, W_ });
+            const win_valid = try g.broadcastTo(try g.expandDims(sel.valid, 0), &.{ b, s, W_ });
+            var kvg = try gatherRows(g, window, win_idx, win_valid);
+            var valid = win_valid;
+            if (comp_kv != null and comp_idx != null) {
+                const cv = try g.greaterEqual(comp_idx.?, try g.scalar(0, .int32));
+                kvg = try g.concat(&.{ kvg, try gatherRows(g, comp_kv.?, comp_idx.?, cv) }, 2);
+                valid = try g.concat(&.{ valid, cv }, 2);
+            }
+            if (rt.attn_core_compile and b * s <= core_compile_max_rows) {
+                var o: [1]T = undefined;
+                try g.tape(AttnCore, c, &.{ q, kvg, valid, w.attn_sink }, &o);
+                return o[0];
+            }
+            return attnCore(g, c, q, kvg, valid, w.attn_sink, true);
+        }
+
+        /// `_attn_core_impl` (and the eager core of `_sparse_attend_selected`):
+        /// QK, mask, value-0 sink softmax, PV, all f32. `lean` casts KVg once.
+        fn attnCore(g: *G, c: *const v41.Config, q: T, kvg: T, valid: T, sink_w: T, lean: bool) !T {
+            const scale = std.math.pow(f64, @floatFromInt(c.head_dim), -0.5);
+            const kf = try g.astype(kvg, .float32);
+            var scores = try g.einsum("bshd,bskd->bshk", &.{ try g.astype(q, .float32), kf });
+            scores = try g.mul(scores, try sf(g, scale, scores));
+            scores = try g.where(try g.expandDims(valid, 2), scores, try sf(g, -std.math.inf(f64), scores));
+            const H = g.shapeOf(q).dim(2);
+            const sink = try g.reshape(try g.astype(sink_w, .float32), &.{ 1, 1, H, 1 });
+            const m = try g.maximum(try g.max(scores, -1, true), sink);
+            const ex = try g.exp(try g.sub(scores, m));
+            const denom = try g.add(try g.sum(ex, -1, true), try g.exp(try g.sub(sink, m)));
+            const values = if (lean) kf else try g.astype(kvg, .float32);
+            return g.div(try g.einsum("bshk,bskd->bshd", &.{ ex, values }), denom);
+        }
+
+        /// W97 `_attn_core_compiled`: in q, kvg, valid, sink.
+        const AttnCore = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
+                out[0] = try attnCore(g, ctx, in[0], in[1], in[2], in[3], false);
+            }
+        };
+
+        /// K22 `_attn_qkv_prep_impl`: in x, qcos, qsin, q_norm, kv_norm, then
+        /// wq_a, wq_b, wkv as (words, scales); out q, qr, kv_new.
+        const QkvPrep = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 3;
+            pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
+                const cs: CosSin = .{ .cos = in[1], .sin = in[2] };
+                const qr = try rmsnorm(g, try g.qmm(in[0], in[5], in[6], .mxfp8), in[3], c.rms_norm_eps);
+                var qs = g.shapeOf(qr);
+                qs.d[qs.n - 1] = @intCast(c.n_heads);
+                qs.d[qs.n] = @intCast(c.head_dim);
+                qs.n += 1;
+                out[0] = try ropeLast(g, try g.reshape(try g.qmm(qr, in[7], in[8], .mxfp8), qs.slice()), cs, false);
+                out[1] = qr;
+                out[2] = try ropeLast(g, try rmsnorm(g, try g.qmm(in[0], in[9], in[10], .mxfp8), in[4], c.rms_norm_eps), cs, false);
+            }
+        };
+
+        /// K22 `_attn_out_prep_impl`: in o, qcos, qsin, the dense grouped wo_a,
+        /// wo_b (words, scales); out the attention output.
+        const OutPrep = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
+                out[0] = try outProj(g, ctx, in[0], .{ .cos = in[1], .sin = in[2] }, in[3], .{ .w = in[4], .s = in[5] }, true);
+            }
+        };
+
+        /// The query-RoPE removal, grouped o-LoRA and `wo_b`. `flat` keeps the
+        /// compiled tape's flatten / unflatten pair (the eager body reshapes once).
+        fn outProj(g: *G, c: *const v41.Config, o0: T, cs: CosSin, w_ol: T, wo_b: Q(T), flat: bool) !T {
+            const s0 = g.shapeOf(o0);
+            const G_: c_int = @intCast(c.o_groups);
+            var o1 = try ropeLast(g, o0, cs, true);
+            if (flat) o1 = try g.reshape(o1, &.{ s0.d[0], s0.d[1], s0.d[2] * s0.d[3] });
+            o1 = try g.reshape(o1, &.{ s0.d[0], s0.d[1], G_, -1 });
+            const o2 = try g.einsum("bsgd,grd->bsgr", &.{ try g.astype(o1, .float32), try g.astype(w_ol, .float32) });
+            return qlinear(g, try g.reshape(o2, &.{ s0.d[0], s0.d[1], -1 }), wo_b);
+        }
+
+        /// The grouped `wo_a` as `[g, rank, in]`: bound once in f32 (W97), else
+        /// dequantized per call (bf16) as `_o_lora_dense_weight`.
+        fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
+            if (w.wo_a_dense) |d| return d;
+            return g.reshape(try g.dequantize(w.wo_a.w, w.wo_a.s, w.wo_a.mode), &.{ @intCast(c.o_groups), @intCast(c.o_lora_rank), -1 });
+        }
+
+        fn rowsOf(g: *G, x: T, trailing: u8) c_int {
+            const s = g.shapeOf(x);
+            var r: c_int = 1;
+            for (s.d[0 .. s.n - trailing]) |d| r *= d;
+            return r;
+        }
+
+        /// `Attention._attend`: the projections (K22 tape at rows <= 32), the
+        /// window append, masked-full (stock, W50 lean at prefill) or K30
+        /// selected-key attention, the output projection.
+        pub fn attention(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, positions: T, cache: *Cache, shared: *Share) !T {
             const sh = g.shapeOf(x);
             const b = sh.d[0];
             const s = sh.d[1];
             const H: c_int = @intCast(c.n_heads);
             const hd: c_int = @intCast(c.head_dim);
+            const compiled = rt.attn_compile and b * s <= attn_compile_max_rows;
             const cs = try cosSin(g, inv_freq, positions);
-            const qr = try rmsnorm(g, try qlinear(g, x, w.wq_a), w.q_norm, c.rms_norm_eps);
-            const q = try ropeLast(g, try g.reshape(try qlinear(g, qr, w.wq_b), &.{ b, s, H, hd }), cs, false);
-            const kv_new = try ropeLast(g, try rmsnorm(g, try qlinear(g, x, w.wkv), w.kv_norm, c.rms_norm_eps), cs, false);
+            var q: T = undefined;
+            var qr: T = undefined;
+            var kv_new: T = undefined;
+            if (compiled) {
+                var o: [3]T = undefined;
+                try g.tape(QkvPrep, c, &.{ x, cs.cos, cs.sin, w.q_norm, w.kv_norm, w.wq_a.w, w.wq_a.s, w.wq_b.w, w.wq_b.s, w.wkv.w, w.wkv.s }, &o);
+                q = o[0];
+                qr = o[1];
+                kv_new = o[2];
+            } else {
+                qr = try rmsnorm(g, try qlinear(g, x, w.wq_a), w.q_norm, c.rms_norm_eps);
+                q = try ropeLast(g, try g.reshape(try qlinear(g, qr, w.wq_b), &.{ b, s, H, hd }), cs, false);
+                kv_new = try ropeLast(g, try rmsnorm(g, try qlinear(g, x, w.wkv), w.kv_norm, c.rms_norm_eps), cs, false);
+            }
             try p.put("attn.qr", qr);
             try p.put("attn.q", q);
             try p.put("attn.kv_new", kv_new);
             try cache.window.append(g, kv_new);
             const window = (try cache.window.view(g)).?;
-            var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), cache.window.dropOffset(), b, s);
-            var kv = window;
-            if (li.ratio > 0) {
-                if (try compressed(g, p, c, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
-                    kv = try g.concat(&.{ window, comp.kv }, 1);
-                    attend = try g.concat(&.{ attend, comp.mask }, -1);
+            const drop = cache.window.dropOffset();
+            var o0: T = undefined;
+            if (rt.selected_keys) {
+                var ckv: ?T = null;
+                var cidx: ?T = null;
+                if (li.ratio > 0) if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
+                    ckv = comp.kv;
+                    cidx = shared.selected_idx;
+                };
+                o0 = try sparseAttendSelected(g, c, rt, w, q, window, drop, ckv, cidx, positions);
+            } else {
+                var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), drop, b, s);
+                var keys = window;
+                if (li.ratio > 0) {
+                    if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
+                        keys = try g.concat(&.{ window, comp.kv }, 1);
+                        attend = try g.concat(&.{ attend, comp.mask }, -1);
+                    }
                 }
+                o0 = if (s > 1 and rt.lean_prefill_score) try sparseAttendLean(g, c, w, q, keys, attend) else try sparseAttend(g, c, w, q, keys, attend);
             }
-            const o0 = try sparseAttend(g, c, w, q, kv, attend);
             try p.put("attn.o", o0);
-            const G_: c_int = @intCast(c.o_groups);
-            const R: c_int = @intCast(c.o_lora_rank);
-            const o1 = try g.reshape(try ropeLast(g, o0, cs, true), &.{ b, s, G_, -1 });
-            const woa = try g.reshape(try g.dequantize(w.wo_a.w, w.wo_a.s, w.wo_a.mode), &.{ G_, R, -1 });
-            const o2 = try g.einsum("bsgd,grd->bsgr", &.{ try g.astype(o1, .float32), try g.astype(woa, .float32) });
-            const out = try qlinear(g, try g.reshape(o2, &.{ b, s, -1 }), w.wo_b);
+            const w_ol = try woaDense(g, c, w);
+            const out = if (compiled) blk: {
+                var o: [1]T = undefined;
+                try g.tape(OutPrep, c, &.{ o0, cs.cos, cs.sin, w_ol, w.wo_b.w, w.wo_b.s }, &o);
+                break :blk o[0];
+            } else try outProj(g, c, o0, cs, w_ol, w.wo_b, false);
             try p.put("attn.out", out);
             return out;
         }
 
         pub const Route = struct { weights: T, indices: T };
 
-        /// `Gate.__call__`: sqrtsoftplus scores, noaux_tc biased selection,
-        /// unbiased normalised weights x route scale.
-        pub fn router(g: *G, p: anytype, c: *const v41.Config, w: *const W, xf: T) !Route {
-            const logits = try g.div(try linear(g, try g.astype(xf, .float32), try g.astype(w.gate_w, .float32)), try g.scalar(1.0, .float32));
+        /// `Gate.__call__`'s pure prefix: f32 score GEMM / temp, sqrtsoftplus, the
+        /// noaux_tc correction bias. Returns the unbiased and the biased scores.
+        fn gatePrefix(g: *G, xf: T, gate_w: T, gate_bias: T) ![3]T {
+            const logits = try g.div(try linear(g, try g.astype(xf, .float32), try g.astype(gate_w, .float32)), try g.scalar(1.0, .float32));
             const scores = try g.sqrt(try g.softplus(logits));
-            const biased = try g.add(scores, w.gate_bias);
+            return .{ scores, try g.add(scores, gate_bias), logits };
+        }
+
+        /// `Gate.__call__`'s selection: top-k of the biased scores in descending
+        /// order, weights from the unbiased ones, normalised, x route scale.
+        fn gateSelect(g: *G, c: *const v41.Config, scores: T, biased: T) !Route {
             const k: c_int = @intCast(c.n_experts_per_tok);
             const part = try sliceLast(g, try g.argpartition(try g.neg(biased), k - 1, -1), 0, k);
             const order = try g.argsort(try g.neg(try g.takeAlongAxis(biased, part, -1)), -1);
@@ -505,65 +763,217 @@ pub fn Trunk(comptime G: type) type {
                 weights = try g.div(weights, try g.add(try g.sum(weights, -1, true), try g.scalar(1e-20, .float32)));
             }
             weights = try g.mul(weights, try g.scalar(c.routed_scaling_factor, .float32));
-            try p.put("gate.logits", logits);
-            try p.put("gate.scores", scores);
-            try p.put("gate.indices", indices);
-            try p.put("gate.weights", weights);
             return .{ .weights = weights, .indices = indices };
+        }
+
+        /// K22 `_gate_prefix_impl`: in xf, gate weight, bias; out scores, biased.
+        const GatePrefix = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 2;
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                out[0..2].* = (try gatePrefix(g, in[0], in[1], in[2]))[0..2].*;
+            }
+        };
+
+        /// `Gate.__call__`: sqrtsoftplus scores, noaux_tc biased selection,
+        /// unbiased normalised weights x route scale (the prefix a K22 tape at
+        /// rows <= 32; the selection eager, it feeds the routing barrier).
+        pub fn router(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, xf: T) !Route {
+            var pre: [2]T = undefined;
+            if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) {
+                try g.tape(GatePrefix, c, &.{ xf, w.gate_w, w.gate_bias }, &pre);
+            } else {
+                const e = try gatePrefix(g, xf, w.gate_w, w.gate_bias);
+                pre = e[0..2].*;
+                try p.put("gate.logits", e[2]);
+                try p.put("gate.scores", e[0]);
+            }
+            const r = try gateSelect(g, c, pre[0], pre[1]);
+            try p.put("gate.indices", r.indices);
+            try p.put("gate.weights", r.weights);
+            return r;
         }
 
         /// `Expert.__call__` (the shared expert): clamped SwiGLU in f32.
         pub fn sharedExpert(g: *G, c: *const v41.Config, w: *const W, x: T) !T {
+            return sharedExpertQ(g, c, x, w.sh_w1, w.sh_w3, w.sh_w2);
+        }
+
+        fn sharedExpertQ(g: *G, c: *const v41.Config, x: T, w1: Q(T), w3: Q(T), w2: Q(T)) !T {
             const dt = g.dtypeOf(x);
-            var gate = try g.astype(try qlinear(g, x, w.sh_w1), .float32);
-            var up = try g.astype(try qlinear(g, x, w.sh_w3), .float32);
+            var gate = try g.astype(try qlinear(g, x, w1), .float32);
+            var up = try g.astype(try qlinear(g, x, w3), .float32);
             if (c.swiglu_limit > 0) {
                 up = try g.clip(up, try g.scalar(-c.swiglu_limit, .float32), try g.scalar(c.swiglu_limit, .float32));
                 gate = try g.minimum(gate, try g.scalar(c.swiglu_limit, .float32));
             }
             const h = try g.mul(try g.silu(gate), up);
-            return qlinear(g, try g.astype(h, dt), w.sh_w2);
+            return qlinear(g, try g.astype(h, dt), w2);
         }
+
+        /// `_moe_combine_impl`: the weighted routed sum in f32 plus the shared output.
+        fn moeCombine(g: *G, ro: T, weights: T, shared: T) !T {
+            return g.add(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(weights, -1)), -2, false), shared);
+        }
+
+        /// K22 `_moe_combine`: in routed, weights, shared.
+        const MoeCombine = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                out[0] = try moeCombine(g, in[0], in[1], in[2]);
+            }
+        };
 
         /// `MoE.__call__`: gate, routed experts (`routed.routed(g, xf, indices)`
         /// returns the unweighted `[n, k, dim]` outputs), shared expert, f32 combine.
-        pub fn moe(g: *G, p: anytype, c: *const v41.Config, w: *const W, x: T, routed: anytype) !T {
+        pub fn moe(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, x: T, routed: anytype) !T {
             const sh = g.shapeOf(x);
             const dim: c_int = @intCast(c.hidden_size);
             const xf = try g.reshape(x, &.{ -1, dim });
-            const r = try router(g, p, c, w, xf);
+            const r = try router(g, p, c, rt, w, xf);
             const ro = try routed.routed(g, xf, r.indices);
             try p.put("moe.routed", ro);
             const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
-            const y = try g.add(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(r.weights, -1)), -2, false), shared);
+            const y = if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) blk: {
+                var o: [1]T = undefined;
+                try g.tape(MoeCombine, c, &.{ ro, r.weights, shared }, &o);
+                break :blk o[0];
+            } else try moeCombine(g, ro, r.weights, shared);
             return g.reshape(try g.astype(y, g.dtypeOf(x)), sh.slice());
         }
 
-        /// `DecoderLayer.__call__` (eager): attention and MoE, each inside a
+        /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
+        /// attention RMSNorm. Out: attention input, pre, post, comb.
+        fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
+            const m = try hcMixes(g, c, h, fnw, base, scale);
+            const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
+            return .{ x, m.pre, m.post, m.comb };
+        }
+
+        /// `_hc_ffn_prep_impl`: the attention HC post, the ffn mixes, collapse and
+        /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
+        fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+            const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
+            const m = try hcMixes(g, c, h1, fnw, base, scale);
+            const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
+            return .{ x, h1, m.post, m.comb, m.pre };
+        }
+
+        /// K4 / K35 seg1: in h, pre_mix, attn fn, base, scale, attn norm.
+        const HcAttnPrep = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 4;
+            pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
+                out[0..4].* = try hcAttnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5]);
+            }
+        };
+
+        /// K4 ffn prep: in attn out, residual, attn pre, post, comb, ffn fn, base, scale, ffn norm.
+        const HcFfnPrep = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 5;
+            pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
+                out[0..5].* = try hcFfnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+            }
+        };
+
+        /// K4 moe combine (`_hc_post_impl`): in moe output, residual, ffn post, ffn comb.
+        const HcPost = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                out[0] = try hcPost(g, in[0], in[1], in[2], in[3]);
+            }
+        };
+
+        /// K35 seg2: the ffn prep, the whole gate and the shared expert. In: the
+        /// HcFfnPrep inputs, gate weight, gate bias, then shared w1, w3, w2 as
+        /// (words, scales). Out: xf, weights, indices, shared, h1, ffn post, ffn comb, ffn pre.
+        const Seg2 = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 8;
+            pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
+                const f = try hcFfnPrep(g, c, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+                const xf = try g.reshape(f[0], &.{ -1, @intCast(c.hidden_size) });
+                const pre = try gatePrefix(g, xf, in[9], in[10]);
+                const r = try gateSelect(g, c, pre[0], pre[1]);
+                const shared = try g.astype(try sharedExpertQ(g, c, xf, .{ .w = in[11], .s = in[12] }, .{ .w = in[13], .s = in[14] }, .{ .w = in[15], .s = in[16] }), .float32);
+                out[0..8].* = .{ xf, r.weights, r.indices, shared, f[1], f[2], f[3], f[4] };
+            }
+        };
+
+        /// K35 seg3: the MoE combine folded into the ffn HC post. In routed,
+        /// weights, shared, residual, ffn post, ffn comb.
+        const Seg3 = struct {
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                const res = g.shapeOf(in[3]);
+                const y = try g.astype(try moeCombine(g, in[0], in[1], in[2]), g.dtypeOf(in[3]));
+                const y3 = try g.reshape(y, &.{ res.d[0], res.d[1], res.d[3] });
+                out[0] = try hcPost(g, y3, in[3], in[4], in[5]);
+            }
+        };
+
+        /// `DecoderLayer.__call__`: attention and MoE, each inside a
         /// Hyper-Connection pre / post, the pre mix threaded across sublayers.
-        pub fn layer(g: *G, p: anytype, c: *const v41.Config, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
-            const am = try hcMixes(g, c, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
-            try p.put("attn.pre", am.pre);
-            try p.put("attn.post", am.post);
-            try p.put("attn.comb", am.comb);
-            const ax = try rmsnorm(g, try hcPre(g, h, pre_mix), w.attn_norm, c.rms_norm_eps);
-            try p.put("attn.x", ax);
-            const ao = try attention(g, p, c, li, w, inv_freq, ax, positions, cache, shared);
-            const h1 = try hcPost(g, ao, h, am.post, am.comb);
-            try p.put("hc1.h", h1);
-            const fm = try hcMixes(g, c, h1, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale);
-            try p.put("ffn.pre", fm.pre);
-            try p.put("ffn.post", fm.post);
-            try p.put("ffn.comb", fm.comb);
-            const fx = try rmsnorm(g, try hcPre(g, h1, am.pre), w.ffn_norm, c.rms_norm_eps);
-            try p.put("ffn.x", fx);
-            const mo = try moe(g, p, c, w, fx, routed);
+        /// At decode / verify rows K35 runs three compiled segments; K4 compiles
+        /// the HC prep / combine; the eager body otherwise.
+        pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
+            const rows = rowsOf(g, h, 2);
+            if (rt.small_stages and rows <= small_stages_max_rows) {
+                var s1: [4]T = undefined;
+                try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &s1);
+                try p.put("attn.x", s1[0]);
+                const ao = try attention(g, p, c, rt, li, w, inv_freq, s1[0], positions, cache, shared);
+                var s2: [8]T = undefined;
+                try g.tape(Seg2, c, &.{ ao, h, s1[1], s1[2], s1[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, w.gate_w, w.gate_bias, w.sh_w1.w, w.sh_w1.s, w.sh_w3.w, w.sh_w3.s, w.sh_w2.w, w.sh_w2.s }, &s2);
+                try p.put("gate.indices", s2[2]);
+                try p.put("gate.weights", s2[1]);
+                try p.put("moe.shared", s2[3]);
+                const ro = try routed.routed(g, s2[0], s2[2]);
+                try p.put("moe.routed", ro);
+                var s3: [1]T = undefined;
+                try g.tape(Seg3, c, &.{ ro, s2[1], s2[3], s2[4], s2[5], s2[6] }, &s3);
+                try p.put("out.h", s3[0]);
+                try p.put("out.pre_mix", s2[7]);
+                return .{ .h = s3[0], .pre_mix = s2[7] };
+            }
+            const hc_tape = rt.hc_compile and rows <= hc_compile_max_rows;
+            var a: [4]T = undefined;
+            if (hc_tape) {
+                try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
+            } else {
+                a = try hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
+                try p.put("attn.pre", a[1]);
+                try p.put("attn.post", a[2]);
+                try p.put("attn.comb", a[3]);
+            }
+            try p.put("attn.x", a[0]);
+            const ao = try attention(g, p, c, rt, li, w, inv_freq, a[0], positions, cache, shared);
+            var f: [5]T = undefined;
+            if (hc_tape) {
+                try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
+            } else {
+                f = try hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+                try p.put("hc1.h", f[1]);
+                try p.put("ffn.pre", f[4]);
+                try p.put("ffn.post", f[2]);
+                try p.put("ffn.comb", f[3]);
+            }
+            try p.put("ffn.x", f[0]);
+            const mo = try moe(g, p, c, rt, w, f[0], routed);
             try p.put("moe.y", mo);
-            const out = try hcPost(g, mo, h1, fm.post, fm.comb);
+            const out = if (hc_tape) blk: {
+                var o: [1]T = undefined;
+                try g.tape(HcPost, c, &.{ mo, f[1], f[2], f[3] }, &o);
+                break :blk o[0];
+            } else try hcPost(g, mo, f[1], f[2], f[3]);
             try p.put("out.h", out);
-            try p.put("out.pre_mix", fm.pre);
-            return .{ .h = out, .pre_mix = fm.pre };
+            try p.put("out.pre_mix", f[4]);
+            return .{ .h = out, .pre_mix = f[4] };
         }
 
         /// `NGramRowCache.dequantize` (mxfp8 records): the E4M3 code words
@@ -645,6 +1055,7 @@ pub fn yarnRamp(dim: f64, base: f64, orig: f64, beta_fast: f64, beta_slow: f64) 
 
 const testing = std.testing;
 const TraceOps = ops.TraceOps;
+const stock: Routes = .{};
 const Tr = Trunk(TraceOps);
 const Shape = ops.Shape;
 
@@ -833,7 +1244,7 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     defer cache.deinit(&g);
     var shared: Tr.Share = .{};
     const pos = try g.arange(0, 5, 1, .int32);
-    const out = try Tr.layer(&g, &p, &c, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
+    const out = try Tr.layer(&g, &p, &c, &stock, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
     try expectStage(&g, &p, "attn.x", &.{ 1, 5, 5120 }, .bfloat16);
     try expectStage(&g, &p, "attn.qr", &.{ 1, 5, 1280 }, .bfloat16);
     try expectStage(&g, &p, "attn.q", &.{ 1, 5, 64, 512 }, .bfloat16);
@@ -853,7 +1264,7 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, 5, 512 }, .bfloat16);
     const fin = try Tr.finalNorm(&g, &c, out.h, out.pre_mix, try g.input(&.{5120}, .bfloat16));
     try expectShape(&g, fin, &.{ 1, 5, 5120 }, .float32);
-    const logits = try Tr.head(&g, fin, try g.input(&.{ 4096, 5120 }, .bfloat16));
+    const logits = try Tr.head(&g, &stock, fin, .{ .dense = try g.input(&.{ 4096, 5120 }, .bfloat16) });
     try expectShape(&g, logits, &.{ 1, 5, 4096 }, .float32);
 }
 
@@ -883,7 +1294,7 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
         p.nodes.clearRetainingCapacity();
         const x = try g.input(&.{ 1, st.s, 5120 }, .float32);
         const pos = try g.arange(@floatFromInt(pos0), @floatFromInt(pos0 + st.s), 1, .int32);
-        const out = try Tr.attention(&g, &p, &c, li, &w, inv, x, pos, &cache, &shared);
+        const out = try Tr.attention(&g, &p, &c, &stock, li, &w, inv, x, pos, &cache, &shared);
         try expectShape(&g, out, &.{ 1, st.s, 5120 }, .float32);
         try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, st.rows, 512 }, .float32);
         try expectShape(&g, (try cache.compress.view(&g)).?, &.{ 1, st.comp, 512 }, .float32);
@@ -924,7 +1335,7 @@ test "dsv41 graph: under the window ring the attention sees a bounded window, on
             const x = try g.input(&.{ 1, s, 5120 }, .bfloat16);
             p.names.clearRetainingCapacity();
             p.nodes.clearRetainingCapacity();
-            _ = try Tr.attention(&g, &p, &c, c.layers[l], &ws[l], inv, x, pos, &caches[l], &shared);
+            _ = try Tr.attention(&g, &p, &c, &stock, c.layers[l], &ws[l], inv, x, pos, &caches[l], &shared);
             masks[l] = shared.win_mask.?;
             caches[l].advance(@intCast(s));
         }
@@ -960,7 +1371,7 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
         const x = try g.input(&.{ 1, s, ci(c.hidden_size) }, .float32);
         p.names.clearRetainingCapacity();
         p.nodes.clearRetainingCapacity();
-        _ = try Tr.attention(&g, &p, &c, li, &w, inv_c, x, pos, &caches[l], &shared);
+        _ = try Tr.attention(&g, &p, &c, &stock, li, &w, inv_c, x, pos, &caches[l], &shared);
         switch (l) {
             // Full, ratio 2: 4 groups from 9 tokens.
             1 => try expectStage(&g, &p, "attn.topk_mask", &.{ 1, 9, 4 }, .bool_),
@@ -993,7 +1404,7 @@ test "dsv41 graph: router, shared expert and Engram apply keep the Python dtypes
     const c = try realConfig();
     const w = try traceLayerW(&g, &c, c.layers[3]);
     const xf = try g.input(&.{ 5, 5120 }, .float32);
-    const r = try Tr.router(&g, &p, &c, &w, xf);
+    const r = try Tr.router(&g, &p, &c, &stock, &w, xf);
     try expectShape(&g, r.indices, &.{ 5, 6 }, .int32);
     try expectShape(&g, r.weights, &.{ 5, 6 }, .float32);
     try expectStage(&g, &p, "gate.scores", &.{ 5, 384 }, .float32);
@@ -1043,4 +1454,149 @@ test "dsv41 graph: the routed stand-in keeps the Python table and shapes" {
     const si: StandIn(TraceOps) = .{ .scale = try g.input(&.{384}, .float32) };
     const out = try si.routed(&g, try g.input(&.{ 5, 5120 }, .float32), try g.input(&.{ 5, 6 }, .int32));
     try expectShape(&g, out, &.{ 5, 6, 5120 }, .float32);
+}
+
+test "dsv41 graph: K30 selected keys gather each query's window and selected rows, the selection published once" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try miniConfig();
+    const rt: Routes = .{ .selected_keys = true };
+    var caches: [5]Tr.Cache = undefined;
+    for (&caches, 0..) |*cc, l| cc.* = Tr.Cache.init(c.layers[l], c.window, .{ .route = .window_ring });
+    defer for (&caches) |*cc| cc.deinit(&g);
+    const inv = try Tr.yarnInvFreq(&g, &c);
+    var shared: Tr.Share = .{};
+    const pos = try g.arange(0, 9, 1, .int32);
+    var published: [5]?u32 = @splat(null);
+    for (1..5) |l| {
+        const w = try traceLayerW(&g, &c, c.layers[l]);
+        const x = try g.input(&.{ 1, 9, ci(c.hidden_size) }, .float32);
+        p.names.clearRetainingCapacity();
+        p.nodes.clearRetainingCapacity();
+        const out = try Tr.attention(&g, &p, &c, &rt, c.layers[l], &w, inv, x, pos, &caches[l], &shared);
+        try expectShape(&g, out, &.{ 1, 9, ci(c.hidden_size) }, .float32);
+        try expectStage(&g, &p, "attn.o", &.{ 1, 9, 2, 32 }, .float32);
+        published[l] = shared.selected_idx;
+    }
+    // No masked-full attention: no window mask was built.
+    try testing.expect(shared.win_mask == null);
+    // Layer 1 (index source over 4 groups) publishes k = min(index_topk 4, 4); reuse layer 2 reads it;
+    // layer 3 (index source, ratio 1) and reindex layer 4 publish their own over 9 rows.
+    try expectShape(&g, published[1].?, &.{ 1, 9, 4 }, .int32);
+    try testing.expectEqual(published[1].?, published[2].?);
+    try expectShape(&g, published[3].?, &.{ 1, 9, 4 }, .int32);
+    try testing.expect(published[4].? != published[3].?);
+    // The core compile pads the selection to index_topk and runs as one region at decode rows.
+    const rtc: Routes = .{ .selected_keys = true, .attn_core_compile = true };
+    const w1 = try traceLayerW(&g, &c, c.layers[1]);
+    var cache1 = Tr.Cache.init(c.layers[1], c.window, .{});
+    defer cache1.deinit(&g);
+    var sh1: Tr.Share = .{};
+    const mark = g.nodes.items.len;
+    _ = try Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache1, &sh1);
+    const seq = try g.opsSince(testing.allocator, mark);
+    defer testing.allocator.free(seq);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(ops.Op, seq, &.{.tape_begin}));
+}
+
+fn countOps(seq: []const ops.Op) [@typeInfo(ops.Op).@"enum".field_names.len]u32 {
+    var n: [@typeInfo(ops.Op).@"enum".field_names.len]u32 = @splat(0);
+    for (seq) |o| n[@backingInt(o)] += 1;
+    return n;
+}
+
+/// The ops one real layer-0 forward records at `rows` query rows under `rt`.
+fn layerOps(rt: *const Routes, rows: c_int) ![]ops.Op {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    const li = c.layers[0];
+    const w = try traceLayerW(&g, &c, li);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    const h = try g.input(&.{ 1, rows, 4, 5120 }, .bfloat16);
+    const pm = try g.input(&.{ 1, rows, 4 }, .float32);
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
+    var shared: Tr.Share = .{};
+    const mark = g.nodes.items.len;
+    _ = try Tr.layer(&g, NoProbe{}, &c, rt, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
+    return g.opsSince(testing.allocator, mark);
+}
+
+test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only at decode / verify rows" {
+    const O = ops.Op;
+    const eager = try layerOps(&.{}, 1);
+    defer testing.allocator.free(eager);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(O, eager, &.{.tape_begin}));
+    // K22 + K4 at one row: 4 + 3 tapes over the same ops, plus the out tape's flatten reshape.
+    const k22k4 = try layerOps(&.{ .attn_compile = true, .hc_compile = true }, 1);
+    defer testing.allocator.free(k22k4);
+    var want = countOps(eager);
+    want[@backingInt(O.reshape)] += 1;
+    var got = countOps(k22k4);
+    try testing.expectEqual(@as(u32, 7), got[@backingInt(O.tape_begin)]);
+    got[@backingInt(O.tape_begin)] = 0;
+    got[@backingInt(O.tape_end)] = 0;
+    try testing.expectEqual(want, got);
+    // K35 at one row: three segments (+ the attention's own K22 tapes) over the same multiset.
+    const k35 = try layerOps(&.{ .small_stages = true, .attn_compile = true }, 1);
+    defer testing.allocator.free(k35);
+    got = countOps(k35);
+    try testing.expectEqual(@as(u32, 3 + 2), got[@backingInt(O.tape_begin)]);
+    got[@backingInt(O.tape_begin)] = 0;
+    got[@backingInt(O.tape_end)] = 0;
+    try testing.expectEqual(want, got);
+    // Past the row caps the eager body runs: K4 / K35 stop at 7 rows, K22 at 32.
+    const wide = try layerOps(&.{ .attn_compile = true, .hc_compile = true, .small_stages = true }, 8);
+    defer testing.allocator.free(wide);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(O, wide, &.{.tape_begin}));
+    const prefill = try layerOps(&.{ .attn_compile = true, .hc_compile = true, .small_stages = true }, 33);
+    defer testing.allocator.free(prefill);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(O, prefill, &.{.tape_begin}));
+}
+
+test "dsv41 graph: head codecs and the cached wo_a keep the Python dtypes" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    const x = try g.input(&.{ 1, 3, 5120 }, .float32);
+    const hw = try g.input(&.{ 129280, 5120 }, .bfloat16);
+    try expectShape(&g, try Tr.head(&g, &.{}, x, .{ .dense = hw }), &.{ 1, 3, 129280 }, .float32);
+    const mark = g.nodes.items.len;
+    try expectShape(&g, try Tr.head(&g, &.{ .head = .bf16 }, x, .{ .dense = hw }), &.{ 1, 3, 129280 }, .float32);
+    const seq = try g.opsSince(testing.allocator, mark);
+    defer testing.allocator.free(seq);
+    // bf16 GEMV: cast the hidden down, matmul at bf16, cast the logits up.
+    try testing.expectEqualSlices(ops.Op, &.{ .astype, .transpose, .matmul, .astype }, seq);
+    const q = try Tr.quantizeHead(&g, hw);
+    try expectShape(&g, q.w, &.{ 129280, 1280 }, .uint32);
+    try expectShape(&g, q.s, &.{ 129280, 160 }, .uint8);
+    try expectShape(&g, try Tr.head(&g, &.{ .head = .mxfp8 }, x, .{ .mxfp8 = q }), &.{ 1, 3, 129280 }, .float32);
+    const w = try traceLayerW(&g, &c, c.layers[0]);
+    try expectShape(&g, try Tr.woaDenseF32(&g, &c, w.wo_a), &.{ 8, 1024, 4096 }, .float32);
+}
+
+test "dsv41 graph: the W50 lean prefill score folds the sink instead of concatenating a column" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const li = c.layers[0];
+    const w = try traceLayerW(&g, &c, li);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    for ([_]bool{ false, true }) |lean| {
+        var cache = Tr.Cache.init(li, c.window, .{});
+        defer cache.deinit(&g);
+        var shared: Tr.Share = .{};
+        const mark = g.nodes.items.len;
+        _ = try Tr.attention(&g, &p, &c, &.{ .lean_prefill_score = lean }, li, &w, inv, try g.input(&.{ 1, 5, 5120 }, .bfloat16), try g.arange(0, 5, 1, .int32), &cache, &shared);
+        try expectStage(&g, &p, "attn.o", &.{ 1, 5, 64, 512 }, .float32);
+        const seq = try g.opsSince(testing.allocator, mark);
+        defer testing.allocator.free(seq);
+        try testing.expectEqual(!lean, std.mem.count(ops.Op, seq, &.{.softmax}) == 1);
+        try testing.expectEqual(lean, std.mem.count(ops.Op, seq, &.{.exp}) == 2);
+    }
 }
