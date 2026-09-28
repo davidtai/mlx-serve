@@ -44,6 +44,8 @@ test {
     _ = @import("expert_bank.zig");
     _ = @import("expert_io.zig");
     _ = @import("expert_stream.zig");
+    _ = @import("exl3_kernels.zig");
+    _ = @import("exl3_selfcheck.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
