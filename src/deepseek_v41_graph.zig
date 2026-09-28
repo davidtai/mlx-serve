@@ -11,6 +11,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
+const kvc = @import("deepseek_v41_cache.zig");
 
 const Dtype = ops.Dtype;
 
@@ -55,21 +56,6 @@ pub fn EngramW(comptime T: type) type {
     return struct { wkv: Q(T), q_weight: T, k_weight: T };
 }
 
-/// Per-layer attention state (Python `LayerAttentionCache`, full-history
-/// backing): the post-RoPE window rows, the compressed KV + index keys of a
-/// kv source, and the compressor frontier. Arrays are `keep` references.
-pub fn LayerCache(comptime T: type) type {
-    return struct {
-        offset: u32 = 0,
-        window: ?T = null,
-        compress_kv: ?T = null,
-        index_k: ?T = null,
-        raw_kv: ?T = null,
-        raw_score: ?T = null,
-        n_fed: u32 = 0,
-    };
-}
-
 /// What a source layer hands down the stack within ONE forward (Python
 /// `SharedAttentionRuntime`); borrowed references, dropped with the forward.
 pub fn Shared(comptime T: type) type {
@@ -78,6 +64,11 @@ pub fn Shared(comptime T: type) type {
         index_k: ?T = null,
         topk_mask: ?T = null,
         candidates: ?T = null,
+        /// The window attend mask, identical for every layer of one forward
+        /// (same positions, window rows and drop offset: K24's memo).
+        win_mask: ?T = null,
+        win_rows: u32 = 0,
+        win_drop: u32 = 0,
     };
 }
 
@@ -90,7 +81,7 @@ pub fn Trunk(comptime G: type) type {
     return struct {
         pub const T = G.T;
         pub const W = LayerW(T);
-        pub const Cache = LayerCache(T);
+        pub const Cache = kvc.LayerState(G);
         pub const Share = Shared(T);
         pub const Mixes = struct { pre: T, post: T, comb: T };
         pub const CosSin = struct { cos: T, sin: T };
@@ -113,17 +104,6 @@ pub fn Trunk(comptime G: type) type {
             return g.slice(x, start[0..s.n], stop[0..s.n], strides[0..s.n]);
         }
 
-        fn sliceAxis1(g: *G, x: T, lo: c_int, hi: c_int) !T {
-            const s = g.shapeOf(x);
-            var start: [ops.max_dims]c_int = @splat(0);
-            var stop: [ops.max_dims]c_int = undefined;
-            const strides: [ops.max_dims]c_int = @splat(1);
-            @memcpy(stop[0..s.n], s.slice());
-            start[1] = lo;
-            stop[1] = hi;
-            return g.slice(x, start[0..s.n], stop[0..s.n], strides[0..s.n]);
-        }
-
         /// `x[..., i]`.
         fn lastIndex(g: *G, x: T, i: c_int) !T {
             const s = g.shapeOf(x);
@@ -133,14 +113,6 @@ pub fn Trunk(comptime G: type) type {
         /// `x[i]` of a 1-D array: a 0-d view.
         fn index0(g: *G, x: T, i: c_int) !T {
             return g.reshape(try sliceLast(g, x, i, i + 1), &.{});
-        }
-
-        /// `_grow`: append along the sequence axis; the cache keeps its own reference.
-        fn grow(g: *G, slot: *?T, new: T) !void {
-            const next = if (slot.*) |old| try g.concat(&.{ old, new }, 1) else new;
-            const kept = g.keep(next);
-            if (slot.*) |old| g.release(old);
-            slot.* = kept;
         }
 
         /// Python `_rmsnorm`.
@@ -311,13 +283,23 @@ pub fn Trunk(comptime G: type) type {
             return linear(g, try g.astype(x, .float32), head_w);
         }
 
-        /// `Attention._window_attend` (full-history backing, drop offset 0).
-        fn windowAttend(g: *G, c: *const v41.Config, positions: T, t_len: c_int, b: c_int, s: c_int) !T {
-            const wpos = try g.add(try g.scalar(0, .int32), try g.arange(0, @floatFromInt(t_len), 1, .int32));
+        /// `Attention._window_attend`: view row j is absolute position `drop + j`.
+        fn windowAttend(g: *G, c: *const v41.Config, positions: T, t_len: c_int, drop: u32, b: c_int, s: c_int) !T {
+            const wpos = try g.add(try g.scalar(@floatFromInt(drop), .int32), try g.arange(0, @floatFromInt(t_len), 1, .int32));
             const qp = try g.expandDims(positions, 1);
             const wp = try g.expandDims(wpos, 0);
             const inside = try g.logicalAnd(try g.lessEqual(wp, qp), try g.greater(wp, try g.sub(qp, try g.scalar(@floatFromInt(c.window), .int32))));
             return g.broadcastTo(try g.expandDims(inside, 0), &.{ b, s, t_len });
+        }
+
+        /// The forward's window mask, built by its first layer and reused.
+        fn windowMask(g: *G, c: *const v41.Config, shared: *Share, positions: T, t_len: c_int, drop: u32, b: c_int, s: c_int) !T {
+            if (shared.win_mask) |m| if (shared.win_rows == t_len and shared.win_drop == drop) return m;
+            const m = try windowAttend(g, c, positions, t_len, drop, b, s);
+            shared.win_mask = m;
+            shared.win_rows = @intCast(t_len);
+            shared.win_drop = drop;
+            return m;
         }
 
         /// `_topk_rows`: the k highest per row, ties to the lowest index.
@@ -403,24 +385,9 @@ pub fn Trunk(comptime G: type) type {
             const comp = w.comp.?;
             if (li.ratio == 1) return try rmsnorm(g, try linear(g, x, comp.wkv), comp.norm, c.rms_norm_eps);
             const xf = try g.astype(x, .float32);
-            const kv = try linear(g, xf, comp.wkv);
+            const proj = try linear(g, xf, comp.wkv);
             const score = try linear(g, xf, comp.wgate.?);
-            const s: u32 = @intCast(g.shapeOf(kv).dim(1));
-            const n_before = cache.n_fed;
-            try grow(g, &cache.raw_kv, kv);
-            try grow(g, &cache.raw_score, score);
-            cache.n_fed += s;
-            const r: u32 = li.ratio;
-            const g_before = n_before / r;
-            const g_after = cache.n_fed / r;
-            if (g_after == g_before) return null;
-            const lo: c_int = @intCast(g_before * r);
-            const hi: c_int = @intCast(g_after * r);
-            const sh = g.shapeOf(kv);
-            const grp: [4]c_int = .{ sh.d[0], @intCast(g_after - g_before), @intCast(r), sh.d[2] };
-            const grp_kv = try g.reshape(try sliceAxis1(g, cache.raw_kv.?, lo, hi), &grp);
-            const grp_sc = try g.reshape(try sliceAxis1(g, cache.raw_score.?, lo, hi), &grp);
-            const pooled = try g.sum(try g.mul(grp_kv, try g.softmax(grp_sc, 2)), 2, false);
+            const pooled = try cache.frontierPush(g, proj, score) orelse return null;
             return try rmsnorm(g, pooled, comp.norm, c.rms_norm_eps);
         }
 
@@ -428,7 +395,7 @@ pub fn Trunk(comptime G: type) type {
         /// keys, append, publish to the forward's shared runtime.
         fn publishCompressed(g: *G, p: anytype, c: *const v41.Config, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, cache: *Cache, shared: *Share) !void {
             if (try compressorPool(g, c, li, w, x, cache)) |lat| {
-                const n_prev: c_int = if (cache.compress_kv) |ck| g.shapeOf(ck).dim(1) else 0;
+                const n_prev: c_int = @intCast(cache.compress.rows());
                 const n_new = g.shapeOf(lat).dim(1);
                 const gpos = try g.mul(try g.arange(@floatFromInt(n_prev), @floatFromInt(n_prev + n_new), 1, .int32), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const gcs = try cosSin(g, inv_freq, gpos);
@@ -437,11 +404,11 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("attn.comp_latent", lat);
                 try p.put("attn.compress_new", cnew);
                 try p.put("attn.index_new", inew);
-                try grow(g, &cache.compress_kv, cnew);
-                try grow(g, &cache.index_k, inew);
+                try cache.compress.append(g, cnew);
+                try cache.index.append(g, inew);
             }
-            shared.compress_kv = cache.compress_kv;
-            shared.index_k = cache.index_k;
+            shared.compress_kv = try cache.compress.view(g);
+            shared.index_k = try cache.index.view(g);
         }
 
         const Compressed = struct { kv: T, mask: T };
@@ -499,9 +466,9 @@ pub fn Trunk(comptime G: type) type {
             try p.put("attn.qr", qr);
             try p.put("attn.q", q);
             try p.put("attn.kv_new", kv_new);
-            try grow(g, &cache.window, kv_new);
-            const window = cache.window.?;
-            var attend = try windowAttend(g, c, positions, g.shapeOf(window).dim(1), b, s);
+            try cache.window.append(g, kv_new);
+            const window = (try cache.window.view(g)).?;
+            var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), cache.window.dropOffset(), b, s);
             var kv = window;
             if (li.ratio > 0) {
                 if (try compressed(g, p, c, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
@@ -862,7 +829,8 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     const e = try Tr.expandEmbedding(&g, &c, rows);
     try expectShape(&g, e.h, &.{ 1, 5, 4, 5120 }, .bfloat16);
     try expectShape(&g, e.pre_mix, &.{ 1, 5, 4 }, .float32);
-    var cache: Tr.Cache = .{};
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
     var shared: Tr.Share = .{};
     const pos = try g.arange(0, 5, 1, .int32);
     const out = try Tr.layer(&g, &p, &c, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
@@ -882,7 +850,7 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     try expectShape(&g, out.h, &.{ 1, 5, 4, 5120 }, .float32);
     try expectShape(&g, out.pre_mix, &.{ 1, 5, 4 }, .float32);
     try testing.expect(p.get("attn.topk_mask") == null); // SWA: no compressed branch
-    try expectShape(&g, cache.window.?, &.{ 1, 5, 512 }, .bfloat16);
+    try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, 5, 512 }, .bfloat16);
     const fin = try Tr.finalNorm(&g, &c, out.h, out.pre_mix, try g.input(&.{5120}, .bfloat16));
     try expectShape(&g, fin, &.{ 1, 5, 5120 }, .float32);
     const logits = try Tr.head(&g, fin, try g.input(&.{ 4096, 5120 }, .bfloat16));
@@ -900,7 +868,8 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
     const w = try traceLayerW(&g, &c, li);
     const inv = try Tr.yarnInvFreq(&g, &c);
     try expectShape(&g, inv, &.{32}, .float32);
-    var cache: Tr.Cache = .{};
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
     // prefill 5 tokens, then decode 2 single tokens
     const steps = [_]struct { s: c_int, rows: c_int, comp: c_int, fresh: bool }{
         .{ .s = 5, .rows = 5, .comp = 2, .fresh = true },
@@ -916,9 +885,9 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
         const pos = try g.arange(@floatFromInt(pos0), @floatFromInt(pos0 + st.s), 1, .int32);
         const out = try Tr.attention(&g, &p, &c, li, &w, inv, x, pos, &cache, &shared);
         try expectShape(&g, out, &.{ 1, st.s, 5120 }, .float32);
-        try expectShape(&g, cache.window.?, &.{ 1, st.rows, 512 }, .float32);
-        try expectShape(&g, cache.compress_kv.?, &.{ 1, st.comp, 512 }, .float32);
-        try expectShape(&g, cache.index_k.?, &.{ 1, st.comp, 128 }, .float32);
+        try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, st.rows, 512 }, .float32);
+        try expectShape(&g, (try cache.compress.view(&g)).?, &.{ 1, st.comp, 512 }, .float32);
+        try expectShape(&g, (try cache.index.view(&g)).?, &.{ 1, st.comp, 128 }, .float32);
         try testing.expectEqual(p.get("attn.compress_new") != null, st.fresh);
         try expectStage(&g, &p, "attn.index_score", &.{ 1, st.s, st.comp }, .float32);
         try expectStage(&g, &p, "attn.topk_mask", &.{ 1, st.s, st.comp }, .bool_);
@@ -926,8 +895,50 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
         try testing.expect(shared.candidates == null); // layer 2 is not the candidate source
         pos0 += st.s;
     }
-    try testing.expectEqual(@as(u32, 7), cache.n_fed);
-    try expectShape(&g, cache.raw_kv.?, &.{ 1, 7, 512 }, .float32);
+    try testing.expectEqual(@as(u32, 7), cache.nFed());
+    try expectShape(&g, (try cache.frontier.?.kv.view(&g)).?, &.{ 1, 7, 512 }, .float32);
+}
+
+test "dsv41 graph: under the window ring the attention sees a bounded window, one mask per forward" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const inv = try Tr.swaInvFreq(&g, &c);
+    // layers 0 and 1 (both SWA) in lockstep: prefill 300, then 20 decode tokens
+    var caches: [2]Tr.Cache = undefined;
+    var ws: [2]Tr.W = undefined;
+    for (&caches, &ws, 0..) |*cc, *w, l| {
+        cc.* = Tr.Cache.init(c.layers[l], c.window, .{ .route = .window_ring });
+        w.* = try traceLayerW(&g, &c, c.layers[l]);
+    }
+    defer for (&caches) |*cc| cc.deinit(&g);
+    var pos0: c_int = 0;
+    for (0..21) |step| {
+        const s: c_int = if (step == 0) 300 else 1;
+        var shared: Tr.Share = .{};
+        const pos = try g.arange(@floatFromInt(pos0), @floatFromInt(pos0 + s), 1, .int32);
+        var masks: [2]u32 = undefined;
+        for (0..2) |l| {
+            const x = try g.input(&.{ 1, s, 5120 }, .bfloat16);
+            p.names.clearRetainingCapacity();
+            p.nodes.clearRetainingCapacity();
+            _ = try Tr.attention(&g, &p, &c, c.layers[l], &ws[l], inv, x, pos, &caches[l], &shared);
+            masks[l] = shared.win_mask.?;
+            caches[l].advance(@intCast(s));
+        }
+        try testing.expectEqual(masks[0], masks[1]); // the second layer reuses the first's mask
+        pos0 += s;
+        const view = (try caches[0].window.view(&g)).?;
+        const rows = g.shapeOf(view).dim(1);
+        try testing.expectEqual(@as(c_int, pos0), @as(c_int, @intCast(caches[0].window.dropOffset())) + rows);
+        try testing.expect(rows <= 300);
+        try expectShape(&g, shared.win_mask.?, &.{ 1, s, rows }, .bool_);
+        try expectStage(&g, &p, "attn.o", &.{ 1, s, 64, 512 }, .float32);
+    }
+    // 300 prefill rows, then the first decode token compacts to window + 8 + 8 = 144 rows.
+    try testing.expectEqual(@as(u32, 321 - 144 - 20), caches[1].window.dropOffset());
 }
 
 test "dsv41 graph: reuse, candidate and reindex layers share one forward's runtime (mini geometry)" {
@@ -936,7 +947,9 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
     var p: TraceProbe = .{ .a = testing.allocator };
     defer p.deinit();
     const c = try miniConfig();
-    var caches: [5]Tr.Cache = @splat(.{});
+    var caches: [5]Tr.Cache = undefined;
+    for (&caches, 0..) |*cc, l| cc.* = Tr.Cache.init(c.layers[l], c.window, .{});
+    defer for (&caches) |*cc| cc.deinit(&g);
     var shared: Tr.Share = .{};
     const s: c_int = 9;
     const pos = try g.arange(0, 9, 1, .int32);
@@ -954,7 +967,7 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
             // Reuse: reads layer 1's selection, computes none.
             2 => {
                 try testing.expect(p.get("attn.index_score") == null);
-                try testing.expect(caches[2].compress_kv == null);
+                try testing.expectEqual(@as(u32, 0), caches[2].compress.rows());
                 try expectStage(&g, &p, "attn.topk_mask", &.{ 1, 9, 4 }, .bool_);
             },
             // Full, ratio 1, the candidate source: sets the block mask.
@@ -965,7 +978,7 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
             // Reindex: its own queries over layer 3's keys, masked by the candidates.
             4 => {
                 try expectStage(&g, &p, "attn.index_score", &.{ 1, 9, 9 }, .float32);
-                try testing.expect(caches[4].compress_kv == null);
+                try testing.expectEqual(@as(u32, 0), caches[4].compress.rows());
             },
             else => unreachable,
         }

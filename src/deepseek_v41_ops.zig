@@ -439,6 +439,20 @@ pub const MlxOps = struct {
         return g.track(r);
     }
 
+    /// `mx.slice_update(src, update, start_indices, axes=all)` with an int32
+    /// start array (the dynamic slice update the Python KV lanes write with).
+    pub fn sliceUpdateDyn(g: *MlxOps, src: T, update: T, start: T) !T {
+        const n = mlx.getShape(update).len;
+        var axes: [max_dims]c_int = undefined;
+        for (0..n) |i| axes[i] = @intCast(i);
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_slice_update_dynamic(&r, src, update, start, &axes, n, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
     pub fn concat(g: *MlxOps, xs: []const T, axis: c_int) !T {
         const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -679,6 +693,7 @@ pub const Op = enum {
     broadcast_to,
     expand_dims,
     slice,
+    slice_update,
     concat,
     stack,
     take,
@@ -1054,6 +1069,14 @@ pub const TraceOps = struct {
             out.d[i] = @divFloor(stop[i] - start[i] + strides[i] - 1, strides[i]);
         }
         return g.push(.slice, g.dtypeOf(x), out);
+    }
+
+    pub fn sliceUpdateDyn(g: *TraceOps, src: T, update: T, start: T) !T {
+        const ss = g.shapeOf(src);
+        const us = g.shapeOf(update);
+        if (ss.n != us.n or g.shapeOf(start).n != 1 or g.shapeOf(start).d[0] != us.n) return error.SliceUpdateShape;
+        for (0..ss.n) |i| if (us.d[i] > ss.d[i]) return error.SliceUpdateShape;
+        return g.push(.slice_update, g.dtypeOf(src), ss);
     }
 
     pub fn concat(g: *TraceOps, xs: []const T, axis: c_int) !T {

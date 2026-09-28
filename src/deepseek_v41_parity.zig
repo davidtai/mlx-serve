@@ -414,10 +414,8 @@ pub const Runner = struct {
         const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
         const inv = try a.alloc(mlx.mlx_array, nl);
         const caches = try a.alloc(Tr.Cache, nl);
-        @memset(caches, .{});
-        defer for (caches) |*cc| inline for (.{ "window", "compress_kv", "index_k", "raw_kv", "raw_score" }) |f| {
-            if (@field(cc.*, f)) |arr| g.release(arr);
-        };
+        for (caches, layers.items) |*cc, l| cc.* = Tr.Cache.init(c.layers[l], c.window, .{});
+        defer for (caches) |*cc| cc.deinit(&g);
         var kb: [96]u8 = undefined;
         for (layers.items, 0..) |l, i| {
             const li = c.layers[l];
@@ -505,6 +503,7 @@ pub const Runner = struct {
                 }
             }
 
+            for (caches) |*cc| cc.advance(@intCast(s_len));
             // Final collapse + norm and the head slice, each from the dump's own input.
             const last = layers.items[nl - 1];
             const lpre = try std.fmt.allocPrint(a, "p{d}.L{d}.", .{ p, last });
@@ -617,10 +616,8 @@ pub const Runner = struct {
         const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
         const inv = try a.alloc(mlx.mlx_array, nl);
         const caches = try a.alloc(Tr.Cache, nl);
-        @memset(caches, .{});
-        defer for (caches) |*cc| inline for (.{ "window", "compress_kv", "index_k", "raw_kv", "raw_score" }) |f| {
-            if (@field(cc.*, f)) |arr| g.release(arr);
-        };
+        for (caches, dg.layers) |*cc, l| cc.* = Tr.Cache.init(c.layers[l], c.window, .{});
+        defer for (caches) |*cc| cc.deinit(&g);
         for (dg.layers, 0..) |l, i| {
             lws[i] = try bindLayer(&weights, c.layers[l], l);
             inv[i] = g.keep(if (c.layers[l].ratio > 0) try Tr.yarnInvFreq(&g, &c) else try Tr.swaInvFreq(&g, &c));
@@ -690,7 +687,7 @@ pub const Runner = struct {
                 g.release(cur.pre_mix);
             }
             var shared: Tr.Share = .{};
-            var masks: [2]?mlx.mlx_array = .{ null, null };
+            var masks: [3]?mlx.mlx_array = .{ null, null, null };
             defer for (masks) |m| if (m) |x| g.release(x);
             var eng_rows: []i64 = &.{};
             if (eng) |*e| {
@@ -722,6 +719,7 @@ pub const Runner = struct {
                 cur = next;
                 persist(&g, &shared.topk_mask, &masks[0]);
                 persist(&g, &shared.candidates, &masks[1]);
+                persist(&g, &shared.win_mask, &masks[2]);
                 g.reset();
             }
             const norm_w = try g.adopt(try arrayFrom(norm_bytes, norm_t));
@@ -729,6 +727,7 @@ pub const Runner = struct {
             try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "p{d}.final.h", .{p}), fin);
             const head_w = try g.adopt(try arrayFrom(head_bytes, head_sub));
             try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "p{d}.head.logits", .{p}), try Tr.head(&g, fin, head_w));
+            for (caches) |*cc| cc.advance(@intCast(s_len));
             tok += s_len;
         }
         return self;
