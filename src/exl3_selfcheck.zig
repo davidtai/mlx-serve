@@ -1035,7 +1035,49 @@ fn sinkCols(c: *[4][4]f64, eps: f64) void {
     }
 }
 
-/// HCTAPE vs q3_decode_hctape_candidate._f64_ref and its split statements.
+fn bf16Value(w: u16) f64 {
+    return @as(f32, @bitCast(@as(u32, w) << 16));
+}
+
+/// The operands of one q3ht_combine output (row m, stream k, column c): x, r_j, post_k, comb[j, k].
+const HcTerms = struct { x: f32, r: [4]f32, post: f32, comb: [4]f32 };
+
+/// The stored word of q3ht_combine's written f32 chain: fma(c0, r0, -0), fma(cj, rj, .) for
+/// j = 1..3, fma(post, x, .), then the RNE bf16 store.
+fn hcChainWord(t: HcTerms) u16 {
+    var mk: f32 = @mulAdd(f32, t.comb[0], t.r[0], -0.0);
+    for (1..4) |j| mk = @mulAdd(f32, t.comb[j], t.r[j], mk);
+    return bf16Bits(@mulAdd(f32, t.post, t.x, mk));
+}
+
+/// The output in float64 (post x + sum_j comb_j r_j, in that order) and the sum of |terms|.
+const HcExact = struct { value: f64, mag: f64 };
+
+fn hcExact(t: HcTerms) HcExact {
+    var acc = @as(f64, t.post) * t.x;
+    var mag = @abs(acc);
+    for (0..4) |j| {
+        const v = @as(f64, t.comb[j]) * t.r[j];
+        acc += v;
+        mag += @abs(v);
+    }
+    return .{ .value = acc, .mag = mag };
+}
+
+/// |chain result - value| <= 6u x sum |terms|: five f32 roundings, each <= u x a partial sum
+/// (<= (1 + u)^5 sum |terms|), plus the f64 reference's own.
+const hc_chain_slack = 6.0 / 16777216.0;
+
+/// A stored combine word is the RNE bf16 store of some f32 chain result: within half a bf16 ulp
+/// (at the word) plus the chain's slack of the f64 value. NaN / inf never pass.
+fn hcWordWithinChain(word: u16, e: HcExact) bool {
+    const eb: u64 = (word >> 7) & 0xFF;
+    const half_ulp: f64 = @bitCast((@max(eb, 1) + 888) << 52);
+    return @abs(bf16Value(word) - e.value) <= half_ulp + hc_chain_slack * e.mag;
+}
+
+/// HCTAPE vs q3_decode_hctape_candidate._f64_ref and its split statements; the combine words
+/// also bitwise against the written chain (h_twin), as the lane's probe checks the device.
 fn hctapeF64(h: *H, sc: *Scope, k: Kernel) !void {
     const e = h.reg.get(k);
     var vars = defaultVars(e);
@@ -1103,26 +1145,37 @@ fn hctapeF64(h: *H, sc: *Scope, k: Kernel) !void {
             defer h.a.free(hb);
             const got_h = try hostCopy(h, outs[0]);
             defer h.a.free(got_h);
-            var far: u64 = 0;
-            var off1: u64 = 0;
+            const fused = k == .q3ht_combine_collapse_norm;
+            const got_hf = if (fused) try hostCopy(h, outs[1]) else &[_]u8{};
+            defer if (fused) h.a.free(got_hf);
+            var twin_bad: u64 = 0;
+            var beyond: u64 = 0;
+            var differing: u64 = 0;
             for (0..rows) |m| {
                 for (0..hc) |kk| {
                     for (0..d) |c| {
-                        var acc = post[m * hc + kk] * x[m * d + c];
-                        for (0..hc) |j| acc += comb[m * 16 + j * hc + kk] * r_[(m * hc + j) * d + c];
-                        const want = bf16Bits(@floatCast(acc));
+                        var t: HcTerms = .{ .x = @floatCast(x[m * d + c]), .r = undefined, .post = @floatCast(post[m * hc + kk]), .comb = undefined };
+                        for (0..hc) |j| {
+                            t.r[j] = @floatCast(r_[(m * hc + j) * d + c]);
+                            t.comb[j] = @floatCast(comb[m * 16 + j * hc + kk]);
+                        }
                         const at = (m * hc + kk) * d + c;
-                        hb[at] = @as(f32, @bitCast(@as(u32, want) << 16));
                         const have = std.mem.readInt(u16, got_h[at * 2 ..][0..2], .little);
-                        const dist = @abs(@as(i32, have) - @as(i32, want));
-                        far += @intFromBool(dist > 1);
-                        off1 += @intFromBool(dist == 1);
+                        const twin = hcChainWord(t);
+                        twin_bad += @intFromBool(have != twin);
+                        if (fused) twin_bad += @intFromBool(std.mem.readInt(u32, got_hf[at * 4 ..][0..4], .little) != @as(u32, twin) << 16);
+                        const ex = hcExact(t);
+                        const want = bf16Bits(@floatCast(ex.value));
+                        hb[at] = bf16Value(want);
+                        differing += @intFromBool(have != want);
+                        beyond += @intFromBool(!hcWordWithinChain(have, ex));
                     }
                 }
             }
             const n = rows * hc * d;
-            const frac = @as(f64, @floatFromInt(off1)) / @as(f64, @floatFromInt(n));
-            try h.record(.{ .kernel = k, .check = .f64, .site = "h", .words = n, .bad = far, .metric = frac, .limit = 2e-3, .ok = far == 0 and frac <= 2e-3 });
+            const frac = @as(f64, @floatFromInt(differing)) / @as(f64, @floatFromInt(n));
+            try h.record(.{ .kernel = k, .check = .f64, .site = "h_twin", .words = if (fused) 2 * n else n, .bad = twin_bad, .ok = twin_bad == 0 });
+            try h.record(.{ .kernel = k, .check = .f64, .site = "h", .words = n, .bad = beyond, .metric = frac, .limit = 2e-3, .ok = beyond == 0 and frac <= 2e-3 });
             if (k == .q3ht_combine_collapse_norm) {
                 const pre = in_host[4];
                 const w = in_host[5];
@@ -1415,6 +1468,40 @@ test "dsv41 kernels: every self-check the manifest plans has an executor" {
         }
     }
     try testing.expect(planned >= 2 * xk.n_kernels);
+}
+
+test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not one f64-rounded word" {
+    // Bar: a cancelled output the chain moves six words passes, a wrong word or binding does not.
+    const t: HcTerms = .{ .x = 1.3867188e-1, .r = .{ -4.9023438e-1, -1.8261719e-1, -1.734375, 1.671875 }, .post = 8.703464e-1, .comb = .{ 8.401252e-3, 5.460165e-1, 8.935257e-1, 9.1684204e-1 } };
+    const e = hcExact(t);
+    try testing.expectEqual(@as(u16, 0xb5c1), hcChainWord(t));
+    try testing.expectEqual(@as(u16, 0xb5bb), bf16Bits(@floatCast(e.value)));
+    try testing.expect(hcWordWithinChain(0xb5c1, e));
+    const e1 = hcExact(.{ .x = 1.0, .r = .{ 0.5, 0.25, 0.125, 0.0625 }, .post = 1.0, .comb = .{ 1, 1, 1, 1 } });
+    try testing.expect(hcWordWithinChain(0x3FF8, e1));
+    try testing.expect(!hcWordWithinChain(0x3FF9, e1));
+    var prng: std.Random.DefaultPrng = .init(20260928);
+    const r = prng.random();
+    const n = 5120;
+    var refused: usize = 0;
+    for (0..n) |_| {
+        var rs: [4]f32 = undefined;
+        for (&rs) |*v| v.* = @floatCast(bf16Value(bf16Bits(@floatCast(r.floatNorm(f64) * 2.0))));
+        const x: f32 = @floatCast(bf16Value(bf16Bits(@floatCast(r.floatNorm(f64) * 0.5))));
+        var comb: [16]f32 = undefined;
+        for (&comb) |*v| v.* = @floatCast(r.float(f64));
+        for (0..4) |kk| {
+            var ok: HcTerms = .{ .x = x, .r = rs, .post = @floatCast(0.2 + 1.6 * r.float(f64)), .comb = undefined };
+            var swapped = ok;
+            for (0..4) |j| {
+                ok.comb[j] = comb[j * 4 + kk];
+                swapped.comb[j] = comb[kk * 4 + j];
+            }
+            try testing.expect(hcWordWithinChain(hcChainWord(ok), hcExact(ok)));
+            refused += @intFromBool(!hcWordWithinChain(hcChainWord(swapped), hcExact(ok)));
+        }
+    }
+    try testing.expect(refused * 10 > 9 * 4 * n);
 }
 
 // The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1.
