@@ -483,6 +483,7 @@ pub fn Trunk(comptime G: type) type {
                     // A fixed-shape core pads the selection to index_topk.
                     const k: c_int = if (rt.attn_core_compile) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
                     shared.selected_idx = try maskToTopkIdx(g, mask, k);
+                    try p.put("attn.selected_idx", shared.selected_idx.?);
                 }
             } else {
                 // The config refuses a reuse layer with no index source before it.
@@ -941,7 +942,27 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("out.pre_mix", s2[7]);
                 return .{ .h = s3[0], .pre_mix = s2[7] };
             }
-            const hc_tape = rt.hc_compile and rows <= hc_compile_max_rows;
+            const half = try attnAndMoeInput(g, p, c, rt, li, w, inv_freq, h, pre_mix, positions, cache, shared);
+            const mo = try moe(g, p, c, rt, w, half.moe_in, routed);
+            try p.put("moe.y", mo);
+            const out = if (rt.hc_compile and rows <= hc_compile_max_rows) blk: {
+                var o: [1]T = undefined;
+                try g.tape(HcPost, c, &.{ mo, half.h1, half.post, half.comb }, &o);
+                break :blk o[0];
+            } else try hcPost(g, mo, half.h1, half.post, half.comb);
+            try p.put("out.h", out);
+            try p.put("out.pre_mix", half.ffn_pre);
+            return .{ .h = out, .pre_mix = half.ffn_pre };
+        }
+
+        /// What `attnAndMoeInput` hands the MoE and its combine.
+        pub const Half = struct { moe_in: T, h1: T, post: T, comb: T, ffn_pre: T };
+
+        /// `DecoderLayer.attn_and_moe_input`: the attention Hyper-Connection
+        /// (which writes this layer's KV), the ffn mixes and the MoE input
+        /// (K4 compiles both HC preps at rows <= 7).
+        pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
+            const hc_tape = rt.hc_compile and rowsOf(g, h, 2) <= hc_compile_max_rows;
             var a: [4]T = undefined;
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
@@ -964,16 +985,27 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("ffn.comb", f[3]);
             }
             try p.put("ffn.x", f[0]);
-            const mo = try moe(g, p, c, rt, w, f[0], routed);
-            try p.put("moe.y", mo);
-            const out = if (hc_tape) blk: {
+            return .{ .moe_in = f[0], .h1 = f[1], .post = f[2], .comb = f[3], .ffn_pre = f[4] };
+        }
+
+        /// `MoE.combine_routed`: the shared expert and the f32 combine (K22 at
+        /// rows <= 32) of routed rows computed elsewhere (K16's batched switch).
+        pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, ro: T, weights: T, xf: T) !T {
+            const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
+            try p.put("moe.shared", shared);
+            if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) {
                 var o: [1]T = undefined;
-                try g.tape(HcPost, c, &.{ mo, f[1], f[2], f[3] }, &o);
-                break :blk o[0];
-            } else try hcPost(g, mo, f[1], f[2], f[3]);
-            try p.put("out.h", out);
-            try p.put("out.pre_mix", f[4]);
-            return .{ .h = out, .pre_mix = f[4] };
+                try g.tape(MoeCombine, c, &.{ ro, weights, shared }, &o);
+                return o[0];
+            }
+            return moeCombine(g, ro, weights, shared);
+        }
+
+        /// `_PREFILL_HC_POST`: K16's ffn combine, always the compiled `_hc_post_impl`.
+        pub fn prefillHcPost(g: *G, c: *const v41.Config, mo: T, half: Half) !T {
+            var o: [1]T = undefined;
+            try g.tape(HcPost, c, &.{ mo, half.h1, half.post, half.comb }, &o);
+            return o[0];
         }
 
         /// `NGramRowCache.dequantize` (mxfp8 records): the E4M3 code words

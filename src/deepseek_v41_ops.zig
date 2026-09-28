@@ -220,6 +220,13 @@ pub const MlxOps = struct {
         return compiled;
     }
 
+    /// `mx.eval(arrays)`: one fence for a span's outputs and cache lanes.
+    pub fn evalAll(_: *MlxOps, xs: []const T) !void {
+        const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+
     /// Free every intermediate built since the last reset.
     pub fn reset(g: *MlxOps) void {
         for (g.live.items) |a| _ = mlx.mlx_array_free(a);
@@ -840,6 +847,7 @@ pub const TraceOps = struct {
     }
 
     pub fn reset(_: *TraceOps) void {}
+    pub fn evalAll(_: *TraceOps, _: []const T) !void {}
     pub fn keep(_: *TraceOps, x: T) T {
         return x;
     }

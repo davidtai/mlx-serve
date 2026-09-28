@@ -454,7 +454,7 @@ test "dsv41 engram: the real manifest and token map hash the prompt to the Pytho
 
 // ── the row source on a synthetic mini bank (hermetic) ──
 
-const MiniBank = struct {
+pub const MiniBank = struct {
     vocab: u32 = 64,
     map_mod: u32 = 50,
     sidecar_vocab: ?u64 = null,
@@ -474,7 +474,7 @@ fn miniRecordByte(r: u64, i: u64) u8 {
 
 /// A bank dir for the mini config (Engram layer 1: 97 rows, 3-grams x 2 heads,
 /// head_dim 32 -> 33-byte records) with its token map + sidecar; returns the map path.
-fn writeMiniBank(a: std.mem.Allocator, tmp: *std.testing.TmpDir, root: []const u8, f: MiniBank) ![]const u8 {
+pub fn writeMiniBank(a: std.mem.Allocator, tmp: *std.testing.TmpDir, root: []const u8, f: MiniBank) ![]const u8 {
     const io = testing.io;
     try tmp.dir.createDirPath(io, "engram");
     const tok = if (f.tokenizer_differs) "{\"model\":\"other\"}" else "{\"model\":\"mini\"}";

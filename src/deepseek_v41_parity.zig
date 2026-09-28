@@ -11,6 +11,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const engram = @import("deepseek_v41_engram.zig");
+const routes = @import("deepseek_v41_routes.zig");
 
 /// How two same-shape tensors differ, in raw words.
 pub const Diff = struct {
@@ -319,6 +320,47 @@ fn jsonNum(v: f64) JsonNum {
     return .{ .v = v };
 }
 
+/// The window-2 dump's `__metadata__` strings (safetensors header).
+pub fn readMetadata(a: std.mem.Allocator, path: []const u8) !std.json.ObjectMap {
+    const pz = try a.dupeSentinel(u8, path, 0);
+    const fd = std.c.open(pz.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    var lenb: [8]u8 = undefined;
+    if (std.c.pread(fd, &lenb, 8, 0) != 8) return error.ShortRead;
+    const n = std.mem.readInt(u64, &lenb, .little);
+    if (n > 64 << 20) return error.ShardHeader;
+    const json = try a.alloc(u8, @intCast(n));
+    if (std.c.pread(fd, json.ptr, json.len, 8) != @as(isize, @intCast(json.len))) return error.ShortRead;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const md = v.object.get("__metadata__") orelse return error.MetadataMissing;
+    if (md != .object) return error.MetadataMissing;
+    return md.object;
+}
+
+/// The window-2 schedule: tokens per pass and the trims after given passes.
+pub const Schedule = struct {
+    pass_tokens: []u32,
+    /// `trim_after[p]` tokens dropped from every lane after pass p.
+    trim_after: []u32,
+
+    pub fn parse(a: std.mem.Allocator, pass_tokens: []const u8, trims: []const u8) !Schedule {
+        var toks: std.ArrayList(u32) = .empty;
+        var it = std.mem.tokenizeScalar(u8, pass_tokens, ',');
+        while (it.next()) |t| try toks.append(a, try std.fmt.parseInt(u32, t, 10));
+        const trim_after = try a.alloc(u32, toks.items.len);
+        @memset(trim_after, 0);
+        var tt = std.mem.tokenizeScalar(u8, trims, ',');
+        while (tt.next()) |t| {
+            const colon = std.mem.indexOfScalar(u8, t, ':') orelse return error.ScheduleSyntax;
+            const p = try std.fmt.parseInt(usize, t[0..colon], 10);
+            if (p >= trim_after.len) return error.ScheduleSyntax;
+            trim_after[p] = try std.fmt.parseInt(u32, t[colon + 1 ..], 10);
+        }
+        return .{ .pass_tokens = toks.items, .trim_after = trim_after };
+    }
+};
+
 pub const StageResult = struct { key: []const u8, dtype: v41.StDtype, shape: [v41.max_rank]u64, rank: u8, diff: Diff, note: []const u8 = "" };
 
 /// Runs the dump's passes through the Zig trunk and compares every stage the
@@ -543,6 +585,223 @@ pub const Runner = struct {
             try self.record(k, t, .{}, "in the dump, not produced by the Zig trunk");
         }
         return self;
+    }
+
+    /// Window 2: the dump's lever set as the Zig tier (routes + KV backing),
+    /// its passes and trims replayed layer by layer from the dump's inputs, the
+    /// Engram rows through the row source and the converter's token map, and
+    /// every lane view compared after each pass.
+    pub fn runRoutes(gpa: std.mem.Allocator, io: std.Io, dump_path: []const u8, bank: []const u8, map_path: []const u8, gpu: bool) !Runner {
+        var self: Runner = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+        errdefer self.deinit();
+        const a = self.arena.allocator();
+        var diag: v41.Diag = .{};
+        errdefer std.debug.print("dsv41 parity: {s}\n", .{diag.message()});
+
+        const c = try v41.Config.load(gpa, io, bank, &diag);
+        var ck = try v41.Checkpoint.openIndexed(gpa, io, bank, &diag);
+        defer ck.deinit();
+        _ = try v41.WeightMap.build(gpa, try v41.residentSpec(a, &c), &ck, &diag);
+        var dump = try v41.Checkpoint.openFile(gpa, dump_path, &diag);
+        defer dump.deinit();
+        const md = try readMetadata(a, dump_path);
+        const levers = (md.get("levers") orelse return error.MetadataMissing).string;
+        const tier = try routes.parse(try routes.splitPairs(a, levers), &diag);
+        const rt = tier.routes;
+        const sched = try Schedule.parse(a, (md.get("pass_tokens") orelse return error.MetadataMissing).string, (md.get("trims") orelse return error.MetadataMissing).string);
+        var layers: std.ArrayList(u32) = .empty;
+        var lit = std.mem.tokenizeScalar(u8, (md.get("layers") orelse return error.MetadataMissing).string, ',');
+        while (lit.next()) |t| try layers.append(a, try std.fmt.parseInt(u32, t, 10));
+        const drops = try std.json.parseFromSliceLeaky([]const std.json.ArrayHashMap(u32), a, (md.get("window_drop") orelse return error.MetadataMissing).string, .{});
+
+        // Compile availability follows the default device, as Python's mx.set_default_device.
+        var prev = mlx.mlx_device{ .ctx = null };
+        _ = mlx.mlx_get_default_device(&prev);
+        defer {
+            _ = mlx.mlx_set_default_device(prev);
+            _ = mlx.mlx_device_free(prev);
+        }
+        const dev = mlx.mlx_device_new_type(if (gpu) .gpu else .cpu, 0);
+        defer _ = mlx.mlx_device_free(dev);
+        try mlx.check(mlx.mlx_set_default_device(dev));
+        const s = if (gpu) mlx.mlx_default_gpu_stream_new() else mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        var g = try ops.MlxOps.init(gpa, s);
+        defer g.deinit();
+        const Tr = graph.Trunk(ops.MlxOps);
+
+        var weights = model.Weights.init(gpa);
+        defer weights.deinit();
+        var loaded: std.ArrayList(u16) = .empty;
+        for (layers.items) |l| {
+            var nb: [64]u8 = undefined;
+            const t = ck.tensors.get(try std.fmt.bufPrint(&nb, "layers.{d}.attn.wq_a.weight", .{l})) orelse return error.TensorMissing;
+            if (std.mem.indexOfScalar(u16, loaded.items, t.shard) != null) continue;
+            try loaded.append(a, t.shard);
+            try model.loadSafetensorsFile(gpa, &weights, (try ck.shardPath(a, t.shard)).ptr, cpu, .{});
+        }
+        const nl = layers.items.len;
+        const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
+        const inv = try a.alloc(mlx.mlx_array, nl);
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer for (owned.items) |x| g.release(x);
+        const caches = try a.alloc(Tr.Cache, nl);
+        for (caches, layers.items) |*cc, l| cc.* = Tr.Cache.init(c.layers[l], c.window, tier.kv);
+        defer for (caches) |*cc| cc.deinit(&g);
+        var kb: [96]u8 = undefined;
+        for (layers.items, 0..) |l, i| {
+            const li = c.layers[l];
+            lws[i] = try bindLayer(&weights, li, l);
+            if (rt.wo_a_f32) {
+                lws[i].wo_a_dense = g.keep(try Tr.woaDenseF32(&g, &c, lws[i].wo_a));
+                try owned.append(a, lws[i].wo_a_dense.?);
+            }
+            inv[i] = g.keep(if (li.ratio > 0) try Tr.yarnInvFreq(&g, &c) else try Tr.swaInvFreq(&g, &c));
+            try owned.append(a, inv[i]);
+            try self.check(&g, &dump, try std.fmt.bufPrint(&kb, "const.L{d}.inv_freq", .{l}), inv[i]);
+        }
+        try g.evalAll(owned.items);
+
+        // The head slice the dump used, under the lever's codec.
+        const head_t = ck.tensors.get("head.weight") orelse return error.TensorMissing;
+        const head_key0 = "p0.head.logits";
+        const head_rows: u64 = if (dump.tensors.get(head_key0)) |ht| ht.shape[ht.rank - 1] else 0;
+        var head_w: Tr.HeadW = undefined;
+        if (head_rows > 0) {
+            var sub = head_t;
+            sub.shape[0] = head_rows;
+            sub.end = sub.begin + head_rows * @as(u64, c.hidden_size) * 2;
+            const buf = try a.alloc(u8, @intCast(sub.end - sub.begin));
+            const hfd = std.c.open((try ck.shardPath(a, head_t.shard)).ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+            if (hfd < 0) return error.ShardMissing;
+            defer _ = std.c.close(hfd);
+            if (std.c.pread(hfd, buf.ptr, buf.len, @intCast(sub.begin)) != @as(isize, @intCast(buf.len))) return error.ShortRead;
+            const dense = g.keep(try arrayFrom(buf, sub));
+            try owned.append(a, dense);
+            head_w = switch (rt.head) {
+                .f32, .bf16 => .{ .dense = dense },
+                .mxfp8 => blk: {
+                    const q = try Tr.quantizeHead(&g, dense);
+                    const qw = g.keep(q.w);
+                    const qs = g.keep(q.s);
+                    try owned.appendSlice(a, &.{ qw, qs });
+                    try g.evalAll(&.{ qw, qs });
+                    break :blk .{ .mxfp8 = .{ .w = qw, .s = qs, .mode = .mxfp8 } };
+                },
+            };
+        }
+
+        // Engram through the production row source (the converter's map + sidecar).
+        var src: ?engram.RowSource = null;
+        defer if (src) |*x| x.deinit();
+        var hash: engram.HashState = .{};
+        defer hash.deinit(gpa);
+        var eweights = model.Weights.init(gpa);
+        defer eweights.deinit();
+        const eng_on = (md.get("engram") orelse return error.MetadataMissing).string.len > 0;
+        if (eng_on) {
+            src = try engram.RowSource.open(gpa, io, bank, map_path, &c, &diag);
+            const res = try std.fmt.allocPrintSentinel(a, "{s}/engram/engram-residents.safetensors", .{bank}, 0);
+            try model.loadSafetensorsFile(gpa, &eweights, res.ptr, cpu, .{});
+        }
+
+        const norm_t = ck.tensors.get("norm.weight") orelse return error.TensorMissing;
+        const norm_w = g.keep(try arrayFrom(try v41.readTensor(a, &ck, "norm.weight"), norm_t));
+        try owned.append(a, norm_w);
+        const ids_bytes = try v41.readTensor(a, &dump, "inputs.ids");
+        var probe: KeepProbe = .{ .g = &g, .gpa = gpa };
+        defer probe.deinit();
+        for (sched.pass_tokens, 0..) |s_len, p| {
+            defer g.reset();
+            const pos_key = try std.fmt.allocPrint(a, "p{d}.positions", .{p});
+            const pos_t = dump.tensors.get(pos_key) orelse return error.TensorMissing;
+            const positions = try g.adopt(try arrayFrom(try v41.readTensor(a, &dump, pos_key), pos_t));
+            var eng_rows: []i64 = &.{};
+            if (src) |*es| {
+                const span = try a.alloc(u32, s_len);
+                const base = try self.passStart(a, &dump, p);
+                for (span, 0..) |*v, j| v.* = @intCast(std.mem.readInt(i32, ids_bytes[(base + j) * 4 ..][0..4], .little));
+                eng_rows = try a.alloc(i64, s_len * es.perToken());
+                try es.advance(gpa, &hash, span, eng_rows);
+            }
+            var shared: Tr.Share = .{};
+            for (layers.items, 0..) |l, i| {
+                probe.clear();
+                const pre = try std.fmt.allocPrint(a, "p{d}.L{d}.", .{ p, l });
+                if (src) |*es| if (c.layers[l].engram_slot) |slot| {
+                    const nr: c_int = @intCast(s_len * es.hashing.cols());
+                    const hd = es.bank.head_dim;
+                    const ids = try a.alloc(i64, s_len * es.hashing.cols());
+                    const codes = try a.alloc(u8, ids.len * hd);
+                    const scales = try a.alloc(u8, ids.len * (hd / 32));
+                    try es.read(slot, eng_rows, s_len, ids, codes, scales);
+                    const er = try Tr.engramRows(&g, try g.hostArray(codes, &.{ nr, @intCast(hd / 4) }, .uint32), try g.hostArray(scales, &.{ nr, @intCast(hd / 32) }, .uint8), 1, @intCast(s_len), @intCast(es.hashing.cols()));
+                    var b: [96]u8 = undefined;
+                    const ew: graph.EngramW(mlx.mlx_array) = .{
+                        .wkv = .{ .w = try getReq(&eweights, &b, "layers.{d}.engram.wkv.weight", .{l}), .s = try getReq(&eweights, &b, "layers.{d}.engram.wkv.scales", .{l}), .mode = .mxfp8 },
+                        .q_weight = try getReq(&eweights, &b, "layers.{d}.engram.q_weight", .{l}),
+                        .k_weight = try getReq(&eweights, &b, "layers.{d}.engram.k_weight", .{l}),
+                    };
+                    const out = try Tr.engramApply(&g, &c, ew, try self.dumpArray(&g, &dump, pre, "engram.in"), er);
+                    try self.check(&g, &dump, try std.fmt.allocPrint(a, "{s}engram.out", .{pre}), out);
+                };
+                const h = try self.dumpArray(&g, &dump, pre, "in.h");
+                const pm = try self.dumpArray(&g, &dump, pre, "in.pre_mix");
+                const routed: DumpRouted = .{ .arr = try self.dumpArray(&g, &dump, pre, "moe.routed") };
+                _ = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
+                const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                try mlx.check(mlx.mlx_eval(vec));
+                for (probe.names.items, probe.arrays.items) |name, arr| try self.check(&g, &dump, try std.fmt.allocPrint(a, "{s}{s}", .{ pre, name }), arr);
+            }
+            for (caches) |*cc| cc.advance(s_len);
+            // The lanes after the pass: the same rows and the same drop offsets.
+            for (layers.items, caches) |l, *cc| {
+                const pre = try std.fmt.allocPrint(a, "p{d}.L{d}.cache.", .{ p, l });
+                if (try cc.window.view(&g)) |x| try self.check(&g, &dump, try std.fmt.allocPrint(a, "{s}window", .{pre}), x);
+                if (try cc.compress.view(&g)) |x| try self.check(&g, &dump, try std.fmt.allocPrint(a, "{s}compress", .{pre}), x);
+                if (try cc.index.view(&g)) |x| try self.check(&g, &dump, try std.fmt.allocPrint(a, "{s}index", .{pre}), x);
+                var nb: [16]u8 = undefined;
+                const want_drop = drops[p].map.get(try std.fmt.bufPrint(&nb, "{d}", .{l})) orelse return error.MetadataMissing;
+                if (cc.window.dropOffset() != want_drop) {
+                    const t: v41.Checkpoint.Tensor = .{ .shard = 0, .dtype = .I32, .shape = @splat(0), .rank = 0, .begin = 0, .end = 0 };
+                    try self.record(try std.fmt.allocPrint(a, "{s}window_drop", .{pre}), t, .{ .n = 1, .mismatches = 1 }, try std.fmt.allocPrint(a, "zig {d} vs python {d}", .{ cc.window.dropOffset(), want_drop }));
+                }
+            }
+            if (sched.trim_after[p] > 0) {
+                const n = sched.trim_after[p];
+                for (caches) |*cc| if (try cc.trim(&g, n) != n) return error.TrimRefused;
+                if (src != null) hash.trim(n);
+            }
+            // Final collapse + norm and the head slice, each from the dump's own input.
+            const last = layers.items[nl - 1];
+            const lpre = try std.fmt.allocPrint(a, "p{d}.L{d}.", .{ p, last });
+            const fin_key = try std.fmt.allocPrint(a, "p{d}.final.h", .{p});
+            const fin = try Tr.finalNorm(&g, &c, try self.dumpArray(&g, &dump, lpre, "out.h"), try self.dumpArray(&g, &dump, lpre, "out.pre_mix"), norm_w);
+            try self.check(&g, &dump, fin_key, fin);
+            if (head_rows > 0) {
+                const head_key = try std.fmt.allocPrint(a, "p{d}.head.logits", .{p});
+                try self.check(&g, &dump, head_key, try Tr.head(&g, &rt, try self.dumpArray(&g, &dump, "", fin_key), head_w));
+            }
+        }
+        for (dump.tensors.keys(), dump.tensors.values()) |k, t| {
+            if (self.reported(k)) continue;
+            const input = std.mem.eql(u8, k, "inputs.ids") or std.mem.endsWith(u8, k, ".positions") or std.mem.endsWith(u8, k, ".embed") or
+                std.mem.endsWith(u8, k, ".moe.routed") or std.mem.endsWith(u8, k, ".in.h") or std.mem.endsWith(u8, k, ".in.pre_mix") or
+                std.mem.endsWith(u8, k, ".engram.in");
+            if (input) continue;
+            try self.record(k, t, .{}, "in the dump, not produced by the Zig trunk");
+        }
+        return self;
+    }
+
+    /// The first id index of pass `p` (its first position).
+    fn passStart(self: *Runner, a: std.mem.Allocator, dump: *const v41.Checkpoint, p: usize) !usize {
+        _ = self;
+        const pos = try v41.readTensor(a, dump, try std.fmt.allocPrint(a, "p{d}.positions", .{p}));
+        return @intCast(std.mem.readInt(i32, pos[0..4], .little));
     }
 
     const Digest = struct { sha256: []const u8, dtype: []const u8, shape: []const u64 };
@@ -863,6 +1122,30 @@ test "dsv41 parity: the Zig trunk equals the Python stock path word for word" {
     var r = try Runner.run(testing.allocator, testing.io, dump_path, bank, gpu);
     defer r.deinit();
     try finish(&r, dump_path);
+}
+
+// Guarded window only: DSV41_PARITY2_DUMP=<dump_dsv41_parity_w2.py output> DSV41_BANK=<bank>
+// DSV41_ENGRAM_TOKEN_MAP=<converter output, with its .json> _GPU_WINDOW_LOCKED=1
+// [DSV41_PARITY_DEVICE=gpu] [DSV41_PARITY_REPORT=<json>] [DSV41_PARITY_REPORT_ONLY=1]
+test "dsv41 parity: the tier routes, window ring, chunked passes and trims equal the Python run" {
+    const dump_path = std.mem.span(std.c.getenv("DSV41_PARITY2_DUMP") orelse return error.SkipZigTest);
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.EngramTokenMapRequired);
+    const gpu = if (std.c.getenv("DSV41_PARITY_DEVICE")) |d| std.mem.eql(u8, std.mem.span(d), "gpu") else false;
+    var r = try Runner.runRoutes(testing.allocator, testing.io, dump_path, bank, map_path, gpu);
+    defer r.deinit();
+    try finish(&r, dump_path);
+}
+
+test "dsv41 parity: the window-2 schedule metadata parses to passes and trims" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sch = try Schedule.parse(arena.allocator(), "64,64,64,8,1,1,1,6,1,1", "7:3");
+    try testing.expectEqual(@as(usize, 10), sch.pass_tokens.len);
+    try testing.expectEqual(@as(u32, 3), sch.trim_after[7]);
+    try testing.expectEqual(@as(u32, 0), sch.trim_after[6]);
+    try testing.expectError(error.ScheduleSyntax, Schedule.parse(arena.allocator(), "1,1", "5:3"));
 }
 
 // Guarded window only: DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1. mlx-serve's own

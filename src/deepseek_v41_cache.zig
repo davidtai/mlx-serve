@@ -471,6 +471,16 @@ pub fn LayerState(comptime G: type) type {
             self.offset += n;
         }
 
+        /// Whether `trim(n)` can restore every lane (the ring keeps the window of
+        /// the next query).
+        pub fn canTrim(self: *const Self, n: u32) bool {
+            if (n > self.offset) return false;
+            return switch (self.window) {
+                .ring => |r| r.canTruncateToLength(self.offset - n),
+                .store => true,
+            };
+        }
+
         /// `trim(n)`: back to `offset - n` tokens; 0 (no change) when a ring
         /// cannot recover that far (the session-restore miss contract).
         pub fn trim(self: *Self, g: *G, n: u32) !u32 {
