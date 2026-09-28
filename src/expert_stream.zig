@@ -9,8 +9,10 @@ const mlx = @import("mlx.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_policy = @import("expert_policy.zig");
+const expert_lookahead = @import("expert_lookahead.zig");
 
 const n_components = expert_bank.n_components;
+const gu_components = expert_bank.gu_components;
 const Component = expert_bank.Component;
 const Layer = expert_bank.Layer;
 const LayerPolicy = expert_policy.LayerPolicy;
@@ -121,7 +123,39 @@ pub const Options = struct {
     /// Decode misses per completion part (one pool job).
     records_per_part: u32 = 3,
     pool: expert_io.Options = .{ .tickets = 1024 },
+    /// Decode routes read the next layer's predicted records ahead and
+    /// pre-read their own certain misses (the lookahead4 lane).
+    lookahead: ?Lookahead = null,
+    /// Gate each call's reads on an event the GPU waits for (needs `lookahead`).
+    event: ?Event = null,
 };
+
+/// DSV41_LOOKAHEAD4=<k>:<tau>:<budget>:<chunks> at horizon 1.
+pub const Lookahead = struct {
+    k: u32 = 8,
+    /// inf keeps each row's plain top-K.
+    tau: f32 = std.math.inf(f32),
+    /// Records read ahead per layer call; 2 x budget staging slots.
+    budget: u32 = 2,
+    /// Chunks per speculative record: 1, 2, 4 or 8.
+    chunks: u32 = 4,
+    /// Speculative threads >= 1 start a chunk only while at most this many
+    /// demand jobs run (0 = demand idle).
+    idle_busy: u32 = 0,
+    preread: bool = true,
+};
+
+pub const Event = struct {
+    /// .host: an int64 word the stream owns (CPU backend, checks); .metal: an
+    /// id<MTLSharedEvent> on MLX's device whose signaled value is 0.
+    backend: union(enum) { host, metal: u64 } = .host,
+    /// A gate whose bytes have not landed by then is forced (the stream fails).
+    watchdog_ms: u32 = 2000,
+};
+
+/// The event values a gated call's waves wait for: its gate/up wave `gu`, the
+/// down wave of part p `down_first + p`.
+pub const Gates = struct { gu: u64, down_first: u64, n_parts: u32 };
 
 pub const Stats = struct {
     route_calls: u64 = 0,
@@ -139,9 +173,22 @@ pub const Stats = struct {
     expert_read_seconds: f64 = 0,
     /// Wall time with a read in flight (the pool's gauge).
     read_wall_ns: u64 = 0,
-    /// Speculative reads, from the lookahead pools (phase 2).
+    /// The lookahead class: records claimed by a demand read, physical bytes
+    /// of speculative reads, records issued / fully landed, demand ranges
+    /// copied out of a speculative record (no preadv) and their bytes.
     claimed: u64 = 0,
     spec_bytes: u64 = 0,
+    spec_issued: u64 = 0,
+    spec_landed: u64 = 0,
+    adopt_ranges: u64 = 0,
+    adopt_bytes: u64 = 0,
+    /// Pre-read ranges queued, served to a demand read, dropped unbound.
+    pre_issued: u64 = 0,
+    pre_served: u64 = 0,
+    pre_expired: u64 = 0,
+    /// Event gates registered and forced by the watchdog.
+    gates: u64 = 0,
+    gates_forced: u64 = 0,
 };
 
 pub const Error = error{
@@ -154,6 +201,14 @@ pub const Error = error{
     QueueFull,
     SubmitRefused,
     InvalidJob,
+    SpecRefused,
+    PreReadRefused,
+    GateInvalid,
+    GatesFull,
+    GateRefused,
+    /// The watchdog released a gate before its bytes landed: the GPU may have
+    /// read them early, so the outputs since are invalid.
+    GateForced,
 };
 
 const SlotState = enum(u8) { empty, loading, ready, failed };
@@ -184,6 +239,9 @@ pub const Route = struct {
     n_parts: u32 = 0,
     parts: [max_route_ids]Part = undefined,
     state: enum { free, live, released } = .free,
+    /// Decode layer calls with the lookahead class: this call's settle value.
+    tag: i64 = 0,
+    gates: ?Gates = null,
 
     pub fn partsOf(r: *const Route) []const Part {
         return r.parts[0..r.n_parts];
@@ -211,6 +269,16 @@ pub const Stream = struct {
     routes: [route_capacity]Route = @splat(.{}),
     counters: Stats = .{},
     read_ns: u64 = 0,
+    selector: ?expert_lookahead.Selector = null,
+    preread: bool = false,
+    /// Decode layer calls so far; a call's pre-reads and speculative records
+    /// carry its tag, settled by its own step.
+    clock: i64 = 0,
+    event_word: ?*i64 = null,
+    gated: bool = false,
+    /// The last event value handed out.
+    gate_value: u64 = 0,
+    forced_seen: i64 = 0,
 
     const LayerSlots = struct {
         policy: LayerPolicy,
@@ -238,6 +306,34 @@ pub const Stream = struct {
         for (bank.layers) |l| for (l.segments, bank.layers[widest].segments) |s, w| {
             if (s.length > w.length) return error.MixedGeometry;
         };
+        if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
+        if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
+        var pool_opt = opt.pool;
+        if (opt.lookahead) |la| {
+            if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
+                la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
+            const page = std.heap.pageSize();
+            const record = bank.layers[widest].logical_bytes;
+            pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
+            // A pre-read range is the record's gate/up span or its down span,
+            // back to back, each no larger than a staging buffer.
+            if (la.preread) for (bank.layers) |l| {
+                var gu: u64 = 0;
+                for (l.segments[0..gu_components]) |sg| gu += sg.length;
+                if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
+                if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
+            };
+        }
+        var selector: ?expert_lookahead.Selector = null;
+        if (opt.lookahead) |la| selector = try expert_lookahead.Selector.init(a, bank.n_experts, la.k, la.tau, la.budget);
+        errdefer if (selector) |*sel| sel.deinit(a);
+        // The pool writes the event word until it stops.
+        var word: ?*i64 = null;
+        if (opt.event) |ev| if (ev.backend == .host) {
+            word = try a.create(i64);
+            word.?.* = 0;
+        };
+        errdefer if (word) |w| a.destroy(w);
 
         const self = try a.create(Stream);
         errdefer a.destroy(self);
@@ -266,7 +362,16 @@ pub const Stream = struct {
         const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
         errdefer a.free(transient_meta);
         @memset(transient_meta, .{});
-        const pool = try expert_io.Pool.start(a, opt.pool);
+        const pool = try expert_io.Pool.start(a, pool_opt);
+        errdefer pool.stop();
+        if (opt.lookahead) |la| if (la.preread) try pool.armPreRead(&layers[widest].lens);
+        if (opt.event) |ev| {
+            const object: u64 = switch (ev.backend) {
+                .host => @intFromPtr(word.?),
+                .metal => |ptr| ptr,
+            };
+            try pool.armEvent(if (ev.backend == .host) .host else .metal, object, @as(i64, ev.watchdog_ms) * std.time.ns_per_ms, 0);
+        }
         self.* = .{
             .allocator = a,
             .bank = bank,
@@ -276,6 +381,10 @@ pub const Stream = struct {
             .transient_meta = transient_meta,
             .max_route_ids = opt.max_route_ids,
             .records_per_part = opt.records_per_part,
+            .selector = selector,
+            .preread = if (opt.lookahead) |la| la.preread else false,
+            .event_word = word,
+            .gated = opt.event != null,
         };
         return self;
     }
@@ -293,6 +402,8 @@ pub const Stream = struct {
         a.free(self.layers);
         self.transient.deinit();
         a.free(self.transient_meta);
+        if (self.selector) |*sel| sel.deinit(a);
+        if (self.event_word) |w| a.destroy(w);
         a.destroy(self);
     }
 
@@ -326,9 +437,18 @@ pub const Stream = struct {
     /// from an evaluated array) to slots: pins every slot it serves and submits
     /// the misses' reads in parts. The eval that produced `ids` also finished
     /// every released route's consumers, so their slots are recycled first.
-    pub fn route(self: *Stream, layer: u32, ids: []const u16) Error!*Route {
+    /// With the lookahead class a decode call first pre-reads its certain
+    /// misses, and after its submits (which claim the records read ahead for
+    /// it) settles what it did not claim and reads ahead the next layer's
+    /// predicted records: `scores` = that layer's gate on this call's rows
+    /// (rows x n_experts f32, evaluated with `ids`); empty = settle only.
+    pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
         if (self.failed) return error.StreamFailed;
         std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
+        const lookahead = self.selector != null and self.phase == .decode;
+        std.debug.assert(lookahead or scores.len == 0);
+        const tag = self.clock + 1;
+        if (lookahead and self.preread) try self.preRead(layer, ids, tag);
         try self.flush();
         const r = for (&self.routes) |*cand| {
             if (cand.state == .free) break cand;
@@ -351,6 +471,11 @@ pub const Stream = struct {
             m.pins = 1;
         }
         try self.submitParts(r);
+        if (lookahead) {
+            r.tag = tag;
+            self.clock = tag;
+            try self.speculate(r, scores);
+        }
         const c = &self.counters;
         c.route_calls += 1;
         c.expert_cache_hits += plan.n_hits;
@@ -362,6 +487,84 @@ pub const Stream = struct {
         }
         r.state = .live;
         return r;
+    }
+
+    /// The call's certain misses (its plan's misses) as pre-read ranges,
+    /// before the plan; the submit binds them.
+    fn preRead(self: *Stream, layer: u32, ids: []const u16, tag: i64) Error!void {
+        var experts: [expert_lookahead.max_candidates]u16 = undefined;
+        const misses = self.selector.?.certainMisses(ids, &self.layers[layer].policy, &experts);
+        if (misses.len == 0) return;
+        var bases: [expert_lookahead.max_candidates]i64 = undefined;
+        for (misses, bases[0..misses.len]) |e, *b| b.* = @intCast(self.bank.recordOffset(layer, e));
+        _ = self.pool.preRead(self.bank.sidecar_fd, self.bank.sidecar_file_size, tag, bases[0..misses.len], &self.layers[layer].lens) catch
+            return self.fail(error.PreReadRefused);
+    }
+
+    /// Settles every record read ahead for this call that it did not claim,
+    /// then reads ahead the next layer's predicted records (keyed by offset).
+    fn speculate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
+        const next = r.layer + 1;
+        var bases: [expert_lookahead.max_budget]i64 = undefined;
+        var n: usize = 0;
+        var len: u64 = 0;
+        if (scores.len > 0 and next < self.layers.len) {
+            const sel = &self.selector.?;
+            var chosen: [expert_lookahead.max_budget]u16 = undefined;
+            for (sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget])) |e| {
+                bases[n] = @intCast(self.bank.recordOffset(next, e));
+                n += 1;
+            }
+            len = self.bank.layers[next].logical_bytes;
+        }
+        _ = self.pool.specStep(self.bank.sidecar_fd, self.bank.sidecar_file_size, r.tag, bases[0..n], len) catch
+            return self.fail(error.SpecRefused);
+    }
+
+    /// Event gates for a live route's reads, registered before the GPU commits
+    /// its waves: the gate/up wave waits for `gu` (every gate/up ticket of the
+    /// call), part p's down wave for `down_first + p` (that part's down
+    /// tickets). Null when nothing is read.
+    pub fn gate(self: *Stream, r: *Route) Error!?Gates {
+        std.debug.assert(self.gated and r.state == .live and r.gates == null);
+        const n = r.n_parts;
+        if (n == 0) return null;
+        const lo = self.gate_value;
+        const hi = lo + 1 + n;
+        self.gate_value = hi;
+        var values: [max_route_ids + 1]u64 = undefined;
+        var counts: [max_route_ids + 1]i32 = undefined;
+        var tickets: [2 * max_route_ids]i64 = undefined;
+        var k: usize = 0;
+        for (r.partsOf()) |p| for (0..p.n_reads) |i| {
+            tickets[k] = @intCast(p.ticket + i);
+            k += 1;
+        };
+        values[0] = lo + 1;
+        counts[0] = @intCast(k);
+        for (r.partsOf(), 0..) |p, pi| {
+            values[1 + pi] = lo + 2 + pi;
+            counts[1 + pi] = @intCast(p.n_reads);
+            for (0..p.n_reads) |i| {
+                tickets[k] = @intCast(p.ticket + p.n_reads + i);
+                k += 1;
+            }
+        }
+        self.pool.registerGates(values[0 .. n + 1], counts[0 .. n + 1], tickets[0..k]) catch |e| {
+            self.pool.releaseGates(hi);
+            return self.fail(switch (e) {
+                error.GateInvalid => error.GateInvalid,
+                error.GatesFull => error.GatesFull,
+                else => error.GateRefused,
+            });
+        };
+        r.gates = .{ .gu = lo + 1, .down_first = lo + 2, .n_parts = n };
+        return r.gates;
+    }
+
+    /// The host event word (Event.backend = .host), for a CPU-stream wait.
+    pub fn eventWord(self: *const Stream) ?*const i64 {
+        return self.event_word;
     }
 
     /// Loads in file order, cut into parts (decode: the bounded parts of
@@ -475,7 +678,8 @@ pub const Stream = struct {
 
     /// Unpins every released route; call only after an eval that consumed
     /// them (`route` does, since its ids come from such an eval). A release
-    /// whose reads are still landing waits for them first.
+    /// whose reads are still landing waits for them first. A gate the
+    /// watchdog forced since the last flush fails the stream here.
     pub fn flush(self: *Stream) Error!void {
         var first_error: ?Error = null;
         for (&self.routes) |*r| {
@@ -488,6 +692,13 @@ pub const Stream = struct {
             r.state = .free;
         }
         if (first_error) |e| return e;
+        if (self.gated) {
+            const forced = self.pool.counter(.ev_wd_forced);
+            if (forced != self.forced_seen) {
+                self.forced_seen = forced;
+                return self.fail(error.GateForced);
+            }
+        }
     }
 
     /// The one phase change: each layer's persistent rows become
@@ -521,6 +732,14 @@ pub const Stream = struct {
         var s = self.counters;
         s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
         s.read_wall_ns = @intCast(@max(self.pool.readGauge()[4], 0));
+        const p = self.pool;
+        const pairs = .{
+            .{ "claimed", .claimed },           .{ "spec_bytes", .spec_bytes },   .{ "spec_issued", .submitted },
+            .{ "spec_landed", .landed },        .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
+            .{ "pre_issued", .pre_issued },     .{ "pre_served", .pre_served },   .{ "pre_expired", .pre_expired },
+            .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
+        };
+        inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
         return s;
     }
 
@@ -737,7 +956,7 @@ const test_pool: expert_io.Options = .{ .workers = 2, .staging_bytes = 16384, .t
 
 /// Routes `ids` and waits for every part (gate/up first, as the kernels do).
 fn serve(s: *Stream, layer: u32, ids: []const u16) !*Route {
-    const r = try s.route(layer, ids);
+    const r = try s.route(layer, ids, &.{});
     for (0..r.n_parts) |p| {
         try s.waitGu(r, @intCast(p));
         try s.waitDown(r, @intCast(p));
@@ -850,8 +1069,8 @@ test "dsv41 stream: a row an unreleased route serves from is never refilled" {
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 0, 0 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
     defer s.deinit();
     _ = try serve(s, 0, &.{ 1, 2 });
-    try testing.expectError(error.SlotStillPinned, s.route(1, &.{3}));
-    try testing.expectError(error.StreamFailed, s.route(1, &.{3}));
+    try testing.expectError(error.SlotStillPinned, s.route(1, &.{3}, &.{}));
+    try testing.expectError(error.StreamFailed, s.route(1, &.{3}, &.{}));
 }
 
 test "dsv41 stream: routes the caller never releases run out, by name" {
@@ -860,7 +1079,7 @@ test "dsv41 stream: routes the caller never releases run out, by name" {
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
     defer s.deinit();
     for (0..4) |_| _ = try serve(s, 0, &.{ 1, 2 });
-    try testing.expectError(error.RoutesExhausted, s.route(0, &.{ 1, 2 }));
+    try testing.expectError(error.RoutesExhausted, s.route(0, &.{ 1, 2 }, &.{}));
 }
 
 test "dsv41 stream: a transient row still holding the record is not read again" {
@@ -915,10 +1134,10 @@ test "dsv41 stream: a failed read fails the route and every later one" {
     defer expert_io.clearFaults();
     const page = std.heap.pageSize();
     expert_io.injectFault(sb.bank.spans(0, 1).gu_offset / page * page, 2, 0);
-    const r = try s.route(0, &.{1});
+    const r = try s.route(0, &.{1}, &.{});
     try testing.expectError(error.ReadFailed, s.waitDown(r, 0));
     try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(1));
-    try testing.expectError(error.StreamFailed, s.route(0, &.{1}));
+    try testing.expectError(error.StreamFailed, s.route(0, &.{1}, &.{}));
 }
 
 /// sha256 of a served slot's logical record (its nine component rows).
@@ -987,4 +1206,301 @@ test "dsv41 stream: a recorded trace on the real bank serves every slot's bytes"
     );
     try testing.expectEqual(st.expert_cache_misses, st.persistent_loads + st.transient_loads);
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped) * geom.logical_bytes, st.expert_bytes_read);
+}
+
+// ── Lookahead, pre-read and event gates ──
+
+const la_pool: expert_io.Options = .{ .workers = 2, .staging_bytes = 16384, .tickets = 512 };
+
+/// One score row over 32 experts: `top` in descending order, the rest 0.
+fn scoresFor(top: []const u16) [32]f32 {
+    var s: [32]f32 = @splat(0);
+    for (top, 0..) |e, i| s[e] = @floatFromInt(top.len - i);
+    return s;
+}
+
+fn waitCounter(s: *Stream, which: expert_io.Counter, at_least: i64) !void {
+    var t: u32 = 0;
+    while (s.pool.counter(which) < at_least) : (t += 1) {
+        if (t > 10_000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+fn waitWord(s: *const Stream, value: u64) !void {
+    const w = s.eventWord().?;
+    var t: u32 = 0;
+    while (@as(u64, @intCast(@atomicLoad(i64, w, .acquire))) < value) : (t += 1) {
+        if (t > 20_000) return error.Timeout;
+        std.Io.sleep(std.testing.io, .fromMicroseconds(500), .awake) catch {};
+    }
+}
+
+/// Routes a call and, as the GPU would, waits on its gates instead of the pool.
+fn serveGated(s: *Stream, layer: u32, ids: []const u16, scores: []const f32) !*Route {
+    const r = try s.route(layer, ids, scores);
+    if (try s.gate(r)) |g| try waitWord(s, g.down_first + g.n_parts - 1);
+    return r;
+}
+
+test "dsv41 stream: the next layer's predicted records are read ahead and claimed by its route" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false } });
+    defer s.deinit();
+    try s.grow(&.{ 4, 4 });
+    // Layer 0's call predicts layer 1's experts 20 and 21.
+    const pred = scoresFor(&.{ 20, 21, 3, 4, 5, 6 });
+    const r0 = try s.route(0, &.{ 1, 2 }, &pred);
+    try s.waitDown(r0, 0);
+    s.release(r0);
+    try waitCounter(s, .landed, 2);
+    const r1 = try serve(s, 1, &.{ 20, 9, 21 });
+    try expectServed(s, &sb, r1, &.{ 20, 9, 21 });
+    s.release(r1);
+    try s.flush();
+    const st = s.stats();
+    const rec = sb.bank.layers[1].logical_bytes;
+    try testing.expectEqual(@as(u64, 2), st.spec_issued);
+    try testing.expectEqual(@as(u64, 2), st.claimed);
+    try testing.expectEqual(@as(u64, 4), st.adopt_ranges);
+    try testing.expectEqual(2 * rec, st.adopt_bytes);
+    // Every record still lands in its slot: read, or copied out of the speculative staging.
+    try testing.expectEqual(5 * rec, st.expert_bytes_read);
+}
+
+test "dsv41 stream: pre-read ranges carry a decode call's certain misses to its reads" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 1, .chunks = 1 } });
+    defer s.deinit();
+    // Prefill routes never pre-read.
+    s.release(try serve(s, 0, &.{ 7, 8 }));
+    try testing.expectEqual(@as(i64, 0), s.pool.counter(.pre_calls));
+    try s.grow(&.{ 4, 4 });
+    const ids = [_]u16{ 1, 7, 2, 3, 1, 8 };
+    const r = try serve(s, 0, &ids);
+    try expectServed(s, &sb, r, &ids);
+    s.release(r);
+    try s.flush();
+    // Certain misses 1, 2, 3: one gate/up and one down range each, bound by the submit or read by it.
+    try testing.expectEqual(@as(i64, 1), s.pool.counter(.pre_calls));
+    try testing.expectEqual(@as(i64, 6), s.pool.counter(.pre_issued));
+    try testing.expectEqual(@as(i64, 6), s.pool.counter(.pre_bound) + s.pool.counter(.pre_cancelled));
+    try testing.expectEqual(s.pool.counter(.pre_bound), s.pool.counter(.pre_served));
+    // A call whose experts are all resident pre-reads nothing.
+    s.release(try serve(s, 0, &.{ 7, 8 }));
+    try testing.expectEqual(@as(i64, 1), s.pool.counter(.pre_calls));
+    try s.flush();
+    try testing.expectEqual(5 * sb.bank.layers[0].logical_bytes, s.stats().expert_bytes_read);
+}
+
+test "dsv41 stream: gated routes register the gate/up wave, then each part's down wave" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 8, 8 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 }, .event = .{ .watchdog_ms = 10_000 } });
+    defer s.deinit();
+    try s.grow(&.{ 8, 8 });
+    // Five misses in file order: parts of three and two.
+    const ids = [_]u16{ 3, 1, 4, 5, 9 };
+    const r = try s.route(0, &ids, &.{});
+    try testing.expectEqual(@as(u32, 2), r.n_parts);
+    const g = (try s.gate(r)).?;
+    try testing.expectEqual(Gates{ .gu = 1, .down_first = 2, .n_parts = 2 }, g);
+    try waitWord(s, g.gu);
+    for (r.partsOf()) |p| for (0..p.n_reads) |i| try testing.expect(s.pool.result(p.ticket + @as(u32, @intCast(i))).status != .pending);
+    try waitWord(s, 3);
+    try expectServed(s, &sb, r, &ids);
+    s.release(r);
+    // Values continue across calls; a call that reads nothing is not gated.
+    const r2 = try s.route(1, &.{ 2, 6 }, &.{});
+    try testing.expectEqual(Gates{ .gu = 4, .down_first = 5, .n_parts = 1 }, (try s.gate(r2)).?);
+    try waitWord(s, 5);
+    s.release(r2);
+    const r3 = try s.route(0, &.{ 3, 9 }, &.{});
+    try testing.expectEqual(@as(?Gates, null), try s.gate(r3));
+    s.release(r3);
+    try s.flush();
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 5), st.gates);
+    try testing.expectEqual(@as(u64, 0), st.gates_forced);
+}
+
+test "dsv41 stream: a gate the watchdog forces fails the stream at the next flush" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false }, .event = .{ .watchdog_ms = 50 } });
+    defer s.deinit();
+    defer expert_io.clearFaults();
+    try s.grow(&.{ 4, 4 });
+    const page = std.heap.pageSize();
+    expert_io.injectFault(sb.bank.spans(0, 11).gu_offset / page * page, 5, 400 * std.time.ns_per_ms);
+    const r = try s.route(0, &.{11}, &.{});
+    const g = (try s.gate(r)).?;
+    try waitWord(s, g.down_first);
+    try testing.expect(s.stats().gates_forced >= 1);
+    s.release(r);
+    try testing.expectError(error.GateForced, s.route(1, &.{2}, &.{}));
+    try testing.expectError(error.StreamFailed, s.route(1, &.{2}, &.{}));
+}
+
+test "dsv41 stream: lookahead options outside the lane's ranges are refused at construction" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const a = testing.allocator;
+    const base: Options = .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool };
+    var o = base;
+    o.lookahead = .{ .k = 5 };
+    try testing.expectError(error.InvalidSelector, Stream.init(a, &sb.bank, o));
+    o.lookahead = .{ .budget = 5 };
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &sb.bank, o));
+    o.lookahead = .{ .chunks = 3 };
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &sb.bank, o));
+    o.lookahead = .{ .idle_busy = 2 };
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &sb.bank, o));
+    o.lookahead = .{ .tau = std.math.nan(f32) };
+    try testing.expectError(error.InvalidSelector, Stream.init(a, &sb.bank, o));
+    o = base;
+    o.event = .{};
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &sb.bank, o));
+    o.lookahead = .{};
+    o.event = .{ .watchdog_ms = 10 };
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &sb.bank, o));
+    // The tier's values construct.
+    o.event = .{};
+    const s = try Stream.init(a, &sb.bank, o);
+    s.deinit();
+}
+
+test "dsv41 stream: a verify trace with lookahead, pre-read and gates serves every slot's bytes" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 2 }, .event = .{ .watchdog_ms = 10_000 } });
+    defer s.deinit();
+    try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
+    s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
+    s.release(try serve(s, 1, &.{ 7, 8, 9 }));
+    try s.grow(&.{ 6, 4 });
+    // Verify forwards of 1..2 rows x top-6 over both layers; layer 0 predicts layer 1.
+    var rng = std.Random.DefaultPrng.init(21);
+    const rand = rng.random();
+    var ids: [12]u16 = undefined;
+    var scores: [2 * 32]f32 = undefined;
+    var gates: u64 = 0;
+    var reads: u64 = 0;
+    for (0..60) |step| {
+        const layer: u32 = @intCast(step % 2);
+        const m = rand.intRangeAtMost(usize, 1, 2);
+        const span: u16 = if (step % 7 == 0) 32 else 12;
+        for (ids[0 .. 6 * m]) |*e| e.* = rand.intRangeLessThan(u16, 0, span);
+        for (scores[0 .. 32 * m]) |*v| v.* = rand.float(f32);
+        const pred: []const f32 = if (layer == 0) scores[0 .. 32 * m] else &.{};
+        const r = try serveGated(s, layer, ids[0 .. 6 * m], pred);
+        try expectServed(s, &sb, r, ids[0 .. 6 * m]);
+        if (r.n_parts > 0) gates += r.n_parts + 1;
+        reads += readsOf(r);
+        s.release(r);
+    }
+    try s.flush();
+    for (0..2) |l| for (0..s.layers[l].policy.capacity + 12) |slot| {
+        try testing.expectEqual(@as(u16, 0), s.pinsOf(@intCast(l), @intCast(slot)));
+    };
+    const st = s.stats();
+    try testing.expectEqual(gates, st.gates);
+    try testing.expectEqual(@as(u64, 0), st.gates_forced);
+    try testing.expectEqual(reads * sb.bank.layers[0].logical_bytes + 8 * sb.bank.layers[0].logical_bytes, st.expert_bytes_read);
+    try testing.expect(st.spec_issued > 0 and st.pre_issued > 0);
+}
+
+/// The phase-2 fixture's calls for one layer as M = 1 routes, and the P1 scores of each row.
+const TraceCall = struct { ids: []const u16, pre: []const u16, sel: []const []const u16, cand: []const []const u16 };
+
+// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py>
+test "dsv41 stream: a two-layer recorded trace with lookahead and gates on the real bank serves every slot's bytes" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const fixture = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.testing.io;
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    var diag: expert_bank.Diag = .{};
+    var bank = expert_bank.Bank.open(a, io, dir, expert_bank.dsv41, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, fixture, a, .limited(16 << 20));
+    defer a.free(text);
+    const Fix = struct { layers: u32, experts: u32, rows: []const u32, resident0: []const []const u16, scores_file: []const u8, calls: []const TraceCall };
+    const parsed = try std.json.parseFromSlice(Fix, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const f = parsed.value;
+    var pbuf: [1024]u8 = undefined;
+    const spath = try std.fmt.bufPrintSentinel(&pbuf, "{s}/{s}", .{ std.fs.path.dirname(fixture) orelse ".", f.scores_file }, 0);
+    const sfd = std.c.open(spath.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (sfd < 0) return error.OpenFailed;
+    defer _ = std.c.close(sfd);
+
+    // Layers 13 and 14 at 3 -> 4 rows, 6 transient rows, the tier's lookahead (8:inf:2, 4 chunks) + event gates.
+    const L: u32 = 13;
+    var rows: [40]u32 = @splat(0);
+    rows[L] = 3;
+    rows[L + 1] = 3;
+    const s = try Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 6, .lookahead = .{}, .event = .{} });
+    defer s.deinit();
+    const geom = &bank.layers[L];
+    for ([_]u32{ L, L + 1 }) |l| {
+        var seed: [3]u16 = undefined;
+        const sorted = try a.dupe(u16, f.resident0[l]);
+        defer a.free(sorted);
+        std.sort.pdq(u16, sorted, {}, std.sort.asc(u16));
+        @memcpy(&seed, sorted[0..3]);
+        try s.seedPrefill(l, &seed);
+        s.release(try serve(s, l, &seed));
+    }
+    rows[L] = 4;
+    rows[L + 1] = 4;
+    try s.grow(&rows);
+
+    var served: u64 = 0;
+    var routes: u64 = 0;
+    var score_row: [384]f32 = undefined;
+    var raw: [384 * 4]u8 = undefined;
+    var at: u64 = 0; // scored rows before this cycle
+    var cycle: usize = 0;
+    outer: while (cycle < f.rows.len) : (cycle += 1) {
+        const m = f.rows[cycle];
+        const c13 = f.calls[cycle * f.layers + L];
+        const c14 = f.calls[cycle * f.layers + L + 1];
+        for (0..m) |r| {
+            if (routes >= 40) break :outer;
+            // Row r of layer 13's call predicts layer 14 (P1 scores of that row).
+            const off = (at + L * m + r) * 384 * 4;
+            if (std.c.pread(sfd, &raw, raw.len, @intCast(off)) != raw.len) return error.ShortRead;
+            for (&score_row, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, raw[4 * i ..][0..4], .little));
+            for ([_]struct { l: u32, ids: []const u16, scores: []const f32 }{
+                .{ .l = L, .ids = c13.ids[6 * r ..][0..6], .scores = &score_row },
+                .{ .l = L + 1, .ids = c14.ids[6 * r ..][0..6], .scores = &.{} },
+            }) |call| {
+                const rt = try serveGated(s, call.l, call.ids, call.scores);
+                for (rt.plan.slotsOf(), call.ids) |slot, e| {
+                    const d = slotDigest(s, call.l, slot, geom);
+                    try testing.expectEqualSlices(u8, &bank.digest(call.l, e).logical, &d);
+                    served += 1;
+                }
+                routes += 1;
+                s.release(rt);
+            }
+        }
+        at += @as(u64, m) * (f.layers - 1);
+    }
+    try s.flush();
+    const st = s.stats();
+    const ru = std.posix.getrusage(std.c.rusage.SELF);
+    std.debug.print(
+        "real bank layers {d}+{d}: {d} gated routes, {d} served slots sha256-checked; misses {d} skipped {d}; {d} B landed ({d} preadv); lookahead: issued {d} landed {d} claimed {d} adopted {d} ranges / {d} B, spec {d} B; pre-read issued {d} served {d} expired {d}; gates {d} forced {d}; {d} ms total; peak RSS {d} B\n",
+        .{ L, L + 1, st.route_calls, served, st.expert_cache_misses, st.loads_skipped, st.expert_bytes_read, st.preadv_calls, st.spec_issued, st.spec_landed, st.claimed, st.adopt_ranges, st.adopt_bytes, st.spec_bytes, st.pre_issued, st.pre_served, st.pre_expired, st.gates, st.gates_forced, @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms), ru.maxrss },
+    );
+    try testing.expectEqual(@as(u64, 0), st.gates_forced);
+    try testing.expectEqual((st.expert_cache_misses - st.loads_skipped) * geom.logical_bytes, st.expert_bytes_read);
+    try testing.expect(st.spec_issued > 0 and st.pre_issued > 0 and st.gates > 0);
 }

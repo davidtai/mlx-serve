@@ -170,7 +170,7 @@ pub fn slotBytes(record_bytes: u64, page: u64) u64 {
 
 /// Page-aligned chunk so `chunks` chunks cover a staging slot.
 pub fn chunkBytes(chunks: u32, record_bytes: u64, page: u64) u64 {
-    return std.math.divCeil(u64, slotBytes(record_bytes, page), chunks * page) catch unreachable;
+    return (std.math.divCeil(u64, slotBytes(record_bytes, page), chunks * page) catch unreachable) * page;
 }
 
 pub const EventKind = enum(i32) { metal = 1, host = 2 };
@@ -598,6 +598,15 @@ test "dsv41 io: stop joins and restarts" {
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .staging_bytes = std.heap.pageSize() + 1 }));
     const bad_spec: Spec = .{ .threads = 1, .slots = max_spec + 1, .record_bytes = 100, .chunk_bytes = std.heap.pageSize() };
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .spec = bad_spec }));
+}
+
+test "dsv41 io: speculative slots and chunks follow the lane's sizes" {
+    // q3_lookahead4_candidate.slot_bytes / chunk_bytes on the 3.0 bank's 13,315,584-byte record, 16 KiB pages.
+    try testing.expectEqual(@as(u64, 13_352_960), slotBytes(13_315_584, 16384));
+    try testing.expectEqual(@as(u64, 3_342_336), chunkBytes(4, 13_315_584, 16384));
+    try testing.expectEqual(@as(u64, 13_352_960), chunkBytes(1, 13_315_584, 16384));
+    try testing.expectEqual(@as(u64, 49_152), slotBytes(2880, 16384));
+    try testing.expectEqual(@as(u64, 16_384), chunkBytes(4, 2880, 16384));
 }
 
 // Speculative class. One record = a gate/up range then a down range, back to back.
