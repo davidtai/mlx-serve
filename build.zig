@@ -183,6 +183,7 @@ pub fn build(b: *std.Build) void {
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
     mod.addIncludePath(b.path("lib/ds4"));
+    addExpertIoSources(b, mod, false);
 
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
@@ -258,6 +259,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/xatlas"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
+    addExpertIoSources(b, test_mod, true);
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
@@ -702,6 +704,18 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
         "-Wno-deprecated-declarations",
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
+}
+
+/// Packed expert streamer I/O (lib/expert_io): the native-issue read pool
+/// (pthreads, pread + memcpy into slot rows, never MLX). `inject` compiles its
+/// scripted-fault hooks, for the test module only.
+fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) void {
+    const flags: []const []const u8 = if (inject)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3NI_INJECT" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_nativeissue.c"), .flags = flags });
+    module.addIncludePath(b.path("lib/expert_io"));
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and
