@@ -41,6 +41,7 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    _ = @import("deepseek_v41.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");

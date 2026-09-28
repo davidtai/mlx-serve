@@ -7,6 +7,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const deepseek_v41 = @import("deepseek_v41.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -3122,6 +3123,17 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
+    } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
+        // Native DeepSeek-V4.1 (deepseek_v41.zig): the config is checked with
+        // its own named refusals; the forward is not served yet, so a valid
+        // bank stops here instead of falling into the Llama defaults.
+        var diag: deepseek_v41.Diag = .{};
+        _ = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
+            log.err("deepseek_v41: {s}\n", .{diag.message()});
+            return e;
+        };
+        log.err("deepseek_v41: the native arch is not served yet; use the GGUF path (ds4)\n", .{});
+        return error.UnsupportedDsv41NotServed;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -7525,4 +7537,13 @@ test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setti
     try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
     cfg.dflash_bound = true;
     try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
+}
+
+test "dsv41 model: a deepseek_v41 config is refused by name, never parsed as Llama" {
+    const ok = try deepseek_v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(ok);
+    try testing.expectError(error.UnsupportedDsv41NotServed, parseConfigFromJson(testing.allocator, ok));
+    const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
+    defer testing.allocator.free(bad);
+    try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
 }
