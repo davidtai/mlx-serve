@@ -706,15 +706,17 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
-/// Packed expert streamer I/O (lib/expert_io): the native-issue read pool
-/// (pthreads, pread + memcpy into slot rows, never MLX). `inject` compiles its
-/// scripted-fault hooks, for the test module only.
+/// Packed expert streamer I/O (lib/expert_io): the lookahead read pool
+/// (pthreads, pread + memcpy into slot rows, never MLX) and its MTLSharedEvent
+/// signal (non-ARC objc). `inject` compiles the pool's scripted-fault hooks,
+/// for the test module only.
 fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) void {
     const flags: []const []const u8 = if (inject)
-        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3NI_INJECT" }
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
     else
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
-    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_nativeissue.c"), .flags = flags });
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_lookahead4_exl3.c"), .flags = flags });
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_event_shim.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
     module.addIncludePath(b.path("lib/expert_io"));
 }
 
