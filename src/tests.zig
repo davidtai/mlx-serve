@@ -44,6 +44,7 @@ test {
     _ = @import("deepseek_v41.zig");
     _ = @import("deepseek_v41_ops.zig");
     _ = @import("deepseek_v41_graph.zig");
+    _ = @import("deepseek_v41_engram.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
