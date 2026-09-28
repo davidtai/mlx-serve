@@ -2,7 +2,8 @@
 //! component, `rows` rows of that component's segment length, handed to the
 //! read pool as nine destination addresses per row (`LayerSlotBank` is the
 //! MLX-owned form the kernels bind, `HostSlotRows` the same layout in host
-//! pages). `Stream`: per-layer slot pools, routes, deferred release, growth.
+//! pages; `Options.slot_memory` picks one). `Stream`: per-layer slot pools,
+//! routes, deferred release, growth, lookahead and event gates.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -109,6 +110,70 @@ pub const LayerSlotBank = struct {
     }
 };
 
+/// Where the stream keeps its slot rows: host pages (the default; hermetic
+/// tests and CPU checks) or MLX arrays the kernels bind, created and evaluated
+/// on `mlx` (creating any MLX array creates the Metal device: callers hold the
+/// GPU lock). Chosen once, at Stream.init.
+pub const SlotMemory = union(enum) { host, mlx: mlx.mlx_stream };
+
+/// One bank of slot rows. Both memories are addressed by the same row
+/// arithmetic, so the read path never asks which one it has.
+const Rows = struct {
+    rows: u32 = 0,
+    base: [n_components]u64 = @splat(0),
+    row_bytes: [n_components]u64 = @splat(0),
+    backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
+
+    fn init(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+        if (rows == 0) return .{};
+        switch (memory) {
+            .host => {
+                const h = try HostSlotRows.init(layer, rows);
+                var r: Rows = .{ .rows = rows, .row_bytes = h.row_bytes, .backing = .{ .host = h } };
+                for (&r.base, h.banks) |*b, bank| b.* = @intFromPtr(bank.ptr);
+                return r;
+            },
+            .mlx => |stream| {
+                const m = try LayerSlotBank.init(layer, rows, stream);
+                return .{ .rows = rows, .base = m.base, .row_bytes = m.row_bytes, .backing = .{ .mlx = m } };
+            },
+        }
+    }
+
+    /// After the pool that wrote into the rows has stopped.
+    fn deinit(self: *Rows) void {
+        switch (self.backing) {
+            .none => {},
+            .host => |*h| h.deinit(),
+            .mlx => |*m| m.deinit(),
+        }
+        self.* = .{};
+    }
+
+    fn row(self: *const Rows, c: Component, r: u32) []u8 {
+        const n = self.row_bytes[@intFromEnum(c)];
+        const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+        return p[0..n];
+    }
+
+    fn rowDest(self: *const Rows, r: u32) [n_components]u64 {
+        var d: [n_components]u64 = undefined;
+        for (&d, self.base, self.row_bytes) |*a, base, n| a.* = base + r * n;
+        return d;
+    }
+};
+
+/// Which of a layer's banks holds a slot: its prefill rows, the rows `grow`
+/// added, or the transient scratch every layer shares.
+pub const BankKind = enum(u8) { base, ext, transient };
+/// A slot's bank and its row in that bank (the index the kernels gather).
+pub const SlotRef = struct { bank: BankKind, row: u32 };
+/// One projection's arrays in a bank: code int16 [rows, in/16, out/16, 16K],
+/// rout f16 [rows, out], rin f16 [rows, in].
+pub const ProjArrays = struct { code: mlx.mlx_array, rout: mlx.mlx_array, rin: mlx.mlx_array };
+/// A bank's nine arrays by projection; the stream owns them for its life.
+pub const BankArrays = struct { gate: ProjArrays, up: ProjArrays, down: ProjArrays };
+
 // ── Stream: per-layer slot pools, routes, deferred release, growth ──
 
 pub const Options = struct {
@@ -128,6 +193,8 @@ pub const Options = struct {
     lookahead: ?Lookahead = null,
     /// Gate each call's reads on an event the GPU waits for (needs `lookahead`).
     event: ?Event = null,
+    /// Host pages, or MLX arrays on the given stream (the serving form).
+    slot_memory: SlotMemory = .host,
 };
 
 /// DSV41_LOOKAHEAD4=<k>:<tau>:<budget>:<chunks> at horizon 1.
@@ -246,6 +313,14 @@ pub const Route = struct {
     pub fn partsOf(r: *const Route) []const Part {
         return r.parts[0..r.n_parts];
     }
+
+    /// The loads (expert, slot) of part `part`, in file order: what its
+    /// gate/up and down kernels read once `waitGu` / `waitDown` return.
+    pub fn partLoads(r: *const Route, part: u32, out: *[max_route_ids]expert_policy.Load) []expert_policy.Load {
+        const p = r.parts[part];
+        for (r.order[p.first..][0..p.n], out[0..p.n]) |li, *l| l.* = r.plan.loads[li];
+        return out[0..p.n];
+    }
 };
 
 /// The route being served plus released ones awaiting the next flush.
@@ -260,8 +335,9 @@ pub const Stream = struct {
     bank: *const expert_bank.Bank,
     pool: *expert_io.Pool,
     layers: []LayerSlots,
-    transient: HostSlotRows,
+    transient: Rows,
     transient_meta: []SlotMeta,
+    memory: SlotMemory = .host,
     max_route_ids: u32,
     records_per_part: u32,
     phase: Phase = .prefill,
@@ -283,14 +359,14 @@ pub const Stream = struct {
     const LayerSlots = struct {
         policy: LayerPolicy,
         /// The prefill rows, then the rows `grow` added.
-        base: HostSlotRows,
-        ext: ?HostSlotRows = null,
+        base: Rows,
+        ext: ?Rows = null,
         /// [n_experts]: one entry per persistent slot.
         meta: []SlotMeta,
         lens: [n_components]u64,
     };
 
-    const Location = struct { rows: *const HostSlotRows, row: u32, meta: *SlotMeta };
+    const Location = struct { rows: *const Rows, row: u32, meta: *SlotMeta };
 
     pub fn init(a: std.mem.Allocator, bank: *const expert_bank.Bank, opt: Options) !*Stream {
         const n_layers = bank.layers.len;
@@ -348,7 +424,7 @@ pub const Stream = struct {
         for (layers, opt.rows, bank.layers) |*ls, rows, *geom| {
             var policy = try LayerPolicy.init(a, bank.n_experts, rows);
             errdefer policy.deinit(a);
-            var base = try HostSlotRows.init(geom, rows);
+            var base = try Rows.init(geom, rows, opt.slot_memory);
             errdefer base.deinit();
             const meta = try a.alloc(SlotMeta, bank.n_experts);
             @memset(meta, .{});
@@ -357,7 +433,7 @@ pub const Stream = struct {
             ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
             n_init += 1;
         }
-        var transient = try HostSlotRows.init(&bank.layers[widest], opt.transient_rows);
+        var transient = try Rows.init(&bank.layers[widest], opt.transient_rows, opt.slot_memory);
         errdefer transient.deinit();
         const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
         errdefer a.free(transient_meta);
@@ -379,6 +455,7 @@ pub const Stream = struct {
             .layers = layers,
             .transient = transient,
             .transient_meta = transient_meta,
+            .memory = opt.slot_memory,
             .max_route_ids = opt.max_route_ids,
             .records_per_part = opt.records_per_part,
             .selector = selector,
@@ -424,6 +501,36 @@ pub const Stream = struct {
     pub fn slotRow(self: *Stream, layer: u32, slot: u32, c: Component) []u8 {
         const loc = self.locate(layer, slot);
         return loc.rows.row(c, loc.row);
+    }
+
+    /// The bank holding a layer's slot and the slot's row in it.
+    pub fn slotRef(self: *const Stream, layer: u32, slot: u32) SlotRef {
+        const ls = &self.layers[layer];
+        if (slot < ls.base.rows) return .{ .bank = .base, .row = slot };
+        if (slot < ls.policy.capacity) return .{ .bank = .ext, .row = slot - ls.base.rows };
+        return .{ .bank = .transient, .row = slot - ls.policy.capacity };
+    }
+
+    /// Per routed id of `r` (plan order), its slot's bank and row.
+    pub fn refsOf(self: *const Stream, r: *const Route, out: *[max_route_ids]SlotRef) []SlotRef {
+        for (r.plan.slotsOf(), out[0..r.plan.n_ids]) |slot, *ref| ref.* = self.slotRef(r.layer, slot);
+        return out[0..r.plan.n_ids];
+    }
+
+    /// A layer's bank as the kernels bind it (MLX slot memory; null for host
+    /// rows or a bank without rows). The stream owns the arrays: never free them.
+    pub fn bankArrays(self: *const Stream, layer: u32, kind: BankKind) ?BankArrays {
+        const rows: *const Rows = switch (kind) {
+            .base => &self.layers[layer].base,
+            .ext => if (self.layers[layer].ext) |*e| e else return null,
+            .transient => &self.transient,
+        };
+        const m = switch (rows.backing) {
+            .mlx => |*m| m,
+            else => return null,
+        };
+        const x = m.arrays;
+        return .{ .gate = .{ .code = x[0], .rout = x[1], .rin = x[2] }, .up = .{ .code = x[3], .rout = x[4], .rin = x[5] }, .down = .{ .code = x[6], .rout = x[7], .rin = x[8] } };
     }
 
     /// prepare_prefill_seed: the prompt's routed ids of `layer`, before its
@@ -714,12 +821,12 @@ pub const Stream = struct {
             if (rows < ls.policy.capacity or rows > ls.policy.n_experts) return error.InvalidRows;
         }
         const a = self.allocator;
-        const exts = try a.alloc(?HostSlotRows, self.layers.len);
+        const exts = try a.alloc(?Rows, self.layers.len);
         defer a.free(exts);
         @memset(exts, null);
         errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
         for (self.layers, decode_rows, exts, self.bank.layers) |*ls, rows, *e, *geom| {
-            if (rows > ls.policy.capacity) e.* = try HostSlotRows.init(geom, rows - ls.policy.capacity);
+            if (rows > ls.policy.capacity) e.* = try Rows.init(geom, rows - ls.policy.capacity, self.memory);
         }
         for (self.layers, decode_rows, exts) |*ls, rows, e| {
             ls.ext = e;
@@ -1151,6 +1258,11 @@ fn slotDigest(s: *Stream, layer: u32, slot: u32, geom: *const Layer) [32]u8 {
 
 // DSV41_BANK=<bank dir> DSV41_PHASE1_ROUTE_FIXTURE=<json from R/exl3/runtime/dump_phase1_route_fixture.py>
 test "dsv41 stream: a recorded trace on the real bank serves every slot's bytes" {
+    try realBankTrace(.host);
+}
+
+/// The phase-1 one-layer recorded trace on the real bank, the slot rows in `memory`.
+fn realBankTrace(memory: SlotMemory) !void {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const fixture = std.mem.span(std.c.getenv("DSV41_PHASE1_ROUTE_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -1170,7 +1282,7 @@ test "dsv41 stream: a recorded trace on the real bank serves every slot's bytes"
     const L = bt.layer;
     var rows: [40]u32 = @splat(0);
     rows[L] = bt.prefill_rows;
-    const s = try Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = bt.transient, .transient_rows = bt.transient });
+    const s = try Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = bt.transient, .transient_rows = bt.transient, .slot_memory = memory });
     defer s.deinit();
     const geom = &bank.layers[L];
     var served: u64 = 0;
@@ -1201,11 +1313,151 @@ test "dsv41 stream: a recorded trace on the real bank serves every slot's bytes"
     const st = s.stats();
     const ru = std.posix.getrusage(std.c.rusage.SELF);
     std.debug.print(
-        "real bank layer {d}: {d} routes, {d} served slots sha256-checked; hits {d} misses {d} evictions {d} persistent {d} transient {d} skipped {d}; {d} B read in {d} preadv ({d:.3} s read, {d} ms wall); {d} ms total; peak RSS {d} B\n",
-        .{ L, st.route_calls, served, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions, st.persistent_loads, st.transient_loads, st.loads_skipped, st.expert_bytes_read, st.preadv_calls, st.expert_read_seconds, @divTrunc(st.read_wall_ns, std.time.ns_per_ms), @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms), ru.maxrss },
+        "real bank layer {d} ({s} rows): {d} routes, {d} served slots sha256-checked; hits {d} misses {d} evictions {d} persistent {d} transient {d} skipped {d}; {d} B read in {d} preadv ({d:.3} s read, {d} ms wall); {d} ms total; peak RSS {d} B\n",
+        .{ L, @tagName(memory), st.route_calls, served, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions, st.persistent_loads, st.transient_loads, st.loads_skipped, st.expert_bytes_read, st.preadv_calls, st.expert_read_seconds, @divTrunc(st.read_wall_ns, std.time.ns_per_ms), @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms), ru.maxrss },
     );
     try testing.expectEqual(st.expert_cache_misses, st.persistent_loads + st.transient_loads);
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped) * geom.logical_bytes, st.expert_bytes_read);
+}
+
+// Inside a guarded window: DSV41_PHASE0B_MLX=1 + the bank env above.
+test "dsv41 stream 0b: the recorded trace on the real bank fills MLX slot banks" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    try realBankTrace(.{ .mlx = stream });
+}
+
+test "dsv41 stream: slot refs name each served slot's bank and row" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    var refs: [max_route_ids]SlotRef = undefined;
+    // Prefill: 1 and 2 fill the two rows, 3 lands in the shared transient scratch.
+    var r = try serve(s, 0, &.{ 1, 2, 3 });
+    try testing.expectEqualSlices(SlotRef, &.{ .{ .bank = .base, .row = 0 }, .{ .bank = .base, .row = 1 }, .{ .bank = .transient, .row = 0 } }, s.refsOf(r, &refs));
+    s.release(r);
+    try s.grow(&.{ 4, 2 });
+    // Decode: the grown rows of layer 0 are its ext bank.
+    r = try serve(s, 0, &.{ 1, 4, 5 });
+    try testing.expectEqualSlices(SlotRef, &.{ .{ .bank = .base, .row = 0 }, .{ .bank = .ext, .row = 0 }, .{ .bank = .ext, .row = 1 } }, s.refsOf(r, &refs));
+    try expectServed(s, &sb, r, &.{ 1, 4, 5 });
+    // A part's loads are the rows its waves read, in file order.
+    var loads: [max_route_ids]expert_policy.Load = undefined;
+    try testing.expectEqual(@as(u32, 1), r.n_parts);
+    const pl = r.partLoads(0, &loads);
+    try testing.expectEqual(@as(usize, 2), pl.len);
+    try testing.expectEqual(@as(u16, 4), pl[0].expert);
+    try testing.expectEqual(@as(u16, 5), pl[1].expert);
+    // Host rows have no MLX arrays to bind.
+    try testing.expectEqual(@as(?BankArrays, null), s.bankArrays(0, .base));
+    s.release(r);
+}
+
+fn expectShape(arr: mlx.mlx_array, dtype: mlx.mlx_dtype, want: []const c_int) !void {
+    try testing.expectEqual(dtype, mlx.mlx_array_dtype(arr));
+    try testing.expectEqual(want.len, mlx.mlx_array_ndim(arr));
+    try testing.expectEqualSlices(c_int, want, mlx.mlx_array_shape(arr)[0..want.len]);
+}
+
+// DSV41_PHASE0B_MLX=1, inside a guarded window.
+test "dsv41 stream 0b: MLX slot memory is filled by the pool like host rows" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .slot_memory = .{ .mlx = stream } });
+    defer s.deinit();
+    // Hidden 64 / inter 32 synthetic geometry: code [rows, 4, 2, 48] (gate/up), [rows, 2, 4, 48] (down).
+    const base = s.bankArrays(0, .base).?;
+    try expectShape(base.gate.code, .int16, &.{ 4, 4, 2, 48 });
+    try expectShape(base.gate.rout, .float16, &.{ 4, 32 });
+    try expectShape(base.down.code, .int16, &.{ 4, 2, 4, 48 });
+    try expectShape(base.down.rin, .float16, &.{ 4, 32 });
+    try testing.expectEqual(s.bankArrays(0, .transient).?.up.code.ctx, s.bankArrays(1, .transient).?.up.code.ctx);
+    try testing.expectEqual(@as(?BankArrays, null), s.bankArrays(0, .ext));
+    s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
+    s.release(try serve(s, 1, &.{ 7, 8, 9 }));
+    try s.grow(&.{ 6, 4 });
+    try expectShape(s.bankArrays(0, .ext).?.up.rin, .float16, &.{ 2, 64 });
+    var rng = std.Random.DefaultPrng.init(7);
+    const rand = rng.random();
+    var ids: [12]u16 = undefined;
+    for (0..40) |step| {
+        const layer: u32 = @intCast(step % 2);
+        const n = rand.intRangeAtMost(usize, 1, 12);
+        for (ids[0..n]) |*e| e.* = rand.intRangeLessThan(u16, 0, if (step % 5 == 0) 32 else 10);
+        const r = try serve(s, layer, ids[0..n]);
+        try expectServed(s, &sb, r, ids[0..n]);
+        s.release(r);
+    }
+    try s.flush();
+}
+
+// DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
+test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const expert_event = @import("expert_event.zig");
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const ev = try expert_event.createMetal();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 8, 8 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .slot_memory = .{ .mlx = stream }, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false }, .event = .{ .backend = .{ .metal = ev.object }, .watchdog_ms = 10_000 } });
+    defer s.deinit();
+    defer expert_io.clearFaults();
+    try s.grow(&.{ 8, 8 });
+    // Expert 4's read is held 300 ms: the GPU, not the host, waits for it.
+    const page = std.heap.pageSize();
+    expert_io.injectFault(sb.bank.spans(0, 4).gu_offset / page * page, 5, 300 * std.time.ns_per_ms);
+    const ids = [_]u16{ 3, 1, 4, 5, 9 };
+    const r = try s.route(0, &ids, &.{});
+    const g = (try s.gate(r)).?;
+    var refs: [max_route_ids]SlotRef = undefined;
+    const rf = s.refsOf(r, &refs);
+    var rows_i: [ids.len]i32 = undefined;
+    for (rf, &rows_i) |ref, *ri| {
+        try testing.expectEqual(BankKind.base, ref.bank);
+        ri.* = @intCast(ref.row);
+    }
+    const bank_arrays = s.bankArrays(0, .base).?;
+    const src = [n_components]mlx.mlx_array{ bank_arrays.gate.code, bank_arrays.gate.rout, bank_arrays.gate.rin, bank_arrays.up.code, bank_arrays.up.rout, bank_arrays.up.rin, bank_arrays.down.code, bank_arrays.down.rout, bank_arrays.down.rin };
+    var gated: [n_components]mlx.mlx_array = @splat(.{});
+    defer for (gated) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    // Every wave of the call has landed at the last down value.
+    try expert_event.wait(&src, ev, g.down_first + g.n_parts - 1, &.{}, false, stream, &gated);
+    const idx = mlx.mlx_array_new_data(&rows_i, &[_]c_int{ids.len}, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    var taken: [n_components]mlx.mlx_array = undefined;
+    for (&taken, gated) |*t, x| {
+        t.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(t, x, idx, 0, stream));
+    }
+    defer for (taken) |t| {
+        _ = mlx.mlx_array_free(t);
+    };
+    const t0 = std.Io.Timestamp.now(std.testing.io, .boot);
+    const vec = mlx.mlx_vector_array_new_data(&taken, taken.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    const ms = @divTrunc(t0.untilNow(std.testing.io, .boot).nanoseconds, std.time.ns_per_ms);
+    const geom = &sb.bank.layers[0];
+    for (taken, geom.segments) |t, seg| {
+        const got = (mlx.mlx_array_data_uint8(t) orelse return error.MlxNoData)[0 .. ids.len * seg.length];
+        for (ids, 0..) |e, i| {
+            const off = sb.bank.recordOffset(0, e) + seg.offset;
+            try testing.expectEqualSlices(u8, sb.image[off..][0..seg.length], got[i * seg.length ..][0..seg.length]);
+        }
+    }
+    std.debug.print("gated MLX slot arrays: GPU gather evaluated after {d} ms, {d} rows x 9 components equal the records\n", .{ ms, ids.len });
+    try testing.expect(ms >= 250);
+    s.release(r);
+    try s.flush();
+    try testing.expectEqual(@as(u64, 0), s.stats().gates_forced);
 }
 
 // ── Lookahead, pre-read and event gates ──
