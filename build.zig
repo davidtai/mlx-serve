@@ -718,6 +718,12 @@ fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) vo
     module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_lookahead4_exl3.c"), .flags = flags });
     module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_event_shim.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
     module.addIncludePath(b.path("lib/expert_io"));
+    // The gate's MLX side: a primitive against the staged MLX headers, handles
+    // converted through mlx-c's private headers, so it links libmlx itself.
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/mlx_event_shim.cpp"), .flags = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" } });
+    module.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
+    module.addIncludePath(b.path("lib/mlxc-src"));
+    module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and
