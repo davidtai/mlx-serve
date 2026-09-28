@@ -40,7 +40,7 @@
  "generator": {
   "note": "R = /Users/davidtai/projects/OpenSourceWTF/reports/dsv41-f39-tcq3-runtime",
   "script": "R/exl3/runtime/dump_kernel_texts.py",
-  "sha256": "09b0d31fc5a43b09bb5306bb591357bb609a54cfef681a981ab83a0be9b09275"
+  "sha256": "bc7665603386971c57b3b9d60da8c508e2cffa17b3f32eba50ea62cd0707a3c3"
  },
  "golden": {
   "mul1_table": {
@@ -433,6 +433,7 @@
       2304
      ]
     },
+    "lane_install_check": "Provider.__init__ refuses a text whose sha differs from KERNEL_SHA256; source_check (CPU): every mul1 form == exl3_ref.decode_mul1 for all 65,536 states",
     "notes": "one-hot xh rows k = 0..R-1 read W_hat[k, :] exactly (every other product is +0): compared word for word with exl3_ref.reconstruct of the seeded plane; the rows cover all 65,536 codebook states",
     "rows_max": 8
    },
@@ -776,6 +777,7 @@
       5120
      ]
     },
+    "lane_install_check": "Provider.__init__ refuses a text whose sha differs from KERNEL_SHA256; source_check (CPU): every mul1 form == exl3_ref.decode_mul1 for all 65,536 states",
     "notes": "one-hot xh rows k = 0..R-1 read W_hat[k, :] exactly (every other product is +0): compared word for word with exl3_ref.reconstruct of the seeded plane; the rows cover all 65,536 codebook states",
     "rows_max": 8
    },
@@ -1095,6 +1097,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_exl3_rinprep_candidate.install: 78 cases (rows 1..8, 17, 22, 31, 34, 48 x distinct / repeat / single slots x contiguous / strided rin views) of the fused gate_up / down vs the stock Exl3PackedOps chain on real 3.0 rin / rout rows, u32 words (Q3_EXL3_PREP_INSTALL self_check)",
     "mlx_chain": "xg = t128(take(x, tok).f32 * take(rg, ids).f32), xu likewise with ru (t128 = hadamard_transform over 128-blocks, scale 128^-0.5): bitwise",
     "rows_max": 8
    },
@@ -1385,6 +1388,7 @@
      "max_err_over_row_rms": 0.0001,
      "ref": "g = t128(zg) * rg[ids], u = t128(zu) * ru[ids]; out = silu(min(g, 10)) * clip(u, -10, 10)"
     },
+    "lane_install_check": "q3_exl3_rinprep_candidate.install: 78 cases (rows 1..8, 17, 22, 31, 34, 48 x distinct / repeat / single slots x contiguous / strided rin views) of the fused gate_up / down vs the stock Exl3PackedOps chain on real 3.0 rin / rout rows, u32 words (Q3_EXL3_PREP_INSTALL self_check)",
     "rows_max": 8
    },
    "source": {
@@ -1629,6 +1633,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_exl3_rinprep_candidate.install: 78 cases (rows 1..8, 17, 22, 31, 34, 48 x distinct / repeat / single slots x contiguous / strided rin views) of the fused gate_up / down vs the stock Exl3PackedOps chain on real 3.0 rin / rout rows, u32 words (Q3_EXL3_PREP_INSTALL self_check)",
     "mlx_chain": "out = t128(hid * take(rn, ids).f32): bitwise",
     "rows_max": 8
    },
@@ -1874,6 +1879,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_exl3_rinprep_candidate.install: 78 cases (rows 1..8, 17, 22, 31, 34, 48 x distinct / repeat / single slots x contiguous / strided rin views) of the fused gate_up / down vs the stock Exl3PackedOps chain on real 3.0 rin / rout rows, u32 words (Q3_EXL3_PREP_INSTALL self_check)",
     "mlx_chain": "out = t128(zd) * take(rd, ids).f32: bitwise",
     "rows_max": 8
    },
@@ -2126,6 +2132,7 @@
      "compile",
      "row_invariance"
     ],
+    "lane_install_check": "q3_decode_rctail_candidate.device_self_check: row invariance M 1..8 every slot + float64 parity",
     "rows_max": 8
    },
    "source": {
@@ -2427,6 +2434,7 @@
      "ref": "x @ w^T (f64), sqrt(softplus), + bias, top-6 by (-biased, index), weights = score / sum * 1.5",
      "weights_max_rel": 1e-05
     },
+    "lane_install_check": "q3_decode_rctail_candidate.device_self_check: row invariance M 1..8 every slot + float64 parity",
     "rows_max": 8
    },
    "source": {
@@ -2686,6 +2694,7 @@
      "compile",
      "row_invariance"
     ],
+    "lane_install_check": "q3_decode_rctail_candidate.device_self_check: row invariance M 1..8 every slot + float64 parity",
     "rows_max": 8
    },
    "source": {
@@ -2921,6 +2930,7 @@
      "pair": "q3rc_premix_part",
      "ref": "x @ w^T (f64)"
     },
+    "lane_install_check": "q3_decode_rctail_candidate.device_self_check: row invariance M 1..8 every slot + float64 parity",
     "rows_max": 8
    },
    "source": {
@@ -3841,6 +3851,7 @@
      "max_abs_err": 1e-05,
      "ref": "row softmax + eps, column normalise, then 19 x (row, column) normalise, eps 1e-6 (f64)"
     },
+    "lane_install_check": "sinkhorn_evidence: probe-q3-decode-kernels-20260925-103818, 0 mismatches vs the stock mtplx_dsv4_sinkhorn_hc4_it20 kernel on the GPU",
     "rows_max": 8
    },
    "source": {
@@ -9608,6 +9619,7 @@
      "row_invariance",
      "layout_guard"
     ],
+    "lane_install_check": "q3_decode_rcproj_candidate.run_self_check per site: synthetic mxfp8 (every e4m3 code), >= 2 sets of 8 rows to 2^19 words, prefixes M 1..7 and single rows == the M 8 call, M 8 within 2e-2 max / 5e-3 rms of MLX's M 1 route; q3_draft_head_candidate repeats it on the real mxfp8 head copy",
     "layout_guard": {
      "max_rel": 0.02,
      "ref": "mlx quantized_matmul(x[m], w, scales, transpose, group 32, bits 8, mode 'mxfp8') per row (per group on woa)",
@@ -9972,6 +9984,7 @@
      "off_by_one_max_fraction": 0.002,
      "ref": "h = post x + sum_j comb[j, k] r_j (f64), bf16 words"
     },
+    "lane_install_check": "q3_decode_hctape_candidate.device_self_check: row invariance M 1..8 every slot (all four kernels) + float64 parity (ROW_TOL)",
     "rows_max": 8
    },
    "source": {
@@ -10316,6 +10329,7 @@
      "ref": "ssq = sum s^2 (f64)",
      "ssq_rel": 1e-05
     },
+    "lane_install_check": "q3_decode_hctape_candidate.device_self_check: row invariance M 1..8 every slot (all four kernels) + float64 parity (ROW_TOL)",
     "rows_max": 8
    },
    "source": {
@@ -10757,6 +10771,7 @@
      "ssq_rel": 1e-05,
      "y_rms_rel": 0.005
     },
+    "lane_install_check": "q3_decode_hctape_candidate.device_self_check: row invariance M 1..8 every slot (all four kernels) + float64 parity (ROW_TOL)",
     "rows_max": 8
    },
    "source": {
@@ -11110,6 +11125,7 @@
      "ref": "rs = 1 / sqrt(ssq / (4 D) + 1e-20); pre = sigmoid(mm[:4] rs scale0 + base) + 1e-6, post = 2 sigmoid(...), comb = affine (f64)",
      "split_rel": 1e-05
     },
+    "lane_install_check": "q3_decode_hctape_candidate.device_self_check: row invariance M 1..8 every slot (all four kernels) + float64 parity (ROW_TOL)",
     "rows_max": 8
    },
    "source": {
@@ -11578,6 +11594,7 @@
      "compile",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_prefill_exl3_rebuild_candidate.self_check: synthetic 4-slot bank, experts at slots (3, 0, 2), every word of og / ou / od == the v2 eager chain on mx_reconstruct",
     "mlx_chain": {
      "bitwise": true,
      "experts": [
@@ -11908,7 +11925,8 @@
     "f64": {
      "max_err_over_row_rms": 0.00390625,
      "ref": "x (f16) @ W_hat (f16, exl3_ref) in f64 on the first and last row of experts 0 and 3, rounded to f16"
-    }
+    },
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition"
    },
    "source": {
     "bytes": 4445,
@@ -12171,7 +12189,8 @@
     "f64": {
      "max_err_over_row_rms": 0.00390625,
      "ref": "x @ W_hat (f64) -> f16 on sampled rows (as gate|up)"
-    }
+    },
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition"
    },
    "source": {
     "bytes": 4392,
@@ -12538,6 +12557,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition",
     "mlx_chain": "out_p = f16(t128(take(act, ridx).f32 * take(rin_p, take(slots, rhs)).f32)): bitwise",
     "rows_max": 8
    },
@@ -12841,6 +12861,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition",
     "mlx_chain": "out = f16(t128(act * take(rin, take(slots, rhs)).f32)): bitwise",
     "rows_max": 8
    },
@@ -13192,6 +13213,7 @@
      "max_err_over_row_rms": 0.00390625,
      "ref": "g = t128(z0) rout0, u = t128(z1) rout1; h = silu(min(g, 10)) clip(u, -10, 10); hd = f16(t128(h rin2)) (f64)"
     },
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition",
     "rows_max": 8
    },
    "source": {
@@ -13552,6 +13574,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition",
     "mlx_chain": "out_p = t128(act_p) * take(rout_p, take(slots, rhs)).f32: bitwise",
     "rows_max": 8
    },
@@ -13847,6 +13870,7 @@
      "row_invariance",
      "mlx_chain"
     ],
+    "lane_install_check": "q3_prefill_exl3_dig_candidate.device_self_check_x on 4 real records of the first layer: golden tiles, rot_take2 / rot_roundx vs the op twin, GEMMs vs MLX f16 (<= 2^-8 row rms) and alone == wave, composition, vs the f32 dequant chain; device_self_check2_x: onepass hd / z / down words == the DIG chain at 3 activation scales + composition",
     "mlx_chain": "out = t128(act) * take(rout, take(slots, rhs)).f32: bitwise",
     "rows_max": 8
    },
@@ -14010,7 +14034,8 @@
       2304
      ],
      "ref": "bt = W_hat^T, W_hat = exl3_ref.reconstruct of the seeded plane: every word"
-    }
+    },
+    "lane_install_check": "the golden-tile half of device_self_check_x: DecMatX (mul1h and the f32 mul1 form) == the numpy twin, every weight of every projection of 4 real records"
    },
    "source": {
     "bytes": 2039,
@@ -14151,7 +14176,8 @@
       5120
      ],
      "ref": "bt = W_hat^T, W_hat = exl3_ref.reconstruct of the seeded plane: every word"
-    }
+    },
+    "lane_install_check": "the golden-tile half of device_self_check_x: DecMatX (mul1h and the f32 mul1 form) == the numpy twin, every weight of every projection of 4 real records"
    },
    "source": {
     "bytes": 2039,
@@ -14286,7 +14312,8 @@
       2304
      ],
      "ref": "bt = W_hat^T, W_hat = exl3_ref.reconstruct of the seeded plane: every word"
-    }
+    },
+    "lane_install_check": "the golden-tile half of device_self_check_x: DecMatX (mul1h and the f32 mul1 form) == the numpy twin, every weight of every projection of 4 real records"
    },
    "source": {
     "bytes": 2039,
@@ -14421,7 +14448,8 @@
       5120
      ],
      "ref": "bt = W_hat^T, W_hat = exl3_ref.reconstruct of the seeded plane: every word"
-    }
+    },
+    "lane_install_check": "the golden-tile half of device_self_check_x: DecMatX (mul1h and the f32 mul1 form) == the numpy twin, every weight of every projection of 4 real records"
    },
    "source": {
     "bytes": 2039,

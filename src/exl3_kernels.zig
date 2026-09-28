@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "eb34663aef63ea34c3d27a9c41605516aaf277f6bb88b7e4e56f204da6fa23e8";
+pub const manifest_sha256 = "e57a6425c28fc77c4ad37e39996ba215db353a6bc3a125bf372b212473835426";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
