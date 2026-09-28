@@ -183,6 +183,7 @@ pub fn build(b: *std.Build) void {
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
     mod.addIncludePath(b.path("lib/ds4"));
+    addExpertIoSources(b, mod, false);
 
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
@@ -258,6 +259,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/xatlas"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
+    addExpertIoSources(b, test_mod, true);
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
@@ -702,6 +704,26 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
         "-Wno-deprecated-declarations",
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
+}
+
+/// Packed expert streamer I/O (lib/expert_io): the lookahead read pool
+/// (pthreads, pread + memcpy into slot rows, never MLX) and its MTLSharedEvent
+/// signal (non-ARC objc). `inject` compiles the pool's scripted-fault hooks,
+/// for the test module only.
+fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) void {
+    const flags: []const []const u8 = if (inject)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_lookahead4_exl3.c"), .flags = flags });
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_event_shim.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+    module.addIncludePath(b.path("lib/expert_io"));
+    // The gate's MLX side: a primitive against the staged MLX headers, handles
+    // converted through mlx-c's private headers, so it links libmlx itself.
+    module.addCSourceFile(.{ .file = b.path("lib/expert_io/mlx_event_shim.cpp"), .flags = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" } });
+    module.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
+    module.addIncludePath(b.path("lib/mlxc-src"));
+    module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and

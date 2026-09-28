@@ -50,6 +50,12 @@ test {
     _ = @import("deepseek_v41_model.zig");
     _ = @import("deepseek_v41_dspark.zig");
     _ = @import("deepseek_v41_parity.zig");
+    _ = @import("expert_bank.zig");
+    _ = @import("expert_io.zig");
+    _ = @import("expert_lookahead.zig");
+    _ = @import("expert_event.zig");
+    _ = @import("expert_policy.zig");
+    _ = @import("expert_stream.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
