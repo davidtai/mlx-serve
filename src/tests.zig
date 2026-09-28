@@ -43,6 +43,7 @@ test {
     _ = @import("deepseek_v4.zig");
     _ = @import("expert_bank.zig");
     _ = @import("expert_io.zig");
+    _ = @import("expert_lookahead.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
     _ = @import("qwen4_exp.zig");
