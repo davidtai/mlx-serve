@@ -45,6 +45,7 @@ test {
     _ = @import("expert_io.zig");
     _ = @import("expert_lookahead.zig");
     _ = @import("expert_event.zig");
+    _ = @import("expert_admission.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
     _ = @import("qwen4_exp.zig");
