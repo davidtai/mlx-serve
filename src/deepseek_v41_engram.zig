@@ -36,6 +36,10 @@ pub const Bank = struct {
     head_dim: u32,
     record_bytes: u32,
     files: [max_layers][]const u8,
+    /// Records per layer file (the manifest's `rows`).
+    rows: [max_layers]u64 = @splat(0),
+    /// The manifest's own identity field; a token map names the manifest it was built for.
+    manifest_sha256: []const u8 = "",
 };
 
 /// `engram-manifest.json` checked against the config's Engram fields; any
@@ -51,6 +55,7 @@ pub fn parseManifest(a: std.mem.Allocator, text: []const u8, c: *const v41.Confi
     const PerLayer = struct { layer_id: u32, primes: []const []const i64, flat_offsets: []const i64, total_rows: u64 };
     const M = struct {
         format: []const u8,
+        manifest_sha256: []const u8 = "",
         layers: []const Layer,
         hashing: struct {
             layer_ids: []const u32,
@@ -78,7 +83,7 @@ pub fn parseManifest(a: std.mem.Allocator, text: []const u8, c: *const v41.Confi
     if (h.layer_ids.len != e.n_layers or h.per_layer.len != e.n_layers or h.hash_multipliers.len != e.n_layers or m.layers.len != e.n_layers)
         return fail(diag, "engram manifest: {d} layers, config has {d}", .{ h.layer_ids.len, e.n_layers });
     var hs: Hashing = .{ .max_ngram = h.max_ngram_size, .n_heads = h.n_heads, .n_layers = e.n_layers, .pad_id = h.pad_id, .compressed_vocab = h.compressed_vocab_size };
-    var bank: Bank = .{ .head_dim = h.head_dim, .record_bytes = h.head_dim + h.head_dim / 32, .files = undefined };
+    var bank: Bank = .{ .head_dim = h.head_dim, .record_bytes = h.head_dim + h.head_dim / 32, .files = undefined, .manifest_sha256 = m.manifest_sha256 };
     for (0..e.n_layers) |i| {
         const lid = h.layer_ids[i];
         const pl = h.per_layer[i];
@@ -101,6 +106,7 @@ pub fn parseManifest(a: std.mem.Allocator, text: []const u8, c: *const v41.Confi
         }
         for (pl.flat_offsets, 0..) |o, k| hs.flat_offsets[i][k] = o;
         bank.files[i] = ly.file;
+        bank.rows[i] = ly.rows;
     }
     return .{ .hashing = hs, .bank = bank };
 }
@@ -183,6 +189,155 @@ pub fn readRows(fd: std.c.fd_t, bank: *const Bank, rows: []const i64, codes: []u
         @memcpy(scales[i * (hd / 32) ..][0 .. hd / 32], rec[hd..rb]);
     }
 }
+
+/// Construction-time refusals of the row source (one named error each; the
+/// message says which field or file).
+pub const Refusal = error{ EngramManifest, EngramTokenMap, EngramBankFile };
+
+fn refuse(diag: ?*v41.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
+    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    return err;
+}
+
+/// The compressed token map: `R/exl3/runtime/export_dsv41_engram_token_map.py`
+/// runs our Python `build_compressed_token_map` (tokenizer normalisation stays
+/// Python) and writes one little-endian u32 per vocab id plus a JSON sidecar
+/// naming the tokenizer.json and the manifest it was built for. Checked once.
+pub const TokenMap = struct {
+    ids: []u32,
+    pad_compressed: u32,
+
+    pub const format = "mtplx-dsv41-engram-token-map-v1";
+
+    /// `map_path` + `map_path.json`, against the bank's tokenizer.json, the
+    /// manifest identity and the config / hashing geometry. `a` owns the result.
+    pub fn load(a: std.mem.Allocator, io: std.Io, map_path: []const u8, bank_dir: []const u8, c: *const v41.Config, h: *const Hashing, bank: *const Bank, diag: ?*v41.Diag) !TokenMap {
+        const Meta = struct {
+            format: []const u8,
+            vocab: u64,
+            compressed_vocab_size: u64,
+            pad_id: u64,
+            pad_compressed: u64,
+            map_sha256: []const u8,
+            tokenizer_sha256: []const u8,
+            manifest_sha256: []const u8,
+        };
+        const meta_path = try std.fmt.allocPrint(a, "{s}.json", .{map_path});
+        const meta_text = std.Io.Dir.cwd().readFileAlloc(io, meta_path, a, .limited(1 << 16)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return refuse(diag, error.EngramTokenMap, "{s}: {s} (the converter writes the map and its sidecar together)", .{ meta_path, @errorName(e) }),
+        };
+        const meta = std.json.parseFromSliceLeaky(Meta, a, meta_text, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ meta_path, @errorName(e) }),
+        };
+        if (!std.mem.eql(u8, meta.format, format)) return refuse(diag, error.EngramTokenMap, "{s}: format {s}", .{ meta_path, meta.format });
+        if (meta.vocab != c.vocab_size) return refuse(diag, error.EngramTokenMap, "token map covers {d} ids, config vocab_size is {d}", .{ meta.vocab, c.vocab_size });
+        if (meta.compressed_vocab_size != h.compressed_vocab) return refuse(diag, error.EngramTokenMap, "token map compresses to {d} ids, the manifest to {d}", .{ meta.compressed_vocab_size, h.compressed_vocab });
+        if (meta.pad_id != h.pad_id) return refuse(diag, error.EngramTokenMap, "token map pad id {d}, the manifest's {d}", .{ meta.pad_id, h.pad_id });
+        if (!std.mem.eql(u8, meta.manifest_sha256, bank.manifest_sha256)) return refuse(diag, error.EngramTokenMap, "token map built for manifest {s}, this bank's is {s}", .{ meta.manifest_sha256, bank.manifest_sha256 });
+        const tok_path = try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{bank_dir});
+        const tok = std.Io.Dir.cwd().readFileAlloc(io, tok_path, a, .limited(256 << 20)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ tok_path, @errorName(e) }),
+        };
+        if (!std.mem.eql(u8, &sha256Hex(tok), meta.tokenizer_sha256)) return refuse(diag, error.EngramTokenMap, "token map built from tokenizer {s}, the bank's tokenizer.json is {s}", .{ meta.tokenizer_sha256, &sha256Hex(tok) });
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, map_path, a, .limited(64 << 20)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ map_path, @errorName(e) }),
+        };
+        if (raw.len != meta.vocab * 4) return refuse(diag, error.EngramTokenMap, "{s}: {d} bytes, want {d} (u32 per id)", .{ map_path, raw.len, meta.vocab * 4 });
+        if (!std.mem.eql(u8, &sha256Hex(raw), meta.map_sha256)) return refuse(diag, error.EngramTokenMap, "{s}: sha256 differs from its sidecar", .{map_path});
+        const ids = try a.alloc(u32, raw.len / 4);
+        var top: u32 = 0;
+        for (ids, 0..) |*v, i| {
+            v.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+            top = @max(top, v.*);
+        }
+        // Python keys the map by distinct normalised forms: ids 0 .. size-1, all used.
+        if (@as(u64, top) + 1 != h.compressed_vocab) return refuse(diag, error.EngramTokenMap, "token map ids reach {d}, want 0 .. {d}", .{ top, h.compressed_vocab - 1 });
+        if (ids[h.pad_id] != meta.pad_compressed) return refuse(diag, error.EngramTokenMap, "token map pads to {d}, its sidecar says {d}", .{ ids[h.pad_id], meta.pad_compressed });
+        return .{ .ids = ids, .pad_compressed = ids[h.pad_id] };
+    }
+};
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
+    return std.fmt.bytesToHex(d, .lower);
+}
+
+/// The Engram row source (Python `EngramV41`'s row fetch: `NgramHashState` ids,
+/// `NGramRowCache` records): the manifest, the token map and one open file per
+/// Engram layer, all checked at `open`. Immutable afterwards; each sequence
+/// owns a `HashState`. The dequantize of the fetched records is MLX
+/// (`Trunk.engramRows`), the gated add `Trunk.engramApply`.
+pub const RowSource = struct {
+    arena: std.heap.ArenaAllocator,
+    hashing: Hashing,
+    bank: Bank,
+    map: TokenMap,
+    fds: [max_layers]std.c.fd_t = @splat(-1),
+
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, bank_dir: []const u8, map_path: []const u8, c: *const v41.Config, diag: ?*v41.Diag) !RowSource {
+        var self: RowSource = .{ .arena = std.heap.ArenaAllocator.init(gpa), .hashing = undefined, .bank = undefined, .map = undefined };
+        errdefer self.deinit();
+        const a = self.arena.allocator();
+        const mpath = try std.fmt.allocPrint(a, "{s}/engram/engram-manifest.json", .{bank_dir});
+        const mtext = std.Io.Dir.cwd().readFileAlloc(io, mpath, a, .limited(1 << 20)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return refuse(diag, error.EngramManifest, "{s}: {s}", .{ mpath, @errorName(e) }),
+        };
+        const m = try parseManifest(a, mtext, c, diag);
+        self.hashing = m.hashing;
+        self.bank = m.bank;
+        self.map = try TokenMap.load(a, io, map_path, bank_dir, c, &self.hashing, &self.bank, diag);
+        for (0..self.hashing.n_layers) |i| {
+            const path = try std.fmt.allocPrintSentinel(a, "{s}/engram/{s}", .{ bank_dir, self.bank.files[i] }, 0);
+            const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+            if (fd < 0) return refuse(diag, error.EngramBankFile, "{s}: cannot open", .{path});
+            self.fds[i] = fd;
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &st) != 0) return refuse(diag, error.EngramBankFile, "{s}: fstat failed", .{path});
+            const want = self.bank.rows[i] * self.bank.record_bytes;
+            if (@as(u64, @intCast(st.size)) != want) return refuse(diag, error.EngramBankFile, "{s}: {d} bytes, the manifest's {d} rows x {d} need {d}", .{ path, st.size, self.bank.rows[i], self.bank.record_bytes, want });
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *RowSource) void {
+        for (self.fds) |fd| if (fd >= 0) {
+            _ = std.c.close(fd);
+        };
+        self.arena.deinit();
+    }
+
+    /// Row ids per position: `[n_layers][cols]`.
+    pub fn perToken(self: *const RowSource) usize {
+        return self.hashing.n_layers * self.hashing.cols();
+    }
+
+    /// `NgramHashState.advance` for one sequence: `out` gets `[ids][n_layers][cols]`.
+    pub fn advance(self: *const RowSource, gpa: std.mem.Allocator, st: *HashState, ids: []const u32, out: []i64) !void {
+        return st.advance(gpa, &self.hashing, self.map.ids, ids, null, out);
+    }
+
+    /// Layer slot `li`'s records for the `n` positions of `rows` (`advance`'s
+    /// output): `codes` gets `[n * cols][head_dim]` E4M3 bytes, `scales`
+    /// `[n * cols][head_dim / 32]` E8M0 bytes, positions then columns.
+    pub fn read(self: *const RowSource, li: usize, rows: []const i64, n: usize, ids_buf: []i64, codes: []u8, scales: []u8) !void {
+        const cols = self.hashing.cols();
+        const per = self.perToken();
+        for (0..n) |t| @memcpy(ids_buf[t * cols ..][0..cols], rows[t * per + li * cols ..][0..cols]);
+        return self.readIds(li, ids_buf[0 .. n * cols], codes, scales);
+    }
+
+    /// The records of row ids `ids` of layer slot `li`.
+    pub fn readIds(self: *const RowSource, li: usize, ids: []const i64, codes: []u8, scales: []u8) !void {
+        for (ids) |r| if (r < 0 or @as(u64, @intCast(r)) >= self.bank.rows[li]) return error.RowOutOfRange;
+        return readRows(self.fds[li], &self.bank, ids, codes, scales);
+    }
+};
 
 const testing = std.testing;
 
@@ -295,4 +450,183 @@ test "dsv41 engram: the real manifest and token map hash the prompt to the Pytho
         try testing.expectEqualStrings(r.sha256, &std.fmt.bytesToHex(d.finalResult(), .lower));
     }
     std.debug.print("dsv41 engram: {d} positions x {d} rows equal the oracle; {d} records byte-equal\n", .{ fx.ids.len, per, fx.bytes.len });
+}
+
+// ── the row source on a synthetic mini bank (hermetic) ──
+
+const MiniBank = struct {
+    vocab: u32 = 64,
+    map_mod: u32 = 50,
+    sidecar_vocab: ?u64 = null,
+    tokenizer_differs: bool = false,
+    manifest_sha: []const u8 = "mini-manifest",
+    sidecar_manifest_sha: []const u8 = "mini-manifest",
+    flip_map_byte: bool = false,
+    drop_sidecar: bool = false,
+    short_bank: bool = false,
+    codec: []const u8 = "mxfp8",
+};
+
+/// Record r byte i of the mini bank: `(r * 7 + i) mod 251`.
+fn miniRecordByte(r: u64, i: u64) u8 {
+    return @intCast((r * 7 + i) % 251);
+}
+
+/// A bank dir for the mini config (Engram layer 1: 97 rows, 3-grams x 2 heads,
+/// head_dim 32 -> 33-byte records) with its token map + sidecar; returns the map path.
+fn writeMiniBank(a: std.mem.Allocator, tmp: *std.testing.TmpDir, root: []const u8, f: MiniBank) ![]const u8 {
+    const io = testing.io;
+    try tmp.dir.createDirPath(io, "engram");
+    const tok = if (f.tokenizer_differs) "{\"model\":\"other\"}" else "{\"model\":\"mini\"}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tok });
+    const manifest = try std.fmt.allocPrint(a,
+        \\{{"format":"mtplx-engram-manifest-v1","manifest_sha256":"{s}",
+        \\"layers":[{{"layer_id":1,"file":"engram-L1.bin","rows":97,"record_bytes":33,
+        \\"quant":{{"bits":8,"group_size":32,"mode":"{s}","head_dim":32}}}}],
+        \\"hashing":{{"layer_ids":[1],"max_ngram_size":3,"n_heads":2,"head_dim":32,"compressed_vocab_size":50,
+        \\"pad_id":2,"n_hash_cols":4,"hash_multipliers":[[3,5,7]],
+        \\"per_layer":[{{"layer_id":1,"primes":[[11,13],[17,19]],"flat_offsets":[0,11,24,41],"total_rows":97}}]}}}}
+    , .{ f.manifest_sha, f.codec });
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram/engram-manifest.json", .data = manifest });
+    const n_rec: u64 = if (f.short_bank) 96 else 97;
+    const bank = try a.alloc(u8, @intCast(n_rec * 33));
+    for (0..n_rec) |r| for (0..33) |i| {
+        bank[r * 33 + i] = miniRecordByte(r, i);
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram/engram-L1.bin", .data = bank });
+    const map = try a.alloc(u8, f.vocab * 4);
+    for (0..f.vocab) |i| std.mem.writeInt(u32, map[i * 4 ..][0..4], @intCast(i % f.map_mod), .little);
+    const map_sha = sha256Hex(map);
+    if (f.flip_map_byte) map[5] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "map.u32", .data = map });
+    if (!f.drop_sidecar) {
+        const meta = try std.fmt.allocPrint(a,
+            \\{{"format":"{s}","vocab":{d},"compressed_vocab_size":50,"pad_id":2,"pad_compressed":2,
+            \\"map_sha256":"{s}","tokenizer_sha256":"{s}","manifest_sha256":"{s}"}}
+        , .{ TokenMap.format, f.sidecar_vocab orelse f.vocab, &map_sha, &sha256Hex("{\"model\":\"mini\"}"), f.sidecar_manifest_sha });
+        try tmp.dir.writeFile(io, .{ .sub_path = "map.u32.json", .data = meta });
+    }
+    return std.fmt.allocPrint(a, "{s}/map.u32", .{root});
+}
+
+fn miniConfig() !v41.Config {
+    const json = try v41.testConfigJson(testing.allocator, .mini);
+    defer testing.allocator.free(json);
+    return v41.Config.parse(testing.allocator, json, null);
+}
+
+test "dsv41 engram: a synthetic bank opens and its rows come back through the row source" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const map_path = try writeMiniBank(a, &tmp, root, .{});
+    const c = try miniConfig();
+    var diag: v41.Diag = .{};
+    var src = RowSource.open(testing.allocator, testing.io, root, map_path, &c, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer src.deinit();
+    try testing.expectEqual(@as(usize, 4), src.perToken());
+    try testing.expectEqual(@as(u32, 2), src.map.pad_compressed);
+    // The source hashes like a bare HashState over the same table and map.
+    const ids = [_]u32{ 5, 7, 9 };
+    var st: HashState = .{};
+    defer st.deinit(testing.allocator);
+    var rows: [3 * 4]i64 = undefined;
+    try src.advance(testing.allocator, &st, &ids, &rows);
+    var ref: HashState = .{};
+    defer ref.deinit(testing.allocator);
+    var want: [3 * 4]i64 = undefined;
+    try ref.advance(testing.allocator, &src.hashing, src.map.ids, &ids, null, &want);
+    try testing.expectEqualSlices(i64, &want, &rows);
+    // Records land positions-then-columns, code bytes and scale bytes split.
+    var idb: [12]i64 = undefined;
+    var codes: [12 * 32]u8 = undefined;
+    var scales: [12]u8 = undefined;
+    try src.read(0, &rows, 3, &idb, &codes, &scales);
+    for (0..12) |k| {
+        const r: u64 = @intCast(rows[k]);
+        for (0..32) |i| try testing.expectEqual(miniRecordByte(r, i), codes[k * 32 + i]);
+        try testing.expectEqual(miniRecordByte(r, 32), scales[k]);
+    }
+    try testing.expectError(error.RowOutOfRange, src.readIds(0, &.{97}, codes[0..32], scales[0..1]));
+}
+
+test "dsv41 engram: the row source refuses a map or bank built for something else, by name" {
+    const Case = struct { f: MiniBank, err: anyerror };
+    const cases = [_]Case{
+        .{ .f = .{ .sidecar_vocab = 63 }, .err = error.EngramTokenMap },
+        .{ .f = .{ .tokenizer_differs = true }, .err = error.EngramTokenMap },
+        .{ .f = .{ .sidecar_manifest_sha = "another-manifest" }, .err = error.EngramTokenMap },
+        .{ .f = .{ .flip_map_byte = true }, .err = error.EngramTokenMap },
+        .{ .f = .{ .map_mod = 49 }, .err = error.EngramTokenMap },
+        .{ .f = .{ .drop_sidecar = true }, .err = error.EngramTokenMap },
+        .{ .f = .{ .short_bank = true }, .err = error.EngramBankFile },
+        .{ .f = .{ .codec = "affine" }, .err = error.EngramManifest },
+    };
+    for (cases, 0..) |cs, i| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var rbuf: [512]u8 = undefined;
+        const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+        const map_path = try writeMiniBank(a, &tmp, root, cs.f);
+        const c = try miniConfig();
+        var diag: v41.Diag = .{};
+        if (RowSource.open(testing.allocator, testing.io, root, map_path, &c, &diag)) |opened| {
+            var o = opened;
+            o.deinit();
+            std.debug.print("case {d}: opened, wanted {s}\n", .{ i, @errorName(cs.err) });
+            return error.TestUnexpectedResult;
+        } else |e| {
+            testing.expectEqual(cs.err, e) catch |x| {
+                std.debug.print("case {d}: {s}\n", .{ i, diag.message() });
+                return x;
+            };
+            try testing.expect(diag.message().len > 0);
+        }
+    }
+}
+
+// DSV41_BANK=<bank> DSV41_ENGRAM_TOKEN_MAP=<converter output> DSV41_ENGRAM_FIXTURE=<m0 fixture json>
+test "dsv41 engram: the real bank's row source hashes and reads like the Python oracle" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    const fixture = std.mem.span(std.c.getenv("DSV41_ENGRAM_FIXTURE") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("refused: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(testing.allocator, testing.io, bank_dir, &diag);
+    var src = try RowSource.open(testing.allocator, testing.io, bank_dir, map_path, &c, &diag);
+    defer src.deinit();
+    const Row = struct { layer: u32, row: i64, sha256: []const u8 };
+    const Fixture = struct { ids: []const u32, prompt: u32, rows: []const i64, bytes: []const Row };
+    const fx = try std.json.parseFromSliceLeaky(Fixture, a, try std.Io.Dir.cwd().readFileAlloc(testing.io, fixture, a, .limited(64 << 20)), .{ .ignore_unknown_fields = true });
+    const per = src.perToken();
+    const got = try a.alloc(i64, fx.ids.len * per);
+    var st: HashState = .{};
+    defer st.deinit(testing.allocator);
+    try src.advance(testing.allocator, &st, fx.ids[0..fx.prompt], got[0 .. fx.prompt * per]);
+    for (fx.prompt..fx.ids.len) |t| try src.advance(testing.allocator, &st, fx.ids[t .. t + 1], got[t * per ..][0..per]);
+    try testing.expectEqualSlices(i64, fx.rows, got);
+    for (fx.bytes) |r| {
+        const li = std.mem.indexOfScalar(u32, src.hashing.layer_ids[0..src.hashing.n_layers], r.layer) orelse return error.TestUnexpectedResult;
+        var codes: [256]u8 = undefined;
+        var scales: [8]u8 = undefined;
+        try src.readIds(li, &.{r.row}, &codes, &scales);
+        var d = std.crypto.hash.sha2.Sha256.init(.{});
+        d.update(&codes);
+        d.update(&scales);
+        try testing.expectEqualStrings(r.sha256, &std.fmt.bytesToHex(d.finalResult(), .lower));
+    }
+    std.debug.print("dsv41 engram: row source over {d} rows x {d} layers; {d} positions and {d} records equal the oracle\n", .{ src.bank.rows[0], src.hashing.n_layers, fx.ids.len, fx.bytes.len });
 }

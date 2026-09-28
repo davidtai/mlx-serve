@@ -54,6 +54,15 @@ pub fn isFloat(d: Dtype) bool {
     return d == .float16 or d == .float32 or d == .float64 or d == .bfloat16;
 }
 
+pub fn dtypeSize(d: Dtype) usize {
+    return switch (d) {
+        .bool_, .uint8, .int8 => 1,
+        .uint16, .int16, .float16, .bfloat16 => 2,
+        .uint32, .int32, .float32 => 4,
+        else => 8,
+    };
+}
+
 /// MLX's `promote_types` (mlx/dtype.cpp), indexed by `mlx_dtype`.
 pub fn promote(a: Dtype, b: Dtype) Dtype {
     const t = [14][14]u8{
@@ -145,6 +154,13 @@ pub const MlxOps = struct {
     /// Take ownership of an array built outside the backend (freed by `reset`).
     pub fn adopt(g: *MlxOps, x: T) !T {
         return g.track(x);
+    }
+
+    /// A copy of host bytes as an array (`mx.array(numpy)`); freed by `reset`.
+    pub fn hostArray(g: *MlxOps, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
+        const a = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), dt);
+        if (a.ctx == null) return error.MlxError;
+        return g.track(a);
     }
 
     fn track(g: *MlxOps, a: T) !T {
@@ -620,6 +636,7 @@ pub fn bf16Bits(f: f32) u16 {
 
 pub const Op = enum {
     input,
+    host,
     scalar,
     arange,
     ones,
@@ -708,6 +725,13 @@ pub const TraceOps = struct {
     /// A leaf the test hands the graph (weights, cache state, inputs).
     pub fn input(g: *TraceOps, shape: []const c_int, dtype: Dtype) !T {
         return g.push(.input, dtype, Shape.of(shape));
+    }
+
+    /// Host bytes handed to the graph (a leaf, like `input`).
+    pub fn hostArray(g: *TraceOps, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
+        const s = Shape.of(shape);
+        if (@as(i64, @intCast(bytes.len)) != s.numel() * @as(i64, @intCast(dtypeSize(dt)))) return error.HostBytes;
+        return g.push(.host, dt, s);
     }
 
     pub fn node(g: *const TraceOps, x: T) Node {

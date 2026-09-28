@@ -599,6 +599,14 @@ pub fn Trunk(comptime G: type) type {
             return .{ .h = out, .pre_mix = fm.pre };
         }
 
+        /// `NGramRowCache.dequantize` (mxfp8 records): the E4M3 code words
+        /// `[n, head_dim / 4]` u32 and E8M0 scales `[n, head_dim / 32]` u8 of
+        /// `B * L * cols` records -> `[B, L, cols, head_dim]` bf16.
+        pub fn engramRows(g: *G, codes: T, scales: T, B: c_int, L: c_int, cols: c_int) !T {
+            const dq = try g.dequantize(codes, scales, .mxfp8);
+            return g.reshape(dq, &.{ B, L, cols, g.shapeOf(dq).dim(-1) });
+        }
+
         /// `EngramV41.__call__` after the row fetch: `rows` are the dequantized
         /// `[B, L, cols, head_dim]` bank rows; returns `h + gate * value`.
         pub fn engramApply(g: *G, c: *const v41.Config, w: EngramW(T), hidden: T, rows: T) !T {
@@ -983,6 +991,16 @@ test "dsv41 graph: router, shared expert and Engram apply keep the Python dtypes
     const rows = try g.input(&.{ 1, 3, 24, 256 }, .bfloat16);
     const e = try Tr.engramApply(&g, &c, ew, hid, rows);
     try expectShape(&g, e, &.{ 1, 3, 4, 5120 }, .bfloat16);
+    // The row fetch: 3 positions x 24 records of E4M3 words + E8M0 scales -> bf16 rows.
+    const codes_b: [72 * 256]u8 = @splat(0);
+    const scales_b: [72 * 8]u8 = @splat(0);
+    const mark = g.nodes.items.len;
+    const er = try Tr.engramRows(&g, try g.hostArray(&codes_b, &.{ 72, 64 }, .uint32), try g.hostArray(&scales_b, &.{ 72, 8 }, .uint8), 1, 3, 24);
+    try expectShape(&g, er, &.{ 1, 3, 24, 256 }, .bfloat16);
+    const seq = try g.opsSince(testing.allocator, mark);
+    defer testing.allocator.free(seq);
+    try testing.expectEqualSlices(ops.Op, &.{ .host, .host, .dequantize, .reshape }, seq);
+    try testing.expectError(error.HostBytes, g.hostArray(codes_b[0..8], &.{ 72, 64 }, .uint32));
 }
 
 test "dsv41 graph: host constants round as the Python floats do" {
