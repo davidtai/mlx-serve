@@ -1372,25 +1372,26 @@ test "dsv41 stream: lookahead options outside the lane's ranges are refused at c
     s.deinit();
 }
 
-test "dsv41 stream: a verify trace with lookahead, pre-read and gates serves every slot's bytes" {
+test "dsv41 stream: a verify trace of 1-8 rows with lookahead, pre-read and gates serves every slot's bytes" {
     var sb = try SynthBank.open(32);
     defer sb.close();
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 2 }, .event = .{ .watchdog_ms = 10_000 } });
+    // Verify widths up to 8 rows x top-6 = 48 ids, the transient scratch sized for them.
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 2 }, .event = .{ .watchdog_ms = 10_000 } });
     defer s.deinit();
     try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
     s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
     s.release(try serve(s, 1, &.{ 7, 8, 9 }));
     try s.grow(&.{ 6, 4 });
-    // Verify forwards of 1..2 rows x top-6 over both layers; layer 0 predicts layer 1.
+    // Verify forwards of 1..8 rows x top-6 over both layers; layer 0 predicts layer 1.
     var rng = std.Random.DefaultPrng.init(21);
     const rand = rng.random();
-    var ids: [12]u16 = undefined;
-    var scores: [2 * 32]f32 = undefined;
+    var ids: [48]u16 = undefined;
+    var scores: [8 * 32]f32 = undefined;
     var gates: u64 = 0;
     var reads: u64 = 0;
     for (0..60) |step| {
         const layer: u32 = @intCast(step % 2);
-        const m = rand.intRangeAtMost(usize, 1, 2);
+        const m = rand.intRangeAtMost(usize, 1, 8);
         const span: u16 = if (step % 7 == 0) 32 else 12;
         for (ids[0 .. 6 * m]) |*e| e.* = rand.intRangeLessThan(u16, 0, span);
         for (scores[0 .. 32 * m]) |*v| v.* = rand.float(f32);
@@ -1402,7 +1403,7 @@ test "dsv41 stream: a verify trace with lookahead, pre-read and gates serves eve
         s.release(r);
     }
     try s.flush();
-    for (0..2) |l| for (0..s.layers[l].policy.capacity + 12) |slot| {
+    for (0..2) |l| for (0..s.layers[l].policy.capacity + 48) |slot| {
         try testing.expectEqual(@as(u16, 0), s.pinsOf(@intCast(l), @intCast(slot)));
     };
     const st = s.stats();
