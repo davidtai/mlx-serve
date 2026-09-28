@@ -820,7 +820,15 @@ const FixInputs = struct {
     rowsx_credit: ?u64 = null,
     rowsx_mlx_credit: ?u64 = null,
 };
-const FixCell = struct { name: []const u8 = "", receipt: []const u8 = "", inputs: FixInputs, outputs: ?FixOutputs = null, refusal: ?[]const u8 = null };
+const FixCell = struct {
+    name: []const u8 = "",
+    receipt: []const u8 = "",
+    inputs: FixInputs,
+    outputs: ?FixOutputs = null,
+    refusal: ?[]const u8 = null,
+    /// A perturbed static envelope (the variants), else the fixture's.
+    envelope: ?FixEnvelope = null,
+};
 const FixEnvelope = struct {
     decode_slots_per_layer: u32,
     prefill_slots_per_layer: u32,
@@ -837,6 +845,25 @@ const FixEnvelope = struct {
     projection_seed_fixed_bytes: u64,
     retirement_owners_proved: bool,
 };
+
+fn envelopeOf(e: FixEnvelope) Envelope {
+    return .{
+        .predecessor_decode_rows = e.decode_slots_per_layer,
+        .predecessor_prefill_rows = e.prefill_slots_per_layer,
+        .decode_cache_bytes = e.decode_cache_allowance_bytes,
+        .allocator_limit_at_base0 = e.allocator_limit_bytes,
+        .host_reserve_bytes = e.host_reserve_bytes,
+        .embedding_credit_bytes = e.embedding_post_prefill_credit_bytes,
+        .projection_credit_bytes = e.projection_steady_credit_bytes,
+        .steady_active_bytes = e.steady_decode_active_bound_bytes,
+        .prefill_active_bytes = e.prefill_active_bound_bytes,
+        .transition_start_bytes = e.transition_start_active_bound_bytes,
+        .prefill_cache_bytes = e.prefill_cache_allowance_bytes,
+        .post_prefill_reserve_bytes = e.post_prefill_reserve_bytes,
+        .projection_seed_fixed_bytes = e.projection_seed_fixed_bytes,
+        .retirement_owners_proved = e.retirement_owners_proved,
+    };
+}
 
 /// The fixture cell as Inputs, or null when a value has no Zig form (a type-level refusal).
 fn inputsOf(c: FixInputs) ?Inputs {
@@ -983,7 +1010,7 @@ fn checkCell(env: Envelope, c: FixCell) !enum { planned, refused, typed } {
         try testing.expect(c.refusal != null);
         return .typed;
     };
-    const got = Admission.plan(env, in);
+    const got = Admission.plan(if (c.envelope) |e| envelopeOf(e) else env, in);
     if (c.refusal) |msg| {
         const want = refusalOf(msg) orelse {
             std.debug.print("unmapped refusal: {s}\n", .{msg});
@@ -1010,36 +1037,27 @@ fn checkCell(env: Envelope, c: FixCell) !enum { planned, refused, typed } {
 test "dsv41 admission: every pass-2 admission, synthetic cell and refusal equals the Python stack's" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE4A_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const Fixture = struct { envelope: FixEnvelope, receipts: []const FixCell, synthetic: []const FixCell, refusals: []const FixCell, canned: []const FixCell };
+    const Fixture = struct {
+        envelope: FixEnvelope,
+        receipts: []const FixCell,
+        synthetic: []const FixCell,
+        refusals: []const FixCell,
+        canned: []const FixCell,
+        variants: []const FixCell,
+    };
     const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(64 << 20));
     defer a.free(text);
     const parsed = try std.json.parseFromSlice(Fixture, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const f = parsed.value;
-    const e = f.envelope;
-    const env: Envelope = .{
-        .predecessor_decode_rows = e.decode_slots_per_layer,
-        .predecessor_prefill_rows = e.prefill_slots_per_layer,
-        .decode_cache_bytes = e.decode_cache_allowance_bytes,
-        .allocator_limit_at_base0 = e.allocator_limit_bytes,
-        .host_reserve_bytes = e.host_reserve_bytes,
-        .embedding_credit_bytes = e.embedding_post_prefill_credit_bytes,
-        .projection_credit_bytes = e.projection_steady_credit_bytes,
-        .steady_active_bytes = e.steady_decode_active_bound_bytes,
-        .prefill_active_bytes = e.prefill_active_bound_bytes,
-        .transition_start_bytes = e.transition_start_active_bound_bytes,
-        .prefill_cache_bytes = e.prefill_cache_allowance_bytes,
-        .post_prefill_reserve_bytes = e.post_prefill_reserve_bytes,
-        .projection_seed_fixed_bytes = e.projection_seed_fixed_bytes,
-        .retirement_owners_proved = e.retirement_owners_proved,
-    };
+    const env = envelopeOf(f.envelope);
     // The built-in calibration is the fixture's envelope.
     try testing.expectEqualDeep(Envelope.dsv41_pass2, env);
-    var counts: [4][3]u32 = @splat(@splat(0));
-    for ([_][]const FixCell{ f.receipts, f.synthetic, f.refusals, f.canned }, 0..) |cells, k| {
+    var counts: [5][3]u32 = @splat(@splat(0));
+    for ([_][]const FixCell{ f.receipts, f.synthetic, f.refusals, f.canned, f.variants }, 0..) |cells, k| {
         for (cells) |c| counts[k][@intFromEnum(try checkCell(env, c))] += 1;
     }
     try testing.expect(f.receipts.len >= 10 and counts[0][0] == f.receipts.len);
-    try testing.expect(counts[2][0] == 0 and counts[3][0] == f.canned.len);
-    std.debug.print("admission parity: {d} pass-2 receipts planned equal; synthetic {d} planned + {d} refused + {d} typed; refusal cells {d} refused + {d} typed; canned {d} planned equal\n", .{ counts[0][0], counts[1][0], counts[1][1], counts[1][2], counts[2][1], counts[2][2], counts[3][0] });
+    try testing.expect(counts[2][0] == 0 and counts[3][0] == f.canned.len and counts[4][0] >= 3);
+    std.debug.print("admission parity: {d} pass-2 receipts planned equal; synthetic {d} planned + {d} refused + {d} typed; refusal cells {d} refused + {d} typed; canned {d} planned equal; envelope variants {d} planned + {d} refused\n", .{ counts[0][0], counts[1][0], counts[1][1], counts[1][2], counts[2][1], counts[2][2], counts[3][0], counts[4][0], counts[4][1] });
 }
