@@ -868,6 +868,36 @@ test "dsv41 kernels: an unknown kernel name is refused" {
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3_moeprep_dpost_k2") != null);
 }
 
+/// `text` with the first occurrence of `needle` replaced (caller frees).
+fn replaceFirst(a: Allocator, text: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, text, needle) orelse return error.NeedleMissing;
+    return std.mem.concat(a, u8, &.{ text[0..at], replacement, text[at + needle.len ..] });
+}
+
+test "dsv41 kernels: every manifest refusal refuses, by name" {
+    const a = testing.allocator;
+    const Case = struct { needle: []const u8, replacement: []const u8, want: Refusal };
+    const cases = [_]Case{
+        .{ .needle = "\"format\": \"mlx-serve-exl3-kernels-v1\"", .replacement = "\"format\": \"mlx-serve-exl3-kernels-v2\"", .want = error.ManifestFormat },
+        .{ .needle = "\"multiplier\": 2212286765", .replacement = "\"multiplier\": 3417055213", .want = error.BankNotImplemented },
+        .{ .needle = "\"id\": \"dig2_x\"", .replacement = "\"id\": \"dig2_y\"", .want = error.UnknownHeader },
+        .{ .needle = "\"name\": \"dsv41_exl3_mul1h_k3_5120\"", .replacement = "\"name\": \"dsv41_exl3_mul1h_k3_2304\"", .want = error.DuplicateKernel },
+        .{ .needle = "\"sha256\": \"035ad69fda53f016", .replacement = "\"sha256\": \"135ad69fda53f016", .want = error.LanePinMismatch },
+        .{ .needle = "\"math_mode\": \"safe\"", .replacement = "\"math_mode\": \"fast\"", .want = error.MathModeNotSafe },
+        .{ .needle = "\n}\n", .replacement = "\n", .want = error.ManifestSyntax },
+    };
+    for (cases) |c| {
+        const m = try replaceFirst(a, embedded.manifest, c.needle, c.replacement);
+        defer a.free(m);
+        var texts = embedded;
+        texts.manifest = m;
+        const pin = shaHex(m);
+        var diag: Diag = .{};
+        try testing.expectError(c.want, Registry.init(a, &texts, &pin, &diag));
+        try testing.expect(diag.len > 0);
+    }
+}
+
 test "dsv41 kernels: every launch rule reproduces the lane's own launches (geometry round trip)" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
