@@ -149,6 +149,15 @@ pub const Pool = struct {
         }
     }
 
+    /// A copy of the read gauge (taken under the pool mutex): 0 in flight, 1 max in flight, 2 depth sum,
+    /// 3 samples, 4 wall ns with a read in flight, 5 busy-since ns.
+    pub fn readGauge(self: *Pool) [6]i64 {
+        _ = self;
+        var out: [6]i64 = undefined;
+        c.q3ni_gauge(&out);
+        return out;
+    }
+
     pub fn result(self: *const Pool, ticket: u32) Result {
         const w = self.res[@as(usize, ticket) * res_w ..][0..res_w];
         return .{ .status = @enumFromInt(w[0]), .preadv_calls = w[1], .bytes_returned = w[2], .payload = w[3], .errno = w[4], .t_start_ns = w[5], .t_end_ns = w[6], .worker = w[7] };
@@ -175,6 +184,16 @@ pub const Pool = struct {
         }
     }
 };
+
+/// Test builds (-DQ3NI_INJECT): one scripted preadv fault at an aligned file
+/// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes).
+pub fn injectFault(aligned_offset: u64, code: i64, arg: i64) void {
+    c.q3ni_test_rules(1, &[_]i64{@intCast(aligned_offset)}, &[_]i64{code}, &[_]i64{arg});
+}
+
+pub fn clearFaults() void {
+    c.q3ni_test_rules(0, &[_]i64{0}, &[_]i64{0}, &[_]i64{0});
+}
 
 pub const RecordRef = struct { layer: u32, expert: u32 };
 

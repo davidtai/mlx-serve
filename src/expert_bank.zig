@@ -676,11 +676,12 @@ test "dsv41 bank: geometry matches bankv2" {
 
 // Synthetic banks: the geometry is written out here independently of
 // `layerSegments`, so a bug there cannot be mirrored by the generator.
-const Synth = struct {
+pub const Synth = struct {
     hidden: u64 = 64,
     inter: u64 = 32,
     n_experts: u32 = 4,
-    k: [2]u32 = .{ 3, 3 },
+    /// K per layer (at most `max_synth_layers` layers).
+    k: []const u32 = &.{ 3, 3 },
     v2_format: []const u8 = "mtplx-expert-manifest-v2",
     codebook: []const u8 = "mul1",
     multiplier: u64 = 0x83DCD12D,
@@ -744,17 +745,21 @@ fn printShape(j: *std.ArrayList(u8), a: std.mem.Allocator, sg: SynthSeg) !void {
     try j.appendSlice(a, "]");
 }
 
-/// Writes a 2-layer bank (manifests + experts.bin) into `tmp`; returns the
-/// experts.bin image (caller frees).
-fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
+const max_synth_layers = 8;
+
+/// Writes a bank of `s.k.len` layers (manifests + experts.bin) into `tmp`;
+/// returns the experts.bin image (caller frees).
+pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     const io = std.testing.io;
     const Sha256 = std.crypto.hash.sha2.Sha256;
-    var segs: [2][9]SynthSeg = undefined;
-    var logical: [2]u64 = undefined;
-    var rb: [2]u64 = undefined;
-    var base: [2]u64 = undefined;
+    const nl = s.k.len;
+    std.debug.assert(nl >= 2 and nl <= max_synth_layers);
+    var segs: [max_synth_layers][9]SynthSeg = undefined;
+    var logical: [max_synth_layers]u64 = undefined;
+    var rb: [max_synth_layers]u64 = undefined;
+    var base: [max_synth_layers]u64 = undefined;
     var total: u64 = 0;
-    for (0..2) |l| {
+    for (0..nl) |l| {
         logical[l] = synthSegments(s.k[l], s.hidden, s.inter, &segs[l]);
         rb[l] = (logical[l] + 4095) / 4096 * 4096;
         base[l] = total;
@@ -763,12 +768,12 @@ fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     const bin = try a.alloc(u8, total);
     errdefer a.free(bin);
     @memset(bin, 0);
-    const n_rec = 2 * s.n_experts;
+    const n_rec = nl * s.n_experts;
     const lsha = try a.alloc([64]u8, n_rec);
     defer a.free(lsha);
     const psha = try a.alloc([64]u8, n_rec);
     defer a.free(psha);
-    for (0..2) |l| for (0..s.n_experts) |e| {
+    for (0..nl) |l| for (0..s.n_experts) |e| {
         const off = base[l] + e * rb[l];
         fillPattern(bin[off .. off + logical[l]], 1 + l * 1000 + e);
         var d: [32]u8 = undefined;
@@ -782,8 +787,8 @@ fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     defer j.deinit(a);
     // v2
     try j.print(a, "{{\"format\":\"{s}\",\"model_key\":\"synthetic\",\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"{s}\",\"codebook_multiplier\":{d},\"tile\":{{\"size\":16}}}},", .{ s.v2_format, s.codebook, s.multiplier });
-    try j.print(a, "\"dims\":{{\"hidden\":{d},\"inter\":{d},\"n_experts\":{d},\"n_layers\":2}},\"sidecar\":{{\"file\":\"experts.bin\",\"alignment\":{d},\"size\":{d}}},\"layers\":[", .{ s.hidden, s.inter, s.n_experts, s.sidecar_alignment, total + s.sidecar_size_delta });
-    for (0..2) |l| {
+    try j.print(a, "\"dims\":{{\"hidden\":{d},\"inter\":{d},\"n_experts\":{d},\"n_layers\":{d}}},\"sidecar\":{{\"file\":\"experts.bin\",\"alignment\":{d},\"size\":{d}}},\"layers\":[", .{ s.hidden, s.inter, s.n_experts, nl, s.sidecar_alignment, total + s.sidecar_size_delta });
+    for (0..nl) |l| {
         if (s.drop_layer_entry and l == 1) continue;
         const index = l + (if (l == 1) s.layer_index_delta else 0);
         try j.print(a, "{s}{{\"layer\":{d},\"K\":{d},\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"segments\":[", .{ if (l == 0) "" else ",", index, s.k[l], rb[l], logical[l], base[l] + (if (l == 1) s.base_delta else 0) });
@@ -797,7 +802,7 @@ fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     }
     try j.appendSlice(a, "],\"records\":[");
     var first = true;
-    for (0..2) |l| for (0..s.n_experts) |e| {
+    for (0..nl) |l| for (0..s.n_experts) |e| {
         if (s.drop_record and l == 1 and e == 3) continue;
         const ee = if (s.dup_record and l == 1 and e == 3) 2 else e;
         var off = base[l] + ee * rb[l];
@@ -817,7 +822,7 @@ fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     j.clearRetainingCapacity();
     try j.print(a, "{{\"artifact\":{{\"record_count\":{d}}},\"format\":\"{s}\",\"manifest_sha256\":\"{s}\",\"model_key\":\"synthetic\",\"quantization\":{{\"bits\":3,\"group_size\":32,\"mode\":\"{s}\"}},\"records\":[", .{ n_rec, s.v1_format, lsha[0], s.v1_mode });
     first = true;
-    for (0..2) |l| for (0..s.n_experts) |e| {
+    for (0..nl) |l| for (0..s.n_experts) |e| {
         if (s.v1_drop_record and l == 1 and e == 0) continue;
         const off = base[l] + e * rb[l];
         try j.print(a, "{s}{{\"expert\":{d},\"layer\":{d},\"logical_bytes\":{d},\"segments\":[", .{ if (first) "" else ",", e, l, logical[l] });
@@ -852,7 +857,7 @@ fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
 
 const implemented_synth: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 2 };
 
-fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
 }
 
@@ -890,7 +895,7 @@ test "dsv41 bank: a clean synthetic bank opens with offsets, spans and digests f
 test "dsv41 bank: a K=2 layer opens only when K=2 is implemented" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const bin = try writeSynth(testing.allocator, &tmp, .{ .k = .{ 3, 2 } });
+    const bin = try writeSynth(testing.allocator, &tmp, .{ .k = &.{ 3, 2 } });
     defer testing.allocator.free(bin);
     var rbuf: [512]u8 = undefined;
     const root = try tmpRoot(&tmp, &rbuf);
@@ -923,7 +928,7 @@ test "dsv41 bank: every bankv2 refusal refuses, by name" {
         .{ .s = .{}, .err = error.DimsNotImplemented, .impl = dsv41 },
         .{ .s = .{ .drop_layer_entry = true }, .err = error.LayerGeometry },
         .{ .s = .{ .layer_index_delta = 4 }, .err = error.LayerGeometry },
-        .{ .s = .{ .k = .{ 3, 2 } }, .err = error.KNotImplemented },
+        .{ .s = .{ .k = &.{ 3, 2 } }, .err = error.KNotImplemented },
         .{ .s = .{ .seg_len_delta = 2 }, .err = error.LayerGeometry },
         .{ .s = .{ .base_delta = 4096 }, .err = error.LayerGeometry },
         .{ .s = .{ .sidecar_size_delta = 4096 }, .err = error.SidecarGeometry },
