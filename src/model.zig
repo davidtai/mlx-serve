@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
+const nocache_reader = @import("nocache_reader.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -3126,18 +3127,20 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
     } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
         // Native DeepSeek-V4.1 (deepseek_v41.zig): the config is checked with
-        // its own named refusals; the forward is not served yet, so a valid
-        // bank stops here instead of falling into the Llama defaults.
+        // its own named refusals, never parsed as Llama. The server's engine
+        // is deepseek_v41_bind's (the scheduler opens it on the inference
+        // thread); while its decode binding is the stand-in, a valid bank
+        // stops here.
         var diag: deepseek_v41.Diag = .{};
         _ = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
             log.err("deepseek_v41: {s}\n", .{diag.message()});
             return e;
         };
-        // deepseek_v41_arm.zig builds the arch; the server generates with it
-        // once the arm's decode seam binds the DSpark loop (then wire it here).
-        comptime std.debug.assert(deepseek_v41_arm.serving_decode == .stand_in);
-        log.err("deepseek_v41: not served until the arm's decode seam binds the DSpark loop; dsv41-cell benchmarks the arm\n", .{});
-        return error.UnsupportedDsv41NotServed;
+        if (deepseek_v41_arm.serving_decode == .stand_in) {
+            log.err("deepseek_v41: not served until the arm's decode seam binds the DSpark loop; dsv41-cell benchmarks the arm\n", .{});
+            return error.UnsupportedDsv41NotServed;
+        }
+        config.model_type = "deepseek_v41";
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -3759,7 +3762,9 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+/// `nocache`: read the shards past the page cache (`nocache_reader`): the
+/// load keeps no file pages next to the array buffers.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, nocache: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
@@ -3789,6 +3794,12 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
+}
+
+/// `loadWeights` past the page cache (`nocache_reader`): for a resident set
+/// that nearly fills the box, where cached pages would count twice.
+pub fn loadWeightsNoCache(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(io, allocator, model_dir, .{ .nocache = true });
 }
 
 fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
@@ -3934,7 +3945,15 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+    if (opts.nocache) {
+        const reader = nocache_reader.reader(std.mem.span(path)) catch |e| {
+            log.err("cannot open {s} past the page cache: {s}\n", .{ path, @errorName(e) });
+            return e;
+        };
+        // Drops our reference only: MLX keeps the reader while an array still reads through it.
+        defer _ = mlx.mlx_io_reader_free(reader);
+        try mlx.check(mlx.mlx_load_safetensors_reader(&tensor_map, &meta_map, reader, s));
+    } else try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -7551,10 +7570,16 @@ test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setti
     try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
 }
 
-test "dsv41 model: a deepseek_v41 config is refused by name, never parsed as Llama" {
+test "dsv41 model: a deepseek_v41 config is served only with the DSpark binding, never parsed as Llama" {
     const ok = try deepseek_v41.testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(ok);
-    try testing.expectError(error.UnsupportedDsv41NotServed, parseConfigFromJson(testing.allocator, ok));
+    if (deepseek_v41_arm.serving_decode == .stand_in) {
+        try testing.expectError(error.UnsupportedDsv41NotServed, parseConfigFromJson(testing.allocator, ok));
+    } else {
+        var c = try parseConfigFromJson(testing.allocator, ok);
+        defer c.deinit(testing.allocator);
+        try testing.expectEqualStrings("deepseek_v41", c.model_type);
+    }
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));

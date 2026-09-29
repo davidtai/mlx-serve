@@ -3,15 +3,17 @@
 //! `Engine.step` once per tick (the first step is the prefill and yields the
 //! primary token, every later one is a decode cycle) and pushes what it emits;
 //! stop ids end the request unemitted, `max_tokens` bounds it. One request at
-//! a time: the scheduler refuses a second concurrent one by name. Every call
-//! runs on the thread that built the arm's stream (the inference thread) or is
-//! refused. `end` returns the request's run in the bench cell's shape, so the
-//! cell's receipt writer serves per-request stats too.
+//! a time: the scheduler refuses a second concurrent one by name. The engine
+//! is bound to the thread that built the arm's stream (the inference thread):
+//! the scheduler builds it there and calls it from its inference loop only,
+//! so safe builds assert it and nothing checks it per step. `end` returns the
+//! request's run in the bench cell's shape, so the cell's receipt writer
+//! serves per-request stats too.
 //!
 //! The decode loop is the arm's seam: `begin(cfg) !void`, `prefill(arm, g,
-//! prompt) !u32`, `cycle(arm, g, a, out) !bool`, `stats()`. The server binds
-//! `ServingDecode` / `ServingMath` below once `arm.serving_decode` is the
-//! DSpark loop; until then `openServing` refuses by name.
+//! prompt) !u32`, `cycle(arm, g, a, out) !bool`, `stats()`. Which loop, math
+//! and residents the server constructs is `deepseek_v41_bind`'s (`serving`,
+//! `openServing`); until the DSpark loop binds, the server refuses by name.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -22,14 +24,11 @@ const cell = @import("deepseek_v41_cell.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
-pub const ServingDecode = arm_mod.StandIn;
-pub const ServingMath = arm_mod.StandInMath;
-
 pub const Acceptance = union(enum) { greedy, typical: f32 };
 
-/// Serve-level defaults: the lane of record (typical at delta 0.5, DSpark depth 5).
+/// Serve-level defaults: the lane of record (typical at delta 0.3, DSpark depth 5).
 pub const Options = struct {
-    acceptance: Acceptance = .{ .typical = 0.5 },
+    acceptance: Acceptance = .{ .typical = 0.3 },
     depth: u32 = 5,
 };
 
@@ -50,6 +49,11 @@ pub fn optionsFrom(mode: ?mtp_acceptance.Mode, depth: u32) !Options {
 
 /// A cycle verifies depth + 1 rows; the decode lane takes at most 8.
 pub const max_depth: u32 = expert_lookahead.max_rows - 1;
+
+/// A step's token buffer: a cycle commits at most its verify rows (<= 8).
+const cycle_tokens_reserve = 16;
+/// `generated` is reserved up to `max_tokens`, at most this many ids (4 MiB).
+const max_reserved_tokens: u32 = 1 << 20;
 
 pub const Request = struct {
     prompt: []const u32,
@@ -121,6 +125,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
         max_tokens: u32 = 0,
         depth: u32 = 0,
         generated: std.ArrayList(u32) = .empty,
+        /// A step's tokens (the prefill's primary, a cycle's committed ones),
+        /// reserved at begin and cleared per step.
+        toks: std.ArrayList(u32) = .empty,
         t0: std.Io.Timestamp = undefined,
         t1: std.Io.Timestamp = undefined,
         prompt_eval_s: f64 = 0,
@@ -137,13 +144,14 @@ pub fn Session(comptime A: type, comptime D: type) type {
             return @ptrCast(@alignCast(p));
         }
 
-        fn onOwner(self: *const Self) !void {
-            if (std.Thread.getCurrentId() != self.arm.stream.owner) return error.NotInferenceThread;
+        /// Safe builds only: the caller is the thread the engine is bound to.
+        fn assertOwner(self: *const Self) void {
+            if (std.debug.runtime_safety) std.debug.assert(std.Thread.getCurrentId() == self.arm.stream.owner);
         }
 
         fn beginFn(p: *anyopaque, r: Request) anyerror!void {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (r.prompt.len == 0) return error.EmptyPrompt;
             if (r.max_tokens == 0) return error.ZeroMaxTokens;
             const depth = if (r.depth == 0) self.opts.depth else r.depth;
@@ -157,6 +165,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
             self.stop_ids = try self.a.dupe(u32, r.stop_ids);
             self.max_tokens = r.max_tokens;
             self.depth = depth;
+            // The request's buffers, reserved once here: no step allocates.
+            try self.generated.ensureTotalCapacity(self.a, @min(r.max_tokens, max_reserved_tokens));
+            try self.toks.ensureTotalCapacity(self.a, cycle_tokens_reserve);
             try self.decode.begin(.{
                 .depth = depth,
                 .typical_delta = if (acc == .typical) acc.typical else null,
@@ -170,10 +181,10 @@ pub fn Session(comptime A: type, comptime D: type) type {
 
         fn stepFn(p: *anyopaque, sink: Sink) anyerror!?Finish {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (!self.active or self.done) return error.NoActiveRequest;
-            var toks: std.ArrayList(u32) = .empty;
-            defer toks.deinit(self.a);
+            const toks = &self.toks;
+            toks.clearRetainingCapacity();
             var loop_done = false;
             if (!self.primed) {
                 try toks.append(self.a, try self.decode.prefill(self.arm, self.g, self.prompt));
@@ -183,7 +194,7 @@ pub fn Session(comptime A: type, comptime D: type) type {
                 if (!self.arm.grown) try self.arm.grow(self.g);
                 self.primed = true;
             } else {
-                loop_done = try self.decode.cycle(self.arm, self.g, self.a, &toks);
+                loop_done = try self.decode.cycle(self.arm, self.g, self.a, toks);
             }
             for (toks.items) |t| {
                 if (std.mem.indexOfScalar(u32, self.stop_ids, t) != null) {
@@ -206,7 +217,7 @@ pub fn Session(comptime A: type, comptime D: type) type {
 
         fn endFn(p: *anyopaque) anyerror!cell.Run {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (!self.active) return error.NoActiveRequest;
             var mlx_peak: ?u64 = null;
             if (G == ops.MlxOps) {
@@ -233,18 +244,28 @@ pub fn Session(comptime A: type, comptime D: type) type {
         fn receiptFn(p: *anyopaque, run: *const cell.Run, path: []const u8, log: *std.Io.Writer) anyerror!void {
             const self = of(p);
             const a = self.a;
-            const spec: cell.Spec = .{ .prompt_tokens = @intCast(run.prompt.len), .cycles = run.stats.cycles, .rows = self.depth + 1, .seed = 0 };
+            const spec: cell.Spec = .{ .prompt_tokens = @intCast(run.prompt.len), .cycles = run.stats.cycles, .rows = self.verifyRows(), .seed = 0 };
             const prompt_sha = try cell.idsSha256(a, run.prompt);
             const ids_sha = try cell.idsSha256(a, run.generated);
-            const binding: arm_mod.DecodeBinding = if (D == ServingDecode(A)) arm_mod.serving_decode else .stand_in;
+            const binding: arm_mod.DecodeBinding = if (D == arm_mod.StandIn(A)) .stand_in else .dspark;
             const r = cell.receiptOf(run, spec, binding, self.arm.admissionRecord(), .{ .DSV41_EXL3_BANK = self.arm.model_dir }, &prompt_sha, &ids_sha);
             try cell.publish(a, self.io, &r, path, log);
+        }
+
+        /// The rows a cycle verifies at most: the stand-in's depth + 1; the
+        /// DSpark loop's own bound (its lookup extends a full 5-draft proposal
+        /// by 2, so 8 at depth 5), set by the request's prefill.
+        fn verifyRows(self: *const Self) u32 {
+            if (D == arm_mod.StandIn(A)) return self.depth + 1;
+            const r = self.decode.req orelse return self.depth + 1;
+            return if (r.live) r.loop.max_rows else self.depth + 1;
         }
 
         fn deinitFn(p: *anyopaque) void {
             const self = of(p);
             self.clear();
             self.generated.deinit(self.a);
+            self.toks.deinit(self.a);
             if (self.release) |f| f(self) else self.a.destroy(self);
         }
 
@@ -261,44 +282,21 @@ pub fn Session(comptime A: type, comptime D: type) type {
     };
 }
 
+/// A finished request's one log line (the scheduler's, and the served path's gate's).
+pub fn writeRequestLine(run: *const cell.Run, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = run.generated.len;
+    try w.print("[dsv41] request: {d} prompt, {d} generated in {d} cycles ({d:.2} tok/cycle), prefill {d:.3} s, decode {d:.2} tok/s\n", .{
+        run.prompt.len,
+        n,
+        run.stats.cycles,
+        if (run.stats.cycles > 0) @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(run.stats.cycles)) else 0,
+        run.prompt_eval_s,
+        if (run.decode_wall_s > 0) @as(f64, @floatFromInt(n -| 1)) / run.decode_wall_s else 0,
+    });
+}
+
 fn seconds(d: std.Io.Duration) f64 {
     return @as(f64, @floatFromInt(d.nanoseconds)) / 1e9;
-}
-
-/// The served engine on MLX: the arm on `stream` (slot banks as MLX arrays)
-/// with the serving decode binding. Refused by name while that binding is the
-/// stand-in, before anything is opened.
-pub fn openServing(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, stream: mlx.mlx_stream, arm_opt: arm_mod.Options, opts: Options, diag: *arm_mod.Diag) !Engine {
-    if (arm_mod.serving_decode == .stand_in) return error.Dsv41DecodeNotBound;
-    return openMlx(ServingDecode, ServingMath(ops.MlxOps), {}, a, io, model_dir, stream, arm_opt, opts, diag);
-}
-
-/// The MLX engine over decode binding `Decode` and math `M` (the GPU gate
-/// opens it with the stand-in).
-pub fn openMlx(comptime Decode: fn (type) type, comptime M: type, math_arg: anytype, a: std.mem.Allocator, io: std.Io, model_dir: []const u8, stream: mlx.mlx_stream, arm_opt: arm_mod.Options, opts: Options, diag: *arm_mod.Diag) !Engine {
-    const A = arm_mod.Arm(ops.MlxOps, M);
-    const S = Session(A, Decode(A));
-    const Box = struct {
-        session: S,
-        g: ops.MlxOps,
-
-        fn release(s: *S) void {
-            const box: *@This() = @fieldParentPtr("session", s);
-            s.arm.deinit();
-            box.g.deinit();
-            s.a.destroy(box);
-        }
-    };
-    const box = try a.create(Box);
-    errdefer a.destroy(box);
-    box.g = try ops.MlxOps.init(a, stream);
-    errdefer box.g.deinit();
-    var o = arm_opt;
-    o.model_dir = model_dir;
-    o.slot_memory = .{ .mlx = stream };
-    const arm = try A.init(a, io, &box.g, math_arg, o, diag);
-    box.session = .{ .a = a, .io = io, .arm = arm, .g = &box.g, .decode = Decode(A).init(0, opts.depth + 1, 0), .opts = opts, .release = Box.release };
-    return box.session.engine();
 }
 
 // ── Tests ──
@@ -428,24 +426,6 @@ test "dsv41 serve: request options are checked before anything runs, and a dropp
     try testing.expectEqual(@as(u64, 2), h.session.requests);
 }
 
-test "dsv41 serve: every engine call from a thread other than the inference thread is refused" {
-    const h = try HostEngine.create();
-    defer h.destroy();
-    const e = h.session.engine();
-    const Helper = struct {
-        fn run(eng: Engine, out: *[3]?anyerror) void {
-            out[0] = if (eng.begin(.{ .prompt = &.{1}, .max_tokens = 1, .stop_ids = &.{} })) null else |err| err;
-            var c: Collect = .{};
-            out[1] = if (eng.step(c.sink())) |_| null else |err| err;
-            out[2] = if (eng.end()) |_| null else |err| err;
-        }
-    };
-    var got: [3]?anyerror = .{ null, null, null };
-    const t = try std.Thread.spawn(.{}, Helper.run, .{ e, &got });
-    t.join();
-    for (got) |g| try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), g);
-}
-
 test "dsv41 serve: a served request's run writes the cell's receipt" {
     const h = try HostEngine.create();
     defer h.destroy();
@@ -474,15 +454,9 @@ test "dsv41 serve: a served request's run writes the cell's receipt" {
     try testing.expect(std.mem.indexOf(u8, log.written(), "COMPARISON_COMPLETE") != null);
 }
 
-test "dsv41 serve: the server's engine is refused by name while the decode binding is the stand-in" {
-    var diag: arm_mod.Diag = .{};
-    const s: mlx.mlx_stream = .{ .ctx = null };
-    try testing.expectError(error.Dsv41DecodeNotBound, openServing(testing.allocator, std.testing.io, "/nonexistent", s, .{ .model_dir = "", .baseline_bytes = null, .slot_memory = .host }, .{}, &diag));
-}
-
 test "dsv41 serve: the serve options follow the model's acceptance setting and the depth cap" {
     const d = try optionsFrom(null, 0);
-    try testing.expectEqual(@as(f32, 0.5), d.acceptance.typical);
+    try testing.expectEqual(@as(f32, 0.3), d.acceptance.typical);
     try testing.expectEqual(@as(u32, 5), d.depth);
     try testing.expect((try optionsFrom(.exact, 3)).acceptance == .greedy);
     try testing.expectEqual(@as(u32, 3), (try optionsFrom(.exact, 3)).depth);

@@ -80,6 +80,9 @@ pub const Options = struct {
     lookahead: ?expert_stream.Lookahead = null,
     event: ?expert_stream.Event = null,
     pool: expert_io.Options = .{ .tickets = 1024 },
+    /// The wide lane's routes are built from this (an arm whose routes install
+    /// the lane: `ArmWith(.., .{ .prefill = ... })`); unused otherwise.
+    prefill: ?xp.PrefillInit = null,
 };
 
 /// The arm's construction up to the admitted rows: config, bank, plan. No
@@ -135,10 +138,17 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
 /// The arm over graph backend `G` (`MlxOps` serving, `TraceOps` host tests)
 /// with routed-expert math `M` (`M.init(math_arg, *const Config)`).
 pub fn Arm(comptime G: type, comptime M: type) type {
+    return ArmWith(G, M, .{});
+}
+
+/// The arm whose hook takes the executor's construction-time `routes` (the
+/// wide lane: `.prefill` = the kernels' DIG-X prefill route, built per layer
+/// from `Options.prefill`).
+pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) type {
     return struct {
         const Self = @This();
         pub const Backend = G;
-        pub const Hook = xp.Experts(G, xp.StreamSource, M);
+        pub const Hook = xp.ExpertsWith(G, xp.StreamSource, M, routes);
 
         a: std.mem.Allocator,
         /// Borrowed from `Options.model_dir`.
@@ -154,6 +164,15 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         source: xp.StreamSource,
         hook: Hook,
         grown: bool = false,
+        /// Run over the banks the phase change binds, before the arm counts as
+        /// grown (the binding's kernels layout check; set once, at construction).
+        /// A refusal leaves the arm ungrown: every later request is refused too.
+        grown_check: ?GrownCheck = null,
+
+        pub const GrownCheck = struct {
+            ctx: *const anyopaque,
+            check: *const fn (ctx: *const anyopaque, arm: *Self, g: *G) anyerror!void,
+        };
 
         pub fn init(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, diag: *Diag) !*Self {
             const self = try a.create(Self);
@@ -189,7 +208,7 @@ pub fn Arm(comptime G: type, comptime M: type) type {
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
-            self.hook = Hook.init(a, g, &self.source, M.init(math_arg, &self.config), &self.config) catch |e|
+            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .prefill = opt.prefill }) catch |e|
                 return refuse(diag, e, "routed-expert hook: {s}", .{@errorName(e)});
             return self;
         }
@@ -211,6 +230,7 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         /// The one phase change, at the admitted decode rows.
         pub fn grow(self: *Self, g: *G) !void {
             try self.hook.grow(g, self.decode_rows);
+            if (self.grown_check) |c| try c.check(c.ctx, self, g);
             self.grown = true;
         }
     };

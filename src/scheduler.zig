@@ -39,6 +39,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const dsv41_serve = @import("deepseek_v41_serve.zig");
+const dsv41_bind = @import("deepseek_v41_bind.zig");
 const dsv41_arm = @import("deepseek_v41_arm.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -5719,7 +5720,8 @@ fn LoadFields(comptime P: type) type {
 }
 
 /// The deepseek_v41 arm's engine on this (the inference) thread: refused by
-/// name until its decode seam binds the DSpark loop (`deepseek_v41_serve`).
+/// name until its decode seam binds the DSpark loop (`deepseek_v41_bind`).
+/// The box baseline is read once, here.
 fn doLoadDsv41OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const opts = try dsv41_serve.optionsFrom(params.config.mtp_acceptance_override, if (@hasField(LoadFields(@TypeOf(params)), "mtp_depth")) params.mtp_depth else 0);
     const baseline: ?u64 = if (std.c.getenv("MTPLX_DSV41_BOX_BASELINE_GB")) |v|
@@ -5727,7 +5729,7 @@ fn doLoadDsv41OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         null;
     var diag: dsv41_arm.Diag = .{};
-    const engine = dsv41_serve.openServing(sch.allocator, sch.io, params.model_dir, mlx.gpuStream(), .{ .model_dir = params.model_dir, .baseline_bytes = baseline, .slot_memory = .host }, opts, &diag) catch |e| {
+    const engine = dsv41_bind.openServing(sch.allocator, sch.io, params.model_dir, mlx.gpuStream(), .{ .model_dir = params.model_dir, .baseline_bytes = baseline, .slot_memory = .host }, opts, &diag) catch |e| {
         log.err("[dsv41] engine refused: {s} {s}\n", .{ @errorName(e), diag.message() });
         return e;
     };
@@ -5799,11 +5801,10 @@ fn dsv41EndRequest(sch: *Scheduler, engine: dsv41_serve.Engine) void {
     };
     defer run.deinit(sch.allocator);
     const n = run.generated.len;
-    log.info("[dsv41] request: {d} prompt, {d} generated in {d} cycles ({d:.2} tok/cycle), prefill {d:.3} s, decode {d:.2} tok/s\n", .{
-        run.prompt.len,                                                                                                                                           n, run.stats.cycles,
-        if (run.stats.cycles > 0) @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(run.stats.cycles)) else 0, run.prompt_eval_s,
-        if (run.decode_wall_s > 0) @as(f64, @floatFromInt(n -| 1)) / run.decode_wall_s else 0,
-    });
+    var line_buf: [256]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    dsv41_serve.writeRequestLine(&run, &line) catch {};
+    log.info("{s}", .{line.buffered()});
     const dir = std.mem.span(std.c.getenv("DSV41_RECEIPT_DIR") orelse return);
     var name_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&name_buf, "{s}/dsv41-serve-{d}-{d}.comparison.json", .{ dir, std.Io.Timestamp.now(sch.io, .real).nanoseconds, n }) catch return;

@@ -343,6 +343,20 @@ pub const Stream = struct {
     phase: Phase = .prefill,
     failed: bool = false,
     routes: [route_capacity]Route = @splat(.{}),
+    /// Free routes (a stack) and released ones awaiting the next flush, in
+    /// release order: `route` and `flush` touch only these, never the ring.
+    free: [route_capacity]u8 = blk: {
+        var f: [route_capacity]u8 = undefined;
+        for (&f, 0..) |*x, i| x.* = route_capacity - 1 - i;
+        break :blk f;
+    },
+    n_free: u8 = route_capacity,
+    released: [route_capacity]u8 = undefined,
+    n_released: u8 = 0,
+    /// The phase's route: the lookahead class (decode with a selector) and
+    /// its pre-reads, set at construction and at the phase change.
+    route_lookahead: bool = false,
+    route_preread: bool = false,
     counters: Stats = .{},
     read_ns: u64 = 0,
     selector: ?expert_lookahead.Selector = null,
@@ -556,14 +570,14 @@ pub const Stream = struct {
     pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
         if (self.failed) return error.StreamFailed;
         std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
-        const lookahead = self.selector != null and self.phase == .decode;
+        const lookahead = self.route_lookahead;
         std.debug.assert(lookahead or scores.len == 0);
         const tag = self.clock + 1;
-        if (lookahead and self.preread) try self.preRead(layer, ids, tag);
+        if (self.route_preread) try self.preRead(layer, ids, tag);
         try self.flush();
-        const r = for (&self.routes) |*cand| {
-            if (cand.state == .free) break cand;
-        } else return self.fail(error.RoutesExhausted);
+        if (self.n_free == 0) return self.fail(error.RoutesExhausted);
+        self.n_free -= 1;
+        const r = &self.routes[self.free[self.n_free]];
         r.* = .{ .layer = layer };
         const ls = &self.layers[layer];
         ls.policy.plan(ids, self.phase, &r.plan);
@@ -572,12 +586,14 @@ pub const Stream = struct {
             s.* = ls.policy.slotOf(e).?;
             self.locate(layer, s.*).meta.pins += 1;
         }
+        var skipped: u64 = 0;
         for (plan.loadsOf(), 0..) |l, i| {
             const m = self.locate(layer, l.slot).meta;
             // A row a live route still serves from is never refilled.
             if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
             const held = m.state == .ready and m.layer == layer and m.expert == l.expert;
             r.reads[i] = !held;
+            skipped += @intFromBool(held);
             if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
             m.pins = 1;
         }
@@ -592,10 +608,9 @@ pub const Stream = struct {
         c.expert_cache_hits += plan.n_hits;
         c.expert_cache_misses += plan.n_misses;
         c.expert_cache_evictions += plan.n_evictions;
-        for (plan.loadsOf(), r.reads[0..plan.n_loads]) |l, reads| {
-            if (l.persistent) c.persistent_loads += 1 else c.transient_loads += 1;
-            if (!reads) c.loads_skipped += 1;
-        }
+        c.persistent_loads += plan.n_persistent;
+        c.transient_loads += plan.n_loads - plan.n_persistent;
+        c.loads_skipped += skipped;
         r.state = .live;
         return r;
     }
@@ -782,9 +797,10 @@ pub const Stream = struct {
     /// Hands a route back. Its slots stay pinned until the next flush: the
     /// kernels that read them finish only with a later eval.
     pub fn release(self: *Stream, r: *Route) void {
-        _ = self;
         std.debug.assert(r.state == .live);
         r.state = .released;
+        self.released[self.n_released] = @intCast((@intFromPtr(r) - @intFromPtr(&self.routes[0])) / @sizeOf(Route));
+        self.n_released += 1;
     }
 
     /// Unpins every released route; call only after an eval that consumed
@@ -793,22 +809,24 @@ pub const Stream = struct {
     /// watchdog forced since the last flush fails the stream here.
     pub fn flush(self: *Stream) Error!void {
         var first_error: ?Error = null;
-        for (&self.routes) |*r| {
-            if (r.state != .released) continue;
+        for (self.released[0..self.n_released]) |ri| {
+            const r = &self.routes[ri];
             for (r.parts[0..r.n_parts]) |*p| self.settle(r, p) catch |e| {
                 if (first_error == null) first_error = e;
             };
             for (r.hit_slots[0..r.plan.n_hits]) |s| self.locate(r.layer, s).meta.pins -= 1;
             for (r.plan.loadsOf()) |l| self.locate(r.layer, l.slot).meta.pins -= 1;
             r.state = .free;
+            self.free[self.n_free] = ri;
+            self.n_free += 1;
         }
+        self.n_released = 0;
         if (first_error) |e| return e;
-        if (self.gated) {
-            const forced = self.pool.counter(.ev_wd_forced);
-            if (forced != self.forced_seen) {
-                self.forced_seen = forced;
-                return self.fail(error.GateForced);
-            }
+        // The watchdog's forced gates (a count that moves only on a gated stream).
+        const forced = self.pool.counter(.ev_wd_forced);
+        if (forced != self.forced_seen) {
+            self.forced_seen = forced;
+            return self.fail(error.GateForced);
         }
     }
 
@@ -838,6 +856,8 @@ pub const Stream = struct {
             ls.policy.grow(rows) catch unreachable;
         }
         self.phase = .decode;
+        self.route_lookahead = self.selector != null;
+        self.route_preread = self.route_lookahead and self.preread;
     }
 
     pub fn stats(self: *Stream) Stats {
