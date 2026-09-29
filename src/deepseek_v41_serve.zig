@@ -20,6 +20,7 @@ const ops = @import("deepseek_v41_ops.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
+const mtp_acceptance = @import("mtp_acceptance.zig");
 
 pub const ServingDecode = arm_mod.StandIn;
 pub const ServingMath = arm_mod.StandInMath;
@@ -31,6 +32,21 @@ pub const Options = struct {
     acceptance: Acceptance = .{ .typical = 0.5 },
     depth: u32 = 5,
 };
+
+/// The serve options from the model's acceptance setting (`mtp_acceptance`:
+/// exact = greedy, typical = its delta; none = the lane of record) and the
+/// `--mtp-depth` cap (0 = the default depth).
+pub fn optionsFrom(mode: ?mtp_acceptance.Mode, depth: u32) !Options {
+    var o: Options = .{};
+    if (mode) |m| o.acceptance = switch (m) {
+        .exact => .greedy,
+        .typical => |t| .{ .typical = t.delta },
+        .tokenv3 => return error.Dsv41AcceptanceNotServed,
+    };
+    if (depth > max_depth) return error.DsparkDepthOutOfRange;
+    if (depth > 0) o.depth = depth;
+    return o;
+}
 
 /// A cycle verifies depth + 1 rows; the decode lane takes at most 8.
 pub const max_depth: u32 = expert_lookahead.max_rows - 1;
@@ -462,4 +478,15 @@ test "dsv41 serve: the server's engine is refused by name while the decode bindi
     var diag: arm_mod.Diag = .{};
     const s: mlx.mlx_stream = .{ .ctx = null };
     try testing.expectError(error.Dsv41DecodeNotBound, openServing(testing.allocator, std.testing.io, "/nonexistent", s, .{ .model_dir = "", .baseline_bytes = null, .slot_memory = .host }, .{}, &diag));
+}
+
+test "dsv41 serve: the serve options follow the model's acceptance setting and the depth cap" {
+    const d = try optionsFrom(null, 0);
+    try testing.expectEqual(@as(f32, 0.5), d.acceptance.typical);
+    try testing.expectEqual(@as(u32, 5), d.depth);
+    try testing.expect((try optionsFrom(.exact, 3)).acceptance == .greedy);
+    try testing.expectEqual(@as(u32, 3), (try optionsFrom(.exact, 3)).depth);
+    try testing.expectEqual(@as(f32, 0.2), (try optionsFrom(.{ .typical = .{ .delta = 0.2 } }, 0)).acceptance.typical);
+    try testing.expectError(error.Dsv41AcceptanceNotServed, optionsFrom(.{ .tokenv3 = 0.5 }, 0));
+    try testing.expectError(error.DsparkDepthOutOfRange, optionsFrom(null, max_depth + 1));
 }

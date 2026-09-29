@@ -38,6 +38,8 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
+const dsv41_serve = @import("deepseek_v41_serve.zig");
+const dsv41_arm = @import("deepseek_v41_arm.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
@@ -623,7 +625,7 @@ pub const Slot = struct {
         // allocations — the engine owns its own KV cache, vision is not
         // supported, and the forward path bypasses `ForwardCtx`. Build
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
-        const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
+        const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null or params.model.dsv41_engine != null;
 
         // Per-slot KVCache, honoring the process-level kv-quant setting. For
         // embedded slots the engine owns its own cache — we initialize a
@@ -1795,7 +1797,10 @@ pub const Scheduler = struct {
         // This serializes concurrent embedded-engine requests without spinning
         // the inference thread, and lets the next request reuse the previous
         // one's prompt KV.
-        if (params.model.llama_engine != null or params.model.ds4_engine != null) {
+        // The deepseek_v41 arm serves one request at a time for now: a second
+        // concurrent one is refused, not queued.
+        if (params.model.dsv41_engine != null and params.model.session_busy) return error.Dsv41ConcurrencyRefused;
+        if (params.model.llama_engine != null or params.model.ds4_engine != null or params.model.dsv41_engine != null) {
             while (params.model.session_busy and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
             }
@@ -2361,7 +2366,7 @@ pub const Scheduler = struct {
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
-        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return .embedded_engine;
+        if (slot.model.ds4_engine != null or slot.model.llama_engine != null or slot.model.dsv41_engine != null) return .embedded_engine;
         const cfg = slot.model.config orelse return .arch;
         if (modelBatchable(cfg)) return .ok;
         // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
@@ -3692,6 +3697,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    (preloadCpuState builds it), since both dispatch off model_type.
     if (gen_mod.modalityFromType(params.config.model_type)) |modality| {
         try doLoadGenOnInferenceThread(sch, params, modality);
+        return;
+    }
+    if (std.mem.eql(u8, params.config.model_type, "deepseek_v41")) {
+        try doLoadDsv41OnInferenceThread(sch, params);
         return;
     }
 
@@ -5705,6 +5714,108 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     slot.state = .decoding;
 }
 
+fn LoadFields(comptime P: type) type {
+    return if (@typeInfo(P) == .pointer) @typeInfo(P).pointer.child else P;
+}
+
+/// The deepseek_v41 arm's engine on this (the inference) thread: refused by
+/// name until its decode seam binds the DSpark loop (`deepseek_v41_serve`).
+fn doLoadDsv41OnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    const opts = try dsv41_serve.optionsFrom(params.config.mtp_acceptance_override, if (@hasField(LoadFields(@TypeOf(params)), "mtp_depth")) params.mtp_depth else 0);
+    const baseline: ?u64 = if (std.c.getenv("MTPLX_DSV41_BOX_BASELINE_GB")) |v|
+        @intFromFloat(@round((std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.Dsv41BaselineSyntax) * 1e9))
+    else
+        null;
+    var diag: dsv41_arm.Diag = .{};
+    const engine = dsv41_serve.openServing(sch.allocator, sch.io, params.model_dir, mlx.gpuStream(), .{ .model_dir = params.model_dir, .baseline_bytes = baseline, .slot_memory = .host }, opts, &diag) catch |e| {
+        log.err("[dsv41] engine refused: {s} {s}\n", .{ @errorName(e), diag.message() });
+        return e;
+    };
+    errdefer engine.deinit();
+    const entry = params.entry;
+    entry.dsv41_engine = engine;
+    entry.releaseRetainedCpuState();
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.dflash = null;
+    entry.prefix_cache = null;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, entry.bytes_on_disk orelse 0);
+    sch.registry.mutex.unlock(sch.io);
+}
+
+const Dsv41SlotSink = struct {
+    slot: *Slot,
+
+    fn push(ctx: *anyopaque, t: u32) void {
+        const self: *Dsv41SlotSink = @ptrCast(@alignCast(ctx));
+        self.slot.pushToken(t);
+        if (t != 0) self.slot.was_pad_only = false;
+        self.slot.completion_tokens += 1;
+    }
+
+    fn sink(self: *Dsv41SlotSink) dsv41_serve.Sink {
+        return .{ .ctx = self, .push = push };
+    }
+};
+
+/// The prefill is the engine's first step: it yields the primary token.
+fn runPrefillDsv41(sch: *Scheduler, slot: *Slot, engine: dsv41_serve.Engine) !void {
+    engine.begin(.{ .prompt = slot.full_prompt, .max_tokens = slot.max_tokens, .stop_ids = slot.eos_token_ids, .depth = slot.mtp_depth }) catch |e| {
+        log.err("[dsv41] request refused: {s}\n", .{@errorName(e)});
+        slot.markError(@errorName(e));
+        return;
+    };
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.state = .decoding;
+    return runDsv41DecodeTick(sch, slot, engine);
+}
+
+/// One engine step (one DSpark cycle); a finished request logs its run.
+fn runDsv41DecodeTick(sch: *Scheduler, slot: *Slot, engine: dsv41_serve.Engine) !void {
+    var sink: Dsv41SlotSink = .{ .slot = slot };
+    const finish = engine.step(sink.sink()) catch |e| {
+        dsv41EndRequest(sch, engine);
+        slot.markError(@errorName(e));
+        return;
+    };
+    if (finish) |f| {
+        dsv41EndRequest(sch, engine);
+        finishSlot(sch, slot, @tagName(f));
+    }
+}
+
+/// The request's run as one log line, and as the bench cell's receipt when
+/// DSV41_RECEIPT_DIR names a directory.
+fn dsv41EndRequest(sch: *Scheduler, engine: dsv41_serve.Engine) void {
+    var run = engine.end() catch |e| {
+        log.warn("[dsv41] request stats unavailable: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer run.deinit(sch.allocator);
+    const n = run.generated.len;
+    log.info("[dsv41] request: {d} prompt, {d} generated in {d} cycles ({d:.2} tok/cycle), prefill {d:.3} s, decode {d:.2} tok/s\n", .{
+        run.prompt.len,                                                                                                                                           n, run.stats.cycles,
+        if (run.stats.cycles > 0) @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(run.stats.cycles)) else 0, run.prompt_eval_s,
+        if (run.decode_wall_s > 0) @as(f64, @floatFromInt(n -| 1)) / run.decode_wall_s else 0,
+    });
+    const dir = std.mem.span(std.c.getenv("DSV41_RECEIPT_DIR") orelse return);
+    var name_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&name_buf, "{s}/dsv41-serve-{d}-{d}.comparison.json", .{ dir, std.Io.Timestamp.now(sch.io, .real).nanoseconds, n }) catch return;
+    var out: std.Io.Writer.Allocating = .init(sch.allocator);
+    defer out.deinit();
+    engine.receipt(&run, path, &out.writer) catch |e| {
+        log.warn("[dsv41] receipt not written ({s}): {s}\n", .{ path, @errorName(e) });
+        return;
+    };
+    log.info("{s}", .{out.written()});
+}
+
 /// llama.cpp prefill: drive a persistent per-model session, reusing the KV from
 /// the previous request's shared prompt prefix (LM-Studio-style prompt caching).
 /// `submit` guarantees a single slot owns the session at a time, so the resident
@@ -6414,6 +6525,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     }
     if (slot.model.llama_engine) |engine| {
         return runPrefillLlama(sch, slot, engine);
+    }
+    if (slot.model.dsv41_engine) |engine| {
+        return runPrefillDsv41(sch, slot, engine);
     }
     // DiffusionGemma: generation is a canvas-denoising loop, not
     // autoregressive decode — no Generator. The encoder prefill fills the
@@ -7322,6 +7436,9 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (slot.llama_session) |session| {
         return runLlamaDecodeTick(sch, slot, session);
     }
+    if (slot.model.dsv41_engine) |engine| {
+        return runDsv41DecodeTick(sch, slot, engine);
+    }
     if (slot.diffusion) |runner| {
         return runDiffusionDecodeTick(sch, slot, runner);
     }
@@ -7746,7 +7863,7 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (gen.ctx.ssm_entries == null) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
-    if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
+    if (slot.model.ds4_engine != null or slot.model.llama_engine != null or slot.model.dsv41_engine != null) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
