@@ -311,6 +311,16 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         outs[8..11].* = try r.mixfin(g, in(ins, "mm"), in(ins, "ssq"), in(ins, "scale"), in(ins, "base"));
         return 11;
     }
+    if (eq(u8, f, "fused_proj")) {
+        var r = try ops.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
+        defer r.deinit(g);
+        const cos, const sin = .{ in(ins, "cos"), in(ins, "sin") };
+        outs[0] = try r.qNorm(g, in(ins, "x_q"));
+        outs[1] = try r.kvNormRope(g, in(ins, "x_kv"), cos, sin);
+        outs[2] = try r.ropeHeads(g, in(ins, "x_rope"), cos, sin, .fwd);
+        outs[3] = try r.ropeHeads(g, in(ins, "x_o"), cos, sin, .inv);
+        return 4;
+    }
     if (eq(u8, f, "gemv")) {
         var r = try ops.Gemv(MlxG).init(g, reg);
         defer r.deinit(g);

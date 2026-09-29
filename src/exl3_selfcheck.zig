@@ -63,6 +63,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         },
         .f64 => switch (k) {
             .q3_exl3_prep_gu_epi, .q3rc_router_tail, .q3rc_premix_fin, .q3dk_sinkhorn16_hc4_it20, .q3ht_combine, .q3ht_collapse_norm, .q3ht_combine_collapse_norm, .q3ht_mixfin, .q3_prefill_dig2_swiglu_2304_x => true,
+            .mtplx_dsv4_sinkhorn_hc4_it20, .mtplx_dsv41_fp_rmsnorm_tg128_d1280, .mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64, .mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd, .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv => true,
             else => isDigGemm(k),
         },
     };
@@ -264,6 +265,7 @@ fn defaultVars(e: *const Entry) Vars {
     v.set(.m_tokens, 3);
     v.set(.experts, 2);
     v.set(.a_rows, 16);
+    v.set(.seq, v.get(.rows));
     return v;
 }
 
@@ -889,7 +891,8 @@ fn checkF64(h: *H, k: Kernel) !void {
         },
         .q3rc_router_tail => try routerF64(h, &sc),
         .q3rc_premix_fin => try premixF64(h, &sc),
-        .q3dk_sinkhorn16_hc4_it20 => try sinkhornF64(h, &sc, k),
+        .q3dk_sinkhorn16_hc4_it20, .mtplx_dsv4_sinkhorn_hc4_it20 => try sinkhornF64(h, &sc, k),
+        .mtplx_dsv41_fp_rmsnorm_tg128_d1280, .mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64, .mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd, .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv => try k36F64(h, &sc, k),
         .q3ht_combine, .q3ht_collapse_norm, .q3ht_combine_collapse_norm, .q3ht_mixfin => try hctapeF64(h, &sc, k),
         else => return error.NoF64ForKernel,
     }
@@ -1071,9 +1074,15 @@ const hc_chain_slack = 6.0 / 16777216.0;
 /// A stored combine word is the RNE bf16 store of some f32 chain result: within half a bf16 ulp
 /// (at the word) plus the chain's slack of the f64 value. NaN / inf never pass.
 fn hcWordWithinChain(word: u16, e: HcExact) bool {
+    return bf16Ratio(word, e.value, hc_chain_slack * e.mag) <= 1.0;
+}
+
+/// |word - value| over (half a bf16 ulp at the word + `slack`): <= 1 iff the word is the RNE
+/// bf16 store of a value within `slack` of `value`. NaN / inf give NaN / inf (never <= 1).
+fn bf16Ratio(word: u16, value: f64, slack: f64) f64 {
     const eb: u64 = (word >> 7) & 0xFF;
     const half_ulp: f64 = @bitCast((@max(eb, 1) + 888) << 52);
-    return @abs(bf16Value(word) - e.value) <= half_ulp + hc_chain_slack * e.mag;
+    return @abs(bf16Value(word) - value) / (half_ulp + slack);
 }
 
 /// HCTAPE vs q3_decode_hctape_candidate._f64_ref and its split statements; the combine words
@@ -1216,6 +1225,84 @@ fn hctapeF64(h: *H, sc: *Scope, k: Kernel) !void {
         },
         else => return error.NoF64ForKernel,
     }
+}
+
+/// |f32 statements - f64 value| bound for K36, relative to the terms' magnitude (a tree sum of
+/// 1280 squares and an rsqrt, or two products and a sum: ~1e-6).
+const k36_slack = 1.0 / 65536.0;
+
+/// K36 vs float64 (the kernels' statements): every bf16 word within half a bf16 ulp (at the
+/// word) + k36_slack x |its terms| of the f64 value.
+fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
+    const e = h.reg.get(k);
+    var vars = defaultVars(e);
+    const wave: Wave = .{};
+    const ins = try genAll(h, sc, e, &vars, null, &wave);
+    const outs = try launch(h, sc, k, ins[0..e.inputs.len], &vars, null);
+    const rows: usize = @intCast(vars.get(.rows));
+    const got = try hostCopy(h, outs[0]);
+    defer h.a.free(got);
+    var in_host: [5][]f64 = undefined;
+    var n_in: usize = 0;
+    defer for (in_host[0..n_in]) |x| h.a.free(x);
+    for (e.inputs) |*arg| {
+        if (arg.role == .scalar) break;
+        in_host[n_in] = try hostF64(h, ins[n_in]);
+        n_in += 1;
+    }
+    const rope_only = k == .mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd or k == .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv;
+    const x = in_host[0];
+    const width: usize = if (rope_only) 64 * 512 else e.inputs[0].shape[1].m;
+    const seg: usize = if (rope_only) 512 else width;
+    const rd = 64;
+    const val = try h.a.alloc(f64, width);
+    defer h.a.free(val);
+    const mag = try h.a.alloc(f64, width);
+    defer h.a.free(mag);
+    var beyond: u64 = 0;
+    var worst: f64 = 0;
+    for (0..rows) |r| {
+        const xr = x[r * width ..][0..width];
+        if (rope_only) {
+            @memcpy(val, xr);
+        } else {
+            const w = in_host[1];
+            const eps = in_host[2][0];
+            var ss: f64 = 0;
+            for (xr) |v| ss += v * v;
+            const inv = 1.0 / @sqrt(ss / @as(f64, @floatFromInt(width)) + eps);
+            for (val, xr, w) |*o, v, wv| o.* = wv * (v * inv);
+        }
+        for (mag, val) |*m, v| m.* = @abs(v);
+        const has_rope = k != .mtplx_dsv41_fp_rmsnorm_tg128_d1280;
+        if (has_rope) {
+            const cos = in_host[if (rope_only) 1 else 3][r * (rd / 2) ..][0 .. rd / 2];
+            const sin = in_host[if (rope_only) 2 else 4][r * (rd / 2) ..][0 .. rd / 2];
+            const sign: f64 = if (k == .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv) -1 else 1;
+            var h0: usize = 0;
+            while (h0 < width) : (h0 += seg) {
+                const t0 = h0 + seg - rd;
+                for (0..rd / 2) |p| {
+                    const v0 = val[t0 + 2 * p];
+                    const v1 = val[t0 + 2 * p + 1];
+                    const c = cos[p];
+                    const sn = sign * sin[p];
+                    val[t0 + 2 * p] = v0 * c - v1 * sn;
+                    val[t0 + 2 * p + 1] = v0 * sn + v1 * c;
+                    const m = @abs(v0 * c) + @abs(v1 * sn) + @abs(v0 * sn) + @abs(v1 * c);
+                    mag[t0 + 2 * p] = m;
+                    mag[t0 + 2 * p + 1] = m;
+                }
+            }
+        }
+        for (val, mag, 0..) |v, m, i| {
+            const word = std.mem.readInt(u16, got[(r * width + i) * 2 ..][0..2], .little);
+            const ratio = bf16Ratio(word, v, k36_slack * m);
+            worst = @max(worst, ratio);
+            beyond += @intFromBool(!(ratio <= 1.0));
+        }
+    }
+    try h.record(.{ .kernel = k, .check = .f64, .words = rows * width, .bad = beyond, .metric = worst, .limit = 1.0, .ok = beyond == 0 });
 }
 
 // ── DIG-X GEMMs: wave composition and float64 parity ──

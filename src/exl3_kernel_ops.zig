@@ -269,20 +269,21 @@ pub fn Premix(comptime G: type) type {
     };
 }
 
-/// sinkhorn (SINKHORN_METAL at decode): `_sinkhorn_kernel_apply` for n <= 32 matrices is the
-/// 16-lane kernel (`Sinkhorn16.run`, bitwise the stock K3 result); more matrices (prefill chunks)
-/// are the stock K3 text, not in this registry: RowsOutOfPlan.
+/// SINKHORN_METAL: `_sinkhorn_kernel_apply` as the RCTAIL sinkhorn member rebinds it: up to 32
+/// matrices on the 16-lane kernel (`Sinkhorn16.run`, bitwise the stock result), more (prefill
+/// chunks) on the stock K3 text (`deepseek_v4._sinkhorn_kernel_apply`).
 pub fn Sinkhorn(comptime G: type) type {
     return struct {
         const Self = @This();
         pub const max_mats = 32;
         e: *const Entry,
+        k3: *const Entry,
         plans: [max_mats]LaunchConfig,
         nmat: [max_mats]G.T,
 
         pub fn init(g: *G, reg: *const xk.Registry) !Self {
             const e = reg.get(.q3dk_sinkhorn16_hc4_it20);
-            var s: Self = .{ .e = e, .plans = undefined, .nmat = undefined };
+            var s: Self = .{ .e = e, .k3 = reg.get(.mtplx_dsv4_sinkhorn_hc4_it20), .plans = undefined, .nmat = undefined };
             var built: usize = 0;
             errdefer for (s.nmat[0..built]) |a| g.release(a);
             for (0..max_mats) |i| {
@@ -304,10 +305,15 @@ pub fn Sinkhorn(comptime G: type) type {
             var numel: usize = 1;
             for (sh.slice()) |v| numel *= @intCast(v);
             const n = numel / 16;
-            if (n < 1 or n > max_mats) return error.RowsOutOfPlan;
             const c3 = try g.reshape(comb, &.{ @intCast(n), 4, 4 });
             var out: [1]G.T = undefined;
-            try g.launch(self.e.kernel, &.{ c3, self.nmat[n - 1] }, &self.plans[n - 1], &out);
+            if (n <= max_mats) {
+                try g.launch(self.e.kernel, &.{ c3, self.nmat[n - 1] }, &self.plans[n - 1], &out);
+            } else {
+                const count: i32 = @intCast(n);
+                const nm = try g.hostArray(std.mem.asBytes(&count), &.{}, .int32);
+                try launchRule(G, g, self.k3, &rowsVars(n), &.{ c3, nm }, &out);
+            }
             return g.reshape(out[0], sh.slice());
         }
     };
@@ -435,6 +441,107 @@ pub fn HcTape(comptime G: type) type {
             var out: [3]G.T = undefined;
             try launchRule(G, g, self.mixfin_e, &vars, &.{ mm, ssq, scale, base }, &out);
             return out;
+        }
+    };
+}
+
+// ── ATTN_FUSED_PROJ (K36) ──
+
+pub const RopeDir = enum { fwd, inv };
+
+/// The decode / verify projection-chain glue (`deepseek_v41_fused_proj_kernels`, rows <= 8 by
+/// `_fused_proj_use`): the q-latent RMSNorm, the KV RMSNorm + k_pe RoPE, the query RoPE (bf16
+/// in) and the attention output's inverse RoPE (f32 in); all store bf16.
+pub fn FusedProj(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        rms: *const Entry,
+        rms_rope: *const Entry,
+        fwd: *const Entry,
+        inv: *const Entry,
+        q_norm: G.T,
+        kv_norm: G.T,
+        rms_statics: Statics(G),
+        rope_statics: Statics(G),
+        ints: [max_rows]G.T,
+
+        /// `q_norm` / `kv_norm`: the layer's q_norm (bf16 [1280]) and kv_norm (bf16 [512]) weights.
+        pub fn init(g: *G, reg: *const xk.Registry, q_norm: G.T, kv_norm: G.T, diag: ?*xk.Diag) !Self {
+            const rms = reg.get(.mtplx_dsv41_fp_rmsnorm_tg128_d1280);
+            const rms_rope = reg.get(.mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64);
+            try expectInput(G, g, rms, "weight", q_norm, &no_vars, diag);
+            try expectInput(G, g, rms_rope, "weight", kv_norm, &no_vars, diag);
+            var s: Self = .{ .rms = rms, .rms_rope = rms_rope, .fwd = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd), .inv = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_inv), .q_norm = undefined, .kv_norm = undefined, .rms_statics = try Statics(G).init(g, rms), .rope_statics = undefined, .ints = undefined };
+            errdefer s.rms_statics.deinit(g);
+            s.rope_statics = try Statics(G).init(g, rms_rope);
+            errdefer s.rope_statics.deinit(g);
+            var built: usize = 0;
+            errdefer for (s.ints[0..built]) |a| g.release(a);
+            for (0..max_rows) |i| {
+                const v: i32 = @intCast(i + 1);
+                s.ints[i] = g.keep(try g.hostArray(std.mem.asBytes(&v), &.{}, .int32));
+                built += 1;
+            }
+            s.q_norm = g.keep(q_norm);
+            s.kv_norm = g.keep(kv_norm);
+            return s;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.rms_statics.deinit(g);
+            self.rope_statics.deinit(g);
+            for (self.ints) |a| g.release(a);
+            g.release(self.q_norm);
+            g.release(self.kv_norm);
+        }
+
+        fn rowsIn(g: *G, x: G.T, width: usize) !struct { Shape, u64 } {
+            const sh = dims(G, g, x);
+            var numel: usize = 1;
+            for (sh.slice()) |v| numel *= @intCast(v);
+            const rows = numel / width;
+            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            return .{ sh, rows };
+        }
+
+        /// seq rows of cos / sin (`S`; 0 rows = the call's rows).
+        fn seqOf(g: *G, cos: G.T, rows: u64) !u64 {
+            const s: u64 = rowsOf(G, g, cos, 0);
+            const seq = if (s == 0) rows else s;
+            if (seq > max_rows) return error.RowsOutOfPlan;
+            return seq;
+        }
+
+        /// `rmsnorm(wq_a(x), q_norm_weight, eps)`: x [..., 1280] bf16 -> x's shape, bf16.
+        pub fn qNorm(self: *const Self, g: *G, x: G.T) !G.T {
+            const sh, const rows = try rowsIn(g, x, 1280);
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.rms, &rowsVars(rows), &.{ try g.reshape(x, &.{ @intCast(rows), 1280 }), self.q_norm, self.rms_statics.arrays[2] }, &out);
+            return g.reshape(out[0], sh.slice());
+        }
+
+        /// `rmsnorm_rope(wkv(x), kv_norm_weight, eps, cos, sin)`: x [..., 512] bf16, cos / sin f32 [S, 32].
+        pub fn kvNormRope(self: *const Self, g: *G, x: G.T, cos: G.T, sin: G.T) !G.T {
+            const sh, const rows = try rowsIn(g, x, 512);
+            const seq = try seqOf(g, cos, rows);
+            var vars = rowsVars(rows);
+            vars.set(.seq, seq);
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.rms_rope, &vars, &.{ try g.reshape(x, &.{ @intCast(rows), 512 }), self.kv_norm, self.rope_statics.arrays[2], cos, sin, self.ints[seq - 1] }, &out);
+            return g.reshape(out[0], sh.slice());
+        }
+
+        /// `rope_heads(x [..., 64, 512], cos, sin, inverse)` -> x's shape, bf16.
+        pub fn ropeHeads(self: *const Self, g: *G, x: G.T, cos: G.T, sin: G.T, dir: RopeDir) !G.T {
+            const sh, const rows = try rowsIn(g, x, 64 * 512);
+            const seq = try seqOf(g, cos, rows);
+            var vars = rowsVars(rows);
+            vars.set(.seq, seq);
+            var out: [1]G.T = undefined;
+            const e = if (dir == .fwd) self.fwd else self.inv;
+            try launchRule(G, g, e, &vars, &.{ try g.reshape(x, &.{ @intCast(rows), 64, 512 }), cos, sin, self.ints[rows - 1], self.ints[seq - 1] }, &out);
+            return g.reshape(out[0], sh.slice());
         }
     };
 }
@@ -895,6 +1002,37 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
             try testing.expectEqual(n, std.mem.bytesToValue(i32, t.nodes.items[l.inputs[1]].bytes));
             try testing.expectEqualSlices(c_int, &.{ n, 16 }, t.shapeOf(y).slice());
         }
+        for (r.k3.samples) |*s| {
+            const n: c_int = @intCast(s.vars.get(.rows));
+            if (n <= Sinkhorn(Trace).max_mats) continue;
+            _ = try r.call(&t, try t.node(&.{ n, 4, 4 }, .float32, &.{}));
+            const l = t.back(1);
+            try expectLaunch(l, r.k3, s, &.{ l.inputs[0], l.inputs[1] });
+            try testing.expectEqual(n, std.mem.bytesToValue(i32, t.nodes.items[l.inputs[1]].bytes));
+        }
+    }
+    {
+        const q_norm, const kv_norm = .{ try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}) };
+        var r = try FusedProj(Trace).init(&t, &reg, q_norm, kv_norm, null);
+        defer r.deinit(&t);
+        for (r.rms.samples) |*s| {
+            const m: c_int = @intCast(s.vars.get(.rows));
+            const x = try t.node(&.{ 1, m, 1280 }, .bfloat16, &.{});
+            const y = try r.qNorm(&t, x);
+            const l = t.back(1);
+            try expectLaunch(l, r.rms, s, &.{ l.inputs[0], q_norm, r.rms_statics.arrays[2] });
+            try testing.expectEqualSlices(c_int, &.{ 1, m, 1280 }, t.shapeOf(y).slice());
+            const cos, const sin = .{ try t.node(&.{ m, 32 }, .float32, &.{}), try t.node(&.{ m, 32 }, .float32, &.{}) };
+            _ = try r.kvNormRope(&t, try t.node(&.{ 1, m, 512 }, .bfloat16, &.{}), cos, sin);
+            const k = t.back(1);
+            try expectLaunch(k, r.rms_rope, sampleAt(r.rms_rope, null, @intCast(m)), &.{ k.inputs[0], kv_norm, r.rope_statics.arrays[2], cos, sin, r.ints[@intCast(m - 1)] });
+            for ([_]RopeDir{ .fwd, .inv }) |dir| {
+                const e = if (dir == .fwd) r.fwd else r.inv;
+                _ = try r.ropeHeads(&t, try t.node(&.{ 1, m, 64, 512 }, if (dir == .fwd) .bfloat16 else .float32, &.{}), cos, sin, dir);
+                const h = t.back(1);
+                try expectLaunch(h, e, sampleAt(e, null, @intCast(m)), &.{ h.inputs[0], cos, sin, r.ints[@intCast(m - 1)], r.ints[@intCast(m - 1)] });
+            }
+        }
     }
     {
         const e = reg.get(.q3rc_mxfp8_fma);
@@ -1057,6 +1195,9 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
     try testing.expectError(error.RouteInput, RcProj(Trace).init(&t, &reg, .wq_a, w, sc, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_mxfp8_fma input scales") != null);
     try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&reg, .float32, &diag));
+    const qn32 = try t.node(&.{1280}, .float32, &.{});
+    try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn32, try t.node(&.{512}, .bfloat16, &.{}), &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280 input weight") != null);
     const bank: ProjArrays(Trace.T) = .{
         .code = try t.node(&.{ 4, 144, 320, 48 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 5120 }, .float32, &.{}),
@@ -1080,10 +1221,16 @@ test "dsv41 kernels ops: plan routes refuse rows outside their tables" {
     var r = try RcProj(Trace).init(&t, &reg, .wkv, w, sc, null);
     defer r.deinit(&t);
     try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .bfloat16, &.{})));
+    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), null);
+    defer fp.deinit(&t);
+    try testing.expectError(error.RowsOutOfPlan, fp.qNorm(&t, try t.node(&.{ 9, 1280 }, .bfloat16, &.{})));
+    try testing.expectEqual(@as(usize, 0), t.launches.items.len);
+    // 33 matrices leave the 16-lane plans for the stock K3 text at threadgroup min(n, 256)
     var s = try Sinkhorn(Trace).init(&t, &reg);
     defer s.deinit(&t);
-    try testing.expectError(error.RowsOutOfPlan, s.call(&t, try t.node(&.{ 33, 4, 4 }, .float32, &.{})));
-    try testing.expectEqual(@as(usize, 0), t.launches.items.len);
+    _ = try s.call(&t, try t.node(&.{ 33, 4, 4 }, .float32, &.{}));
+    try testing.expectEqual(Kernel.mtplx_dsv4_sinkhorn_hc4_it20, t.back(1).k);
+    try testing.expectEqual([3]u32{ 33, 1, 1 }, t.back(1).cfg.threadgroup);
 }
 
 test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
@@ -1124,6 +1271,12 @@ test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
     for (&cbv, 0..) |*v, i| v.* = std.mem.readInt(u32, cb[i * 4 ..][0..4], .little);
     try testing.expectEqualSlices(u32, &.{ 0xCBAC1FED, 0, 0x8FFF8FFF, 0x3B603B60 }, &cbv);
     for (gv.dn_statics.arrays[4..9]) |z| try testing.expect(std.mem.allEqual(u8, t.nodes.items[z].bytes, 0));
+    // config.json rms_norm_eps 1e-20 (a 0-d f32 input); every K36 kernel stores bf16
+    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), null);
+    defer fp.deinit(&t);
+    const eps = std.mem.bytesToValue(f32, t.nodes.items[fp.rms_statics.arrays[2]].bytes);
+    try testing.expectEqual(@as(f32, 1e-20), eps);
+    for ([_]*const Entry{ fp.rms, fp.rms_rope, fp.fwd, fp.inv }) |k36| try testing.expectEqual(Dtype.bfloat16, k36.template[0].value.dtype);
 }
 
 fn templateInt(tmpl: []const xk.TemplateArg, name: []const u8) i32 {

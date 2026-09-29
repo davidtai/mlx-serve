@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "e57a6425c28fc77c4ad37e39996ba215db353a6bc3a125bf372b212473835426";
+pub const manifest_sha256 = "156576ba2958e13e7216230163bf58548ab2c7fba6292e3cf12ecb1e9e5965d0";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -51,6 +51,11 @@ pub const Kernel = enum {
     q3_exl3_dig_decmat_2304x5120_mul1hk3,
     q3_exl3_dig_decmat_5120x2304_mul1k3,
     q3_exl3_dig_decmat_2304x5120_mul1k3,
+    mtplx_dsv4_sinkhorn_hc4_it20,
+    mtplx_dsv41_fp_rmsnorm_tg128_d1280,
+    mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64,
+    mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd,
+    mtplx_dsv41_fp_rope_h64_hd512_rd64_inv,
 };
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
@@ -116,16 +121,18 @@ fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) R
 // ── Signature and geometry ──
 
 /// Runtime sizes a launch depends on (the site shape supplies gn / k4 / k32 / gk).
-pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk };
+pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq };
 pub const Vars = std.enums.EnumArray(Var, u64);
 
-/// One extent: m x value(v), or the constant m.
+/// One extent: m x value(v), or the constant m; at most `max` when set.
 pub const Dim = struct {
     m: u32,
     v: ?Var = null,
+    max: ?u32 = null,
 
     pub fn eval(d: Dim, vars: *const Vars) u64 {
-        return @as(u64, d.m) * (if (d.v) |v| vars.get(v) else 1);
+        const x = @as(u64, d.m) * (if (d.v) |v| vars.get(v) else 1);
+        return if (d.max) |cap| @min(x, cap) else x;
     }
 };
 
@@ -168,7 +175,8 @@ pub const Plan = struct {
     output_shapes: []const []const u32,
 };
 
-pub const Rule = struct { grid: [3]Dim, threadgroup: [3]u32 };
+/// A launch rule; `threadgroup_rule`, when set, replaces the fixed threadgroup (the stock K3's min(n, 256)).
+pub const Rule = struct { grid: [3]Dim, threadgroup: [3]u32, threadgroup_rule: ?[3]Dim = null };
 pub const Launch = union(enum) { rule: Rule, plans: []const Plan };
 
 /// A plan kernel's weight site (rcproj): N outputs per group, K inputs, G groups, strides.
@@ -232,6 +240,9 @@ pub fn launchFor(e: *const Entry, vars: *const Vars, site_name: ?[]const u8) err
         .rule => |r| {
             for (r.grid, 0..) |d, i| cfg.grid[i] = @intCast(d.eval(vars));
             cfg.threadgroup = r.threadgroup;
+            if (r.threadgroup_rule) |tr| for (tr, 0..) |d, i| {
+                cfg.threadgroup[i] = @intCast(d.eval(vars));
+            };
             for (e.outputs, 0..) |o, i| {
                 cfg.out_ranks[i] = o.shape.len;
                 for (o.shape, 0..) |d, j| cfg.out_shapes[i][j] = @intCast(d.eval(vars));
@@ -427,7 +438,7 @@ pub const Bound = struct {
 
 // ── Manifest adoption (once, at init) ──
 
-const JDim = struct { m: u32, v: ?[]const u8 = null };
+const JDim = struct { m: u32, v: ?[]const u8 = null, max: ?u32 = null };
 const JDomain = struct {
     kind: []const u8,
     scale: ?f64 = null,
@@ -473,6 +484,7 @@ const JKernel = struct {
     vars: []const JVarBound,
     grid: ?[3]JDim = null,
     threadgroup: ?[3]u32 = null,
+    threadgroup_rule: ?[3]JDim = null,
     plans: ?[]const JPlan = null,
     sites: []const JSite = &.{},
     launch_samples: []const JSample,
@@ -535,7 +547,7 @@ fn adoptDims(a: Allocator, js: []const JDim, k: Kernel, diag: ?*Diag) (Refusal |
     const out = try a.alloc(Dim, js.len);
     for (js, out) |j, *d| {
         if (j.m == 0) return refuse(diag, error.GeometryInvalid, "exl3 kernels: {t}: a zero extent", .{k});
-        d.* = .{ .m = j.m, .v = if (j.v) |v| try parseVar(v, k, diag) else null };
+        d.* = .{ .m = j.m, .v = if (j.v) |v| try parseVar(v, k, diag) else null, .max = j.max };
     }
     return out;
 }
@@ -622,6 +634,11 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, headers
         try checkThreadgroup(tg, k, diag);
         const dims = try adoptDims(a, &g, k, diag);
         e.launch = .{ .rule = .{ .grid = dims[0..3].*, .threadgroup = tg } };
+        if (j.threadgroup_rule) |tr| {
+            const tdims = try adoptDims(a, &tr, k, diag);
+            for (tdims) |d| if ((d.v != null and d.max == null) or (d.max orelse d.m) > 1024) return refuse(diag, error.GeometryInvalid, "exl3 kernels: {t}: threadgroup rule without a bound", .{k});
+            e.launch.rule.threadgroup_rule = tdims[0..3].*;
+        }
     } else {
         const ps = try a.alloc(Plan, j.plans.?.len);
         for (j.plans.?, ps) |jp, *p| {
@@ -812,9 +829,10 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 28), n_kernels);
+    try testing.expectEqual(@as(usize, 33), n_kernels);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
+    try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
     try testing.expect(reg.get(.q3rc_mxfp8_fma).checks.contains(.row_invariance));
     try testing.expect(reg.get(.q3_exl3_dig_decmat_5120x2304_mul1hk3).checks.contains(.golden_tiles));
     try testing.expectEqual(Header.rcproj, reg.get(.q3rc_mxfp8_fma).header.?);

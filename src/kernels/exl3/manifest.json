@@ -32,7 +32,7 @@
    "why": "attn and drafthead are not in the tier keys; headpad adds no text (a padded row)"
   },
   {
-   "texts": "families of the tier outside this registry (plan sec. 1f): minvariant attn + m1order rows, DISPATCH_FUSE, ATTN_FUSE, INDEX_TOPK, WT Sinkhorn / hc-premix / K28 softmax / fused proj, prefill GEMM16, DENSE16, ATTNCORE, ATTNHALF, GATHER, SMALLK",
+   "texts": "families of the tier outside this registry (plan sec. 1f): minvariant attn + m1order rows, DISPATCH_FUSE, ATTN_FUSE, INDEX_TOPK, WT hc-premix / K28 softmax / K29, prefill GEMM16, DENSE16, ATTNCORE, ATTNHALF, GATHER, SMALLK (registered since: the K3 Sinkhorn and the K36 fused projections)",
    "why": "not EXL3-bank kernels; they join the registry with their lanes (phases M1 / 2 / 3)"
   }
  ],
@@ -40,7 +40,7 @@
  "generator": {
   "note": "R = /Users/davidtai/projects/OpenSourceWTF/reports/dsv41-f39-tcq3-runtime",
   "script": "R/exl3/runtime/dump_kernel_texts.py",
-  "sha256": "bc7665603386971c57b3b9d60da8c508e2cffa17b3f32eba50ea62cd0707a3c3"
+  "sha256": "ee1e66a5757d2e855d970f7ad85cd797520da7ca71b60cdaf0f63551a5dd46a1"
  },
  "golden": {
   "mul1_table": {
@@ -14466,6 +14466,1414 @@
     "prefill-dx (install self-check only)"
    ],
    "vars": []
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "note": "probe-q3-decode-kernels-20260925-103818 ran it on the GPU as the identity reference of the 16-lane kernel (0 mismatches)"
+   },
+   "ensure_row_contiguous": true,
+   "family": "sinkhorn_k3",
+   "grid": [
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 2.0
+     },
+     "dtype": "float32",
+     "name": "comb",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "rows"
+     },
+     "dtype": "int32",
+     "name": "nmat",
+     "role": "scalar",
+     "shape": []
+    }
+   ],
+   "lane": {
+    "arm": "cell16k_ring_v2_draft_attn_pf0 (WT scripts/deepseek_v41/ab_decode_env_levers.py: sinkhorn=1, attn_fused_proj=1)",
+    "env": "MTPLX_DSV41_SINKHORN_METAL",
+    "module": "WT mtplx/models/deepseek_v4.py",
+    "route": "the RCTAIL sinkhorn member's _sinkhorn_kernel_apply above 32 matrices (prefill chunks); up to 32 is q3dk_sinkhorn16_hc4_it20",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "b382a91ff8e7b26034bf1df04420c72f58e4d884cd3686a514f0b433a7d8311b",
+     "symbol": "the text deepseek_v4._sinkhorn_metal_kernel(4, 20, 1e-6) builds; the generator is pinned by q3_decode_kernels_candidate.SEAM_SHA256['deepseek_v4._sinkhorn_metal_kernel'] f5635bf5411c3b40"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4,
+       4
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      1,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      33,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       33,
+       4,
+       4
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      33,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 33
+      }
+     ]
+    },
+    {
+     "grid": [
+      300,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       300,
+       4,
+       4
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 300
+      }
+     ]
+    },
+    {
+     "grid": [
+      4096,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       4096,
+       4,
+       4
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 4096
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "mtplx_dsv4_sinkhorn_hc4_it20",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 4
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "f64"
+    ],
+    "f64": {
+     "max_abs_err": 1e-05,
+     "ref": "row softmax + eps, column normalise, then 19 x (row, column) normalise, eps 1e-6 (f64)"
+    },
+    "lane_install_check": "deepseek_v4._install_sinkhorn_normaliser builds it at install (fp32 hc 4, iters 20, eps 1e-6 only); the 16-lane member proved bitwise identity against it on the GPU (probe-q3-decode-kernels-20260925)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 2097,
+    "file": "mtplx_dsv4_sinkhorn_hc4_it20.metal",
+    "sha256": "b382a91ff8e7b26034bf1df04420c72f58e4d884cd3686a514f0b433a7d8311b"
+   },
+   "template": [],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "threadgroup_rule": [
+    {
+     "m": 1,
+     "max": 256,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "fused_proj_k36",
+   "grid": [
+    {
+     "m": 128,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1280
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.5,
+      "kind": "uniform",
+      "lo": 0.5
+     },
+     "dtype": "bfloat16",
+     "name": "weight",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1280
+      }
+     ]
+    },
+    {
+     "domain": {
+      "floats": [
+       1e-20
+      ],
+      "kind": "values"
+     },
+     "dtype": "float32",
+     "name": "eps",
+     "role": "static",
+     "shape": []
+    }
+   ],
+   "lane": {
+    "arm": "cell16k_ring_v2_draft_attn_pf0 (WT scripts/deepseek_v41/ab_decode_env_levers.py: sinkhorn=1, attn_fused_proj=1)",
+    "env": "MTPLX_DSV41_ATTN_FUSED_PROJ",
+    "module": "WT mtplx/models/deepseek_v41_fused_proj_kernels.py",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "272897da997792f84664e15681f4df4d5a80acd9a70b631d444179a00de5e027",
+     "symbol": "the text WT deepseek_v41_fused_proj_kernels builds (module sha256 6e769b53dfd4d45d)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      128,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       1280
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      },
+      {
+       "name": "seq",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      768,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       6,
+       1280
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 6
+      },
+      {
+       "name": "seq",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       1280
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 8
+      },
+      {
+       "name": "seq",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1280
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "f64"
+    ],
+    "f64": {
+     "max_err_over_row_rms": 0.00390625,
+     "ref": "x w / sqrt(mean(x^2) + eps) (f64), bf16"
+    },
+    "lane_install_check": "none at install: the W101 unit tests vs the module *_reference MLX ops (ROUNDING-CLASS); the model counts its engagement (note_qkv / note_out)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1064,
+    "file": "mtplx_dsv41_fp_rmsnorm_tg128_d1280.metal",
+    "sha256": "272897da997792f84664e15681f4df4d5a80acd9a70b631d444179a00de5e027"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "T"
+    }
+   ],
+   "threadgroup": [
+    128,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "seq"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "fused_proj_k36",
+   "grid": [
+    {
+     "m": 128,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.5,
+      "kind": "uniform",
+      "lo": 0.5
+     },
+     "dtype": "bfloat16",
+     "name": "weight",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "floats": [
+       1e-20
+      ],
+      "kind": "values"
+     },
+     "dtype": "float32",
+     "name": "eps",
+     "role": "static",
+     "shape": []
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "cos",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "sin",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "seq"
+     },
+     "dtype": "int32",
+     "name": "S",
+     "role": "scalar",
+     "shape": []
+    }
+   ],
+   "lane": {
+    "arm": "cell16k_ring_v2_draft_attn_pf0 (WT scripts/deepseek_v41/ab_decode_env_levers.py: sinkhorn=1, attn_fused_proj=1)",
+    "env": "MTPLX_DSV41_ATTN_FUSED_PROJ",
+    "module": "WT mtplx/models/deepseek_v41_fused_proj_kernels.py",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "4d46f3a89971919f372e553428b51f6c7a0574bdb80ee067f9dd3486e80a5ef6",
+     "symbol": "the text WT deepseek_v41_fused_proj_kernels builds (module sha256 6e769b53dfd4d45d)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      128,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      },
+      {
+       "name": "seq",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      768,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       6,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 6
+      },
+      {
+       "name": "seq",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 8
+      },
+      {
+       "name": "seq",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 512
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "f64"
+    ],
+    "f64": {
+     "max_err_over_row_rms": 0.00390625,
+     "ref": "the RMSNorm, then interleaved pairs (a, b) of the last 64 dims -> (a c - b s, a s + b c) (inverse: s -> -s) at row r % S"
+    },
+    "lane_install_check": "none at install: the W101 unit tests vs the module *_reference MLX ops (ROUNDING-CLASS); the model counts its engagement (note_qkv / note_out)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1918,
+    "file": "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64.metal",
+    "sha256": "4d46f3a89971919f372e553428b51f6c7a0574bdb80ee067f9dd3486e80a5ef6"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "T"
+    }
+   ],
+   "threadgroup": [
+    128,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "seq"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "fused_proj_k36",
+   "grid": [
+    {
+     "m": 32768,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "cos",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "sin",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "rows"
+     },
+     "dtype": "int32",
+     "name": "rows",
+     "role": "scalar",
+     "shape": []
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "seq"
+     },
+     "dtype": "int32",
+     "name": "S",
+     "role": "scalar",
+     "shape": []
+    }
+   ],
+   "lane": {
+    "arm": "cell16k_ring_v2_draft_attn_pf0 (WT scripts/deepseek_v41/ab_decode_env_levers.py: sinkhorn=1, attn_fused_proj=1)",
+    "env": "MTPLX_DSV41_ATTN_FUSED_PROJ",
+    "module": "WT mtplx/models/deepseek_v41_fused_proj_kernels.py",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "ce381e2b0e9a1c5bc3f032cb801c756cdb4f111b9eeaaf2e1085d6819ee30dae",
+     "symbol": "the text WT deepseek_v41_fused_proj_kernels builds (module sha256 6e769b53dfd4d45d)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32768,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      },
+      {
+       "name": "seq",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      196608,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       6,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 6
+      },
+      {
+       "name": "seq",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      262144,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 8
+      },
+      {
+       "name": "seq",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "f64"
+    ],
+    "f64": {
+     "max_err_over_row_rms": 0.00390625,
+     "ref": "interleaved pairs (a, b) of the last 64 dims -> (a c - b s, a s + b c) (inverse: s -> -s) at row r % S; the head part copies"
+    },
+    "lane_install_check": "none at install: the W101 unit tests vs the module *_reference MLX ops (ROUNDING-CLASS); the model counts its engagement (note_qkv / note_out)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1065,
+    "file": "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd.metal",
+    "sha256": "ce381e2b0e9a1c5bc3f032cb801c756cdb4f111b9eeaaf2e1085d6819ee30dae"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "T"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "seq"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "fused_proj_k36",
+   "grid": [
+    {
+     "m": 32768,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "cos",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": -1.0
+     },
+     "dtype": "float32",
+     "name": "sin",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "seq"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "rows"
+     },
+     "dtype": "int32",
+     "name": "rows",
+     "role": "scalar",
+     "shape": []
+    },
+    {
+     "domain": {
+      "kind": "var",
+      "of": "seq"
+     },
+     "dtype": "int32",
+     "name": "S",
+     "role": "scalar",
+     "shape": []
+    }
+   ],
+   "lane": {
+    "arm": "cell16k_ring_v2_draft_attn_pf0 (WT scripts/deepseek_v41/ab_decode_env_levers.py: sinkhorn=1, attn_fused_proj=1)",
+    "env": "MTPLX_DSV41_ATTN_FUSED_PROJ",
+    "module": "WT mtplx/models/deepseek_v41_fused_proj_kernels.py",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "bbe7410bbed7cb040a31627b5634d3cb827cc7e2d3c8a0fa5cdd10701307a1a4",
+     "symbol": "the text WT deepseek_v41_fused_proj_kernels builds (module sha256 6e769b53dfd4d45d)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32768,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      },
+      {
+       "name": "seq",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      196608,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       6,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 6
+      },
+      {
+       "name": "seq",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      262144,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 8
+      },
+      {
+       "name": "seq",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "f64"
+    ],
+    "f64": {
+     "max_err_over_row_rms": 0.00390625,
+     "ref": "interleaved pairs (a, b) of the last 64 dims -> (a c - b s, a s + b c) (inverse: s -> -s) at row r % S (inverse); the head part copies"
+    },
+    "lane_install_check": "none at install: the W101 unit tests vs the module *_reference MLX ops (ROUNDING-CLASS); the model counts its engagement (note_qkv / note_out)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1065,
+    "file": "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv.metal",
+    "sha256": "bbe7410bbed7cb040a31627b5634d3cb827cc7e2d3c8a0fa5cdd10701307a1a4"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "T"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "seq"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -14503,6 +15911,8 @@
   "R/q3_prefill_fused_candidate.py": "29b5c9a28fc154fa300b536ffec398cce0452e93e94c36f9f959599491510df7",
   "R/q3_prefill_gemm16_candidate.py": "2ef7319e27953f46263f18f3794e584c83daddf6e644d0aaacea3d1988b72c74",
   "R/q3_prefill_hfold_candidate.py": "b1ed272cfb634626cc5432478ee0aac618de478c2a78c11d236ed2ad80bd4790",
+  "WT/mtplx/models/deepseek_v4.py": "ab63e1a619bdcb3f5c637c836713798a73e614822261b32db4893a68c4431cbc",
+  "WT/mtplx/models/deepseek_v41_fused_proj_kernels.py": "6e769b53dfd4d45ddad4c43bd6cc84c77b0daeecebe794a02bcd88d85de6790a",
   "WT/scripts/deepseek_v41/tcq_runner/packed/native_tcq_kernel.py": "feddaf30eb849ea616fe5034fb991fafa54cd0ee12e3e8f031155b48014a43a1",
   "WT/scripts/deepseek_v41/trellis/tcq_kernels.py": "cfc524cc69e21cd9880cc8f7e1524913be9d0c8860a8d64d110c1550cca38652"
  }
