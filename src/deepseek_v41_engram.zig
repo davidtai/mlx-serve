@@ -8,6 +8,7 @@
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const row_cache = @import("row_cache.zig");
+const io_util = @import("io_util.zig");
 
 pub const max_ngram = 8;
 pub const max_heads = 16;
@@ -339,12 +340,9 @@ pub const RowSource = struct {
         self.map = try TokenMap.load(a, io, map_path, bank_dir, c, &self.hashing, &self.bank, diag);
         for (0..self.hashing.n_layers) |i| {
             const path = try std.fmt.allocPrintSentinel(a, "{s}/engram/{s}", .{ bank_dir, self.bank.files[i] }, 0);
-            const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-            if (fd < 0) return refuse(diag, error.EngramBankFile, "{s}: cannot open", .{path});
-            self.fds[i] = fd;
             // Records are read one by one at random rows: past the page cache, read-ahead off.
-            if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0 or std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0)
-                return refuse(diag, error.EngramBankFile, "{s}: F_NOCACHE / F_RDAHEAD refused", .{path});
+            const fd = io_util.openNoCache(path.ptr, .{}) catch |e| return refuse(diag, error.EngramBankFile, "{s}: {s}", .{ path, @errorName(e) });
+            self.fds[i] = fd;
             var st: std.c.Stat = undefined;
             if (std.c.fstat(fd, &st) != 0) return refuse(diag, error.EngramBankFile, "{s}: fstat failed", .{path});
             const want = self.bank.rows[i] * self.bank.record_bytes;

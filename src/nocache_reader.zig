@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const io_util = @import("io_util.zig");
 
 /// The reader's state (MLX owns it once handed over; `free` releases it).
 /// Allocated with the C allocator: MLX may free it from an IO thread.
@@ -19,17 +20,15 @@ pub const Desc = struct {
 
     /// `path` read-only (symlinked blobs allowed), F_NOCACHE, read-ahead off.
     pub fn open(path: [:0]const u8) !*Desc {
-        const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.NoCacheOpen;
+        const fd = io_util.openNoCache(path.ptr, .{}) catch |e| return if (e == error.NoCacheFcntl or e == error.NoCacheUnsupported) e else error.NoCacheOpen;
         errdefer _ = std.c.close(fd);
-        if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0 or std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0)
-            return error.NoCacheFcntl;
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return error.NoCacheStat;
+        // The size by lseek, as qwen4_exp's table does (std.c.Stat is void on Linux).
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size < 0) return error.NoCacheStat;
         const a = std.heap.c_allocator;
         const d = try a.create(Desc);
         errdefer a.destroy(d);
-        d.* = .{ .fd = fd, .size = @intCast(st.size), .label = try a.dupeSentinel(u8, path, 0) };
+        d.* = .{ .fd = fd, .size = @intCast(size), .label = try a.dupeSentinel(u8, path, 0) };
         return d;
     }
 
