@@ -154,6 +154,15 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         source: xp.StreamSource,
         hook: Hook,
         grown: bool = false,
+        /// Run over the banks the phase change binds, before the arm counts as
+        /// grown (the binding's kernels layout check; set once, at construction).
+        /// A refusal leaves the arm ungrown: every later request is refused too.
+        grown_check: ?GrownCheck = null,
+
+        pub const GrownCheck = struct {
+            ctx: *const anyopaque,
+            check: *const fn (ctx: *const anyopaque, arm: *Self, g: *G) anyerror!void,
+        };
 
         pub fn init(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, diag: *Diag) !*Self {
             const self = try a.create(Self);
@@ -211,6 +220,7 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         /// The one phase change, at the admitted decode rows.
         pub fn grow(self: *Self, g: *G) !void {
             try self.hook.grow(g, self.decode_rows);
+            if (self.grown_check) |c| try c.check(c.ctx, self, g);
             self.grown = true;
         }
     };

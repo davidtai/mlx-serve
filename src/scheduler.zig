@@ -39,6 +39,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const dsv41_serve = @import("deepseek_v41_serve.zig");
+const dsv41_bind = @import("deepseek_v41_bind.zig");
 const dsv41_arm = @import("deepseek_v41_arm.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -5719,7 +5720,8 @@ fn LoadFields(comptime P: type) type {
 }
 
 /// The deepseek_v41 arm's engine on this (the inference) thread: refused by
-/// name until its decode seam binds the DSpark loop (`deepseek_v41_serve`).
+/// name until its decode seam binds the DSpark loop (`deepseek_v41_bind`).
+/// The box baseline is read once, here.
 fn doLoadDsv41OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const opts = try dsv41_serve.optionsFrom(params.config.mtp_acceptance_override, if (@hasField(LoadFields(@TypeOf(params)), "mtp_depth")) params.mtp_depth else 0);
     const baseline: ?u64 = if (std.c.getenv("MTPLX_DSV41_BOX_BASELINE_GB")) |v|
@@ -5727,7 +5729,7 @@ fn doLoadDsv41OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         null;
     var diag: dsv41_arm.Diag = .{};
-    const engine = dsv41_serve.openServing(sch.allocator, sch.io, params.model_dir, mlx.gpuStream(), .{ .model_dir = params.model_dir, .baseline_bytes = baseline, .slot_memory = .host }, opts, &diag) catch |e| {
+    const engine = dsv41_bind.openServing(sch.allocator, sch.io, params.model_dir, mlx.gpuStream(), .{ .model_dir = params.model_dir, .baseline_bytes = baseline, .slot_memory = .host }, opts, &diag) catch |e| {
         log.err("[dsv41] engine refused: {s} {s}\n", .{ @errorName(e), diag.message() });
         return e;
     };

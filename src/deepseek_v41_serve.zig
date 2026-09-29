@@ -9,9 +9,9 @@
 //! cell's receipt writer serves per-request stats too.
 //!
 //! The decode loop is the arm's seam: `begin(cfg) !void`, `prefill(arm, g,
-//! prompt) !u32`, `cycle(arm, g, a, out) !bool`, `stats()`. The server binds
-//! `ServingDecode` / `ServingMath` below once `arm.serving_decode` is the
-//! DSpark loop; until then `openServing` refuses by name.
+//! prompt) !u32`, `cycle(arm, g, a, out) !bool`, `stats()`. Which loop, math
+//! and residents the server constructs is `deepseek_v41_bind`'s (`serving`,
+//! `openServing`); until the DSpark loop binds, the server refuses by name.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -21,9 +21,6 @@ const arm_mod = @import("deepseek_v41_arm.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
-
-pub const ServingDecode = arm_mod.StandIn;
-pub const ServingMath = arm_mod.StandInMath;
 
 pub const Acceptance = union(enum) { greedy, typical: f32 };
 
@@ -233,12 +230,21 @@ pub fn Session(comptime A: type, comptime D: type) type {
         fn receiptFn(p: *anyopaque, run: *const cell.Run, path: []const u8, log: *std.Io.Writer) anyerror!void {
             const self = of(p);
             const a = self.a;
-            const spec: cell.Spec = .{ .prompt_tokens = @intCast(run.prompt.len), .cycles = run.stats.cycles, .rows = self.depth + 1, .seed = 0 };
+            const spec: cell.Spec = .{ .prompt_tokens = @intCast(run.prompt.len), .cycles = run.stats.cycles, .rows = self.verifyRows(), .seed = 0 };
             const prompt_sha = try cell.idsSha256(a, run.prompt);
             const ids_sha = try cell.idsSha256(a, run.generated);
-            const binding: arm_mod.DecodeBinding = if (D == ServingDecode(A)) arm_mod.serving_decode else .stand_in;
+            const binding: arm_mod.DecodeBinding = if (D == arm_mod.StandIn(A)) .stand_in else .dspark;
             const r = cell.receiptOf(run, spec, binding, self.arm.admissionRecord(), .{ .DSV41_EXL3_BANK = self.arm.model_dir }, &prompt_sha, &ids_sha);
             try cell.publish(a, self.io, &r, path, log);
+        }
+
+        /// The rows a cycle verifies at most: the stand-in's depth + 1; the
+        /// DSpark loop's own bound (its lookup extends a full 5-draft proposal
+        /// by 2, so 8 at depth 5), set by the request's prefill.
+        fn verifyRows(self: *const Self) u32 {
+            if (D == arm_mod.StandIn(A)) return self.depth + 1;
+            const r = self.decode.req orelse return self.depth + 1;
+            return if (r.live) r.loop.max_rows else self.depth + 1;
         }
 
         fn deinitFn(p: *anyopaque) void {
@@ -263,42 +269,6 @@ pub fn Session(comptime A: type, comptime D: type) type {
 
 fn seconds(d: std.Io.Duration) f64 {
     return @as(f64, @floatFromInt(d.nanoseconds)) / 1e9;
-}
-
-/// The served engine on MLX: the arm on `stream` (slot banks as MLX arrays)
-/// with the serving decode binding. Refused by name while that binding is the
-/// stand-in, before anything is opened.
-pub fn openServing(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, stream: mlx.mlx_stream, arm_opt: arm_mod.Options, opts: Options, diag: *arm_mod.Diag) !Engine {
-    if (arm_mod.serving_decode == .stand_in) return error.Dsv41DecodeNotBound;
-    return openMlx(ServingDecode, ServingMath(ops.MlxOps), {}, a, io, model_dir, stream, arm_opt, opts, diag);
-}
-
-/// The MLX engine over decode binding `Decode` and math `M` (the GPU gate
-/// opens it with the stand-in).
-pub fn openMlx(comptime Decode: fn (type) type, comptime M: type, math_arg: anytype, a: std.mem.Allocator, io: std.Io, model_dir: []const u8, stream: mlx.mlx_stream, arm_opt: arm_mod.Options, opts: Options, diag: *arm_mod.Diag) !Engine {
-    const A = arm_mod.Arm(ops.MlxOps, M);
-    const S = Session(A, Decode(A));
-    const Box = struct {
-        session: S,
-        g: ops.MlxOps,
-
-        fn release(s: *S) void {
-            const box: *@This() = @fieldParentPtr("session", s);
-            s.arm.deinit();
-            box.g.deinit();
-            s.a.destroy(box);
-        }
-    };
-    const box = try a.create(Box);
-    errdefer a.destroy(box);
-    box.g = try ops.MlxOps.init(a, stream);
-    errdefer box.g.deinit();
-    var o = arm_opt;
-    o.model_dir = model_dir;
-    o.slot_memory = .{ .mlx = stream };
-    const arm = try A.init(a, io, &box.g, math_arg, o, diag);
-    box.session = .{ .a = a, .io = io, .arm = arm, .g = &box.g, .decode = Decode(A).init(0, opts.depth + 1, 0), .opts = opts, .release = Box.release };
-    return box.session.engine();
 }
 
 // ── Tests ──
@@ -472,12 +442,6 @@ test "dsv41 serve: a served request's run writes the cell's receipt" {
     try testing.expectEqual(@as(u32, 3), back.value.selection.policy.prompt_tokens);
     try testing.expectEqual(@as(u32, 6), back.value.selection.policy.verify_rows);
     try testing.expect(std.mem.indexOf(u8, log.written(), "COMPARISON_COMPLETE") != null);
-}
-
-test "dsv41 serve: the server's engine is refused by name while the decode binding is the stand-in" {
-    var diag: arm_mod.Diag = .{};
-    const s: mlx.mlx_stream = .{ .ctx = null };
-    try testing.expectError(error.Dsv41DecodeNotBound, openServing(testing.allocator, std.testing.io, "/nonexistent", s, .{ .model_dir = "", .baseline_bytes = null, .slot_memory = .host }, .{}, &diag));
 }
 
 test "dsv41 serve: the serve options follow the model's acceptance setting and the depth cap" {
