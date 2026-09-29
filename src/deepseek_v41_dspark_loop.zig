@@ -55,6 +55,12 @@ pub const CycleLog = struct {
     correction: u32 = 0,
     verified: u32 = 0,
     trimmed: u32 = 0,
+    /// Set by a caller that classifies divergences (the window harness): each
+    /// verify row's top two ids and f32 logits and its rms, indexed like `targets`.
+    want_top: bool = false,
+    top_ids: [ds.max_block + 1][2]u32 = undefined,
+    top_logits: [ds.max_block + 1][2]f32 = undefined,
+    rms: [ds.max_block + 1]f32 = undefined,
 };
 
 pub fn Loop(comptime G: type) type {
@@ -187,6 +193,37 @@ pub fn Loop(comptime G: type) type {
             return try g.hostBool(typical, flags[0..drafted]);
         }
 
+        /// A logged verify chunk's rows, for the tie-flip rule: the top two ids
+        /// and f32 logits of each row and the row's rms (one extra sync, only
+        /// when the caller asks: `CycleLog.want_top`).
+        fn topTwo(self: *Self, logits: T, width: u32, ids: [][2]u32, vals: [][2]f32, rms: []f32) !void {
+            const g = self.g;
+            const vocab = g.shapeOf(logits).dim(-1);
+            const w: c_int = @intCast(width);
+            const rows = try g.astype(try g.reshape(logits, &.{ w, vocab }), .float32);
+            const first_id = try g.argmax(rows, -1);
+            const m1 = try g.max(rows, -1, false);
+            const col = try g.reshape(try g.arange(0, @floatFromInt(vocab), 1, .uint32), &.{ 1, vocab });
+            const masked = try g.where(try g.equal(col, try g.reshape(first_id, &.{ w, 1 })), try g.scalar(-std.math.inf(f64), .float32), rows);
+            const second_id = try g.argmax(masked, -1);
+            const m2 = try g.max(masked, -1, false);
+            const r = try g.sqrt(try g.mean(try g.square(rows), -1, false));
+            try g.evalAll(&.{ first_id, m1, second_id, m2, r });
+            var a1: [ds.max_block + 1]u32 = undefined;
+            var a2: [ds.max_block + 1]u32 = undefined;
+            var v1: [ds.max_block + 1]f32 = undefined;
+            var v2: [ds.max_block + 1]f32 = undefined;
+            _ = try g.hostU32(first_id, a1[0..width]);
+            _ = try g.hostU32(second_id, a2[0..width]);
+            _ = try g.hostF32(m1, v1[0..width]);
+            _ = try g.hostF32(m2, v2[0..width]);
+            _ = try g.hostF32(r, rms[0..width]);
+            for (ids[0..width], vals[0..width], 0..) |*id, *v, i| {
+                id.* = .{ a1[i], a2[i] };
+                v.* = .{ v1[i], v2[i] };
+            }
+        }
+
         /// One cycle; returns null to continue, or how the run finished.
         pub fn cycle(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog) !?Finish {
             const g = self.g;
@@ -237,6 +274,7 @@ pub fn Loop(comptime G: type) type {
                 var flags: [ds.max_block + 1]bool = undefined;
                 const typ = try self.decide(r.logits.?, drafts, .{ start, end }, k_eff, &target, &flags);
                 if (log) |lg| {
+                    if (lg.want_top) try self.topTwo(r.logits.?, end - start, lg.top_ids[lg.n_targets..], lg.top_logits[lg.n_targets..], lg.rms[lg.n_targets..]);
                     @memcpy(lg.targets[lg.n_targets..][0 .. end - start], target[0 .. end - start]);
                     lg.n_targets += end - start;
                     if (typ) |ty| {
@@ -625,6 +663,46 @@ test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every
             try testing.expectEqual(nf + n_st, nc);
         } else try testing.expectEqual(nf, nc);
     }
+}
+
+test "dsv41 dspark loop: a logged cycle that wants the tie-flip rule reads each verify row's top two and rms" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // One cycle (block 2, greedy): drafts 5, 6; verify rows [3, 5, 6] -> targets 5, 9, 7 (accepts 1).
+    // Then the logged top two: ids [5, 9, 7] / [8, 2, 4], logits [2, 1, 3] / [1.5, 0.5, 2.5], rms [4, 4, 4].
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 5, 9, 7 }, &.{ 8, 2, 4 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 2, 1, 3 }, &.{ 1.5, 0.5, 2.5 }, &.{ 4, 4, 4 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var lg: CycleLog = .{ .primary = 0, .want_top = true };
+    const e0 = rig.g.nodes.items.len;
+    _ = try lp.cycle(&rig.ex, &out, a, &lg);
+    try testing.expectEqual(@as(usize, 4), script.nu);
+    try testing.expectEqual(@as(usize, 4), script.nf);
+    try testing.expectEqualSlices(u32, &.{ 5, 9 }, out.items);
+    try testing.expectEqual([2]u32{ 9, 2 }, lg.top_ids[1]);
+    try testing.expectEqual([2]f32{ 1, 0.5 }, lg.top_logits[1]);
+    try testing.expectEqual(@as(f32, 4), lg.rms[2]);
+    // The verify's own argmax, plus the logged first and second (masked) argmax.
+    var n_argmax: usize = 0;
+    var n_where: usize = 0;
+    for (rig.g.nodes.items[e0..]) |nd| {
+        n_argmax += @intFromBool(nd.op == .argmax);
+        n_where += @intFromBool(nd.op == .where);
+    }
+    try testing.expect(n_argmax >= 3 and n_where >= 1);
 }
 
 /// A wide route that records each call: its layer (routes are built in layer

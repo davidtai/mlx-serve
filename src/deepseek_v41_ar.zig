@@ -284,8 +284,9 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     var first_accept: ?usize = null;
     var first_decision: ?usize = null;
     const t0 = std.Io.Timestamp.now(io, .boot);
+    var classified = false;
     for (ref.cycles, 0..) |rc, i| {
-        var lg: dsl.CycleLog = .{ .primary = 0 };
+        var lg: dsl.CycleLog = .{ .primary = 0, .want_top = true };
         _ = try lp.cycle(&ex, &out, gpa, &lg);
         const accept_same = lg.accepted + 1 == rc.kept and lg.verified == rc.verified and lg.k_eff == rc.drafts.len;
         var same = accept_same and lg.primary == rc.primary and lg.k_native == rc.k_eff_native;
@@ -294,7 +295,19 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
         for (rc.conf_sigmoid_bits, 0..) |bits, j| same = same and @as(u32, @bitCast(lg.conf[j])) == bits;
         var t: usize = 0;
         for (rc.targets) |chunk| for (chunk) |v| {
-            same = same and t < lg.n_targets and lg.targets[t] == v;
+            const eq = t < lg.n_targets and lg.targets[t] == v;
+            same = same and eq;
+            // The first verify row that picks another token, by the tie-flip rule: the reference's token
+            // is our second and the top two logits lie within 2^-5 of the row's rms.
+            if (!eq and !classified and t < lg.n_targets) {
+                classified = true;
+                const margin = (lg.top_logits[t][0] - lg.top_logits[t][1]) / lg.rms[t];
+                const flip = lg.top_ids[t][1] == v and margin <= 1.0 / 32.0;
+                std.debug.print("dsv41 dspark: first divergence cycle {d} verify row {d}: ours {d} (logit {d:.6}), second {d} (logit {d:.6}), reference {d}; margin / rms {d:.6}: {s}\n", .{
+                    i, t, lg.top_ids[t][0], lg.top_logits[t][0], lg.top_ids[t][1], lg.top_logits[t][1], v, margin,
+                    if (flip) "TIE FLIP (within 2^-5 of the row rms)" else if (lg.top_ids[t][1] == v) "NOT a tie flip (margin above 2^-5)" else "NOT a tie flip (the reference token is not our second)",
+                });
+            }
             t += 1;
         };
         var fl: usize = 0;
