@@ -75,7 +75,8 @@ pub fn BankArraysOf(comptime T: type) type {
 /// Compile-time check that `S` is an expert source:
 ///   `Call` (a live route);
 ///   `route(*S, layer, ids, scores) Error!*Call` (scores: the next routed
-///       layer's gate scores for the lookahead, or empty);
+///       layer's gate scores for the lookahead, or empty; a source reads
+///       them only in the decode phase and ignores them before it);
 ///   `served(*S, *const Call) Served`;
 ///   `waitGu(*S, *Call, part) Error!void`, `waitDown(*S, *Call, part) Error!void`;
 ///   `release(*S, *Call) void` (after the call's waves are built);
@@ -372,7 +373,7 @@ pub const FakeSource = struct {
 
     pub fn route(self: *FakeSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
         std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
-        std.debug.assert(scores.len == 0 or (self.selector != null and self.phase == .decode));
+        std.debug.assert(scores.len == 0 or self.selector != null);
         try self.flush();
         const call = for (&self.calls) |*c| {
             if (c.state == .free) break c;
@@ -432,7 +433,7 @@ pub const FakeSource = struct {
         for (plan.loadsOf()) |l| {
             if (l.persistent) c.persistent_loads += 1 else c.transient_loads += 1;
         }
-        if (scores.len > 0 and layer + 1 < self.policies.len) {
+        if (scores.len > 0 and self.phase == .decode and layer + 1 < self.policies.len) {
             const sel = &self.selector.?;
             var pick: Pick = .{ .layer = layer + 1 };
             pick.n = @intCast(sel.select(scores, &self.policies[layer + 1], pick.experts[0..sel.budget]).len);

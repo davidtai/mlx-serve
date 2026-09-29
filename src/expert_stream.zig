@@ -566,12 +566,13 @@ pub const Stream = struct {
     /// misses, and after its submits (which claim the records read ahead for
     /// it) settles what it did not claim and reads ahead the next layer's
     /// predicted records: `scores` = that layer's gate on this call's rows
-    /// (rows x n_experts f32, evaluated with `ids`); empty = settle only.
+    /// (rows x n_experts f32, evaluated with `ids`); empty = settle only. The
+    /// read-ahead is the decode phase's: before the phase change (and on a
+    /// stream without the lookahead class) the scores are not read.
     pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
         if (self.failed) return error.StreamFailed;
         std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
         const lookahead = self.route_lookahead;
-        std.debug.assert(lookahead or scores.len == 0);
         const tag = self.clock + 1;
         if (self.route_preread) try self.preRead(layer, ids, tag);
         try self.flush();
