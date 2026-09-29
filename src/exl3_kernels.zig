@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "182e55b35a369575834ae23f29758e050056198462408138bdcac60173b74a28";
+pub const manifest_sha256 = "9fbf4ab873c953728555fc010a5a6b81726f42690f0db667bc3b51b336803091";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -77,6 +77,33 @@ pub const Kernel = enum {
     dsv41_head_m1rows,
     dsv41_smallm_all,
     dsv41_smallm_all__bf16,
+    // prefill batch 2 (09-29): the prefill-rows texts the P line still runs (ATTNHALF idxscore /
+    // corevec / ropefuse at every (TQ, TKV) the lane warms, ATTN hcnorm at both stream dtypes,
+    // SMALLK combine)
+    q3_ph_index_score,
+    q3_ph_qkvec_win,
+    q3_ph_qkvec_win__kvf32,
+    q3_ph_qkvec_win__qf32,
+    q3_ph_qkvec_win__qf32_kvf32,
+    q3_ph_qkvec_cmp,
+    q3_ph_qkvec_cmp__qf32,
+    q3_ph_pvvec_win,
+    q3_ph_pvvec_win__kvf32,
+    q3_ph_pvvec_cmp,
+    q3_ph_qkrope_win,
+    q3_ph_qkrope_win__kvf32,
+    q3_ph_qkrope_win__qf32,
+    q3_ph_qkrope_win__qf32_kvf32,
+    q3_ph_qkrope_cmp,
+    q3_ph_qkrope_cmp__qf32,
+    q3_ph_pvrope_win,
+    q3_ph_pvrope_win__kvf32,
+    q3_ph_pvrope_cmp,
+    q3pf_hc_mix_rsqrt,
+    q3pf_hc_pre_norm,
+    q3pf_hc_mix_rsqrt__f32,
+    q3pf_hc_pre_norm__f32,
+    q3sk_combine,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -92,7 +119,7 @@ pub fn baseOf(k: Kernel) ?Kernel {
 }
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
-pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows };
+pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
@@ -157,18 +184,23 @@ fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) R
 
 /// Runtime sizes a launch depends on (the site shape supplies gn / k4 / k32 / gk). keys: the
 /// attention's key count; ncomp / topk / width / allfin: the index top-k's compressed count, k,
-/// output width and its k >= n flag (0-d int32 scalars of the call).
-pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq, keys, ncomp, topk, width, allfin };
+/// output width and its k >= n flag (0-d int32 scalars of the call); ring / store / kc: the
+/// prefill attention's window-store rows, compressed-store rows and compressed selection width.
+pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq, keys, ncomp, topk, width, allfin, ring, store, kc };
 pub const Vars = std.enums.EnumArray(Var, u64);
 
-/// One extent: m x value(v), or the constant m; at most `max` when set.
+/// One extent: m x ceil(value(v) / div) + add, or the constant m (+ add); at most `max` when
+/// set. div / add describe the prefill attention: its key tiles (256 x ceil(k / 128)) and its
+/// key count (the 128 window keys + the compressed selection width).
 pub const Dim = struct {
     m: u32,
     v: ?Var = null,
     max: ?u32 = null,
+    div: u32 = 1,
+    add: u32 = 0,
 
     pub fn eval(d: Dim, vars: *const Vars) u64 {
-        const x = @as(u64, d.m) * (if (d.v) |v| vars.get(v) else 1);
+        const x = @as(u64, d.m) * (if (d.v) |v| std.math.divCeil(u64, vars.get(v), d.div) catch unreachable else 1) + d.add;
         return if (d.max) |cap| @min(x, cap) else x;
     }
 };
@@ -530,7 +562,7 @@ pub const Bound = struct {
 
 // ── Manifest adoption (once, at init) ──
 
-const JDim = struct { m: u32, v: ?[]const u8 = null, max: ?u32 = null };
+const JDim = struct { m: u32, v: ?[]const u8 = null, max: ?u32 = null, div: u32 = 1, add: u32 = 0 };
 const JDomain = struct {
     kind: []const u8,
     scale: ?f64 = null,
@@ -655,7 +687,8 @@ fn adoptDims(a: Allocator, js: []const JDim, k: Kernel, diag: ?*Diag) (Refusal |
     const out = try a.alloc(Dim, js.len);
     for (js, out) |j, *d| {
         if (j.m == 0) return refuse(diag, error.GeometryInvalid, "exl3 kernels: {t}: a zero extent", .{k});
-        d.* = .{ .m = j.m, .v = if (j.v) |v| try parseVar(v, k, diag) else null, .max = j.max };
+        if (j.div == 0 or (j.div != 1 and j.v == null)) return refuse(diag, error.GeometryInvalid, "exl3 kernels: {t}: extent divisor {d}", .{ k, j.div });
+        d.* = .{ .m = j.m, .v = if (j.v) |v| try parseVar(v, k, diag) else null, .max = j.max, .div = j.div, .add = j.add };
     }
     return out;
 }
@@ -1009,8 +1042,8 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 49), n_kernels);
-    try testing.expectEqual(@as(usize, 10), n_headers);
+    try testing.expectEqual(@as(usize, 73), n_kernels);
+    try testing.expectEqual(@as(usize, 14), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1022,8 +1055,9 @@ test "dsv41 kernels: the embedded manifest is the pinned one and every text matc
 test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the predecessor e03f9820" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    // the predecessor's 41 kernels are unchanged here (the exporter's check), so its fixtures stand
-    try testing.expectEqual(@as(usize, 1), reg.predecessors.len);
+    // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
+    // check), so their fixtures stand
+    try testing.expectEqual(@as(usize, 2), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
@@ -1051,6 +1085,68 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     try testing.expectEqual(Var.ncomp, it.inputs[2].domain.of.?);
     try testing.expectEqual(mlx.mlx_dtype.bool_, it.outputs[1].dtype);
     try testing.expect(reg.get(.dsv41_woa_decode_transpose_32).bounds.get(.rows) == null);
+}
+
+test "dsv41 kernels: prefill batch 2 carries its instantiations, the div / add rules and the predecessor 182e55b3" {
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    // decode batch 2's manifest stays a predecessor: its softmax / top-k entries only grew their rows bound
+    try testing.expect(reg.acceptsManifest("182e55b35a369575834ae23f29758e050056198462408138bdcac60173b74a28"));
+    const prefill_rows = [2]u64{ 1, 1 << 20 };
+    try testing.expectEqual(prefill_rows, reg.get(.q3_attnfuse_softmax).bounds.get(.rows).?);
+    try testing.expectEqual(prefill_rows, reg.get(.q3_attnfuse_softmax__ls128).bounds.get(.rows).?);
+    try testing.expectEqual(prefill_rows, reg.get(.mtplx_dsv41_index_topk_select).bounds.get(.rows).?);
+    try testing.expectEqual(@as(u32, 8), reg.get(.q3_attnfuse_softmax).rows_max);
+    // every (TQ, TKV) the lane warms: one text per stage, the instantiations as variants
+    const V = struct { k: Kernel, base: Kernel, tq: ?mlx.mlx_dtype, tkv: mlx.mlx_dtype };
+    const vs = [_]V{
+        .{ .k = .q3_ph_qkvec_win, .base = .q3_ph_qkvec_win, .tq = .bfloat16, .tkv = .bfloat16 },
+        .{ .k = .q3_ph_qkvec_win__kvf32, .base = .q3_ph_qkvec_win, .tq = .bfloat16, .tkv = .float32 },
+        .{ .k = .q3_ph_qkvec_win__qf32, .base = .q3_ph_qkvec_win, .tq = .float32, .tkv = .bfloat16 },
+        .{ .k = .q3_ph_qkvec_win__qf32_kvf32, .base = .q3_ph_qkvec_win, .tq = .float32, .tkv = .float32 },
+        .{ .k = .q3_ph_qkrope_cmp__qf32, .base = .q3_ph_qkrope_cmp, .tq = .float32, .tkv = .float32 },
+        .{ .k = .q3_ph_pvrope_win__kvf32, .base = .q3_ph_pvrope_win, .tq = null, .tkv = .float32 },
+        .{ .k = .q3_ph_pvvec_cmp, .base = .q3_ph_pvvec_cmp, .tq = null, .tkv = .float32 },
+    };
+    for (vs) |v| {
+        const e = reg.get(v.k);
+        try testing.expectEqual(v.base, e.variant_of orelse e.kernel);
+        try testing.expectEqual(Header.attnfuse_s2, e.header.?);
+        try testing.expectEqualStrings(if (v.tq != null) "TQ" else "TKV", e.template[0].name);
+        if (v.tq) |tq| try testing.expectEqual(tq, e.template[0].value.dtype);
+        try testing.expectEqual(v.tkv, e.template[if (v.tq != null) 1 else 0].value.dtype);
+        try testing.expect(e.checks.contains(.row_invariance));
+    }
+    // the key count and the key tiles: k = 128 + kc, grid.x = 256 ceil(k / 128)
+    var vars: Vars = .initFill(0);
+    vars.set(.rows, 183);
+    vars.set(.ring, 311);
+    vars.set(.store, 4096);
+    const Tile = struct { kc: u64, gx: u32, k: c_int };
+    for ([_]Tile{ .{ .kc = 512, .gx = 1280, .k = 640 }, .{ .kc = 476, .gx = 1280, .k = 604 }, .{ .kc = 128, .gx = 512, .k = 256 }, .{ .kc = 129, .gx = 768, .k = 257 }, .{ .kc = 1, .gx = 512, .k = 129 } }) |c| {
+        vars.set(.kc, c.kc);
+        const qk = try launchFor(reg.get(.q3_ph_qkrope_cmp), &vars, null);
+        try testing.expectEqual([3]u32{ c.gx, 1, 183 }, qk.grid);
+        try testing.expectEqual([4]c_int{ 1, 183, 64, c.k }, qk.out_shapes[0][0..4].*);
+        try testing.expectEqual([3]c_int{ 1, 183, c.k }, qk.out_shapes[1][0..3].*);
+        const pv = try launchFor(reg.get(.q3_ph_pvrope_cmp), &vars, null);
+        try testing.expectEqual([3]u32{ 1024, 1, 183 }, pv.grid);
+        try testing.expectEqual([3]c_int{ 8, 183, 4096 }, pv.out_shapes[0][0..3].*);
+    }
+    // the index score: 128 keys x 2 queries per threadgroup
+    vars.set(.rows, 953);
+    vars.set(.ncomp, 4097);
+    try testing.expectEqual([3]u32{ 8448, 477, 1 }, (try launchFor(reg.get(.q3_ph_index_score), &vars, null)).grid);
+    try testing.expectEqual(Header.attnhalf_idx, reg.get(.q3_ph_index_score).header.?);
+    // the HC norms: one threadgroup of 1024 per row, the model's eps as the f32 static
+    const pre = reg.get(.q3pf_hc_pre_norm__f32);
+    try testing.expectEqual([3]u32{ 1024, 953, 1 }, (try launchFor(pre, &vars, null)).grid);
+    try testing.expectEqual(@as(i32, 8), pre.template[1].value.int);
+    try testing.expectEqual(@as(f32, 1e-20), @as(f32, @floatCast(pre.inputs[3].domain.floats[0])));
+    try testing.expect(!pre.ensure_row_contiguous);
+    // the combine: 4 columns per thread
+    try testing.expectEqual([3]u32{ 953 * 1280, 1, 1 }, (try launchFor(reg.get(.q3sk_combine), &vars, null)).grid);
+    try testing.expectEqual(Header.smallk, reg.get(.q3sk_combine).header.?);
 }
 
 test "dsv41 kernels: a tampered source or header text is refused, by name" {
@@ -1118,6 +1214,7 @@ test "dsv41 kernels: every manifest refusal refuses, by name" {
         .{ .needle = "\"sha256\": \"035ad69fda53f016", .replacement = "\"sha256\": \"135ad69fda53f016", .want = error.LanePinMismatch },
         .{ .needle = "\"math_mode\": \"safe\"", .replacement = "\"math_mode\": \"fast\"", .want = error.MathModeNotSafe },
         .{ .needle = "\n}\n", .replacement = "\n", .want = error.ManifestSyntax },
+        .{ .needle = "\"div\": 128", .replacement = "\"div\": 0", .want = error.GeometryInvalid },
     };
     for (cases) |c| {
         const m = try replaceFirst(a, embedded.manifest, c.needle, c.replacement);

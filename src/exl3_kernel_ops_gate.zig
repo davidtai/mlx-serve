@@ -171,12 +171,13 @@ const JGen = struct {
 };
 const JArray = struct { name: []const u8, dtype: []const u8, shape: []const i64, gen: ?JGen = null, sha256: []const u8, file: ?[]const u8 = null };
 const JVars = struct { rows: u64 = 0, cap: u64 = 0, experts: u64 = 0 };
-const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, inputs: []const JArray, outputs: []const JArray };
+const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, eps: ?f64 = null, inputs: []const JArray, outputs: []const JArray };
 const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const JCase };
 
 const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
 const draft_fixture_format = "mlx-serve-exl3-kernel-draft-fixture-v1";
 const decode2_fixture_format = "mlx-serve-exl3-kernel-decode2-fixture-v1";
+const prefill2_fixture_format = "mlx-serve-exl3-kernel-prefill2-fixture-v1";
 const golden: u64 = 0x9E3779B97F4A7C15;
 
 fn sm(seed: u64, i: u64) u64 {
@@ -216,7 +217,7 @@ fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
 fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
     const b = try a.alloc(u8, n * size(dt));
     errdefer a.free(b);
-    const kind = std.meta.stringToEnum(enum { bits, bf16bits, uniform, index, range, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
+    const kind = std.meta.stringToEnum(enum { bits, bf16bits, uniform, index, range, srange, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
     switch (kind) {
         .bits, .bf16bits => {
             var w: usize = 0;
@@ -247,6 +248,8 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
         },
         .index => for (0..n) |i| putInt(b, i, dt, sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi))),
         .range => for (0..n) |i| putInt(b, i, dt, @as(u64, @intFromFloat(gen.lo)) + sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi - gen.lo))),
+        // prefill batch 2: a signed range (lo may be negative: the compressed selection's -1 = no key)
+        .srange => for (0..n) |i| putInt(b, i, dt, @bitCast(@as(i64, @intFromFloat(gen.lo)) + @as(i64, @intCast(sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi - gen.lo)))))),
         .wave_rhs => {
             var r: usize = 0;
             for (gen.rows, 0..) |rows, j| for (0..rows) |_| {
@@ -383,6 +386,36 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         defer r.deinit(g);
         for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
         return 8;
+    }
+    // prefill batch 2 (dump_kernel_prefill2_fixture.py): the P line's prefill-rows texts; the
+    // prefill-rows index top-k replays through the index_topk branch above
+    if (eq(u8, f, "idxscore")) {
+        const r = ops.IdxScore(MlxG).init(reg);
+        outs[0] = try r.call(g, in(ins, "q"), in(ins, "k"), in(ins, "w"), in(ins, "clen"));
+        return 1;
+    }
+    if (eq(u8, f, "core_vec") or eq(u8, f, "core_rope")) {
+        const kind: ops.CoreKind = if (eq(u8, f, "core_vec")) .vec else .rope;
+        const ckv = ins.get("ckv");
+        var r = try ops.PrefillAttn(MlxG).init(g, reg, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
+        defer r.deinit(g);
+        const cmp: ?[2]mlx.mlx_array = if (ckv) |store| .{ store, in(ins, "cidx") } else null;
+        const rope: ?[2]mlx.mlx_array = if (kind == .rope) .{ in(ins, "qcos"), in(ins, "qsin") } else null;
+        outs[0] = try r.attend(g, in(ins, "q"), in(ins, "win"), in(ins, "widx"), in(ins, "wval"), cmp, in(ins, "sink"), rope);
+        return 1;
+    }
+    if (eq(u8, f, "hcnorm")) {
+        const x = in(ins, "x");
+        var r = try ops.HcNorm(MlxG).init(g, reg, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
+        defer r.deinit(g);
+        outs[0] = try r.rsqrt(g, x);
+        outs[1] = try r.preNorm(g, x, in(ins, "pre"), in(ins, "w"));
+        return 2;
+    }
+    if (eq(u8, f, "smallk")) {
+        const r = ops.SmallKCombine(MlxG).init(reg);
+        outs[0] = try r.call(g, in(ins, "routed"), in(ins, "weights"), in(ins, "shared"));
+        return 1;
     }
     // DRAFTRC (dump_draftrc_fixture.py): the draft routes, outputs in the dump's order
     if (eq(u8, f, "draft_proj")) {
@@ -683,6 +716,14 @@ test "dsv41 kernels ops gpu: the decode batch 2 routes reproduce their lanes' ow
     try replayFixture(dir, decode2_fixture_format, null, std.c.getenv("DSV41_KERNEL_DECODE2_RECEIPT"), "kernel decode2 gate");
 }
 
+// The guarded window only (prefill batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL2_FIXTURE=<dir>
+// (the dump_kernel_prefill2_fixture.py fixture); DSV41_KERNEL_PREFILL2_RECEIPT=<path> keeps the lines.
+test "dsv41 kernels ops gpu: the prefill batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_PREFILL2_FIXTURE") orelse return error.SkipZigTest);
+    try replayFixture(dir, prefill2_fixture_format, null, std.c.getenv("DSV41_KERNEL_PREFILL2_RECEIPT"), "kernel prefill2 gate");
+}
+
 // The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
 // DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
 test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
@@ -755,6 +796,8 @@ test "dsv41 kernels ops: the fixture generators are the dump's (sha256 of its --
         // decode batch 2 (dump_kernel_decode2_fixture.py --golden): bool bytes and the bf16 head weight words
         .{ .{ .kind = "range", .seed = 21, .lo = 0, .hi = 2 }, .bool_, 13, "61e3fd288705a89f08816c151a557cdd31d7a9ef95ba607c437d6bd4f66095e3" },
         .{ .{ .kind = "bf16bits", .seed = 22 }, .bfloat16, 11, "7b6c6bc9a8d38b9b98954f6abd0aee09c1693bbbe62c9bac446bde806cf9d0f1" },
+        // prefill batch 2 (dump_kernel_prefill2_fixture.py --golden): the signed range (-1 .. -64 = no key)
+        .{ .{ .kind = "srange", .seed = 23, .lo = -64, .hi = 2048 }, .int32, 13, "967d23bfcc0bc9205fd577bcd469258765f0c31131017d7fb326be0c5a4a325e" },
     };
     for (cases) |c| {
         const b = try generate(a, c[0], c[1], c[2]);

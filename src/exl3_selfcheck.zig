@@ -287,6 +287,12 @@ fn defaultVars(e: *const Entry) Vars {
         v.set(d[0], std.math.clamp(@as(u64, d[1]), b[0], b[1]));
     }
     v.set(.allfin, @intFromBool(v.get(.topk) >= v.get(.ncomp)));
+    // prefill batch 2: a 256-row window store, a 700-row compressed store (the lane's warm) and
+    // the full 512-key selection (k = 640, the tier's common key count)
+    v.set(.ring, 256);
+    v.set(.store, 700);
+    const kc = e.bounds.get(.kc) orelse .{ 1, 512 };
+    v.set(.kc, std.math.clamp(@as(u64, 512), kc[0], kc[1]));
     return v;
 }
 

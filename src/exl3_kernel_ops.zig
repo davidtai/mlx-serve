@@ -209,10 +209,11 @@ fn RowPlans(comptime G: type, comptime n: usize) type {
         }
 
         /// As `init` at the fixed values `base` of the kernel's other vars (the attention's key
-        /// count): the table varies M only.
+        /// count): the table varies M only. The kernel's rows bound covers the table (a kernel the
+        /// prefill routes also launch, at more rows per call, has a wider bound).
         fn initAt(g: *G, e: *const Entry, site: ?[]const u8, base: *const Vars, diag: ?*xk.Diag) !Self {
             const b = e.bounds.get(.rows) orelse return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} has no row bound", .{e.kernel});
-            if (b[0] != 1 or b[1] != n) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} takes rows {d}..{d}, the route's table 1..{d}", .{ e.kernel, b[0], b[1], n });
+            if (b[0] != 1 or b[1] < n) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} takes rows {d}..{d}, the route's table 1..{d}", .{ e.kernel, b[0], b[1], n });
             var p: Self = .{ .e = e, .cfg = undefined, .prep = undefined };
             for (&p.cfg, 1..) |*c, m| {
                 var vars = base.*;
@@ -806,14 +807,14 @@ pub fn WoaRingTranspose(comptime G: type) type {
 }
 
 /// DSV41_INDEX_TOPK=metal (`q3_indextopk_candidate.metal_select`): the DSA indexer's row
-/// selection in one dispatch (radix select + one ascending emit pass), decode / verify rows.
-/// k = min(512, N) and the output width = k on the tier (ATTN_CORE_COMPILE / K29 off); the flag
-/// is k >= N. N (the compressed count) grows during decode, so each call builds its launch
+/// selection in one dispatch (radix select + one ascending emit pass), decode / verify rows and
+/// the prefill rows of the rewritten `_q3_ph_select` (ATTNHALF idxscore: topkgeom is not on the
+/// tier). k = min(512, N) and the output width = k on the tier (ATTN_CORE_COMPILE / K29 off); the
+/// flag is k >= N. N (the compressed count) grows during decode, so each call builds its launch
 /// config and its N / k scalars (the lane's own per-call ints); the 0 / 1 flags are built once.
 pub fn IndexTopk(comptime G: type) type {
     return struct {
         const Self = @This();
-        pub const max_rows = 8;
         pub const index_topk = 512;
         e: *const Entry,
         flag: [2]G.T,
@@ -836,13 +837,13 @@ pub fn IndexTopk(comptime G: type) type {
 
         /// score f32 [M, N] (the indexer's final scores, -inf outside reach / candidates), clen
         /// int32 [M] -> .{ sel int32 [M, k] (ascending selected indices, -1 padded), mask bool
-        /// [M, N] }, M = 1..8, N >= 1.
+        /// [M, N] }, M >= 1 (decode / verify or a prefill chunk), N >= 1.
         pub fn select(self: *const Self, g: *G, score: G.T, clen: G.T) ![2]G.T {
             const sh = dims(G, g, score);
             if (sh.n != 2) return error.RouteInput;
             const rows: u64 = @intCast(sh.d[0]);
             const n: u64 = @intCast(sh.d[1]);
-            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            if (rows < 1) return error.RowsOutOfPlan;
             if (n < 1) return error.RouteInput;
             const k = @min(index_topk, n);
             var vars: Vars = .initFill(0);
@@ -867,7 +868,8 @@ pub fn IndexTopk(comptime G: type) type {
 /// row_reduce_simple threadgroup (32 for k <= 512, 128 for 512 < k <= 1024). The tier's two key
 /// counts (128 on the window-only layers, 640 elsewhere) launch from per-M tables built here;
 /// another k in (64, 1024] (warm-up, fewer compressed rows than index_topk) builds its launch per
-/// call. Rows > 8 or another k are the stock chain's (the lane's route).
+/// call. Another k is the stock chain's (the lane's route); rows > 8 are the prefill cores'
+/// (`PrefillAttn`, the same entries per call).
 pub fn AttnSoftmax(comptime G: type) type {
     return struct {
         const Self = @This();
@@ -1039,6 +1041,229 @@ pub fn SmallM(comptime G: type) type {
         pub fn call(self: *const Self, g: *G, a: G.T) !G.T {
             var out: [1]G.T = undefined;
             try self.plans.launch(g, rowsOf(G, g, a, 0), &.{ a, self.w }, &out);
+            return out[0];
+        }
+    };
+}
+
+// ── Prefill batch 2: the P line's prefill-rows texts (ATTNHALF, ATTN hcnorm, SMALLK) ──
+//
+// Each call launches at its own sizes (the chunk's rows, the context's store rows and key
+// count): a per-call launch config, as the other prefill routes. The instantiation (dtype set)
+// and the model constants are chosen and checked at construction.
+
+/// ATTNHALF idxscore (`q3_prefill_attnhalf_candidate.make_ops(..)['idxscore']`, the rewritten
+/// `_q3_ph_select` at rows > 8): out[s, n] = sum_h relu(q_h . k_n) w_h where n < clen[s], else
+/// -inf, in one kernel (MLX's gemm_loop + the topksum epilogue). The lane casts q and index_k to
+/// f32 before the launch (exact widenings); INDEX_TOPK's select then takes out.
+pub fn IdxScore(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        e: *const Entry,
+
+        pub fn init(reg: *const xk.Registry) Self {
+            return .{ .e = reg.get(.q3_ph_index_score) };
+        }
+
+        /// q [1, S, 32, 128] (the roped indexer q, any float dtype), index_k [1, N, 128] (any float
+        /// dtype), w f32 [1, S, 32] (the head weights), clen int32 [S] (reach) -> f32 [1, S, N].
+        pub fn call(self: *const Self, g: *G, q: G.T, index_k: G.T, w: G.T, clen: G.T) !G.T {
+            var vars: Vars = .initFill(0);
+            vars.set(.rows, rowsOf(G, g, q, 1));
+            vars.set(.ncomp, rowsOf(G, g, index_k, 1));
+            const q32 = try g.astype(q, .float32);
+            const k32 = try g.astype(index_k, .float32);
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.e, &vars, &.{ q32, k32, w, clen }, &out);
+            return out[0];
+        }
+    };
+}
+
+/// The two prefill attention cores: corevec (the attncore core at rows 9..32) and ropefuse
+/// (`_attend` at rows > 32: q roped in the QK load, o inverse-roped into the o-LoRA group layout).
+pub const CoreKind = enum { vec, rope };
+
+/// A text's instantiation at template dtypes (TQ when the text has one, TKV): the base or one of
+/// its variants; null when the registry carries none (the lane never warmed it).
+fn instantiation(reg: *const xk.Registry, base: Kernel, tq: Dtype, tkv: Dtype) ?*const Entry {
+    for (&reg.entries) |*e| {
+        if ((e.variant_of orelse e.kernel) != base) continue;
+        var ok = true;
+        for (e.template) |x| {
+            if (std.mem.eql(u8, x.name, "TQ")) ok = ok and x.value.dtype == tq;
+            if (std.mem.eql(u8, x.name, "TKV")) ok = ok and x.value.dtype == tkv;
+        }
+        if (ok) return e;
+    }
+    return null;
+}
+
+/// ATTNHALF corevec / ropefuse (`make_vec_core` / `make_rope_core` over the lane's kernels): the
+/// selected-keys attention of one layer at prefill rows as three launches, QK (the unscaled
+/// scores + the valid mask over the 128 window keys and, on a compressed layer, the kc selected
+/// compressed keys), ATTN_FUSE's softmax (scale, mask, sink; ls 32 up to 512 keys, 128 above) and
+/// PV. One route per layer kind, built at construction: the query dtype, the window store's dtype
+/// (bf16 on layer 0, f32 on the others) and compressed or window-only.
+pub fn PrefillAttn(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const heads = 64;
+        pub const head_dim = 512;
+        pub const window = 128;
+        pub const max_kc = 512;
+        kind: CoreKind,
+        cmp: bool,
+        qk: *const Entry,
+        pv: *const Entry,
+        s32: *const Entry,
+        s128: *const Entry,
+        statics: Statics(G),
+
+        /// `q` the query dtype (bf16 on the tier), `ring` the window store's dtype, `cmp` a
+        /// compressed layer (its store f32). A dtype set the lane does not warm is refused
+        /// (TemplateNotRegistered).
+        pub fn init(g: *G, reg: *const xk.Registry, kind: CoreKind, q: Dtype, ring: Dtype, cmp: bool, diag: ?*xk.Diag) !Self {
+            const Stage = struct { vec: Kernel, rope: Kernel };
+            const qk_base: Stage = if (cmp) .{ .vec = .q3_ph_qkvec_cmp, .rope = .q3_ph_qkrope_cmp } else .{ .vec = .q3_ph_qkvec_win, .rope = .q3_ph_qkrope_win };
+            const pv_base: Stage = if (cmp) .{ .vec = .q3_ph_pvvec_cmp, .rope = .q3_ph_pvrope_cmp } else .{ .vec = .q3_ph_pvvec_win, .rope = .q3_ph_pvrope_win };
+            const qb, const pb = switch (kind) {
+                .vec => .{ qk_base.vec, pv_base.vec },
+                .rope => .{ qk_base.rope, pv_base.rope },
+            };
+            const qk = instantiation(reg, qb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at q {t}, window store {t}", .{ qb, q, ring });
+            const pv = instantiation(reg, pb, q, ring) orelse return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: {t} has no instantiation at window store {t}", .{ pb, ring });
+            const s32 = reg.get(.q3_attnfuse_softmax);
+            return .{ .kind = kind, .cmp = cmp, .qk = qk, .pv = pv, .s32 = s32, .s128 = reg.get(.q3_attnfuse_softmax__ls128), .statics = try Statics(G).init(g, s32) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.statics.deinit(g);
+        }
+
+        /// q [1, S, 64, 512] (UN-roped for rope), win [1, T, 512] (the window store), widx int32 /
+        /// wval bool [S, 128] (Attention._window_selected_idx), on a compressed layer
+        /// `cmp_kv` = .{ ckv f32 [1, Nc, 512], cidx int32 [1, S, kc] (-1 = no key) }, sink f32
+        /// [1, 1, 64, 1], for rope `rope` = .{ qcos, qsin } f32 [S, 32] -> vec: o f32 [1, S, 64,
+        /// 512]; rope: o f32 [8, S, 4096] (the lane hands on its [1, S, 8, 4096] transposed view).
+        pub fn attend(self: *const Self, g: *G, q: G.T, win: G.T, widx: G.T, wval: G.T, cmp_kv: ?[2]G.T, sink: G.T, rope: ?[2]G.T) !G.T {
+            if ((cmp_kv != null) != self.cmp or (rope != null) != (self.kind == .rope)) return error.RouteInput;
+            const s = rowsOf(G, g, q, 1);
+            var vars: Vars = .initFill(0);
+            vars.set(.rows, s);
+            vars.set(.ring, rowsOf(G, g, win, 1));
+            var k: u64 = window;
+            if (cmp_kv) |c| {
+                const kc = rowsOf(G, g, c[1], 2);
+                if (kc < 1 or kc > max_kc) return error.KeysOutOfPlan;
+                vars.set(.store, rowsOf(G, g, c[0], 1));
+                vars.set(.kc, kc);
+                k += kc;
+            }
+            // the lane: contiguous(broadcast_to(idx[None], (1, s, W))), a reshape at b = 1
+            const sw = [_]c_int{ 1, @intCast(s), window };
+            const widx3 = try g.reshape(widx, &sw);
+            const wval3 = try g.reshape(wval, &sw);
+            var kv: [7]G.T = undefined; // win, widx, wval (+ ckv, cidx) (+ qcos, qsin)
+            var n_kv: usize = 0;
+            for ([_]G.T{ win, widx3, wval3 }) |x| {
+                kv[n_kv] = x;
+                n_kv += 1;
+            }
+            if (cmp_kv) |c| for (c) |x| {
+                kv[n_kv] = x;
+                n_kv += 1;
+            };
+            if (rope) |r| for (r) |x| {
+                kv[n_kv] = x;
+                n_kv += 1;
+            };
+            var ins: [9]G.T = undefined; // q | ex, denom; then the kv operands
+            ins[0] = q;
+            @memcpy(ins[1 .. 1 + n_kv], kv[0..n_kv]);
+            var sv: [2]G.T = undefined;
+            try launchRule(G, g, self.qk, &vars, ins[0 .. 1 + n_kv], &sv);
+            var soft_vars: Vars = .initFill(0);
+            soft_vars.set(.rows, s);
+            soft_vars.set(.keys, k);
+            var ed: [2]G.T = undefined;
+            try launchRule(G, g, if (k <= 512) self.s32 else self.s128, &soft_vars, &.{ sv[0], sv[1], sink, self.statics.arrays[3] }, &ed);
+            ins[0] = ed[0];
+            ins[1] = ed[1];
+            @memcpy(ins[2 .. 2 + n_kv], kv[0..n_kv]);
+            var o: [1]G.T = undefined;
+            try launchRule(G, g, self.pv, &vars, ins[0 .. 2 + n_kv], &o);
+            return o[0];
+        }
+    };
+}
+
+/// ATTN hcnorm (`q3_prefill_attn_candidate.make_ops(..)['hc_rsqrt' / 'hc_pre_norm']`, rows >= 32):
+/// DecoderLayer._mixes' rsqrt(mean(square(flat)) + eps) and _rmsnorm(_hc_pre(h, pre), w, eps), one
+/// kernel each in the stock reduction order. The HC stream's dtype and the model's eps are fixed at
+/// construction.
+pub fn HcNorm(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        rsq: *const Entry,
+        pre: *const Entry,
+        rsq_st: Statics(G),
+        pre_st: Statics(G),
+
+        /// `stream` the HC state's dtype (bf16 on the tier, f32 for an f32 stream); `eps` the
+        /// model's rms_norm_eps: another value than the registered constant is refused.
+        pub fn init(g: *G, reg: *const xk.Registry, stream: Dtype, eps: f32, diag: ?*xk.Diag) !Self {
+            const rsq, const pre = switch (stream) {
+                .bfloat16 => .{ reg.get(.q3pf_hc_mix_rsqrt), reg.get(.q3pf_hc_pre_norm) },
+                .float32 => .{ reg.get(.q3pf_hc_mix_rsqrt__f32), reg.get(.q3pf_hc_pre_norm__f32) },
+                else => return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: the HC norms carry a bf16 or an f32 stream, not {t}", .{stream}),
+            };
+            const want: f32 = @floatCast(argOf(rsq, "eps").domain.floats[0]);
+            if (eps != want) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} is registered at eps {e}, the model's is {e}", .{ rsq.kernel, want, eps });
+            var rsq_st = try Statics(G).init(g, rsq);
+            errdefer rsq_st.deinit(g);
+            return .{ .rsq = rsq, .pre = pre, .rsq_st = rsq_st, .pre_st = try Statics(G).init(g, pre) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.rsq_st.deinit(g);
+            self.pre_st.deinit(g);
+        }
+
+        /// x [1, S, 4, 5120] (the stream dtype) -> r f32 [1, S, 1] = rsqrt(mean(x^2) + eps).
+        pub fn rsqrt(self: *const Self, g: *G, x: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.rsq, &rowsVars(rowsOf(G, g, x, 1)), &.{ x, self.rsq_st.arrays[1], self.rsq_st.arrays[2] }, &out);
+            return out[0];
+        }
+
+        /// h [1, S, 4, 5120] (the stream dtype), pre f32 [1, S, 4], w bf16 [5120] (the layer's
+        /// attention or MoE norm weight) -> y [1, S, 5120] (the stream dtype).
+        pub fn preNorm(self: *const Self, g: *G, h: G.T, pre: G.T, w: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.pre, &rowsVars(rowsOf(G, g, h, 1)), &.{ h, pre, w, self.pre_st.arrays[3], self.pre_st.arrays[4] }, &out);
+            return out[0];
+        }
+    };
+}
+
+/// SMALLK combine (`q3_prefill_smallk_candidate.CombineKernel`, `_moe_combine_dispatch` at rows >
+/// 32): (routed * w) summed over the 6 routed experts in col_reduce_small order, + shared, one f32
+/// kernel.
+pub fn SmallKCombine(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        e: *const Entry,
+
+        pub fn init(reg: *const xk.Registry) Self {
+            return .{ .e = reg.get(.q3sk_combine) };
+        }
+
+        /// routed f32 [n, 6, 5120] (the unweighted expert outputs), weights f32 [n, 6], shared f32
+        /// [n, 5120] -> f32 [n, 5120].
+        pub fn call(self: *const Self, g: *G, routed: G.T, weights: G.T, shared: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.e, &rowsVars(rowsOf(G, g, routed, 0)), &.{ routed, weights, shared }, &out);
             return out[0];
         }
     };
@@ -1947,6 +2172,14 @@ fn isDecode2(e: *const Entry) bool {
     return false;
 }
 
+/// The prefill batch 2 families (their routes' own test covers them).
+fn isPrefill2(e: *const Entry) bool {
+    inline for (.{ "pf_idxscore", "pf_attn_core", "pf_hcnorm", "pf_smallk" }) |f| {
+        if (std.mem.eql(u8, e.family, f)) return true;
+    }
+    return false;
+}
+
 fn testRegistry() !xk.Registry {
     var diag: xk.Diag = .{};
     return xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
@@ -2217,9 +2450,9 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     for (t.launches.items) |l| hit.insert(l.k);
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
-    // only), the DRAFTRC entries and decode batch 2 (their routes' own tests cover those)
+    // only), the DRAFTRC entries and decode / prefill batch 2 (their routes' own tests cover those)
     for (reg.entries) |e| {
-        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e);
+        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e);
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
@@ -2942,10 +3175,13 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
         switch (e.launch) {
             .rule => {
                 const b = e.bounds.get(.rows) orelse continue;
+                // prefill rules (rows up to 2^20): their launch stays per call
+                if (std.mem.eql(u8, e.phase, "prefill")) continue;
                 launches += switch (b[1]) {
-                    8 => try expectRowPlans(8, &t, e, null),
                     48 => try expectRowPlans(48, &t, e, null),
-                    else => continue, // prefill rules (rows up to 2^20): their launch stays per call
+                    // decode tables over M 1..8 (the index top-k and the softmax: their bound grew to
+                    // the prefill rows the prefill routes launch per call)
+                    else => try expectRowPlans(8, &t, e, null),
                 };
                 rule += 1;
             },
@@ -3067,7 +3303,9 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
             try testing.expectEqual(@as(i32, @intCast(s.vars.get(.topk))), std.mem.bytesToValue(i32, t.nodes.items[l.inputs[3]].bytes[0..4]));
             try expectLaunch(l, e, s, &.{ score, clen, l.inputs[2], l.inputs[3], l.inputs[4], l.inputs[5] });
         }
-        try testing.expectError(error.RowsOutOfPlan, r.select(&t, try t.node(&.{ 9, 600 }, .float32, &.{}), try t.node(&.{9}, .int32, &.{})));
+        // rows > 8 (a prefill chunk's) launch the same entry per call (prefill batch 2)
+        _ = try r.select(&t, try t.node(&.{ 9, 600 }, .float32, &.{}), try t.node(&.{9}, .int32, &.{}));
+        try testing.expect(!t.back(1).prepared and t.back(1).cfg.grid[0] == 256 * 9);
     }
     // the fused softmax: the tier's 128 / 640 keys from per-M tables, other keys per call, by ls
     {
@@ -3156,5 +3394,161 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
     var hit: std.EnumSet(Kernel) = .empty;
     for (t.launches.items) |l| hit.insert(l.k);
     for (reg.entries) |e| if (isDecode2(&e)) try testing.expect(hit.contains(e.kernel));
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
+/// The lane's own launch of `e` at exactly `vars` (the samples of an entry several routes share).
+fn sampleWith(e: *const Entry, vars: *const Vars) *const xk.Sample {
+    for (e.samples) |*s| if (std.meta.eql(s.vars, vars.*)) return s;
+    std.debug.print("{t}: no lane sample at {any}\n", .{ e.kernel, vars.values });
+    unreachable;
+}
+
+test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at the lanes' sizes, per call" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    // idxscore: q / index_k cast to f32 first (the lane's astype), one launch per call at (S, N)
+    {
+        const e = reg.get(.q3_ph_index_score);
+        const r = IdxScore(Trace).init(&reg);
+        for (e.samples) |*s| {
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const n_c: c_int = @intCast(s.vars.get(.ncomp));
+            const q = try t.node(&.{ 1, n_s, 32, 128 }, .bfloat16, &.{});
+            const k = try t.node(&.{ 1, n_c, 128 }, .float32, &.{});
+            const w = try t.node(&.{ 1, n_s, 32 }, .float32, &.{});
+            const clen = try t.node(&.{n_s}, .int32, &.{});
+            _ = try r.call(&t, q, k, w, clen);
+            const l = t.back(1);
+            try testing.expect(!l.prepared);
+            try testing.expectEqual(Dtype.float32, t.dtypeOf(l.inputs[0]));
+            try testing.expectEqual(Dtype.float32, t.dtypeOf(l.inputs[1]));
+            try expectLaunch(l, e, s, &.{ l.inputs[0], l.inputs[1], w, clen });
+        }
+    }
+    // the attention cores, every instantiation the lane warms, at the lane's own launches: QK, the
+    // softmax (ls 32 up to 512 keys, 128 above; the registered scale), PV; the window selection
+    // reshaped to [1, S, 128]
+    const sink = try t.node(&.{ 1, 1, 64, 1 }, .float32, &.{});
+    const Layer = struct { ring: Dtype, cmp: bool };
+    for ([_]CoreKind{ .vec, .rope }) |kind| for ([_]Dtype{ .bfloat16, .float32 }) |qdt| for ([_]Layer{ .{ .ring = .bfloat16, .cmp = false }, .{ .ring = .float32, .cmp = false }, .{ .ring = .float32, .cmp = true } }) |lay| {
+        var r = try PrefillAttn(Trace).init(&t, &reg, kind, qdt, lay.ring, lay.cmp, null);
+        defer r.deinit(&t);
+        try testing.expect(r.qk.samples.len > 0);
+        for (r.qk.samples) |*s| {
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const q = try t.node(&.{ 1, n_s, 64, 512 }, qdt, &.{});
+            const win = try t.node(&.{ 1, @intCast(s.vars.get(.ring)), 512 }, lay.ring, &.{});
+            const widx = try t.node(&.{ n_s, 128 }, .int32, &.{});
+            const wval = try t.node(&.{ n_s, 128 }, .bool_, &.{});
+            var ops_kv: [4]Trace.T = undefined;
+            var n_kv: usize = 0;
+            var cmp: ?[2]Trace.T = null;
+            var keys: u64 = 128;
+            if (lay.cmp) {
+                const kc: c_int = @intCast(s.vars.get(.kc));
+                cmp = .{ try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .float32, &.{}), try t.node(&.{ 1, n_s, kc }, .int32, &.{}) };
+                ops_kv[0..2].* = cmp.?;
+                n_kv = 2;
+                keys += @intCast(kc);
+            }
+            var rope: ?[2]Trace.T = null;
+            if (kind == .rope) {
+                rope = .{ try t.node(&.{ n_s, 32 }, .float32, &.{}), try t.node(&.{ n_s, 32 }, .float32, &.{}) };
+                ops_kv[n_kv..][0..2].* = rope.?;
+                n_kv += 2;
+            }
+            _ = try r.attend(&t, q, win, widx, wval, cmp, sink, rope);
+            const lq, const ls, const lp = .{ t.back(3), t.back(2), t.back(1) };
+            for ([_]*const Trace.Launch{ lq, ls, lp }) |l| try testing.expect(!l.prepared);
+            // the window selection: views of the caller's [S, 128] arrays, [1, S, 128]
+            const widx3, const wval3 = .{ lq.inputs[2], lq.inputs[3] };
+            try testing.expectEqual(widx, t.root(widx3));
+            try testing.expectEqual(wval, t.root(wval3));
+            try testing.expectEqualSlices(c_int, &.{ 1, n_s, 128 }, t.shapeOf(widx3).slice());
+            var want: [9]Trace.T = undefined;
+            want[0..4].* = .{ q, win, widx3, wval3 };
+            @memcpy(want[4 .. 4 + n_kv], ops_kv[0..n_kv]);
+            try expectLaunch(lq, r.qk, s, want[0 .. 4 + n_kv]);
+            // the softmax on the QK outputs
+            try testing.expectEqual(if (keys <= 512) Kernel.q3_attnfuse_softmax else Kernel.q3_attnfuse_softmax__ls128, ls.k);
+            try testing.expectEqualSlices(Trace.T, &.{ lq.outs[0], lq.outs[1], sink, r.statics.arrays[3] }, ls.inputs[0..ls.n_in]);
+            try testing.expectEqual([3]u32{ if (keys <= 512) 32 else 128, 64, @intCast(n_s) }, ls.cfg.grid);
+            // PV on the softmax outputs and the same kv operands
+            want[0..5].* = .{ ls.outs[0], ls.outs[1], win, widx3, wval3 };
+            @memcpy(want[5 .. 5 + n_kv], ops_kv[0..n_kv]);
+            try expectLaunch(lp, r.pv, sampleWith(r.pv, &s.vars), want[0 .. 5 + n_kv]);
+        }
+    };
+    // a dtype set the lane never warms, a mismatched call and a selection wider than index_topk
+    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, .vec, .bfloat16, .bfloat16, true, null));
+    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, .rope, .float16, .float32, false, null));
+    {
+        var r = try PrefillAttn(Trace).init(&t, &reg, .rope, .bfloat16, .float32, true, null);
+        defer r.deinit(&t);
+        const n_launch = t.launches.items.len;
+        const q = try t.node(&.{ 1, 40, 64, 512 }, .bfloat16, &.{});
+        const win = try t.node(&.{ 1, 168, 512 }, .float32, &.{});
+        const widx = try t.node(&.{ 40, 128 }, .int32, &.{});
+        const wval = try t.node(&.{ 40, 128 }, .bool_, &.{});
+        const qc = try t.node(&.{ 40, 32 }, .float32, &.{});
+        const ckv = try t.node(&.{ 1, 700, 512 }, .float32, &.{});
+        try testing.expectError(error.RouteInput, r.attend(&t, q, win, widx, wval, null, sink, .{ qc, qc }));
+        try testing.expectError(error.RouteInput, r.attend(&t, q, win, widx, wval, .{ ckv, try t.node(&.{ 1, 40, 512 }, .int32, &.{}) }, sink, null));
+        try testing.expectError(error.KeysOutOfPlan, r.attend(&t, q, win, widx, wval, .{ ckv, try t.node(&.{ 1, 40, 513 }, .int32, &.{}) }, sink, .{ qc, qc }));
+        try testing.expectEqual(n_launch, t.launches.items.len);
+    }
+    // the HC norms at the stream dtype, eps and the 1/numel constants from the registry
+    for ([_]Dtype{ .bfloat16, .float32 }) |dt| {
+        var r = try HcNorm(Trace).init(&t, &reg, dt, 1e-20, null);
+        defer r.deinit(&t);
+        for (r.rsq.samples) |*s| {
+            const x = try t.node(&.{ 1, @intCast(s.vars.get(.rows)), 4, 5120 }, dt, &.{});
+            _ = try r.rsqrt(&t, x);
+            try testing.expect(!t.back(1).prepared);
+            try expectLaunch(t.back(1), r.rsq, s, &.{ x, r.rsq_st.arrays[1], r.rsq_st.arrays[2] });
+        }
+        for (r.pre.samples) |*s| {
+            const n_s: c_int = @intCast(s.vars.get(.rows));
+            const h, const pre, const w = .{ try t.node(&.{ 1, n_s, 4, 5120 }, dt, &.{}), try t.node(&.{ 1, n_s, 4 }, .float32, &.{}), try t.node(&.{5120}, .bfloat16, &.{}) };
+            _ = try r.preNorm(&t, h, pre, w);
+            try expectLaunch(t.back(1), r.pre, s, &.{ h, pre, w, r.pre_st.arrays[3], r.pre_st.arrays[4] });
+        }
+    }
+    var diag: xk.Diag = .{};
+    try testing.expectError(error.RouteInput, HcNorm(Trace).init(&t, &reg, .bfloat16, 1e-6, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "q3pf_hc_mix_rsqrt") != null);
+    try testing.expectError(error.TemplateNotRegistered, HcNorm(Trace).init(&t, &reg, .float16, 1e-20, null));
+    // the MoE combine
+    {
+        const e = reg.get(.q3sk_combine);
+        const r = SmallKCombine(Trace).init(&reg);
+        for (e.samples) |*s| {
+            const n: c_int = @intCast(s.vars.get(.rows));
+            const routed, const w, const sh = .{ try t.node(&.{ n, 6, 5120 }, .float32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
+            _ = try r.call(&t, routed, w, sh);
+            try expectLaunch(t.back(1), e, s, &.{ routed, w, sh });
+        }
+    }
+    // INDEX_TOPK's select at a prefill chunk's rows (the same entry, per call)
+    {
+        var r = try IndexTopk(Trace).init(&t, &reg);
+        defer r.deinit(&t);
+        _ = try r.select(&t, try t.node(&.{ 183, 4096 }, .float32, &.{}), try t.node(&.{183}, .int32, &.{}));
+        const l = t.back(1);
+        try testing.expect(!l.prepared);
+        try testing.expectEqual([3]u32{ 256 * 183, 1, 1 }, l.cfg.grid);
+        try testing.expectEqual(@as(c_int, 512), l.cfg.out_shapes[0][1]);
+    }
+    // every prefill batch 2 entry was launched through its route; nothing kept past its route
+    var hit: std.EnumSet(Kernel) = .empty;
+    for (t.launches.items) |l| hit.insert(l.k);
+    for (reg.entries) |e| if (isPrefill2(&e)) {
+        if (!hit.contains(e.kernel)) std.debug.print("not launched: {t}\n", .{e.kernel});
+        try testing.expect(hit.contains(e.kernel));
+    };
+    try testing.expectEqual(@as(isize, 0), t.keeps);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
 }
