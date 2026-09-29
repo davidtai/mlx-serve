@@ -527,6 +527,51 @@ test "dsv41 bind: a served request's receipt names the DSpark decode and the row
     try testing.expectEqual(@as(u32, 3), back.value.selection.policy.verify_rows);
 }
 
+// DSV41_BANK=<the 3.0 bank dir>: the plan G6 constructs at a box baseline, on the CPU (config, bank, admission;
+// no slot memory): the slot rows and bytes behind G6's static peak table. [DSV41_BIND_BASELINE_GB=7.755397656]
+// [DSV41_BIND_WIRED_GB=3.377741824] (the pass-2 reference receipt's; the window's own come from its guard)
+// [DSV41_BIND_ROWS=<forced decode rows>].
+test "dsv41 bind: the served plan on the real bank at a box baseline (G6's static table, CPU)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const gbOf = struct {
+        fn f(name: [*:0]const u8, default: f64) !u64 {
+            const v = if (std.c.getenv(name)) |x| try std.fmt.parseFloat(f64, std.mem.span(x)) else default;
+            return @intFromFloat(@round(v * 1e9));
+        }
+    }.f;
+    var diag: arm_mod.Diag = .{};
+    var p = arm_mod.planRows(testing.allocator, testing.io, .{
+        .model_dir = dir,
+        .baseline_bytes = try gbOf("DSV41_BIND_BASELINE_GB", 7.755397656),
+        .wired_bytes = try gbOf("DSV41_BIND_WIRED_GB", 3.377741824),
+        .fixed_rows = if (std.c.getenv("DSV41_BIND_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else null,
+        .slot_memory = .host,
+    }, &diag) catch |e| {
+        std.debug.print("dsv41 bind plan: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    const adm = p.plan.admission;
+    var widest: u64 = 0;
+    for (p.bank.layers) |l| widest = @max(widest, l.logical_bytes);
+    // The stream's slot memory: every layer's rows of its record, plus the transient rows of the widest record.
+    const slots = struct {
+        fn f(bank: *const @import("expert_bank.zig").Bank, rows: u32, transient_record: u64) u64 {
+            var sum: u64 = @as(u64, @import("expert_policy.zig").max_route_ids) * transient_record;
+            for (bank.layers) |l| sum += @as(u64, rows) * l.logical_bytes;
+            return sum;
+        }
+    }.f;
+    const prefill_slots = slots(&p.bank, p.prefill_rows, widest);
+    const decode_slots = slots(&p.bank, p.decode_rows, widest);
+    std.debug.print("dsv41 bind plan: baseline {d} B, wired {d} B -> prefill {d} / decode {d} rows; slot memory {d} B (prefill) / {d} B (decode); record {d} B; admission final bank {d} B, active bound {d} B, physical bound {d} B, modeled peak {d} B\n", .{
+        adm.baseline_bytes, p.inputs.wired_bytes, p.prefill_rows, p.decode_rows, prefill_slots, decode_slots, widest,
+        adm.final_bank_bytes, adm.active_bound_bytes, adm.physical_bound_bytes,
+        if (p.plan.peak_fill) |pf| pf.modeled_peak_bytes else adm.physical_bound_bytes,
+    });
+    try testing.expect(p.decode_rows >= p.prefill_rows);
+}
+
 /// A window's prompt ids from a reference file: its `prompt` (a DSpark
 /// reference) or `prompt_ids` (an AR reference).
 fn promptFromFile(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u32 {
@@ -545,7 +590,8 @@ fn promptFromFile(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u32 {
 // _GPU_WINDOW_LOCKED=1 DSV41_BIND_MODEL=<model dir, with engram-token-map.u32 and its .json>
 // DSV41_BIND_OUT=<receipt path; must not exist> MTPLX_DSV41_BOX_BASELINE_GB=<the guard's baseline>
 // DSV41_BIND_PROMPT=<json: `prompt` (a DSpark reference) or `prompt_ids` (an AR reference); unset: seeded ids>
-// [DSV41_BIND_PROMPT_TOKENS=64 (seeded only)] [DSV41_BIND_MAX_TOKENS=100]
+// [DSV41_BIND_ROWS=<forced decode rows; unset: the admission's own>] [DSV41_BIND_PROMPT_TOKENS=64 (seeded only)]
+// [DSV41_BIND_MAX_TOKENS=100]
 test "dsv41 bind: the DSpark binding constructs on the bank and serves one request (the served path's GPU gate)" {
     const envOf = struct {
         fn f(name: [*:0]const u8) ?[]const u8 {
@@ -575,6 +621,7 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     const arm_opt: arm_mod.Options = .{
         .model_dir = model_dir,
         .baseline_bytes = if (baseline_gb) |v| @intFromFloat(@round(try std.fmt.parseFloat(f64, v) * 1e9)) else null,
+        .fixed_rows = if (envOf("DSV41_BIND_ROWS")) |v| try std.fmt.parseInt(u32, v, 10) else null,
         .slot_memory = .host,
     };
     // The plan at the box now (CPU: config, bank, admission; no slot memory), for the window's child cap.
