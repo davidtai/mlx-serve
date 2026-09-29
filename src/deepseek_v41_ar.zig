@@ -238,7 +238,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer kernels.deinit(&g);
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
-    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, &diag);
+    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, null, &diag);
     defer res.deinit(&g);
     const m = res.model;
     const head = res.head;
@@ -271,6 +271,8 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer lp.deinit();
     const primary = try lp.prefill(gpa, &ex, ref.prompt);
     try testing.expectEqual(ref.tokens[0], primary);
+    // The served adapter's fence: the embedding table retires to its host rows before the cycles.
+    try res.retireEmbedding(&g);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     // The gate: the generated ids and each cycle's acceptance (drafts proposed,

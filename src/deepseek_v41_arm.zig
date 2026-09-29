@@ -32,6 +32,7 @@ const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
+const dspark_head = @import("deepseek_v41_dspark_head.zig");
 
 pub const DecodeBinding = enum { stand_in, dspark };
 /// The decode loop the server would generate with; the DSpark loop sets it.
@@ -83,13 +84,21 @@ pub const Options = struct {
     /// The wide lane's routes are built from this (an arm whose routes install
     /// the lane: `ArmWith(.., .{ .prefill = ... })`); unused otherwise.
     prefill: ?xp.PrefillInit = null,
+    /// The draft head's resident bytes for the admission: null charges the
+    /// envelope's own head, 0 the full DSpark head (the binding sets it for a
+    /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
+    draft_pruned_bytes: ?u64 = null,
+    /// A subset of the DSpark head's experts to keep resident, loaded and
+    /// pinned by its sha256 at construction (default: the full head).
+    draft_subset: ?dspark_head.SubsetPin = null,
 };
 
 /// The arm's construction up to the admitted rows: config, bank, plan. No
-/// slot memory yet (the caller owns `bank`).
+/// slot memory yet (the caller owns `bank` and `draft_subset`).
 pub const Planned = struct {
     config: v41.Config,
     bank: expert_bank.Bank,
+    draft_subset: ?dspark_head.Subset = null,
     inputs: expert_admission.Inputs,
     plan: expert_admission.Plan,
     /// Per layer, before and after the phase change.
@@ -106,6 +115,17 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
             c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, im.hidden, im.inter, im.n_experts, im.n_layers,
         });
     const baseline = opt.baseline_bytes orelse return refuse(diag, error.BaselineMissing, "admission: no measured box baseline", .{});
+    var subset: ?dspark_head.Subset = null;
+    errdefer if (subset) |*x| x.deinit();
+    var draft_pruned = opt.draft_pruned_bytes;
+    if (opt.draft_subset) |pin| {
+        var sdiag: dspark_head.SubsetDiag = .{};
+        subset = dspark_head.Subset.load(a, io, pin, &sdiag) catch |e| return refuse(diag, e, "draft subset: {s}", .{sdiag.message()});
+        const sub = &subset.?;
+        if (sub.n_experts != c.dspark.n_routed_experts or sub.selected.len != c.dspark.n_stages)
+            return refuse(diag, error.SubsetGeometry, "draft subset: {d} blocks of {d} experts, the head has {d} stages of {d}", .{ sub.selected.len, sub.n_experts, c.dspark.n_stages, c.dspark.n_routed_experts });
+        draft_pruned = dspark_head.prunedBytes(&c, sub);
+    }
     var bdiag: expert_bank.Diag = .{};
     var bank = expert_bank.Bank.open(a, io, opt.model_dir, im, &bdiag) catch |e| return refuse(diag, e, "bank: {s}", .{bdiag.message()});
     errdefer bank.deinit();
@@ -123,6 +143,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         .prefill_charge_bytes = opt.prefill_charge_bytes,
         .peak_fill = opt.peak_fill,
         .rowsx = opt.rowsx,
+        .draft_pruned_bytes = draft_pruned,
     };
     const plan_ = expert_admission.Admission.plan(opt.envelope, inputs) catch |e| return refuse(diag, e, "admission: {s}", .{@errorName(e)});
     // The stream holds what the admitted prefill bank bound holds (the
@@ -132,7 +153,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     const prefill = @min(plan_.admission.prefill_capacity, n_experts);
     const decode = @min(plan_.admission.decode_rows, n_experts);
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
-    return .{ .config = c, .bank = bank, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
+    return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
 }
 
 /// The arm over graph backend `G` (`MlxOps` serving, `TraceOps` host tests)
@@ -155,6 +176,8 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         model_dir: []const u8,
         config: v41.Config,
         bank: expert_bank.Bank,
+        /// The pinned subset of the DSpark head's experts (`Options.draft_subset`).
+        draft_subset: ?dspark_head.Subset,
         inputs: expert_admission.Inputs,
         plan: expert_admission.Plan,
         /// Per layer: the stream's rows before and after the phase change.
@@ -179,6 +202,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             errdefer a.destroy(self);
             var p = try planRows(a, io, opt, diag);
             errdefer p.bank.deinit();
+            errdefer if (p.draft_subset) |*x| x.deinit();
             const c = p.config;
             const prefill_rows = try a.alloc(u32, c.n_layers);
             errdefer a.free(prefill_rows);
@@ -191,6 +215,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .model_dir = opt.model_dir,
                 .config = c,
                 .bank = p.bank,
+                .draft_subset = p.draft_subset,
                 .inputs = p.inputs,
                 .plan = p.plan,
                 .prefill_rows = prefill_rows,
@@ -218,6 +243,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             self.hook.deinit();
             self.stream.deinit();
             self.bank.deinit();
+            if (self.draft_subset) |*x| x.deinit();
             a.free(self.prefill_rows);
             a.free(self.decode_rows);
             a.destroy(self);

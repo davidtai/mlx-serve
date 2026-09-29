@@ -1056,6 +1056,10 @@ pub const TraceOps = struct {
     prepared_live: usize = 0,
     /// The regions `prepareTape` compiled, by context.
     regions: [n_regions][contexts_per_region]?*const anyopaque = @splat(@splat(null)),
+    /// When set, `hostArray` keeps a copy of its bytes (`hostBytesOf`), so a
+    /// test can compare what a graph was fed.
+    record_host: bool = false,
+    host_data: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1067,6 +1071,14 @@ pub const TraceOps = struct {
         g.waits.deinit(g.gpa);
         g.freed.deinit(g.gpa);
         g.evals.deinit(g.gpa);
+        var it = g.host_data.valueIterator();
+        while (it.next()) |v| g.gpa.free(v.*);
+        g.host_data.deinit(g.gpa);
+    }
+
+    /// The bytes host array `x` was made from (`record_host` set before it was made).
+    pub fn hostBytesOf(g: *const TraceOps, x: T) ?[]const u8 {
+        return g.host_data.get(x);
     }
 
     pub fn reset(_: *TraceOps) void {}
@@ -1105,7 +1117,13 @@ pub const TraceOps = struct {
     pub fn hostArray(g: *TraceOps, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
         const s = Shape.of(shape);
         if (@as(i64, @intCast(bytes.len)) != s.numel() * @as(i64, @intCast(dtypeSize(dt)))) return error.HostBytes;
-        return g.push(.host, dt, s);
+        const x = try g.push(.host, dt, s);
+        if (g.record_host) {
+            const copy = try g.gpa.dupe(u8, bytes);
+            errdefer g.gpa.free(copy);
+            try g.host_data.put(g.gpa, x, copy);
+        }
+        return x;
     }
 
     pub fn node(g: *const TraceOps, x: T) Node {
