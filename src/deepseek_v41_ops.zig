@@ -1017,6 +1017,8 @@ pub const TraceOps = struct {
     /// Each event wait's timeline value and dependency count, in build order.
     waits: std.ArrayList(Wait) = .empty,
     freed: std.ArrayList(Freed) = .empty,
+    /// The node count at each `evalAll` (where a host sync fell in the build).
+    evals: std.ArrayList(usize) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1027,6 +1029,7 @@ pub const TraceOps = struct {
         g.nodes.deinit(g.gpa);
         g.waits.deinit(g.gpa);
         g.freed.deinit(g.gpa);
+        g.evals.deinit(g.gpa);
     }
 
     pub fn reset(_: *TraceOps) void {}
@@ -1043,7 +1046,9 @@ pub const TraceOps = struct {
         std.debug.assert(m.n <= g.nodes.items.len);
         g.freed.append(g.gpa, .{ .from = @intCast(m.n), .to = @intCast(g.nodes.items.len) }) catch @panic("trace: out of memory");
     }
-    pub fn evalAll(_: *TraceOps, _: []const T) !void {}
+    pub fn evalAll(g: *TraceOps, _: []const T) !void {
+        try g.evals.append(g.gpa, g.nodes.items.len);
+    }
     pub fn keep(_: *TraceOps, x: T) T {
         return x;
     }

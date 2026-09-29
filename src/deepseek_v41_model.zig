@@ -743,6 +743,75 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
     try testing.expectError(error.PrefillLaneNotPorted, model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {}));
 }
 
+test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
+    const xp = @import("deepseek_v41_experts.zig");
+    const xk = @import("exl3_kernels.zig");
+    const xko = @import("exl3_kernel_ops.zig");
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const model_ = try TM.init(testing.allocator, &g, m.c, try routes.parse(&.{}, null), &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const nl = m.c.n_layers;
+    var rows0: [8]u32 = @splat(4);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
+    defer src.deinit();
+    // A wide route that counts its calls and returns the DIG route's output shape.
+    const Count = struct {
+        calls: u32 = 0,
+        rows: u32 = 0,
+        pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !@This() {
+            return .{};
+        }
+        pub fn deinit(_: *@This(), _: *TraceOps) void {}
+        pub fn call(self: *@This(), gg: *TraceOps, act: u32, r: xko.PrefillRows, _: xko.BankArrays(u32)) !u32 {
+            self.calls += 1;
+            self.rows += @intCast(r.slot.len);
+            return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
+        }
+        pub fn finish(_: *@This(), _: *TraceOps) !void {}
+    };
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = Count });
+    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    const Host = struct {
+        n: u16,
+        next: u16 = 0,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out) |*o| {
+                o.* = h.next % h.n;
+                h.next += 1;
+            }
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 7;
+        }
+    };
+    var host: Host = .{ .n = @intCast(m.c.n_routed_experts) };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    // 25 prompt rows x top-k in one forward: every layer's call is wide; then two decode forwards.
+    const k = m.c.n_experts_per_tok;
+    try testing.expect(25 * k > xp.max_route_ids);
+    var out: [3]u32 = undefined;
+    try model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {});
+    try testing.expectEqualSlices(u32, &.{ 7, 7, 7 }, &out);
+    try testing.expectEqual(@as(u32, 27), st.offset);
+    for (ex.wide_routes) |r| {
+        try testing.expectEqual(@as(u32, 1), r.calls);
+        try testing.expectEqual(@as(u32, 25 * k), r.rows);
+    }
+    // One route per layer for the wide forward (4 experts: one group), one per layer per decode forward.
+    try testing.expectEqual(@as(u64, 3 * nl), src.stats().route_calls);
+}
+
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
     const json = try v41.testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(json);
