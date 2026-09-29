@@ -243,7 +243,7 @@ pub fn Loop(comptime G: type) type {
                 start = end;
                 if (done) break;
             }
-            const correction = o.correction orelse return error.VerifyNoTarget;
+            const correction = o.correction.?; // acceptChunk sets it on the chunk that ends the verify
             st.endCycle(o, k_eff);
             const verify_hidden = if (n_hidden == 1) hiddens[0] else try g.concat(hiddens[0..n_hidden], 1);
             // Commit: keep [primary, d1 .. d_accepted] in the target, seed the draft windows.

@@ -188,6 +188,23 @@ pub const MlxOps = struct {
         for (out[0..cfg.n_out]) |*o| o.* = try g.track(o.*);
     }
 
+    /// A launch's mlx config built once (the kernels' decode routes, at construction).
+    pub const Prepared = xk.Prepared;
+
+    pub fn prepareLaunch(g: *MlxOps, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        return g.launcher.?.prepare(k, cfg);
+    }
+
+    /// One launch of a prepared config; the outputs join this scope.
+    pub fn launchPrepared(g: *MlxOps, p: *const Prepared, inputs: []const T, out: []T) !void {
+        try g.launcher.?.applyPrepared(p, inputs, out);
+        for (out[0..p.n_out]) |*o| o.* = try g.track(o.*);
+    }
+
+    pub fn releasePrepared(_: *MlxOps, p: *Prepared) void {
+        p.deinit();
+    }
+
     /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
     /// once per input signature, replayed after. `ctx` carries the region's
     /// structural constants and must outlive the backend.
@@ -775,6 +792,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostIdsSize;
+        // Two producers: the router (int32) and the arm's stand-in decode (uint32).
         switch (mlx.mlx_array_dtype(flat)) {
             .int32 => {
                 const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
@@ -819,13 +837,8 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        switch (mlx.mlx_array_dtype(flat)) {
-            .uint32 => @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]),
-            .int32 => for (out, (mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData)[0..n]) |*o, v| {
-                o.* = @intCast(v);
-            },
-            else => return error.HostReadDtype,
-        }
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .uint32); // argmax outputs and draft ids
+        @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
 
@@ -834,7 +847,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        if (mlx.mlx_array_dtype(flat) != .float32) return error.HostReadDtype;
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .float32);
         @memcpy(out, (mlx.mlx_array_data_float32(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
@@ -844,7 +857,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        if (mlx.mlx_array_dtype(flat) != .bool_) return error.HostReadDtype;
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .bool_);
         @memcpy(out, (mlx.mlx_array_data_bool(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
@@ -1019,6 +1032,9 @@ pub const TraceOps = struct {
     freed: std.ArrayList(Freed) = .empty,
     /// The node count at each `evalAll` (where a host sync fell in the build).
     evals: std.ArrayList(usize) = .empty,
+    /// Launches of prepared configs, and the prepared configs not yet released.
+    prepared_launches: usize = 0,
+    prepared_live: usize = 0,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1339,6 +1355,24 @@ pub const TraceOps = struct {
         for (out[0..cfg.n_out], 0..) |*o, i| o.* = try g.kernel(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i]);
     }
 
+    /// A prepared launch on the trace backend: the kernel and its config, kept by value.
+    pub const Prepared = struct { k: xk.Kernel, cfg: xk.LaunchConfig };
+
+    pub fn prepareLaunch(g: *TraceOps, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        g.prepared_live += 1;
+        return .{ .k = k, .cfg = cfg.* };
+    }
+
+    /// Launches `p` (counted apart from per-call launches).
+    pub fn launchPrepared(g: *TraceOps, p: *const Prepared, inputs: []const T, out: []T) !void {
+        g.prepared_launches += 1;
+        return g.launch(p.k, inputs, &p.cfg, out);
+    }
+
+    pub fn releasePrepared(g: *TraceOps, _: *Prepared) void {
+        g.prepared_live -= 1;
+    }
+
     /// The resident switch: x [..., 1, K] x w [E, N, K*bits/32] at rhs indices [...]
     /// -> [indices..., 1, N] at x's dtype.
     pub fn gatherQmm(g: *TraceOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
@@ -1384,18 +1418,21 @@ pub const TraceOps = struct {
     }
 
     pub fn hostU32(g: *TraceOps, x: T, out: []u32) ![]const u32 {
+        if (g.dtypeOf(x) != .uint32) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.u32s orelse return error.NoHostValues)(hv.ctx, out);
         return out;
     }
 
     pub fn hostF32(g: *TraceOps, x: T, out: []f32) ![]const f32 {
+        if (g.dtypeOf(x) != .float32) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.f32s orelse return error.NoHostValues)(hv.ctx, out);
         return out;
     }
 
     pub fn hostBool(g: *TraceOps, x: T, out: []bool) ![]const bool {
+        if (g.dtypeOf(x) != .bool_) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.bools orelse return error.NoHostValues)(hv.ctx, out);
         return out;
@@ -1720,6 +1757,9 @@ test "dsv41 ops: both backends carry the kernels contract's launch, wave and sco
         comptime std.debug.assert(hasMethod(G, "take", false, &.{ T, T, c_int }, T, true));
         comptime std.debug.assert(hasMethod(G, "mark", true, &.{}, Mark, false));
         comptime std.debug.assert(hasMethod(G, "resetTo", false, &.{Mark}, void, false));
+        comptime std.debug.assert(hasMethod(G, "prepareLaunch", false, &.{ xk.Kernel, *const xk.LaunchConfig }, G.Prepared, true));
+        comptime std.debug.assert(hasMethod(G, "launchPrepared", false, &.{ *const G.Prepared, []const T, []T }, void, true));
+        comptime std.debug.assert(hasMethod(G, "releasePrepared", false, &.{*G.Prepared}, void, false));
     }
 }
 

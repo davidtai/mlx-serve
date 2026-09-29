@@ -434,6 +434,21 @@ pub fn LayerState(comptime G: type) type {
             }
         }
 
+        /// The longest sequence `canAdmit` lets through (null: unbounded). A
+        /// constant of the layer's geometry: a state checks its minimum once.
+        pub fn admitLimit(self: *const Self) ?u32 {
+            const m = self.bounded_max_kv orelse return null;
+            var lim: ?u32 = null;
+            if (self.frontier != null) if (boundedLatentCap(m)) |cap| {
+                lim = cap;
+            };
+            if (self.kv_source and self.ratio >= 1) if (boundedCompCap(m, self.ratio)) |cap| {
+                const l = (cap + 1) * self.ratio - 1; // new_len / ratio <= cap
+                lim = if (lim) |x| @min(x, l) else l;
+            };
+            return lim;
+        }
+
         /// `assert_can_admit`: an over-cap forward fails before any lane is written.
         pub fn canAdmit(self: *const Self, n: u32) Error!void {
             const m = self.bounded_max_kv orelse return;
@@ -754,6 +769,15 @@ test "dsv41 cache: grow and bounded lanes read like the concatenated store, trim
     st.offset = 700;
     try testing.expectError(error.BoundedLaneFull, st.canAdmit(9));
     try st.canAdmit(8);
+    // The per-state limit agrees with the per-forward check at every length around it.
+    const lim = st.admitLimit().?;
+    for (690..730) |len| {
+        st.offset = 0;
+        const ok = if (st.canAdmit(@intCast(len))) |_| true else |_| false;
+        try testing.expectEqual(len <= lim, ok);
+    }
+    const unbounded = RS.init(li, 128, .{ .route = .full_history });
+    try testing.expectEqual(@as(?u32, null), unbounded.admitLimit());
 }
 
 test "dsv41 cache: the compressor frontier pools each group once, across chunks and a trim" {

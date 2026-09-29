@@ -1399,6 +1399,23 @@ fn sampleRows(a: std.mem.Allocator, seed: u64, slots: []const u32, counts: []con
     return rows;
 }
 
+test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the model's backend at construction" {
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    {
+        var gemv = try xko.Gemv(TraceOps).init(&g, &reg);
+        defer gemv.deinit(&g);
+        try testing.expect(g.prepared_live > 0);
+        // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
+        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16));
+        try testing.expect(g.shapeOf(z).eql(ops.Shape.of(&.{ 6, 2304 })));
+        try testing.expectEqual(@as(usize, 1), g.prepared_launches);
+    }
+    try testing.expectEqual(@as(usize, 0), g.prepared_live);
+}
+
 test "dsv41 experts: the joined outputs are put back in routed order" {
     // Outputs joined as positions 3, 0, 4, 1, 2: routed position p reads joined row inv[p].
     var inv: [5]u32 = undefined;
@@ -1462,6 +1479,8 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
         for (g.nodes.items[first_node..]) |nd| kernels += @intFromBool(nd.op == .kernel);
         try testing.expectEqual(7 * waves, kernels);
         try testing.expectEqual(waves + 1, g.freed.items.len - resets_before);
+        // A prefill route builds each launch per call (its rows vary up to 2^20).
+        try testing.expectEqual(@as(usize, 0), g.prepared_launches);
         checked += 1;
         src.flush() catch {};
     }

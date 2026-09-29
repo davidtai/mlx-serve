@@ -59,13 +59,22 @@ pub fn Model(comptime G: type) type {
             offset: u32 = 0,
             layers: []Cache,
             hash: ?eng.HashState = null,
+            /// The longest sequence every lane admits (null: unbounded), from the layers' geometry.
+            max_len: ?u32 = null,
+            /// Host scratch of a forward of at most `scratch_rows` rows (the decode / verify lane).
+            scratch: []u8 = &.{},
 
             pub fn deinit(self: *State, g: *G, gpa: std.mem.Allocator) void {
                 for (self.layers) |*l| l.deinit(g);
                 gpa.free(self.layers);
+                gpa.free(self.scratch);
                 if (self.hash) |*h| h.deinit(gpa);
             }
         };
+
+        /// Rows a forward may run on the state's scratch (the decode lane's
+        /// widest call: a verify block of 8 rows).
+        pub const scratch_rows = 8;
 
         pub const Mark = struct { offset: u32, layers: []Cache.Mark };
 
@@ -192,8 +201,28 @@ pub fn Model(comptime G: type) type {
         /// A fresh sequence: lanes per the tier's KV route, its own n-gram history.
         pub fn newState(self: *const Self) !State {
             const cs = try self.gpa.alloc(Cache, self.c.n_layers);
-            for (cs, 0..) |*lc, l| lc.* = Cache.init(self.c.layers[l], self.c.window, self.tier.kv);
-            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null };
+            errdefer self.gpa.free(cs);
+            var max_len: ?u32 = null;
+            for (cs, 0..) |*lc, l| {
+                lc.* = Cache.init(self.c.layers[l], self.c.window, self.tier.kv);
+                if (lc.admitLimit()) |m| max_len = if (max_len) |x| @min(x, m) else m;
+            }
+            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null, .max_len = max_len, .scratch = try self.gpa.alloc(u8, self.scratchBytes(scratch_rows)) };
+        }
+
+        /// Host bytes a forward of `rows` rows allocates (the embed ids, the Engram
+        /// rows, per Engram layer its ids / codes / scales), each rounded up to
+        /// the allocator's worst alignment.
+        fn scratchBytes(self: *const Self, rows: usize) usize {
+            const pad = 16;
+            var n: usize = rows * @sizeOf(i32) + pad;
+            if (self.engram) |en| {
+                const cols = en.src.hashing.cols();
+                const hd: usize = en.src.bank.head_dim;
+                n += rows * en.src.perToken() * @sizeOf(i64) + pad;
+                n += self.c.engram.n_layers * (rows * cols * @sizeOf(i64) + rows * cols * hd + rows * cols * (hd / 32) + 3 * pad);
+            }
+            return n;
         }
 
         fn invFor(self: *const Self, li: v41.LayerInfo) T {
@@ -294,11 +323,13 @@ pub fn Model(comptime G: type) type {
         /// chunked by `_resolve_prefill_chunk` (K16 layer-major when the tier
         /// asks). The result's arrays live until the backend's next reset.
         pub fn forward(self: *Self, g: *G, st: *State, ids: []const u32, want: Want, routed: anytype, probe: anytype) !Result {
-            var arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena.deinit();
-            const a = arena.allocator();
             const n: u32 = @intCast(ids.len);
-            for (st.layers) |*lc| try lc.canAdmit(n);
+            if (st.max_len) |m| if (st.offset + n > m) return error.BoundedLaneFull;
+            // A decode / verify forward runs on the state's scratch; a prefill span on an arena.
+            var fba: std.heap.FixedBufferAllocator = .init(st.scratch);
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const a = if (n <= scratch_rows) fba.allocator() else arena.allocator();
             const chunk = kvc.resolvePrefillChunk(&self.c, n, self.tier.prefill_chunk, self.tier.chunk_target_bytes);
             var hidden: T = undefined;
             var main: ?T = null;
