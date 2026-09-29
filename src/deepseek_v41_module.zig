@@ -8,7 +8,8 @@
 //!      bank it bound checked against the kernels' layout, again at the phase change;
 //!   3. the residents' rows and model (as `deepseek_v41_dspark_serve.Resources.open`, over the
 //!      shell's loaded residents: the Engram sidecar, the Engram rows, the embedding rows, the trunk
-//!      at the stock tier, the draft head).
+//!      at the served tier `routes.served`, the draft head at its draft routes), then the install
+//!      warm-up: every compiled region traced once at the shapes a request reaches.
 //! The phase change (the embedding's host rows, the grown slot banks) runs once, at the first
 //! decode-width forward after a prompt.
 
@@ -29,6 +30,7 @@ const mdl = @import("deepseek_v41_model.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
 const qwen4 = @import("qwen4_exp.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
+const dsl = @import("deepseek_v41_dspark_loop.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -99,9 +101,16 @@ pub const Module = struct {
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
-        self.model = try M.init(gpa, &self.g, c, try routes.parse(&.{}, &vd), weights, &self.engram);
+        self.model = try M.init(gpa, &self.g, c, routes.served, weights, &self.engram);
         errdefer self.model.deinit(&self.g);
-        self.head = try H.initWith(gpa, &self.g, c, .{}, weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
+        self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
+        errdefer self.head.deinit(&self.g);
+        // The install warm-up (P4.3): the served tier's compiled regions trace here, never in a request.
+        // Decode forwards only until the draft round (P5) serves its depth; each shape's MLX peak is the bill's.
+        var peak: [1]u64 = undefined;
+        try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &self.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, &peak);
+        _ = mlx.mlx_clear_cache();
+        log.info("warm-up: decode forward peak {d} B above the residents; built residents {d} B (W97)", .{ peak[0], self.model.builtBytes() + self.head.builtBytes() });
         return self;
     }
 
@@ -206,7 +215,7 @@ fn checkArmBanks(arm: *A, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !
     for (arm.hook.banks, 0..) |banks, l| for (banks, 0..) |maybe, kind| {
         const bank = maybe orelse continue;
         checkBank(g, reg, bank, &kd) catch |e|
-            return refuse(diag, e, "kernels: layer {d} {t} bank: {s}", .{ l, @as(xp.BankKind, @enumFromInt(kind)), kd.message() });
+            return refuse(diag, e, "kernels: layer {d} {t} bank: {s}", .{ l, @as(xp.BankKind, @fromBackingInt(@intCast(kind))), kd.message() });
     };
 }
 
@@ -221,6 +230,10 @@ const GrownBanks = struct {
         };
     }
 };
+
+test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
+    try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);
+}
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
 // [DSV41_MODULE_ROWS=<--expert-rows>] [DSV41_MODULE_HEAD=ceiling: the record's pruned draft head]: the module's
