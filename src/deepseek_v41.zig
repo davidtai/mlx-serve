@@ -33,6 +33,13 @@ pub const PrefillBill = struct {
     head_promotion_bytes: u64,
     /// The allocator cache the module holds MLX to during the prefill.
     cache_bytes: u64,
+    /// K16's kept state (`layerMajorBytes`): the hidden width, hc copies, routed top-k, the DSpark
+    /// target taps, the indexer's top-k.
+    hidden: u64 = 0,
+    hc: u64 = 0,
+    top_k: u64 = 0,
+    n_main: u64 = 0,
+    index_topk: u64 = 0,
 
     /// The trunk's attention: the stock tier scores every position (masked full), the served tier the selected keys.
     pub const Tier = enum { stock, served };
@@ -69,6 +76,15 @@ pub const PrefillBill = struct {
             .window_ring_bytes = @as(u64, c.n_layers) * c.window * c.head_dim * 4,
             .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
             .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
+            .hidden = c.hidden_size,
+            .hc = c.hc_mult,
+            .top_k = c.n_experts_per_tok,
+            .n_main = n_main: {
+                var n: u64 = 0;
+                for (c.layers[0..c.n_layers]) |li| n += @intFromBool(li.dspark_target);
+                break :n_main n;
+            },
+            .index_topk = c.index_topk,
         };
     }
 
@@ -91,6 +107,38 @@ pub const PrefillBill = struct {
         const attn = rows * b.n_heads * (keys + 1) * 4;
         const index = rows * b.index_heads * positions * 4;
         return wave_fixed_bytes + rows * wave_row_bytes + chain_copies * @max(attn, index) + positions * kept_pos_bytes;
+    }
+
+    /// K16 (layer-major prefill: every layer over all of the prompt's chunks before the next) at `seq`
+    /// tokens: the peak of one layer, by construction from `forwardLayerMajor`'s structure (d776910):
+    ///   kept across the layer: every chunk's f32 HC stream (hs) and pre-mix, positions, the DSpark
+    ///   main taps, every chunk's Half (moe_in, h1, post, comb, ffn_pre) and shared runtime (the
+    ///   index selection: a top-k mask row over the compressed positions, the selected ids);
+    ///   plus the larger of the two sub-waves that open inside a layer, one at a time: a chunk's
+    ///   attention side (`waveBytes` without the chunk-major kept positions, which the kept state
+    ///   above replaces) or a routed group (moeRowCap rows: the routed outputs, the joined input,
+    ///   the combine and the HC post to the next stream, with the group's new stream held beside the old).
+    pub fn layerMajorWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
+        const d = b.hidden;
+        const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
+        const halves = seq * (b.hc * d * 4 + d * 4 + 2 * b.hc * 4 + b.hc * b.hc * 4);
+        const selection = seq * ((if (b.min_ratio > 0) seq / b.min_ratio else 0) + b.index_topk * 4);
+        const attn = b.waveBytes(b.chunkRows(seq), seq, tier) - seq * kept_pos_bytes;
+        const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
+        const g_rows = @min(seq, cap);
+        const group = g_rows * (2 * b.top_k * d * 4 + 2 * d * 4 + 4 * b.hc * d * 4);
+        return kept_stream + halves + selection + @max(attn, group);
+    }
+
+    /// `bytes` for a K16 request: the layer-major wave (x 5/4) in place of the chunk-major one.
+    pub fn layerMajorBytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
+        const positions = seq + max_tokens + 8;
+        const kv = switch (tier) {
+            .stock => positions * b.kv_pos_bytes,
+            .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
+        };
+        const head = if (tier == .stock) b.head_promotion_bytes else 0;
+        return b.layerMajorWaveBytes(seq, tier) / 4 * 5 + kv + head + b.cache_bytes;
     }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by

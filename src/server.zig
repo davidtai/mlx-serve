@@ -5707,7 +5707,11 @@ pub fn prefillNeededAtChunk(
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     // deepseek_v41 forwards the whole prompt in its own chunks, one wave per layer: its own bill.
-    if (config.dsv41_prefill) |bill| return bill.bytes(seq, max_tokens, .served);
+    if (config.dsv41_prefill) |bill| {
+        // The module's numeric tier and pass (K16 layer-major is refused on the stock tier at construction).
+        const tier: @TypeOf(bill).Tier = if ((config.numeric_tier orelse .served) == .stock) .stock else .served;
+        return if (config.layer_major_prefill orelse false) bill.layerMajorBytes(seq, max_tokens, tier) else bill.bytes(seq, max_tokens, tier);
+    }
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
@@ -21813,6 +21817,13 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
     // The served gate's 64-token prompt: a small bill.
     try t.expect(bill.bytes(64, 32, .served) < 5_000_000_000);
+    // The module's tier and pass choose the bill.
+    cfg.numeric_tier = .stock;
+    try t.expectEqual(bill.bytes(16384, 1024, .stock), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    cfg.numeric_tier = null;
+    cfg.layer_major_prefill = true;
+    try t.expectEqual(bill.layerMajorBytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    cfg.layer_major_prefill = null;
     try t.expect(!scheduler_mod.configBatchesDecode(&cfg));
 }
 

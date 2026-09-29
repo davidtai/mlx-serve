@@ -65,7 +65,6 @@ pub const stock: Tier = .{};
 pub const served_levers = [_][2][]const u8{
     .{ "MTPLX_DSV41_SELECTED_KEYS", "1" }, // A18 K30
     .{ "MTPLX_DSV41_ATTN_COMPILE", "1" }, // A19 K22 (warmed at construction: Loop.warm)
-    .{ "MTPLX_DSV41_ATTN_WO_A_CACHE", "1" }, // A20 W97 (billed: builtBytes)
     .{ "MTPLX_DSV41_PREFILL_SCORE_PATH", "lean" }, // A21 W50
     .{ "MTPLX_DSV41_HEAD_MODE", "bf16" }, // A22
     .{ "MTPLX_DSV41_WINDOW_RING", "1" }, // G3's ring
@@ -83,6 +82,11 @@ pub const served: Tier = blk: {
     t.routes.rc_sinkhorn = true; // C12 RCTAIL sinkhorn (+ SINKHORN_METAL above 32 matrices)
     t.routes.rc_router = true; // C13 RCTAIL router (rows <= 8)
     t.routes.rc_premix = true; // C13 RCTAIL hcpremix (rows <= 8)
+    t.routes.rc_proj = true; // C14 RCPROJ mxfp8 + woarc (rows <= 8); W97 left the levers with it
+    t.routes.rc_tape = true; // C15 HCTAPE all (rows <= 8, over C14's bf16 stream)
+    t.routes.rc_fused_proj = true; // A9 K36 ATTN_FUSED_PROJ (rows <= 8, beside C14)
+    t.routes.rc_head = true; // C11 the verify head on m1rows + RCTAIL headpad (rows <= 8)
+    t.routes.rc_draft = true; // C16 DRAFTRC all (the draft block's routes; draftRoutes carries it)
     break :blk t;
 };
 
@@ -375,8 +379,16 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.rc_sinkhorn = false;
     rc_off.rc_router = false;
     rc_off.rc_premix = false;
+    rc_off.rc_proj = false;
+    rc_off.rc_tape = false;
+    rc_off.rc_fused_proj = false;
+    rc_off.rc_head = false;
+    rc_off.rc_draft = false;
+    // C14 drops W97 (the dense f32 wo_a, 5.37 GB over 40 layers): the tier's arm keeps it.
+    rc_off.wo_a_f32 = true;
     try testing.expectEqual(trunk.routes, rc_off);
-    try testing.expect(served.routes.rc_sinkhorn and served.routes.rc_router and served.routes.rc_premix);
+    try testing.expect(served.routes.rc_sinkhorn and served.routes.rc_router and served.routes.rc_premix and served.routes.rc_proj and served.routes.rc_tape and served.routes.rc_fused_proj and served.routes.rc_head and served.routes.rc_draft and served.draftRoutes().rc_draft);
+    try testing.expect(!served.routes.wo_a_f32);
     try testing.expectEqual(trunk.kv, served.kv);
     try testing.expectEqual(trunk.draft_head_bf16, served.draft_head_bf16);
     try testing.expectEqual(trunk.prefill_chunk, served.prefill_chunk);

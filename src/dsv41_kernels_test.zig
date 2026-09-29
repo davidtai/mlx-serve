@@ -399,7 +399,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     {
         const q_norm, const kv_norm = .{ try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}) };
-        var r = try FusedProj(Trace).init(&t, &reg, q_norm, kv_norm, null);
+        var r = try FusedProj(Trace).init(&t, &reg, q_norm, kv_norm, 1e-20, null);
         defer r.deinit(&t);
         for (r.rms.samples) |*s| {
             const m: c_int = @intCast(s.vars.get(.rows));
@@ -592,8 +592,22 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_mxfp8_fma input scales") != null);
     try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&t, &reg, .float16, &diag));
     const qn32 = try t.node(&.{1280}, .float32, &.{});
-    try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn32, try t.node(&.{512}, .bfloat16, &.{}), &diag));
+    try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn32, try t.node(&.{512}, .bfloat16, &.{}), 1e-20, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280 input weight") != null);
+    // K36's RMSNorm eps is bound from the model config at install: another rms_norm_eps (or 0) is
+    // refused before anything is built; the registered static is the f32 1e-20 the lane passes
+    const qn = try t.node(&.{1280}, .bfloat16, &.{});
+    const kn = try t.node(&.{512}, .bfloat16, &.{});
+    for ([_]f32{ 0, 1e-6, 1e-19 }) |bad_eps| {
+        try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn, kn, bad_eps, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280 is registered at eps") != null);
+    }
+    inline for (.{ Kernel.mtplx_dsv41_fp_rmsnorm_tg128_d1280, Kernel.mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64 }) |k| {
+        var sbuf: [1024]u8 = undefined;
+        const shape, const bytes = kr.staticBytes(kr.argOf(reg.get(k), "eps"), &sbuf);
+        try testing.expectEqual(@as(usize, 0), shape.slice().len);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&@as(f32, 1e-20)), bytes);
+    }
     const bank: ProjArrays(Trace.T) = .{
         .code = try t.node(&.{ 4, 144, 320, 48 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 5120 }, .float32, &.{}),
@@ -646,7 +660,7 @@ test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
     try testing.expectEqualSlices(u32, &.{ 0xCBAC1FED, 0, 0x8FFF8FFF, 0x3B603B60 }, &cbv);
     for (gv.dn_statics.arrays[4..9]) |z| try testing.expect(std.mem.allEqual(u8, t.nodes.items[z].bytes, 0));
     // config.json rms_norm_eps 1e-20 (a 0-d f32 input); every K36 kernel stores bf16
-    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), null);
+    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), 1e-20, null);
     defer fp.deinit(&t);
     const eps = std.mem.bytesToValue(f32, t.nodes.items[fp.rms_statics.arrays[2]].bytes);
     try testing.expectEqual(@as(f32, 1e-20), eps);

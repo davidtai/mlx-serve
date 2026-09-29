@@ -109,7 +109,7 @@ pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *qwen
     _ = try model.retireEmbedding(g, rows);
     owner.drop("embed.weight");
     if (G == ops.MlxOps) {
-        _ = mlx.mlx_clear_cache();
+        g.clearCache();
         if (before -| activeBytes(G, g) < model.embeddingBytes()) return error.EmbeddingNotReleased;
     }
 }
@@ -400,39 +400,45 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
     }.count;
     const depth2: dsl.Config = .{ .k_request = 2, .max_tokens = std.math.maxInt(u32) };
     {
-        // The router / premix kernels bake the real geometry (384 x 5120, 24 x 20480): the mini
+        // The router / premix / RCPROJ / HC tape kernels bake the real geometry (384 x 5120, 24 x 20480, ...): the mini
         // model refuses them by name at construction; they bind on the real shapes (the graph
         // test, the 16K accounting on the bank). Here the served tier without those two members.
         try testing.expectError(error.RouterGeometry, Rig.createAt(routes.served));
         var mini_served = routes.served;
         mini_served.routes.rc_router = false;
         mini_served.routes.rc_premix = false;
+        mini_served.routes.rc_proj = false;
+        mini_served.routes.rc_tape = false;
+        mini_served.routes.rc_fused_proj = false;
+        mini_served.routes.rc_head = false;
+        mini_served.routes.rc_draft = false;
         const r = try Rig.createAt(mini_served);
         defer r.destroy();
         var s: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };
         r.script(&s);
-        // A18 K30, A19 K22, A20 W97, A21 W50, A22 the bf16 head, the window ring; A25 K33 and A26 W103 on the draft head.
+        // A18 K30, A19 K22, A21 W50, A22 the bf16 head, the window ring; A25 K33 and A26 W103 on the draft head.
         const rt = r.model.tier.routes;
-        try testing.expect(rt.selected_keys and rt.attn_rows == graph.attn_compile_max_rows and rt.wo_a_f32 and rt.lean_prefill_score);
+        try testing.expect(rt.selected_keys and rt.attn_rows == graph.attn_compile_max_rows and rt.lean_prefill_score);
         try testing.expectEqual(graph.Routes.Head.bf16, rt.head);
         try testing.expectEqualStrings("window_ring", @tagName(r.model.tier.kv.route));
         try testing.expectEqual(graph.draft_compile_max_rows, r.head.rt.draft_rows);
         try testing.expectEqual(graph.Routes.Head.bf16, r.head.rt.head);
-        // W97 on every trunk layer and every draft stage (DSparkAttention inherits the cache), billed.
-        for (r.model.layers) |lw| try testing.expect(lw.wo_a_dense != null);
-        for (r.head.stages) |st| try testing.expect(st.w.wo_a_dense != null);
-        const woa = graph.woaDenseBytes(&r.mini.c);
-        try testing.expectEqual(@as(u64, r.mini.c.n_layers) * woa, r.model.builtBytes());
-        try testing.expectEqual(@as(u64, r.head.nStages()) * woa, r.head.builtBytes());
+        // C14 dropped W97 (review sec. 20 #11): no dense f32 wo_a on any layer or draft stage, nothing billed.
+        try testing.expect(!rt.wo_a_f32 and !r.head.rt.wo_a_f32);
+        for (r.model.layers) |lw| try testing.expect(lw.wo_a_dense == null);
+        for (r.head.stages) |st| try testing.expect(st.w.wo_a_dense == null);
+        try testing.expectEqual(@as(u64, 0), r.model.builtBytes() + r.head.builtBytes());
         // The warm-up of depth-2 requests (verify rows 1..3, then a draft block) through the served routes:
-        // the compiled regions trace here, and no forward dequantizes a wo_a (W97 on trunk and draft).
+        // the compiled regions trace here. The mini binds no RCPROJ (its geometry), so each forward
+        // dequantizes its wo_a as the stock path does (on the real geometry the verify rows take
+        // the packed woarc route: the graph test).
         const n0 = r.g.nodes.items.len;
         const c0 = r.g.compiles;
         const peaks = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, depth2, 0);
         defer a.free(peaks);
         try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, peaks);
         try testing.expect(r.g.compiles > c0);
-        try testing.expectEqual(@as(usize, 0), woaDequants(&r.g, &r.mini.c, n0));
+        try testing.expectEqual(3 * @as(usize, r.mini.c.n_layers) + r.head.nStages(), woaDequants(&r.g, &r.mini.c, n0));
         // C12: every trunk HC mix's Sinkhorn is the kernel route; only the draft block's stages
         // (their attention and ffn mixes) keep the op chain until C16 binds the draft's routes (bitwise equal: the
         // 16-lane kernel's manifest note).

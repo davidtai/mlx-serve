@@ -13,6 +13,7 @@ const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const graph = @import("deepseek_v41_graph.zig");
+const kr = @import("dsv41_kernel_routes.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
@@ -58,6 +59,8 @@ pub fn Model(comptime G: type) type {
         owned: std.ArrayList(T) = .empty,
         /// The tier's RC kernel routes (C12 ...), bound at `initWith`; empty on a stock tier.
         kx: Tr.Kernels = .{},
+        /// C11: the verify head's m1rows route (rows <= 8), over the dense bf16 head.
+        head_rows: ?kr.HeadRows(G) = null,
 
         const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
 
@@ -167,7 +170,14 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
-            if (opts.registry) |reg| self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
+            if (opts.registry) |reg| {
+                self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
+                if (tier.routes.rc_head) {
+                    // The kernel reads the bf16 head (HEAD_MODE bf16: the served head's weight as bound).
+                    if (tier.routes.head != .bf16) return error.HeadRowsNeedsBf16;
+                    self.head_rows = kr.HeadRows(G).init(g, reg, self.head.dense, null) catch |e| return if (e == error.RouteInput) error.HeadRowsGeometry else e;
+                }
+            }
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
@@ -177,6 +187,7 @@ pub fn Model(comptime G: type) type {
             for (self.owned.items) |x| g.release(x);
             self.owned.deinit(self.gpa);
             self.kx.deinit(g);
+            if (self.head_rows) |*x| x.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
         }
@@ -479,14 +490,23 @@ pub fn Model(comptime G: type) type {
             var res: Result = .{ .hidden = hidden, .main_hidden = main };
             switch (want.logits) {
                 .none => {},
-                .all => res.logits = try Tr.head(g, &self.tier.routes, hidden, self.head),
+                .all => res.logits = try self.headOf(g, hidden),
                 .last => {
                     const s = g.shapeOf(hidden);
                     const last = try g.slice(hidden, &.{ 0, s.d[1] - 1, 0 }, s.slice(), &.{ 1, 1, 1 });
-                    res.logits = try Tr.head(g, &self.tier.routes, last, self.head);
+                    res.logits = try self.headOf(g, last);
                 },
             }
             return res;
+        }
+
+        /// The head under its route: C11's m1rows at <= 8 rows when bound (a phase route), else `Tr.head`.
+        fn headOf(self: *const Self, g: *G, x: T) !T {
+            if (self.head_rows) |*hr| {
+                const s = g.shapeOf(x);
+                if (s.d[0] * s.d[1] <= graph.rc_max_rows) return Tr.headRows(g, hr, x);
+            }
+            return Tr.head(g, &self.tier.routes, x, self.head);
         }
 
         /// Greedy AR (the M3 token-parity run): the prompt in forwards of at
@@ -538,6 +558,8 @@ pub fn Model(comptime G: type) type {
             const shareds = try a.alloc(Tr.Share, nc);
             const mains = try a.alloc([8]T, nc);
             var n_main: usize = 0;
+            // The embedding's own wave: only each chunk's (kept) h, pre_mix and positions survive it.
+            const embed_wave = g.mark();
             for (spans, 0..) |sp, i| {
                 const e = try self.embedSpan(g, a, ids[sp[0]..sp[1]]);
                 hs[i] = g.keep(e.h);
@@ -546,6 +568,8 @@ pub fn Model(comptime G: type) type {
                 rows[i] = try self.engramRowsFor(st, a, ids[sp[0]..sp[1]]);
                 shareds[i] = .{};
             }
+            try g.evalAll(hs);
+            g.resetTo(embed_wave);
             // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
             const carries = try a.alloc(Tr.Carry, nc);
             @memset(carries, .{});
@@ -558,12 +582,23 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const lc = &st.layers[l];
+                // One wave per layer (freed at its end; hs, pms and the chunks' shared runtime carried).
+                const layer_wave = g.mark();
                 for (spans, 0..) |sp, i| {
+                    // One sub-wave per chunk: its attention side is freed before the next chunk's, only
+                    // its Half and its shared runtime kept to the layer's routed call (as chunk-major
+                    // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
+                    const wave = g.mark();
                     var h = hs[i];
                     if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
-                    try fence(g, st, &.{ halves[i].moe_in, halves[i].ffn_pre });
+                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
+                    const hf = halves[i];
+                    try fence(g, st, &.{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb });
+                    keepHalf(g, &halves[i]);
+                    carries[i].persistShared(g, &shareds[i]);
+                    g.resetTo(wave);
                 }
                 if (want_main and li.dspark_target) n_main += 1;
                 // Per chunk: the resident gate (M == the chunk, as chunk-major).
@@ -581,6 +616,9 @@ pub fn Model(comptime G: type) type {
                         if (j > i and n_rows + r_ > cap) break;
                         n_rows += r_;
                     }
+                    // One sub-wave per routed group: its routed outputs, combines and HC posts are freed
+                    // once the group's new hidden states are evaluated and kept.
+                    const group_wave = g.mark();
                     const cat_xf = if (j - i == 1) xfs[i] else try g.concat(xfs[i..j], 0);
                     const idxs = try a.alloc(T, j - i);
                     for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
@@ -600,12 +638,15 @@ pub fn Model(comptime G: type) type {
                         hs[k] = g.keep(next);
                         g.release(pms[k]);
                         pms[k] = g.keep(halves[k].ffn_pre);
+                        releaseHalf(g, &halves[k]);
                     }
+                    try g.evalAll(hs[i..j]);
+                    g.resetTo(group_wave);
                     i = j;
                 }
                 try g.evalAll(hs);
                 for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
-                g.reset();
+                g.resetTo(layer_wave);
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));
             st.offset += @intCast(ids.len);
@@ -625,6 +666,15 @@ pub fn Model(comptime G: type) type {
                 for (mains[i][0..n_main]) |x| g.release(x);
             }
             return .{ .hidden = hidden, .main = main };
+        }
+
+        /// K16's per-chunk sub-wave keeps a chunk's Half past its reset (released after its HC post).
+        fn keepHalf(g: *G, hf: *Tr.Half) void {
+            inline for (@typeInfo(Tr.Half).@"struct".field_names) |name| @field(hf, name) = g.keep(@field(hf, name));
+        }
+
+        fn releaseHalf(g: *G, hf: *Tr.Half) void {
+            inline for (@typeInfo(Tr.Half).@"struct".field_names) |name| g.release(@field(hf, name));
         }
 
         /// Drop the last `n` tokens from every lane and the n-gram history, all or

@@ -486,7 +486,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 11;
     }
     if (eq(u8, f, "fused_proj")) {
-        var r = try tr.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
+        // the fixture's eps: dump_kernel_ops_fixture.py reads the bank config's rms_norm_eps (1e-20)
+        var r = try tr.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), 1e-20, null);
         defer r.deinit(g);
         const cos, const sin = .{ in(ins, "cos"), in(ins, "sin") };
         outs[0] = try r.qNorm(g, in(ins, "x_q"));

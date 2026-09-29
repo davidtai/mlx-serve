@@ -42,6 +42,10 @@ const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_event = @import("expert_event.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
+// The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
+comptime {
+    std.debug.assert(xp.decode_forward_rows == graph.rc_max_rows);
+}
 /// The expert source: the EXL3 quant's math (C2), the wide (prefill) routed calls on its DIG-X route, the
 /// next layer's reads started from the predictor. `A` waits on the host (LOOKAHEAD3, the exact tier);
 /// `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
@@ -125,7 +129,7 @@ pub const Module = struct {
         // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
         const ceiling = boxCeiling(config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet(), c0.n_routed_experts);
         errdefer self.dropKernels();
-        _ = mlx.mlx_clear_cache();
+        self.g.clearCache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
         errdefer setCacheLimit(self.prev_cache_limit);
@@ -152,7 +156,7 @@ pub const Module = struct {
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg });
         errdefer self.head.deinit(&self.g);
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
         // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
@@ -161,8 +165,8 @@ pub const Module = struct {
             inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows),
         };
         errdefer gpa.free(self.warm_peaks);
-        _ = mlx.mlx_clear_cache();
-        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B (W97)", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        self.g.clearCache();
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
         // The bill against the warm-up's measured peak (C4 G7): the widest decode-width wave, the tier's head.
         if (config.dsv41_prefill) |bill| {
             const bt: v41.PrefillBill.Tier = switch (config.numeric_tier orelse .served) {
@@ -181,18 +185,9 @@ pub const Module = struct {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, .{
-            .model_dir = config.expert_bank_dir.?,
-            .envelope = envelope,
-            .baseline_bytes = config.memory_baseline_bytes,
-            .fixed_rows = config.expert_rows,
-            .slot_memory = .{ .mlx = s },
-            .draft_pruned_bytes = 0,
-            .lookahead = lookahead,
-            .ceiling = ceiling,
-            .event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null,
-            .wide_depth = config.expert_wide_depth orelse 1,
-        }, .{ .gates = gates, .event = event, .wide = wideRoute(config) }, diag) catch |e| return refused(e, diag);
+        var opts = armOptions(config, ceiling, .{ .mlx = s });
+        opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wideRoute(config) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
@@ -279,19 +274,30 @@ pub const Module = struct {
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
-        switch (self.arm) {
-            inline else => |t| if (phaseChangeDue(ids.len, t.arm.grown)) {
-                if (!self.fenced) {
-                    try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
-                    self.fenced = true;
-                }
-                // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
-                _ = mlx.mlx_clear_cache();
-                setCacheLimit(envelope.decode_cache_bytes);
-                try t.arm.grow(&self.g);
-            },
-        }
+        if (phaseChangeDue(ids.len, self.grown())) try self.phaseChange();
         return self.forward(ids);
+    }
+
+    /// The prompt fence and the grown slot banks, once (a no-op after): the embedding to its host
+    /// rows, the prefill's parked buffers back, the decode cache charge, the banks at the decode rows.
+    pub fn phaseChange(self: *Module) !void {
+        if (self.grown()) return;
+        if (!self.fenced) {
+            try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
+            self.fenced = true;
+        }
+        // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
+        self.g.clearCache();
+        setCacheLimit(envelope.decode_cache_bytes);
+        switch (self.arm) {
+            inline else => |t| try t.arm.grow(&self.g),
+        }
+    }
+
+    fn grown(self: *const Module) bool {
+        return switch (self.arm) {
+            inline else => |t| t.arm.grown,
+        };
     }
 
     fn forward(self: *Module, ids: []const u32) !mlx.mlx_array {
@@ -303,9 +309,9 @@ pub const Module = struct {
     }
 };
 
-/// Whether `v41.PrefillBill` bills the layer-major pass (every chunk's kept state across a layer
-/// and the routed call batched across chunks); until it does, the route is refused at construction.
-pub const layer_major_billed = false;
+/// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
+/// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
+pub const layer_major_billed = true;
 
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
@@ -339,6 +345,22 @@ pub const ceiling_stop_bytes: u64 = 2_000_000_000;
 
 /// The box a streamed-expert admission fits under a memory ceiling (the GPU's working set by default):
 /// the peak `ceiling_stop_bytes` under it, every layer up to its expert count.
+/// The arm's construction options from the shell's config (the admission's inputs): the module builds
+/// with them, and a host bill plans the same rows with them (`slot_memory = .host`).
+pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission.Ceiling, slot_memory: expert_stream.SlotMemory) arm_mod.Options {
+    return .{
+        .model_dir = config.expert_bank_dir.?,
+        .envelope = envelope,
+        .baseline_bytes = config.memory_baseline_bytes,
+        .fixed_rows = config.expert_rows,
+        .slot_memory = slot_memory,
+        .draft_pruned_bytes = 0,
+        .lookahead = lookahead,
+        .ceiling = ceiling,
+        .wide_depth = config.expert_wide_depth orelse 1,
+    };
+}
+
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
 }

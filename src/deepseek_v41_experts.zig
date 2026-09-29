@@ -37,6 +37,12 @@ const quant = @import("quant.zig");
 const xq = @import("exl3_quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
+/// The widest decode / verify forward (the RC routes' and the verify block's rows): at most
+/// `decode_forward_rows * top_k` routed ids, which construction proves fit one route (`max_route_ids`),
+/// so a forward of <= 8 rows never reaches the wide lane.
+pub const decode_forward_rows: u32 = 8;
+/// The fewest routed ids a wide-lane call takes (one more than a route): refused below, by name.
+pub const wide_min_ids: u32 = max_route_ids + 1;
 pub const BankKind = expert_stream.BankKind;
 pub const SlotRef = expert_stream.SlotRef;
 pub const Stats = expert_stream.Stats;
@@ -798,6 +804,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn initWith(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config, opt: Options) !Self {
+            // A decode-width forward must fit one route: its calls are the decode lane's by arithmetic.
+            if (@as(u64, decode_forward_rows) * c.n_experts_per_tok > max_route_ids) return error.DecodeRowsWiderThanRoute;
             if (routes.lookahead and opt.gates.len != c.n_layers) return error.LookaheadNeedsGates;
             if (routes.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
             const wr = opt.wide;
@@ -1058,6 +1066,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
+            // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
+            // `constant`; a decode-width call is the decode lane's).
+            if (n_ids < wide_min_ids) return error.WideLaneUnderMinIds;
             const feed = self.wide_route.feed;
             const depth: usize = self.wide_route.depth;
             const cold: u32 = self.wide_route.cold_rows;
@@ -1263,6 +1274,7 @@ fn testConfig(hidden: u32, inter: u32, n_layers: u8) v41.Config {
     c.hidden_size = hidden;
     c.moe_intermediate_size = inter;
     c.n_layers = n_layers;
+    c.n_experts_per_tok = 6;
     c.swiglu_limit = 10.0;
     return c;
 }
@@ -1571,6 +1583,36 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     var inv: [5]u32 = undefined;
     invertPositions(&.{ 3, 0, 4, 1, 2 }, &inv);
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
+}
+
+test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route, the wide lane refuses it by name" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 64;
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    src.trace = &g;
+    RecRoute.source = &src;
+    defer RecRoute.source = null;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    var rrs = [_]RecRoute{RecRoute.init(a)};
+    defer rrs[0].deinit(&g);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    // A top-k whose decode block would overflow one route is refused at construction.
+    var wide_k = c;
+    wide_k.n_experts_per_tok = 7;
+    try testing.expectError(error.DecodeRowsWiderThanRoute, Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &wide_k));
+    var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
+    defer ex.deinit();
+    // 8 rows x top-6 = 48 ids: the wide lane refuses them by name (the dispatch sends them to the decode lane).
+    try testing.expectEqual(@as(u32, 48), decode_forward_rows * 6);
+    try testing.expectError(error.WideLaneUnderMinIds, ex.runWide(&g, 0, try g.input(&.{ 8, 256 }, .float32), try g.input(&.{ 8, 6 }, .int32), 8, 6));
+    try testing.expectEqual(@as(usize, 0), rrs[0].calls.items.len);
 }
 
 test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samples' wave structure" {

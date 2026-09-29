@@ -24,11 +24,19 @@ const kernel_set = @import("kernel_set.zig");
 const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
+const cell = @import("deepseek_v41_cell.zig");
+const arm_mod = @import("deepseek_v41_arm.zig");
+const expert_admission = @import("expert_admission.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
 /// (`status.getAppMemFootprintMb`). The gap between the footprint and MLX is the host side.
 fn memProbe(harness: []const u8, phase: []const u8) void {
+    _ = memProbePeak(harness, phase);
+}
+
+/// `memProbe`, returning the MLX peak since the previous probe (the probe resets it).
+fn memProbePeak(harness: []const u8, phase: []const u8) usize {
     var active: usize = 0;
     var peak: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
@@ -38,6 +46,7 @@ fn memProbe(harness: []const u8, phase: []const u8) void {
         harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp_mib << 20)) / 1e9,
     });
     _ = mlx.mlx_reset_peak_memory();
+    return peak;
 }
 
 /// The load context's kernels on the harness's GPU stream, as the served module takes them
@@ -634,6 +643,561 @@ test "dsv41 ar: the served schedule's host preconditions: the top-2 rule and, on
         try testing.expectEqualStrings(reference_format, ref.format);
         try testing.expect(ref.prompt_ids.len >= 2 and ref.generated_ids.len == ref.new_tokens);
     }
+}
+
+/// The standard cell's prompt (`mtplx-server-cell-prompt-ids-v1`: scripts/fable/server_cell_bench.py's
+/// export; the sweep cell at 16,384 templated tokens, seed 20260829).
+pub const prompt_ids_schema = "mtplx-server-cell-prompt-ids-v1";
+pub const CellPrompt = struct { cell: []const u8, target_tokens: u32 = 0, seed: ?u64 = null, token_ids: []const u32, token_ids_sha256: []const u8 };
+pub const PromptIds = struct { schema: []const u8, context_sha256: []const u8 = "", prompts: []const CellPrompt };
+
+/// The standard cell's prompt from `path`: the sweep entry at `target` tokens and `seed`, its ids'
+/// digest (Python's `json.dumps`) equal to the file's. Refused by name otherwise.
+pub fn standardPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, target: u32, seed: u64) ![]const u32 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    const f = try std.json.parseFromSliceLeaky(PromptIds, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, f.schema, prompt_ids_schema)) return error.PromptIdsSchema;
+    for (f.prompts) |p| {
+        if (!std.mem.eql(u8, p.cell, "sweep") or p.target_tokens != target or p.seed != seed) continue;
+        if (p.token_ids.len != target) return error.PromptIdsLength;
+        const d = try cell.idsSha256(a, p.token_ids);
+        if (!std.mem.eql(u8, &d, p.token_ids_sha256)) return error.PromptIdsDigest;
+        return p.token_ids;
+    }
+    return error.PromptIdsNoCell;
+}
+
+/// The seeded fixture (`dsv41-seeded-mtp-comparison-v1`): the Python tier's headline cases (the
+/// FASTEST prompt of record is case code-20260923, the one grade_typical_case.py grades).
+pub const seeded_fixture_schema = "dsv41-seeded-mtp-comparison-v1";
+const FixtureCase = struct { id: []const u8, prompt_ids: []const u32, prompt_ids_sha256: []const u8 };
+const SeededFixture = struct { schema: []const u8, cases: []const FixtureCase };
+
+/// The cell's prompt: case `case_id` of a seeded fixture (DSV41_CELL_CASE; the headline's fastest
+/// prompt), else the standard sweep entry of a prompt-ids file; 16,384 tokens, its json.dumps digest
+/// equal to the file's. Refused by name otherwise.
+pub fn cellPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, case_id: ?[]const u8) ![]const u32 {
+    const id = case_id orelse return standardPrompt(a, io, path, 16384, 20260829);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    const f = try std.json.parseFromSliceLeaky(SeededFixture, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, f.schema, seeded_fixture_schema)) return error.PromptIdsSchema;
+    for (f.cases) |c| {
+        if (!std.mem.eql(u8, c.id, id)) continue;
+        if (c.prompt_ids.len != 16384) return error.PromptIdsLength;
+        const d = try cell.idsSha256(a, c.prompt_ids);
+        if (!std.mem.eql(u8, &d, c.prompt_ids_sha256)) return error.PromptIdsDigest;
+        return c.prompt_ids;
+    }
+    return error.PromptIdsNoCell;
+}
+
+/// The typical-tier cell's receipt (`mlx-serve-dsv41-served-cell-v1`): the standard cell's
+/// numbers (prefill tok/s, TTFT, decode tok/s, peak GB decimal, wall), the rows admitted, the
+/// per-cycle acceptance and the generated ids.
+pub const served_cell_format = "mlx-serve-dsv41-served-cell-v1";
+const CellCycle = struct { k_eff: u32, accepted: u32, verified: u32 };
+const CellReceipt = struct {
+    format: []const u8 = served_cell_format,
+    tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
+    typical_delta: f64,
+    prompt_file: []const u8,
+    /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
+    prompt_source: []const u8,
+    prompt_tokens: usize,
+    prompt_ids_sha256: []const u8,
+    max_tokens: u32,
+    finish: []const u8,
+    prefill_rows_per_layer: u32,
+    decode_rows_per_layer: u32,
+    ttft_s: f64,
+    prefill_tok_s: f64,
+    phase_change_s: f64,
+    decode_wall_s: f64,
+    decode_tok_s: f64,
+    decode_tok_s_with_phase_change: f64,
+    wall_s: f64,
+    peak_footprint_gb: f64,
+    mlx_peak_gb: f64,
+    generated_tokens: usize,
+    generated_ids: []const u32,
+    generated_ids_sha256: []const u8,
+    cycles: []const CellCycle,
+    accepted_drafts: u32,
+    drafted_tokens: u32,
+    accept_rate: f64,
+    tokens_per_cycle: f64,
+};
+
+// Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
+// (the standard cell's)> DSV41_BANK=<bank> DSV41_CELL_OUT=<new json> _GPU_WINDOW_LOCKED=1
+// [DSV41_CELL_BASELINE_GB=<the box baseline for the admission>] [DSV41_CELL_ROWS=<fixed decode rows>]
+// [DSV41_CELL_DELTA=<typical delta, 0.3>] [DSV41_CELL_MAX_TOKENS=<1024>]. The typical tier's timed cell:
+// the served module as the server builds it, the standard 16,384-token prompt as ONE prompt pass (the
+// model's chunk rule, the wide lane), the phase change, then DSpark cycles (typical acceptance, the greedy
+// correction) until 1,024 tokens or an EOS id. Deterministic (the in-process cell's temperature 0).
+test "dsv41 served cell: the typical tier's 16K cell through the served module, timed" {
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const out_path = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
+    const prompt = inputs.prompt;
+    var config = inputs.config;
+    try cellConfig(&config);
+    const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
+    // The cap counts every generated id, the prompt pass's primary included (the Python headline's
+    // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
+    const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
+    if (max_tokens < 2) return error.CellMaxTokens;
+
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    memProbe("dsv41 served cell", "start");
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    defer md.deinit();
+    memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
+
+    const g = &md.g;
+    // The host-waits arm (the served default: no event gates configured).
+    const arm = switch (md.arm) {
+        .host_waits => |t| t.arm,
+        else => return error.CellArmVariant,
+    };
+    const L = dsl.Loop(ops.MlxOps);
+    // The request's bounded lanes: the prompt, the token cap, one verify block (Module.prefill's rule).
+    var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(prompt.len, prompt.len + max_tokens)));
+    defer st.deinit(g, gpa);
+    const caches = try a.alloc(L.H.Cache, md.head.nStages());
+    for (caches) |*x| x.* = .{};
+    defer for (caches) |*x| x.deinit(g);
+    var stops: [8]u32 = undefined;
+    const n_stop = config.num_eos_tokens;
+    @memcpy(stops[0..n_stop], config.eos_token_ids[0..n_stop]);
+    var lp = L.init(g, md.model, md.head, &st, caches, .{
+        .acceptance = .{ .typical = .{ .delta = @floatCast(delta) } },
+        .prompt_chunk = dsl.whole_prompt,
+        .max_tokens = max_tokens - 1,
+        .stop_ids = stops[0..n_stop],
+    });
+    defer lp.deinit();
+
+    _ = mlx.mlx_reset_peak_memory();
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    const primary = try lp.prefill(gpa, &arm.hook, prompt);
+    const ttft_s = secondsSince(io, t0);
+    // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
+    var mlx_peak: usize = memProbePeak("dsv41 served cell", "prompt (one pass)");
+    const t1 = std.Io.Timestamp.now(io, .boot);
+    try md.phaseChange();
+    const phase_s = secondsSince(io, t1);
+    mlx_peak = @max(mlx_peak, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)"));
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    var cycles: std.ArrayList(CellCycle) = .empty;
+    const t2 = std.Io.Timestamp.now(io, .boot);
+    var finish: dsl.Finish = .stop;
+    if (std.mem.indexOfScalar(u32, stops[0..n_stop], primary) == null) while (true) {
+        var lg: dsl.CycleLog = .{ .primary = 0 };
+        const f = try lp.cycle(&arm.hook, &out, gpa, &lg);
+        try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
+        if (f) |x| {
+            finish = x;
+            break;
+        }
+    };
+    const decode_s = secondsSince(io, t2);
+    const wall_s = secondsSince(io, t0);
+    mlx_peak = @max(mlx_peak, memProbePeak("dsv41 served cell", "cycles"));
+
+    const ids = try a.alloc(u32, out.items.len + 1);
+    ids[0] = primary;
+    @memcpy(ids[1..], out.items);
+    const fp = arm_mod.footprint();
+    const stt = lp.stats;
+    const prompt_sha = try cell.idsSha256(a, prompt);
+    const ids_sha = try cell.idsSha256(a, ids);
+    const rec: CellReceipt = .{
+        .typical_delta = delta,
+        .prompt_file = prompt_path,
+        .prompt_source = case_id orelse "sweep-16384-20260829",
+        .prompt_tokens = prompt.len,
+        .prompt_ids_sha256 = &prompt_sha,
+        .max_tokens = max_tokens,
+        .finish = @tagName(finish),
+        .prefill_rows_per_layer = arm.prefill_rows[0],
+        .decode_rows_per_layer = arm.decode_rows[0],
+        .ttft_s = ttft_s,
+        .prefill_tok_s = @as(f64, @floatFromInt(prompt.len)) / ttft_s,
+        .phase_change_s = phase_s,
+        .decode_wall_s = decode_s,
+        // The primary token is the prompt pass's; the decode rate counts the cycles' tokens.
+        .decode_tok_s = @as(f64, @floatFromInt(out.items.len)) / decode_s,
+        .decode_tok_s_with_phase_change = @as(f64, @floatFromInt(out.items.len)) / (decode_s + phase_s),
+        .wall_s = wall_s,
+        .peak_footprint_gb = @as(f64, @floatFromInt(fp.peak)) / 1e9,
+        .mlx_peak_gb = @as(f64, @floatFromInt(mlx_peak)) / 1e9,
+        .generated_tokens = ids.len,
+        .generated_ids = ids,
+        .generated_ids_sha256 = &ids_sha,
+        .cycles = cycles.items,
+        .accepted_drafts = stt.accepted_drafts,
+        .drafted_tokens = stt.drafted_tokens,
+        .accept_rate = stt.acceptRate(),
+        .tokens_per_cycle = if (cycles.items.len == 0) 0 else @as(f64, @floatFromInt(out.items.len)) / @as(f64, @floatFromInt(cycles.items.len)),
+    };
+    const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
+    std.debug.print("\ndsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
+        delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
+        ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
+        cycles.items.len,           decode_s,               rec.decode_tok_s,           rec.decode_tok_s_with_phase_change,
+        stt.accepted_drafts,        stt.drafted_tokens,     wall_s,                     rec.peak_footprint_gb,
+        rec.mlx_peak_gb,            rec.finish,             rec.generated_ids_sha256,   out_path,
+    });
+}
+
+/// The window's admission inputs on the shell's config, from the environment the runner sets:
+/// DSV41_CELL_BASELINE_GB (the guard's box baseline, required), DSV41_CELL_CEILING_GB (the box the
+/// admission fits, required: the window and the bill plan the same rows) and DSV41_CELL_ROWS (a
+/// forced decode row count; unset = the admission's fill).
+fn cellConfig(config: *model.ModelConfig) !void {
+    const gb = struct {
+        fn of(name: [*:0]const u8) !?u64 {
+            const v = std.c.getenv(name) orelse return null;
+            return @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+        }
+    }.of;
+    config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
+    config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
+    if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+}
+
+/// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
+/// admission the module builds with (`Module.armOptions` at the same config) and the arch's prefill
+/// bill (`v41.PrefillBill`, its wave pinned by the served 16K trace test): the prompt phase and the
+/// decode phase over the box baseline. `processBound` is what the child may hold above the baseline.
+pub const CellBill = struct {
+    baseline: u64,
+    prefill_rows: u32,
+    decode_rows: u32,
+    /// (layers x rows + the transient bank's max_route_ids rows) x the bank's record.
+    slot_prefill: u64,
+    slot_decode: u64,
+    lookahead_staging: u64,
+    /// Every resident tensor the index names (trunk, head, embedding, the DSpark head); the
+    /// embedding leaves the device at the prompt fence (decode phase).
+    residents: u64,
+    embedding: u64,
+    /// The Engram sidecar's residents and its row caches (host).
+    engram: u64,
+    /// The prompt pass's widest wave x 5 / 4 (`PrefillBill.bytes`' margin).
+    prefill_wave: u64,
+    /// The request's bounded KV (the served ring + the sources' lanes) for prompt + max_tokens + a block.
+    kv: u64,
+    /// The served tier's prefill allocator cache (4 GiB, D5) and the decode charge.
+    prefill_cache: u64,
+    decode_cache: u64,
+    /// A verify forward's wave (8 rows) with its index chain over every position, and the draft block's.
+    decode_wave: u64,
+    draft_wave: u64,
+    /// The admission's host reserve (pools, tables, the token map, the process).
+    host_reserve: u64,
+    /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in both phases.
+    unbilled_overhead: u64 = unbilled_process_overhead_bytes,
+
+    pub fn prefillTotal(b: CellBill) u64 {
+        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead;
+    }
+
+    pub fn decodeTotal(b: CellBill) u64 {
+        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.unbilled_overhead;
+    }
+
+    pub fn processBound(b: CellBill) u64 {
+        return @max(b.prefillTotal(), b.decodeTotal()) - b.baseline;
+    }
+};
+
+/// The measured process overhead the named terms do not cover: the served cells' peak phys_footprint
+/// over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657 GB = 0.637; standard
+/// 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up; re-sized after the
+/// full-admission window. Unattributed so far (Metal libraries / pipelines, allocator slack).
+pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
+
+pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
+    const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
+    var vd: v41.Diag = .{};
+    errdefer if (vd.len > 0) std.debug.print("dsv41 served cell bill: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, io, dir, &vd);
+    const ceiling = module.boxCeiling(config.memory_ceiling_bytes orelse return error.CellCeilingMissing, c.n_routed_experts);
+    var diag: arm_mod.Diag = .{};
+    // The wired bytes the module reads at construction (vm_stat) are the window's: the runner measures
+    // them after the guard unloaded the service and passes DSV41_CELL_WIRED_GB (unset: read now).
+    var opts = module.armOptions(config, ceiling, .host);
+    if (std.c.getenv("DSV41_CELL_WIRED_GB")) |v| opts.wired_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
+        std.debug.print("dsv41 served cell bill: refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    defer if (p.draft_subset) |*x| x.deinit();
+    const rec = p.inputs.record_bytes;
+    const transient: u64 = xp.max_route_ids;
+    var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
+    defer ck.deinit();
+    const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
+    const epath = try std.fmt.allocPrint(a, "{s}/engram/engram-residents.safetensors", .{dir});
+    var eck = try v41.Checkpoint.openFile(a, epath, &vd);
+    defer eck.deinit();
+    const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
+    const bill = v41.PrefillBill.of(&c);
+    const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
+    const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
+    // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
+    const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
+    return .{
+        .baseline = config.memory_baseline_bytes.?,
+        .prefill_rows = p.prefill_rows,
+        .decode_rows = p.decode_rows,
+        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient) * rec,
+        .lookahead_staging = p.inputs.lookahead_staging_bytes,
+        .residents = m.totalBytes(),
+        .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
+        .engram = em.totalBytes() + engram.row_cache_host_bytes,
+        .prefill_wave = bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
+        .prefill_cache = module.prefillCacheLimit(.served),
+        .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
+        .decode_wave = decode_wave,
+        .draft_wave = decode_wave,
+        .host_reserve = p.inputs.host_reserve_bytes,
+    };
+}
+
+fn printBill(b: CellBill) void {
+    const gb = struct {
+        fn f(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e9;
+        }
+    }.f;
+    std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
+    const T = struct { name: []const u8, p: u64, d: u64 };
+    for ([_]T{
+        .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
+        .{ .name = "slot banks (layers x rows + 48) x record", .p = b.slot_prefill, .d = b.slot_decode },
+        .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
+        .{ .name = "residents (the embedding off at the fence)", .p = b.residents, .d = b.residents - b.embedding },
+        .{ .name = "Engram residents + row caches", .p = b.engram, .d = b.engram },
+        .{ .name = "prompt wave x 5/4 (PrefillBill) / verify + draft waves", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
+        .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
+        .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
+        .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
+        .{ .name = "unbilled process overhead (measured, unattributed)", .p = b.unbilled_overhead, .d = b.unbilled_overhead },
+    }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
+    std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()) });
+}
+
+// The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
+// DSV41_CELL_CEILING_GB [DSV41_CELL_WIRED_GB] [DSV41_CELL_ROWS] [DSV41_CELL_MAX_TOKENS]: the cell's bill at the rows the window
+// will admit, printed as a table and one DSV41_CELL_BILL json line.
+test "dsv41 served cell: the cell's bill on the host (the window's admission, every term)" {
+    if (std.c.getenv("DSV41_CELL_BILL") == null) return error.SkipZigTest;
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    try cellConfig(&config);
+    const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
+    const b = try cellBill(a, testing.io, &config, 16384, max_tokens);
+    printBill(b);
+    try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
+}
+
+/// The prompt pass's stage profile: the model's probe points (`p.put` in the graph: attn.x ... out.h),
+/// each one evaluated where the model publishes it, the host clock charged to the stage that ends
+/// there (so a segment is everything the graph built and ran since the previous point), per stage
+/// name and per chunk. The routed call's segment ("moe.routed") also carries the expert stream's
+/// read counters. The syncs serialize the pass: the profile's wall exceeds the unprobed TTFT; the
+/// split, not the sum, is the reading.
+const PrefillProbe = struct {
+    const n_max = 40;
+    g: *ops.MlxOps,
+    io: std.Io,
+    stats_of: *const fn (*anyopaque) expert_stream.Stats,
+    stats_ctx: *anyopaque,
+    n_layers: u32,
+    last: std.Io.Timestamp,
+    names: [n_max][]const u8 = undefined,
+    ns: [n_max]u64 = @splat(0),
+    n: usize = 0,
+    layers_done: u64 = 0,
+    chunk_ns: [64]u64 = @splat(0),
+    chunk_rows: [64]u32 = @splat(0),
+    read_wall_ns: u64 = 0,
+    read_bytes: u64 = 0,
+    misses: u64 = 0,
+    before: expert_stream.Stats = .{},
+
+    fn slot(self: *PrefillProbe, name: []const u8) usize {
+        for (self.names[0..self.n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return i;
+        self.names[self.n] = name;
+        self.n += 1;
+        return self.n - 1;
+    }
+
+    pub fn put(self: *PrefillProbe, name: []const u8, x: anytype) !void {
+        if (@TypeOf(x) != ops.MlxOps.T) return;
+        const is_routed = std.mem.eql(u8, name, "moe.routed");
+        if (std.mem.eql(u8, name, "gate.weights")) self.before = self.stats_of(self.stats_ctx);
+        try self.g.evalAll(&.{x});
+        const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+        self.ns[self.slot(name)] += d;
+        const chunk: usize = @min(self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        self.chunk_ns[chunk] += d;
+        if (is_routed) {
+            const after = self.stats_of(self.stats_ctx);
+            self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
+            self.read_bytes += after.expert_bytes_read -| self.before.expert_bytes_read;
+            self.misses += after.expert_cache_misses -| self.before.expert_cache_misses;
+            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(self.g.shapeOf(x).dim(0));
+        }
+        if (std.mem.eql(u8, name, "out.h")) self.layers_done += 1;
+    }
+};
+
+// Profiling window only (the prompt pass, no decode): DSV41_CELL_PROFILE=1 plus the cell's window env
+// (DSV41_CELL_PROMPT_IDS [DSV41_CELL_CASE] DSV41_BANK DSV41_CELL_BASELINE_GB DSV41_CELL_CEILING_GB
+// _GPU_WINDOW_LOCKED). The served module as the cell builds it; the prompt as ONE model forward at the
+// model's chunk rule through the served hook (the cell's prompt pass without the draft seed), probed.
+// Prints PREFILL_PROFILE lines: per stage (seconds, share), per chunk (rows, seconds), the stream's
+// reads (bytes, read-busy wall, misses), the probed wall. Writes nothing.
+test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling window)" {
+    if (std.c.getenv("DSV41_CELL_PROFILE") == null) return error.SkipZigTest;
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
+    var config = inputs.config;
+    try cellConfig(&config);
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    defer md.deinit();
+    const arm = switch (md.arm) {
+        .host_waits => |t| t.arm,
+        else => return error.CellArmVariant,
+    };
+    const Hook = @TypeOf(arm.hook);
+    const stats_of = struct {
+        fn f(ctx: *anyopaque) expert_stream.Stats {
+            const h: *Hook = @ptrCast(@alignCast(ctx));
+            return h.source.stats();
+        }
+    }.f;
+    const g = &md.g;
+    var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(inputs.prompt.len, inputs.prompt.len + 1024)));
+    defer st.deinit(g, gpa);
+    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
+    const s0 = stats_of(@ptrCast(&arm.hook));
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    probe.last = t0;
+    const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
+    try g.evalAll(&.{r.logits.?});
+    const wall_s = secondsSince(io, t0);
+    const s1 = stats_of(@ptrCast(&arm.hook));
+    const secs = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e9;
+        }
+    }.f;
+    var total: u64 = 0;
+    for (probe.ns[0..probe.n]) |x| total += x;
+    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}}}\n", .{
+        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, s1.expert_bytes_read - s0.expert_bytes_read, secs(s1.read_wall_ns - s0.read_wall_ns), s1.expert_cache_misses - s0.expert_cache_misses, secs(probe.read_wall_ns),
+    });
+    for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
+    for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+}
+
+fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t.untilNow(io, .boot).nanoseconds)) / 1e9;
+}
+
+/// The cell's host inputs: the standard prompt (16,384 tokens, seed 20260829, digest checked) and
+/// the shell's config of the bank (its bank / token-map paths, the EOS ids the Generator stops on).
+fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: model.ModelConfig } {
+    const prompt = try cellPrompt(a, io, prompt_path, case_id);
+    const config = try model.parseConfig(io, a, bank_dir);
+    if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
+    if (config.num_eos_tokens == 0) return error.NoEosIds;
+    return .{ .prompt = prompt, .config = config };
+}
+
+// The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and
+// DSV41_CELL_PROMPT_IDS as the window passes them. The prompt entry, its length and digest, the
+// config's paths and EOS ids; the receipt serialises.
+test "dsv41 served cell: the window's inputs pass on the host (the standard prompt, the bank's shell config)" {
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Either line: the fastest prompt (a fixture case, DSV41_CELL_CASE) or the standard sweep prompt.
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, testing.io, prompt_path, case_id, bank_dir);
+    try testing.expectEqual(@as(usize, 16384), inputs.prompt.len);
+    const sha = try cell.idsSha256(a, inputs.prompt);
+    // The fastest line's prompt is pinned here; either file's own digest was checked by the loader.
+    if (case_id) |id| if (std.mem.eql(u8, id, "code-20260923")) try testing.expectEqualStrings("667506d734cce8152f3c42c9a97639a5b466540c70d9798a72e7564e2361bf86", &sha);
+    if (case_id != null) {
+        try testing.expectError(error.PromptIdsNoCell, cellPrompt(a, testing.io, prompt_path, "no-such-case"));
+    } else try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
+    try testing.expectEqual(@as(usize, 16384 + 1024 + mdl.Model(ops.MlxOps).scratch_rows), module.Module.maxPositions(16384, 16384 + 1024));
+    // The admission inputs come from the runner's environment (refused by name without them).
+    var cfg = inputs.config;
+    if (std.c.getenv("DSV41_CELL_BASELINE_GB") == null) try testing.expectError(error.CellBaselineMissing, cellConfig(&cfg));
+    const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_source = "x", .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
+    const json = try std.json.Stringify.valueAlloc(a, rec, .{});
+    try testing.expect(std.mem.indexOf(u8, json, "\"decode_rows_per_layer\":2") != null);
 }
 
 pub const dspark_reference_format = "mlx-serve-dsv41-dspark-ref-v1";
