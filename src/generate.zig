@@ -1207,8 +1207,10 @@ pub fn visionChunkedPrefillEnabled() bool {
 /// vision prompt with chunking killed. The guard and this loop must agree or
 /// admission either over-refuses (bills seq for a chunked prefill) or
 /// under-bills (uncatchable Metal OOM).
-pub fn visionPrefillUnchunked(has_vision: bool) bool {
-    return has_vision and !visionChunkedPrefillEnabled();
+/// The prompt goes in one forward: the vision kill switch, or an arch that chunks the
+/// prompt itself (`ModelConfig.prefillWholePrompt`).
+pub fn prefillUnchunked(config: *const model_mod.ModelConfig, has_vision: bool) bool {
+    return config.prefillWholePrompt() or (has_vision and !visionChunkedPrefillEnabled());
 }
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
@@ -2622,11 +2624,12 @@ pub const Generator = struct {
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
-            const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
+            const whole = prefillUnchunked(&xfm.config, has_vision);
+            const default_chunk = if (whole) loop_end else PREFILL_CHUNK;
             // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
             // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
             // for this prompt, never wider than `ssm_cp_stride`.
-            const adapt_chunked = !(has_vision and !vision_chunked);
+            const adapt_chunked = !whole;
             // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
             // (installed process-wide).
             const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;

@@ -9,7 +9,6 @@ const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const deepseek_v41 = @import("deepseek_v41.zig");
-const deepseek_v41_arm = @import("deepseek_v41_arm.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -403,6 +402,15 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
+    /// deepseek_v41: the model directory (config.json, the resident shards, the expert bank) and
+    /// the exported Engram token map beside it, stamped by `parseConfig` as `ngram_table_path`; owned.
+    expert_bank_dir: ?[]const u8 = null,
+    engram_token_map_path: ?[]const u8 = null,
+    /// The non-model box baseline (`--memory-baseline-gb`): the only override of the memory model.
+    memory_baseline_bytes: ?u64 = null,
+    /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
+    /// the arch's default).
+    nocache_weights: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -806,6 +814,18 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
+    /// The arch keeps its per-request decode state on its own module (deepseek_v4, deepseek_v41):
+    /// no prefix-cache restore rebuilds it and no batch merges it.
+    pub fn moduleOwnsDecodeState(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "deepseek_v4") or std.mem.eql(u8, self.model_type, "deepseek_v41");
+    }
+
+    /// The arch chunks the prompt itself (deepseek_v41's layer-major prefill), so it takes the
+    /// whole prompt in one forward.
+    pub fn prefillWholePrompt(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
@@ -1062,7 +1082,7 @@ pub const ModelConfig = struct {
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
         if (std.mem.eql(u8, self.model_type, "laguna")) return false;
-        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        if (self.moduleOwnsDecodeState()) return false;
         return true;
     }
 
@@ -1353,6 +1373,10 @@ pub const ModelConfig = struct {
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.expert_bank_dir) |p| allocator.free(p);
+        self.expert_bank_dir = null;
+        if (self.engram_token_map_path) |p| allocator.free(p);
+        self.engram_token_map_path = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
@@ -1373,6 +1397,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+    }
+    if (std.mem.eql(u8, config.model_type, "deepseek_v41")) {
+        config.expert_bank_dir = try allocator.dupe(u8, model_dir);
+        config.engram_token_map_path = try std.fmt.allocPrint(allocator, "{s}/engram-token-map.u32", .{model_dir});
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -1809,6 +1837,9 @@ fn yarnMscale(factor: f32) f32 {
 /// therefore the way to A/B a scaling experiment on identical weights.
 var config_overrides: ?[]const u8 = null;
 
+/// `--memory-baseline-gb`, in bytes: stamped on every parsed config.
+pub var memory_baseline_override: ?u64 = null;
+
 pub fn setConfigOverrides(raw: ?[]const u8) void {
     config_overrides = raw;
 }
@@ -1871,6 +1902,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     const root = parsed.value.object;
     var config = ModelConfig{};
+    config.memory_baseline_bytes = memory_baseline_override;
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
@@ -3126,21 +3158,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
     } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
-        // Native DeepSeek-V4.1 (deepseek_v41.zig): the config is checked with
-        // its own named refusals, never parsed as Llama. The server's engine
-        // is deepseek_v41_bind's (the scheduler opens it on the inference
-        // thread); while its decode binding is the stand-in, a valid bank
-        // stops here.
+        // Native DeepSeek-V4.1: the arch's own parse refuses by name; the module
+        // (deepseek_v41_module.zig) owns everything past the shell's generic fields.
         var diag: deepseek_v41.Diag = .{};
         _ = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
             log.err("deepseek_v41: {s}\n", .{diag.message()});
             return e;
         };
-        if (deepseek_v41_arm.serving_decode == .stand_in) {
-            log.err("deepseek_v41: not served until the arm's decode seam binds the DSpark loop; dsv41-cell benchmarks the arm\n", .{});
-            return error.UnsupportedDsv41NotServed;
-        }
         config.model_type = "deepseek_v41";
+        // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
+        config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -3768,7 +3795,7 @@ pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, noca
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .nocache = config.nocache_weights orelse false });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3796,13 +3823,7 @@ pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
-/// `loadWeights` past the page cache (`nocache_reader`): for a resident set
-/// that nearly fills the box, where cached pages would count twice.
-pub fn loadWeightsNoCache(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, .{ .nocache = true });
-}
-
-fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
+pub fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     return loadWeightsFromOpenDir(io, allocator, dir, model_dir, opts);
@@ -7570,16 +7591,14 @@ test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setti
     try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
 }
 
-test "dsv41 model: a deepseek_v41 config is served only with the DSpark binding, never parsed as Llama" {
+test "dsv41 model: a deepseek_v41 config parses by its own refusals into the module arch's shell" {
     const ok = try deepseek_v41.testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(ok);
-    if (deepseek_v41_arm.serving_decode == .stand_in) {
-        try testing.expectError(error.UnsupportedDsv41NotServed, parseConfigFromJson(testing.allocator, ok));
-    } else {
-        var c = try parseConfigFromJson(testing.allocator, ok);
-        defer c.deinit(testing.allocator);
-        try testing.expectEqualStrings("deepseek_v41", c.model_type);
-    }
+    var c = try parseConfigFromJson(testing.allocator, ok);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqualStrings("deepseek_v41", c.model_type);
+    try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
+    try testing.expect(!c.perRequestPrefillChunk());
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));

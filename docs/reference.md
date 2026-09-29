@@ -437,6 +437,10 @@ Assistant shape (no embed table, no lm_head — borrows the trunk's): `encoder.f
 
 Every memory plan (load preflight, auto-context, prefill admission) subtracts a reserve for macOS from available memory before it bills anything: an eighth of RAM, never under 2 GB or over 8 GB (`server.osReserveBytes`). `--os-reserve-gib N` sets it explicitly and `0` turns it off; the app's "Keep a memory reserve for macOS" switch in Settings passes `--os-reserve-gib 0` when off. It exists because wired GPU memory starves the kernel before Metal reports an error: a 16 GB Mac panicked with 14 MB free. It works with the sibling bill (`scheduler.PromiseLedger`): a restored prefix shares the cached buffers until its first append, so concurrent admits are billed against what earlier admits were promised and have not allocated yet, plus a 2 GB margin.
 
+### Streamed-expert models: memory baseline and page-cache bypass
+
+A model whose routed experts stream from disk (deepseek_v41) plans its slot banks against the box: `--memory-baseline-gb <gb>` gives the non-model baseline in decimal GB (the memory in use before the model loads) and is the only override of the memory model. Its resident weights load past the page cache (F_NOCACHE: cached pages would count twice against a box the residents nearly fill); the per-model setting `"nocache_weights": false` in `model-settings.json` turns that off, and `true` turns it on for any other model.
+
 ### Workload-fair hot-cache eviction (#378)
 
 One model, two workloads: an agent conversation and a batch sweep of documents share `LoadedModel.prefix_cache`, and plain LRU let the sweep evict the conversation every time (more entries made it worse). Every entry now carries a `cache_key`, derived per request by `server.requestCacheKey` from the first of: `prompt_cache_key` (OpenAI's routing field; Codex sends it, a scripted pipeline can), `metadata.user_id` (Anthropic; Claude Code embeds its session id), the system prompt (OpenAI `messages[0]` system content incl. text parts, Anthropic `system`, Responses `instructions`), else 0 = anonymous. `/v1/completions` keys on `prompt_cache_key` only.

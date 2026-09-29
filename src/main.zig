@@ -152,6 +152,9 @@ fn printUsage(io: std.Io) void {
         \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
         \\                        it off: more context and concurrency, but a small Mac
         \\                        under heavy load can freeze or restart.
+        \\  --memory-baseline-gb <gb>  The non-model box baseline in decimal GB (memory
+        \\                        in use before the model loads): the only override of
+        \\                        mlx-serve's memory model, for streamed-expert models.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -882,6 +885,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--memory-baseline-gb") and i + 1 < args.len) {
+            i += 1;
+            const gb = std.fmt.parseFloat(f64, args[i]) catch -1;
+            if (!(gb > 0 and gb < 1024)) {
+                log.err("--memory-baseline-gb: expected decimal GB above 0, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            model_mod.memory_baseline_override = @intFromFloat(@round(gb * 1e9));
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {

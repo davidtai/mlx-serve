@@ -61,9 +61,8 @@ test {
     _ = @import("expert_admission.zig");
     _ = @import("deepseek_v41_arm.zig");
     _ = @import("deepseek_v41_cell.zig");
-    _ = @import("deepseek_v41_serve.zig");
     _ = @import("deepseek_v41_dspark_serve.zig");
-    _ = @import("deepseek_v41_bind.zig");
+    _ = @import("deepseek_v41_module.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
@@ -71,7 +70,6 @@ test {
     _ = @import("exl3_selfcheck.zig");
     _ = @import("exl3_kernel_ops.zig");
     _ = @import("exl3_kernel_ops_gate.zig");
-    _ = @import("dsv41_integration.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");

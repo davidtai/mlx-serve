@@ -5982,7 +5982,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // its row index across chunks), so it bills the chunk-bounded envelope —
     // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
     // whole-prompt forward, in which case `unchunked_prefill` bills the real
-    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
+    // width. Call sites pass generate_mod.prefillUnchunked(config, has_vision)
     // so the guard and the prefill loop cannot disagree.
     //
     // Otherwise the width comes from `chooseRequestPrefillChunk`, the same rule the scheduler
@@ -6139,7 +6139,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
     const prompt_len: usize = prompt_ids.len;
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null or lm.dsv41_engine != null, lm.llama_engine != null)) return true;
+    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
     var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
@@ -7255,7 +7255,7 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
-    if (entry.ds4_engine != null or entry.llama_engine != null or entry.dsv41_engine != null) return .embedded_engine;
+    if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
 }
@@ -8952,7 +8952,7 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(mm.embeddings != null), enable_mtp, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.prefillUnchunked(config, mm.embeddings != null), enable_mtp, mm.bytes(config))) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -15228,7 +15228,7 @@ fn handleAnthropicMessages(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(mm.embeddings != null), enable_mtp, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.prefillUnchunked(config, mm.embeddings != null), enable_mtp, mm.bytes(config))) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -16995,7 +16995,7 @@ fn handleResponsesInner(
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(mm.embeddings != null), enable_mtp_resp, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.prefillUnchunked(config, mm.embeddings != null), enable_mtp_resp, mm.bytes(config))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
+const dsv41_mod = if (@import("build_options").macos_engines) @import("deepseek_v41_module.zig") else @import("deepseek_v41_module_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -16204,6 +16205,10 @@ pub const Transformer = struct {
     // and the forward dispatches to the module. v0 decode = full re-forward.
     dsv4: ?*dsv4_mod.Dsv4Model = null,
 
+    // DeepSeek-V4.1 (deepseek_v41): the module (deepseek_v41_module.zig) owns the trunk, the
+    // streamed experts and the per-request state, as dsv4 does; the shell stays empty.
+    dsv41: ?*dsv41_mod.Module = null,
+
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
@@ -16350,6 +16355,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+        if (std.mem.eql(u8, config.model_type, "deepseek_v41")) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -17754,6 +17760,10 @@ pub const Transformer = struct {
             mdl.deinit();
             self.allocator.destroy(mdl);
             self.dsv4 = null;
+        }
+        if (self.dsv41) |mdl| {
+            mdl.deinit();
+            self.dsv41 = null;
         }
         if (self.rht) |reg| {
             reg.deinit();
@@ -19392,7 +19402,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -19465,6 +19475,7 @@ pub const Transformer = struct {
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
+        if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
@@ -42414,18 +42425,59 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
 }
 
+/// deepseek_v41: the module over the loaded residents; the shell is dsv4's (a 0-layer KVCache,
+/// empty standard fields).
+fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
+    const mdl = try dsv41_mod.Module.init(allocator, io, &config, weights, s);
+    errdefer mdl.deinit();
+    var t = try initDsv4Shell(allocator, config, s);
+    t.dsv41 = mdl;
+    return t;
+}
+
+/// The prompt at `cache.step == 0` (a fresh request), later positions after it; the last row's
+/// logits as rank-3 [1, 1, vocab] f32 (callers slice the last position).
+fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *dsv41_mod.Module) !mlx.mlx_array {
+    const n = mlx.mlx_array_size(token_ids);
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_array_eval(ids32));
+    const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
+    const ids = try self.allocator.alloc(u32, n);
+    defer self.allocator.free(ids);
+    for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
+    const logits = if (ctx.cache.step == 0) try mdl.prefill(ids) else try mdl.extend(ids);
+    defer _ = mlx.mlx_array_free(logits);
+    ctx.cache.step += n;
+    var f32_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_logits);
+    try mlx.check(mlx.mlx_astype(&f32_logits, logits, .float32, self.s));
+    const shape = [_]c_int{ 1, 1, @intCast(mlx.mlx_array_size(f32_logits)) };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, f32_logits, &shape, 3, self.s));
+    return out;
+}
+
 fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const dw = try dsv4_mod.loadDsv4Weights(allocator, &config, weights);
     const mdl = try allocator.create(dsv4_mod.Dsv4Model);
     errdefer allocator.destroy(mdl);
     mdl.* = try dsv4_mod.initModel(allocator, &config, dw, s);
+    var t = try initDsv4Shell(allocator, config, s);
+    t.dsv4 = mdl;
+    return t;
+}
+
+/// A module arch's shell: a 0-layer KVCache and every standard field empty.
+fn initDsv4Shell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const cache = try KVCache.init(allocator, 0);
     return .{
         .config = config,
         .cache = cache,
         .s = s,
         .allocator = allocator,
-        .dsv4 = mdl,
         .emb_w = mlx.mlx_array_new(),
         .emb_s = mlx.mlx_array_new(),
         .emb_b = mlx.mlx_array_new(),
@@ -61726,11 +61778,17 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     var t: Transformer = undefined;
     t.rht = null;
     t.dsv4 = null;
+    t.dsv41 = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_dsv4: dsv4_mod.Dsv4Model = undefined;
     t.dsv4 = &fake_dsv4;
+    try testing.expect(t.ownsModuleDecodeState());
+
+    var fake_dsv41: dsv41_mod.Module = undefined;
+    t.dsv4 = null;
+    t.dsv41 = &fake_dsv41;
     try testing.expect(t.ownsModuleDecodeState());
 }
 

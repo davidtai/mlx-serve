@@ -5,13 +5,12 @@
 //! over the stream. Every refusal is a named error at construction; nothing
 //! here runs per token.
 //!
-//! The decode loop is a seam, bound at compile time: `decode.prefill(arm, g,
-//! prompt) !u32` (the primary token), `decode.cycle(arm, g, a, out) !bool`
-//! (appends the cycle's tokens; true when done), `decode.stats() Stats`. The
-//! DSpark loop binds it; until then `StandIn` does: seeded routes through the
-//! same hook with no model math, so construction, the reads and the receipt
-//! can be exercised and measured. The server refuses the arch while its
-//! decode binding is the stand-in (`serving_decode`).
+//! The bench cell's decode loop is a seam: `decode.prefill(arm, g, prompt) !u32`
+//! (the primary token), `decode.cycle(arm, g, a, out) !bool` (appends the
+//! cycle's tokens; true when done), `decode.stats() Stats`. `StandIn` drives
+//! seeded routes through the same hook with no model math, so construction,
+//! the reads and the receipt can be exercised and measured. The served arch is
+//! deepseek_v41_module.zig, which builds this arm as its expert source.
 //!
 //! Threads: mlx-serve builds and runs a model on the scheduler's inference
 //! thread, the only MLX caller (model load, every forward, growth, unload);
@@ -34,9 +33,8 @@ const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
 const dspark_head = @import("deepseek_v41_dspark_head.zig");
 
+/// The receipt's `decode_binding`: which loop drove the cell.
 pub const DecodeBinding = enum { stand_in, dspark };
-/// The decode loop the server would generate with; the DSpark loop sets it.
-pub const serving_decode: DecodeBinding = .stand_in;
 
 pub const Diag = struct {
     buf: [320]u8 = undefined,
