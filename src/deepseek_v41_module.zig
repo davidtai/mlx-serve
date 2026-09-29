@@ -130,7 +130,7 @@ pub const Module = struct {
         self.warm_peaks = try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &self.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows);
         errdefer gpa.free(self.warm_peaks);
         _ = mlx.mlx_clear_cache();
-        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B (W97)", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
         return self;
     }
 
@@ -204,17 +204,21 @@ pub const Module = struct {
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
-        if (ids.len == 1 and !self.arm.grown) {
-            if (!self.fenced) {
-                try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
-                self.fenced = true;
-            }
-            // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
-            _ = mlx.mlx_clear_cache();
-            setCacheLimit(envelope.decode_cache_bytes);
-            try self.arm.grow(&self.g);
-        }
+        if (ids.len == 1) try self.phaseChange();
         return self.forward(ids);
+    }
+
+    /// The prompt fence and the grown slot banks, once (a no-op after): the embedding to its host
+    /// rows, the prefill's parked buffers back, the decode cache charge, the banks at the decode rows.
+    pub fn phaseChange(self: *Module) !void {
+        if (self.arm.grown) return;
+        if (!self.fenced) {
+            try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
+            self.fenced = true;
+        }
+        _ = mlx.mlx_clear_cache();
+        setCacheLimit(envelope.decode_cache_bytes);
+        try self.arm.grow(&self.g);
     }
 
     fn forward(self: *Module, ids: []const u32) !mlx.mlx_array {

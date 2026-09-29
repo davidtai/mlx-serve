@@ -24,6 +24,8 @@ const kernel_set = @import("kernel_set.zig");
 const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
+const cell = @import("deepseek_v41_cell.zig");
+const arm_mod = @import("deepseek_v41_arm.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -374,6 +376,234 @@ test "dsv41 ar: the served schedule's host preconditions: the top-2 rule and, on
         try testing.expectEqualStrings(reference_format, ref.format);
         try testing.expect(ref.prompt_ids.len >= 2 and ref.generated_ids.len == ref.new_tokens);
     }
+}
+
+/// The standard cell's prompt (`mtplx-server-cell-prompt-ids-v1`: scripts/fable/server_cell_bench.py's
+/// export; the sweep cell at 16,384 templated tokens, seed 20260829).
+pub const prompt_ids_schema = "mtplx-server-cell-prompt-ids-v1";
+pub const CellPrompt = struct { cell: []const u8, target_tokens: u32 = 0, seed: ?u64 = null, token_ids: []const u32, token_ids_sha256: []const u8 };
+pub const PromptIds = struct { schema: []const u8, context_sha256: []const u8 = "", prompts: []const CellPrompt };
+
+/// The standard cell's prompt from `path`: the sweep entry at `target` tokens and `seed`, its ids'
+/// digest (Python's `json.dumps`) equal to the file's. Refused by name otherwise.
+pub fn standardPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, target: u32, seed: u64) ![]const u32 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    const f = try std.json.parseFromSliceLeaky(PromptIds, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, f.schema, prompt_ids_schema)) return error.PromptIdsSchema;
+    for (f.prompts) |p| {
+        if (!std.mem.eql(u8, p.cell, "sweep") or p.target_tokens != target or p.seed != seed) continue;
+        if (p.token_ids.len != target) return error.PromptIdsLength;
+        const d = try cell.idsSha256(a, p.token_ids);
+        if (!std.mem.eql(u8, &d, p.token_ids_sha256)) return error.PromptIdsDigest;
+        return p.token_ids;
+    }
+    return error.PromptIdsNoCell;
+}
+
+/// The typical-tier cell's receipt (`mlx-serve-dsv41-served-cell-v1`): the standard cell's
+/// numbers (prefill tok/s, TTFT, decode tok/s, peak GB decimal, wall), the rows admitted, the
+/// per-cycle acceptance and the generated ids.
+pub const served_cell_format = "mlx-serve-dsv41-served-cell-v1";
+const CellCycle = struct { k_eff: u32, accepted: u32, verified: u32 };
+const CellReceipt = struct {
+    format: []const u8 = served_cell_format,
+    tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
+    typical_delta: f64,
+    prompt_file: []const u8,
+    prompt_tokens: usize,
+    prompt_ids_sha256: []const u8,
+    max_tokens: u32,
+    finish: []const u8,
+    prefill_rows_per_layer: u32,
+    decode_rows_per_layer: u32,
+    ttft_s: f64,
+    prefill_tok_s: f64,
+    phase_change_s: f64,
+    decode_wall_s: f64,
+    decode_tok_s: f64,
+    decode_tok_s_with_phase_change: f64,
+    wall_s: f64,
+    peak_footprint_gb: f64,
+    mlx_peak_gb: f64,
+    generated_tokens: usize,
+    generated_ids: []const u32,
+    generated_ids_sha256: []const u8,
+    cycles: []const CellCycle,
+    accepted_drafts: u32,
+    drafted_tokens: u32,
+    accept_rate: f64,
+    tokens_per_cycle: f64,
+};
+
+// Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
+// (the standard cell's)> DSV41_BANK=<bank> DSV41_CELL_OUT=<new json> _GPU_WINDOW_LOCKED=1
+// [DSV41_CELL_BASELINE_GB=<the box baseline for the admission>] [DSV41_CELL_ROWS=<fixed decode rows>]
+// [DSV41_CELL_DELTA=<typical delta, 0.3>] [DSV41_CELL_MAX_TOKENS=<1024>]. The typical tier's timed cell:
+// the served module as the server builds it, the standard 16,384-token prompt as ONE prompt pass (the
+// model's chunk rule, the wide lane), the phase change, then DSpark cycles (typical acceptance, the greedy
+// correction) until 1,024 tokens or an EOS id. Deterministic (the in-process cell's temperature 0).
+test "dsv41 served cell: the typical tier's 16K cell through the served module, timed" {
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const out_path = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = try cellInputs(a, io, prompt_path, bank_dir);
+    const prompt = inputs.prompt;
+    var config = inputs.config;
+    if (std.c.getenv("DSV41_CELL_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
+    const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
+
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    memProbe("dsv41 served cell", "start");
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    defer md.deinit();
+    memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
+
+    const g = &md.g;
+    const L = dsl.Loop(ops.MlxOps);
+    // The request's bounded lanes: the prompt, the token cap, one verify block (Module.prefill's rule).
+    var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(prompt.len, prompt.len + max_tokens)));
+    defer st.deinit(g, gpa);
+    const caches = try a.alloc(L.H.Cache, md.head.nStages());
+    for (caches) |*x| x.* = .{};
+    defer for (caches) |*x| x.deinit(g);
+    var stops: [8]u32 = undefined;
+    const n_stop = config.num_eos_tokens;
+    @memcpy(stops[0..n_stop], config.eos_token_ids[0..n_stop]);
+    var lp = L.init(g, md.model, md.head, &st, caches, .{
+        .acceptance = .{ .typical = .{ .delta = @floatCast(delta) } },
+        .prompt_chunk = dsl.whole_prompt,
+        .max_tokens = max_tokens,
+        .stop_ids = stops[0..n_stop],
+    });
+    defer lp.deinit();
+
+    _ = mlx.mlx_reset_peak_memory();
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    const primary = try lp.prefill(gpa, &md.arm.hook, prompt);
+    const ttft_s = secondsSince(io, t0);
+    memProbe("dsv41 served cell", "prompt (one pass)");
+    const t1 = std.Io.Timestamp.now(io, .boot);
+    try md.phaseChange();
+    const phase_s = secondsSince(io, t1);
+    memProbe("dsv41 served cell", "the phase change (embedding fence, slot banks grown)");
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    var cycles: std.ArrayList(CellCycle) = .empty;
+    const t2 = std.Io.Timestamp.now(io, .boot);
+    var finish: dsl.Finish = .stop;
+    if (std.mem.indexOfScalar(u32, stops[0..n_stop], primary) == null) while (true) {
+        var lg: dsl.CycleLog = .{ .primary = 0 };
+        const f = try lp.cycle(&md.arm.hook, &out, gpa, &lg);
+        try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
+        if (f) |x| {
+            finish = x;
+            break;
+        }
+    };
+    const decode_s = secondsSince(io, t2);
+    const wall_s = secondsSince(io, t0);
+    memProbe("dsv41 served cell", "cycles");
+
+    const ids = try a.alloc(u32, out.items.len + 1);
+    ids[0] = primary;
+    @memcpy(ids[1..], out.items);
+    var mlx_peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&mlx_peak);
+    const fp = arm_mod.footprint();
+    const stt = lp.stats;
+    const prompt_sha = try cell.idsSha256(a, prompt);
+    const ids_sha = try cell.idsSha256(a, ids);
+    const rec: CellReceipt = .{
+        .typical_delta = delta,
+        .prompt_file = prompt_path,
+        .prompt_tokens = prompt.len,
+        .prompt_ids_sha256 = &prompt_sha,
+        .max_tokens = max_tokens,
+        .finish = @tagName(finish),
+        .prefill_rows_per_layer = md.arm.prefill_rows[0],
+        .decode_rows_per_layer = md.arm.decode_rows[0],
+        .ttft_s = ttft_s,
+        .prefill_tok_s = @as(f64, @floatFromInt(prompt.len)) / ttft_s,
+        .phase_change_s = phase_s,
+        .decode_wall_s = decode_s,
+        // The primary token is the prompt pass's; the decode rate counts the cycles' tokens.
+        .decode_tok_s = @as(f64, @floatFromInt(out.items.len)) / decode_s,
+        .decode_tok_s_with_phase_change = @as(f64, @floatFromInt(out.items.len)) / (decode_s + phase_s),
+        .wall_s = wall_s,
+        .peak_footprint_gb = @as(f64, @floatFromInt(fp.peak)) / 1e9,
+        .mlx_peak_gb = @as(f64, @floatFromInt(mlx_peak)) / 1e9,
+        .generated_tokens = ids.len,
+        .generated_ids = ids,
+        .generated_ids_sha256 = &ids_sha,
+        .cycles = cycles.items,
+        .accepted_drafts = stt.accepted_drafts,
+        .drafted_tokens = stt.drafted_tokens,
+        .accept_rate = stt.acceptRate(),
+        .tokens_per_cycle = if (cycles.items.len == 0) 0 else @as(f64, @floatFromInt(out.items.len)) / @as(f64, @floatFromInt(cycles.items.len)),
+    };
+    const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
+    std.debug.print("\ndsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
+        delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
+        ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
+        cycles.items.len,           decode_s,               rec.decode_tok_s,           rec.decode_tok_s_with_phase_change,
+        stt.accepted_drafts,        stt.drafted_tokens,     wall_s,                     rec.peak_footprint_gb,
+        rec.mlx_peak_gb,            rec.finish,             rec.generated_ids_sha256,   out_path,
+    });
+}
+
+fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t.untilNow(io, .boot).nanoseconds)) / 1e9;
+}
+
+/// The cell's host inputs: the standard prompt (16,384 tokens, seed 20260829, digest checked) and
+/// the shell's config of the bank (its bank / token-map paths, the EOS ids the Generator stops on).
+fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: model.ModelConfig } {
+    const prompt = try standardPrompt(a, io, prompt_path, 16384, 20260829);
+    const config = try model.parseConfig(io, a, bank_dir);
+    if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
+    if (config.num_eos_tokens == 0) return error.NoEosIds;
+    return .{ .prompt = prompt, .config = config };
+}
+
+// The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and
+// DSV41_CELL_PROMPT_IDS as the window passes them. The prompt entry, its length and digest, the
+// config's paths and EOS ids; the receipt serialises.
+test "dsv41 served cell: the window's inputs pass on the host (the standard prompt, the bank's shell config)" {
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = try cellInputs(a, testing.io, prompt_path, bank_dir);
+    try testing.expectEqual(@as(usize, 16384), inputs.prompt.len);
+    const sha = try cell.idsSha256(a, inputs.prompt);
+    try testing.expectEqualStrings("1a45b35bae742fae0e26d4f40ee0dc1093a2038e5b514460a4f02e9e56d74565", &sha);
+    try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
+    try testing.expectEqual(@as(usize, 16384 + 1024 + mdl.Model(ops.MlxOps).scratch_rows), module.Module.maxPositions(16384, 16384 + 1024));
+    const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
+    const json = try std.json.Stringify.valueAlloc(a, rec, .{});
+    try testing.expect(std.mem.indexOf(u8, json, "\"decode_rows_per_layer\":2") != null);
 }
 
 pub const dspark_reference_format = "mlx-serve-dsv41-dspark-ref-v1";
