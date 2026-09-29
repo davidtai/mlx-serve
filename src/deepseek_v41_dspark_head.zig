@@ -421,9 +421,18 @@ pub fn Head(comptime G: type) type {
             var fba = std.heap.FixedBufferAllocator.init(self.block_scratch);
             const e = try Tr.expandEmbedding(g, c, try embed.of(g, fba.allocator(), block_ids[0..ds.block_size], c.hidden_size));
             var cur: Tr.Out = e;
-            for (self.stages, caches) |*st, *cache| cur = try self.stage(g, st, cur.h, cur.pre_mix, main_x, cache);
+            // One wave per stage, as the trunk's layers (`Tr.Carry`).
+            var carry: Tr.Carry = .{};
+            errdefer carry.release(g);
+            for (self.stages, caches) |*st, *cache| {
+                const wave = g.mark();
+                cur = try self.stage(g, st, cur.h, cur.pre_mix, main_x, cache);
+                carry.persist(g, &cur.h, &cur.pre_mix, null);
+                g.resetTo(wave);
+            }
             // forward_head
             const x = try Tr.hcPre(g, cur.h, cur.pre_mix);
+            carry.release(g);
             const hn = try Tr.rmsnorm(g, x, self.norm, c.rms_norm_eps);
             const base = try Tr.head(g, &self.rt, hn, head_w);
             const vocab = g.shapeOf(base).dim(-1);

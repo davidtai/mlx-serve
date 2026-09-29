@@ -126,6 +126,70 @@ pub fn Trunk(comptime G: type) type {
         pub const CosSin = struct { cos: T, sin: T };
         pub const Out = struct { h: T, pre_mix: T };
 
+        /// The arrays a layer hands the next: its hidden and pre-mix, and every
+        /// array of the shared runtime (the published compressed lanes, masks,
+        /// selections, the window mask memo).
+        const share_arrays = blk: {
+            const info = @typeInfo(Share).@"struct";
+            var names: []const []const u8 = &.{};
+            for (info.field_names, info.field_types) |name, ty| {
+                if (ty == ?T) names = names ++ &[_][]const u8{name};
+            }
+            break :blk names;
+        };
+
+        /// One wave per layer (the backend's `mark` / `resetTo`, the kernels'
+        /// wave lifecycle). MlxOps holds every op output until a reset, so a
+        /// forward reset only at its end holds all its layers' intermediates at
+        /// once; the grouped wo_a alone, dequantized per call (bf16 67 MB, its
+        /// f32 cast 134 MB), is 8.05 GB over 40 layers (the M3 AR run's MLX peak,
+        /// 27.66 GB against 18.3 planned). The Python lane frees each array at
+        /// its last use. Before a wave's `resetTo`, `persist` turns what later
+        /// layers read into kept handles (a slot then holds its kept handle; a
+        /// handle is released when a later wave replaces it); `release` drops
+        /// them once the forward's tail holds what it reads.
+        pub const Carry = struct {
+            h: ?T = null,
+            pre_mix: ?T = null,
+            shared: [share_arrays.len]?T = @splat(null),
+
+            pub fn persist(self: *Carry, g: *G, h: *T, pre_mix: *T, shared: ?*Share) void {
+                persistOne(g, h, &self.h);
+                persistOne(g, pre_mix, &self.pre_mix);
+                if (shared) |s| self.persistShared(g, s);
+            }
+
+            pub fn persistShared(self: *Carry, g: *G, s: *Share) void {
+                inline for (share_arrays, 0..) |name, i| persistSlot(g, &@field(s, name), &self.shared[i]);
+            }
+
+            pub fn release(self: *Carry, g: *G) void {
+                drop(g, &self.h);
+                drop(g, &self.pre_mix);
+                for (&self.shared) |*k| drop(g, k);
+            }
+
+            fn persistOne(g: *G, slot: *T, kept: *?T) void {
+                var v: ?T = slot.*;
+                persistSlot(g, &v, kept);
+                slot.* = v.?;
+            }
+
+            fn persistSlot(g: *G, slot: *?T, kept: *?T) void {
+                const cur = slot.* orelse return drop(g, kept);
+                if (kept.*) |k| if (std.meta.eql(k, cur)) return;
+                const fresh = g.keep(cur);
+                drop(g, kept);
+                kept.* = fresh;
+                slot.* = fresh;
+            }
+
+            fn drop(g: *G, kept: *?T) void {
+                if (kept.*) |x| g.release(x);
+                kept.* = null;
+            }
+        };
+
         /// A weak Python float against `like` (MLX `to_array(v, like.dtype)`).
         fn sf(g: *G, v: f64, like: T) !T {
             const d = g.dtypeOf(like);
@@ -1674,7 +1738,7 @@ test "dsv41 graph: the W50 lean prefill score folds the sink instead of concaten
 /// op output until the per-layer `reset`, so an evaluated layer keeps all of
 /// them at once. Views (reshape / transpose / expand / broadcast / slice) and
 /// leaves share or own no new buffer and are left out.
-fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, max: u64, max_op: ops.Op } {
+pub fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, max: u64, max_op: ops.Op } {
     var sum: u64 = 0;
     var mx: u64 = 0;
     var mop: ops.Op = .input;
@@ -1691,6 +1755,88 @@ fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, max:
         }
     }
     return .{ .sum = sum, .max = mx, .max_op = mop };
+}
+
+/// Handles with MLX's lifetimes (the trace backend frees nothing): `keep` makes
+/// an untracked handle, `resetTo` kills every handle tracked since the mark.
+const Handles = struct {
+    pub const T = u32;
+    gpa: std.mem.Allocator,
+    alive: std.ArrayList(bool) = .empty,
+    tracked: std.ArrayList(u32) = .empty,
+
+    fn deinit(h: *Handles) void {
+        h.alive.deinit(h.gpa);
+        h.tracked.deinit(h.gpa);
+    }
+
+    fn make(h: *Handles) !u32 {
+        try h.alive.append(h.gpa, true);
+        const x: u32 = @intCast(h.alive.items.len - 1);
+        try h.tracked.append(h.gpa, x);
+        return x;
+    }
+
+    pub fn keep(h: *Handles, x: u32) u32 {
+        std.debug.assert(h.alive.items[x]);
+        h.alive.append(h.gpa, true) catch @panic("oom");
+        return @intCast(h.alive.items.len - 1);
+    }
+
+    pub fn release(h: *Handles, x: u32) void {
+        std.debug.assert(h.alive.items[x]);
+        h.alive.items[x] = false;
+    }
+
+    pub fn mark(h: *const Handles) ops.Mark {
+        return .{ .n = h.tracked.items.len };
+    }
+
+    pub fn resetTo(h: *Handles, m: ops.Mark) void {
+        for (h.tracked.items[m.n..]) |x| h.alive.items[x] = false;
+        h.tracked.shrinkRetainingCapacity(m.n);
+    }
+
+    fn nAlive(h: *const Handles) usize {
+        return std.mem.count(bool, h.alive.items, &.{true});
+    }
+};
+
+test "dsv41 graph: a layer wave's carry keeps what later layers read alive past its reset and leaks nothing" {
+    var hs: Handles = .{ .gpa = testing.allocator };
+    defer hs.deinit();
+    const Tw = Trunk(Handles);
+    var h = try hs.make();
+    var pm = try hs.make();
+    var shared: Tw.Share = .{};
+    var carry: Tw.Carry = .{};
+    const before = hs.nAlive();
+    // Layer 0 publishes the compressed lanes and a window mask; layer 1 changes only the mask;
+    // layer 2 publishes a selection; layer 3 drops the selection and changes nothing else.
+    for (0..4) |l| {
+        const wave = hs.mark();
+        h = try hs.make();
+        pm = try hs.make();
+        switch (l) {
+            0 => {
+                shared.compress_kv = try hs.make();
+                shared.index_k = try hs.make();
+                shared.win_mask = try hs.make();
+            },
+            1 => shared.win_mask = try hs.make(),
+            2 => shared.topk_mask = try hs.make(),
+            else => shared.topk_mask = null,
+        }
+        _ = try hs.make(); // an intermediate nothing carries
+        carry.persist(&hs, &h, &pm, &shared);
+        hs.resetTo(wave);
+        // Everything a later layer reads is alive; so is nothing else the waves made.
+        for ([_]?u32{ h, pm, shared.compress_kv, shared.index_k, shared.win_mask, shared.topk_mask }) |s| if (s) |x| try testing.expect(hs.alive.items[x]);
+        const carried: usize = 2 + 3 + @as(usize, @intFromBool(shared.topk_mask != null));
+        try testing.expectEqual(before + carried, hs.nAlive());
+    }
+    carry.release(&hs);
+    try testing.expectEqual(before, hs.nAlive());
 }
 
 // The window-2 stage-3 bound (host only): the chained 40-layer stock trunk at a

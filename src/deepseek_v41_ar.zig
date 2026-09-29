@@ -218,6 +218,72 @@ pub const DsparkReference = struct {
     cycles: []const RefCycle,
 };
 
+// Bank mode, host only: DSV41_BANK, DSV41_ENGRAM_TOKEN_MAP and DSV41_ENGRAM_REPLAY_REF=<dump_dsv41_dspark_ref.py
+// json>. The reference run's Engram history replayed twice through the native hashing: as the lane of record keeps
+// it (each verify's rejected rows trimmed with the KV: deepseek_v41_cache.py trim / rollback) and as the reference
+// kept it before the fix (its cache had no engram_state, so no trim reached the history). Names every verify row
+// whose Engram rows differ.
+test "dsv41 engram: a reference without the Engram trim hashes the verify rows after each trimmed verify apart" {
+    const ref_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_REPLAY_REF") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, ref_path, a, .limited(64 << 20));
+    const ref = try std.json.parseFromSliceLeaky(DsparkReference, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, ref.format, dspark_reference_format)) return error.ReferenceFormat;
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 engram: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(gpa, io, bank_dir, &diag);
+    var src = try engram.RowSource.open(gpa, io, bank_dir, map_path, &c, &diag);
+    defer src.deinit();
+    const per = src.perToken();
+    var lane: engram.HashState = .{};
+    defer lane.deinit(gpa);
+    var untrimmed: engram.HashState = .{};
+    defer untrimmed.deinit(gpa);
+    // The prompt in forwards of 8 rows, as the reference ran it.
+    var i: usize = 0;
+    while (i < ref.prompt.len) : (i += 8) {
+        const span = ref.prompt[i..@min(i + 8, ref.prompt.len)];
+        const rows = try a.alloc(i64, span.len * per);
+        try src.advance(gpa, &lane, span, rows);
+        try src.advance(gpa, &untrimmed, span, rows);
+    }
+    var first: ?usize = null;
+    var n_cycles: usize = 0;
+    var n_rows: usize = 0;
+    for (ref.cycles, 0..) |rc, ci| {
+        const span = try a.alloc(u32, 1 + rc.drafts.len);
+        span[0] = rc.primary;
+        @memcpy(span[1..], rc.drafts);
+        if (span.len != rc.verified or rc.kept == 0 or rc.kept > rc.verified) return error.ReferenceShape;
+        const rl = try a.alloc(i64, span.len * per);
+        const ru = try a.alloc(i64, span.len * per);
+        try src.advance(gpa, &lane, span, rl);
+        try src.advance(gpa, &untrimmed, span, ru);
+        var differ: [ds.max_block + 1]u32 = undefined;
+        var n: usize = 0;
+        for (0..span.len) |j| if (!std.mem.eql(i64, rl[j * per ..][0..per], ru[j * per ..][0..per])) {
+            differ[n] = @intCast(j);
+            n += 1;
+        };
+        if (n > 0) {
+            if (first == null) first = ci;
+            n_cycles += 1;
+            n_rows += n;
+        }
+        if (ci < 6) std.debug.print("dsv41 engram: cycle {d}: verify {any}, kept {d} of {d}; rows whose Engram rows differ {any}\n", .{ ci, span, rc.kept, rc.verified, differ[0..n] });
+        lane.trim(rc.verified - rc.kept);
+    }
+    std.debug.print("dsv41 engram: {d} cycles; the untrimmed history first hashes a verify row apart at cycle {?d}; {d} cycles, {d} rows apart in all\n", .{ ref.cycles.len, first, n_cycles, n_rows });
+    // The first verify hashes alike; a trimmed verify leaves the next one's first rows apart.
+    try testing.expect(first != null and first.? >= 1);
+}
+
 // Guarded window only (loads the bank): DSV41_DSPARK_REF=<dump_dsv41_dspark_ref.py json> DSV41_BANK=<bank>
 // DSV41_ENGRAM_TOKEN_MAP=<converter map> _GPU_WINDOW_LOCKED=1 [DSV41_AR_ROWS=<decode rows per layer, default 16>]
 // [DSV41_KV_BOUNDED=1: the request's KV lanes bounded to its positions (M5BOUND), else the tier's route]
@@ -347,7 +413,16 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
         }
         if (!same and first_decision == null) {
             first_decision = i;
-            std.debug.print("dsv41 dspark: cycle {d} first finer difference: primary {d} vs {d}, native {any} vs {any}, k {d} vs {d}, conf bits {any} vs {any}\n", .{ i, lg.primary, rc.primary, lg.native[0..rc.draft_ids.len], rc.draft_ids, lg.k_native, rc.k_eff_native, @as([]const u32, @ptrCast(lg.conf[0..rc.conf_sigmoid_bits.len])), rc.conf_sigmoid_bits });
+            std.debug.print("\ndsv41 dspark: cycle {d} first finer difference: primary {d} vs {d}, native {any} vs {any}, k {d} vs {d}, conf bits {any} vs {any}, drafts {any} vs {any}, targets {any} vs {any}, flags {any} vs {any}\n", .{
+                i,                    lg.primary,
+                rc.primary,           lg.native[0..rc.draft_ids.len],
+                rc.draft_ids,         lg.k_native,
+                rc.k_eff_native,      @as([]const u32, @ptrCast(lg.conf[0..rc.conf_sigmoid_bits.len])),
+                rc.conf_sigmoid_bits, lg.drafts[0..lg.k_eff],
+                rc.drafts,            lg.targets[0..lg.n_targets],
+                rc.targets,           lg.flags[0..lg.n_flags],
+                rc.flags,
+            });
         }
     }
     const wall_ms = @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms);

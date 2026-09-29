@@ -609,6 +609,169 @@ const DropLookup = struct {
     }
 };
 
+test "dsv41 dspark loop: each draft stage is one wave, freed at the stage's end" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    const n_st = rig.head.nStages();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..n_st], .{ .lookup = null, .max_tokens = 8 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    const e0: u32 = @intCast(rig.g.nodes.items.len);
+    const waves0 = rig.g.freed.items.len;
+    const d = try rig.head.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed, rig.model.head);
+    const waves = rig.g.freed.items[waves0..];
+    try testing.expectEqual(@as(usize, n_st), waves.len);
+    var prev = e0;
+    for (waves) |w| {
+        try testing.expect(w.from >= prev and w.to > w.from);
+        prev = w.to;
+    }
+    // forward_head (the base logits, the markov steps, the confidence) builds after the last stage.
+    try testing.expect(d.ids >= prev and d.logits >= prev and d.conf >= prev);
+}
+
+/// The bytes MlxOps holds over one traced call `[from, to)` whose waves are
+/// `waves`: `reset` = every allocating node until the call's reset (one reset
+/// per forward, the 8b72bd27 harness), `outside` + `widest` = the call's nodes
+/// outside its waves plus its widest wave (one wave per layer).
+const Held = struct {
+    reset: u64,
+    outside: u64,
+    widest: u64,
+    widest_at: usize,
+
+    fn of(g: *const TraceOps, from: usize, to: usize, waves: []const TraceOps.Freed) Held {
+        var h: Held = .{ .reset = graph.heldBytes(g, from, to).sum, .outside = 0, .widest = 0, .widest_at = 0 };
+        var in_waves: u64 = 0;
+        for (waves, 0..) |w, i| {
+            const b = graph.heldBytes(g, w.from, w.to).sum;
+            in_waves += b;
+            if (b > h.widest) {
+                h.widest = b;
+                h.widest_at = i;
+            }
+        }
+        h.outside = h.reset - in_waves;
+        return h;
+    }
+
+    fn print(h: Held, what: []const u8) void {
+        std.debug.print("dsv41 held: {s}: one reset per forward {d} B; one wave per layer {d} B ({d} B outside the waves + the widest wave, #{d}, {d} B)\n", .{ what, h.reset, h.outside + h.widest, h.outside, h.widest_at, h.widest });
+    }
+};
+
+// Bank mode (host only, the trace backend; DSV41_BANK): the window harnesses'
+// forwards on the bank's own config, residents bound from the resident spec,
+// the Engram rows read from the bank, the routed calls through the EXL3 chain
+// over 8 slot rows per layer (the harness's). The held bytes per forward with
+// one reset per forward against one wave per layer: the static bound of the
+// M3 / M5 re-runs (the head's f32 promotion inside the matmul is not a node:
+// 2.65 GB at each forward's head, both sides).
+test "dsv41 dspark loop: the bank's forwards hold one layer's arrays per wave, not the forward's" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 held: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(a, io, bank, &diag);
+    const eng = @import("deepseek_v41_engram.zig");
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+    const L = Loop(TraceOps);
+    const model_ = try L.M.init(a, &g, c, try routes.parse(&.{}, null), &lookup, &src);
+    defer model_.deinit(&g);
+    const head = try L.H.init(a, &g, c, .{}, &lookup);
+    defer head.deinit(&g);
+    const nl = c.n_layers;
+    const rows0 = try aa.alloc(u32, nl);
+    @memset(rows0, 0);
+    const rows8 = try aa.alloc(u32, nl);
+    @memset(rows8, 8);
+    var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = rows0 });
+    defer fsrc.deinit();
+    const Chain = xp.EagerChain(TraceOps, xp.TraceGemv);
+    var ex = try xp.Experts(TraceOps, xp.FakeSource, Chain).init(a, &g, &fsrc, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try ex.grow(&g, rows8);
+    var script: Script = .{ .n_experts = @intCast(c.n_routed_experts), .pick = 1, .u32s = &.{}, .f32s = &.{} };
+    g.host_values = script.values();
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+
+    // M3: the prompt in forwards of 8 rows (the last with its row's logits), then a decode forward.
+    var st = try model_.newState();
+    defer st.deinit(&g, a);
+    var m3_prompt: Held = undefined;
+    var i: usize = 0;
+    while (i < prompt.len) : (i += 8) {
+        const last = i + 8 == prompt.len;
+        const f0 = g.nodes.items.len;
+        const w0 = g.freed.items.len;
+        const r = try model_.forward(&g, &st, prompt[i .. i + 8], .{ .logits = if (last) .last else .none }, &ex, graph.NoProbe{});
+        const h = Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+        if (i == 0 or h.reset > m3_prompt.reset) m3_prompt = h;
+        try L.M.fence(&g, &st, &.{if (last) r.logits.? else r.hidden});
+        try ex.flush();
+        g.reset();
+    }
+    const f0 = g.nodes.items.len;
+    const w0 = g.freed.items.len;
+    _ = try model_.forward(&g, &st, prompt[0..1], .{ .logits = .last }, &ex, graph.NoProbe{});
+    const m3_decode = Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+    try ex.flush();
+    g.reset();
+    m3_prompt.print("M3 prompt forward (8 rows)");
+    m3_decode.print("M3 decode forward (1 row)");
+
+    // M5: the loop's prefill seeds the draft stages; then a verify forward of 8 rows (every
+    // row's logits and the DSpark taps) and a draft block.
+    var st5 = try model_.newState();
+    defer st5.deinit(&g, a);
+    const n_st = head.nStages();
+    var caches: [4]L.H.Cache = @splat(.{});
+    defer for (caches[0..n_st]) |*cc| cc.deinit(&g);
+    var lp = L.init(&g, model_, head, &st5, caches[0..n_st], .{ .lookup = null, .max_tokens = 8 });
+    defer lp.deinit();
+    _ = try lp.prefill(a, &ex, &prompt);
+    const v0 = g.nodes.items.len;
+    const vw0 = g.freed.items.len;
+    const ver = try model_.forward(&g, &st5, prompt[0..8], .{ .logits = .all, .main_hidden = true }, &ex, graph.NoProbe{});
+    const m5_verify = Held.of(&g, v0, g.nodes.items.len, g.freed.items[vw0..]);
+    try L.M.fence(&g, &st5, &.{ ver.logits.?, ver.main_hidden.? });
+    try ex.flush();
+    g.reset();
+    const d0 = g.nodes.items.len;
+    const dw0 = g.freed.items.len;
+    _ = try head.draftBlock(&g, lp.main_h.?, 1, caches[0..n_st], model_.embed, model_.head);
+    const m5_draft = Held.of(&g, d0, g.nodes.items.len, g.freed.items[dw0..]);
+    g.reset();
+    m5_verify.print("M5 verify forward (8 rows, every row's logits, the taps)");
+    m5_draft.print("M5 draft block");
+
+    // One wave per layer (stage): the forward's waves are its layers.
+    // The grouped wo_a dequantized per call and its f32 cast (201 MB a layer) sit in every
+    // forward's one-reset total, and in no more than one wave at a time.
+    const woa_layer: u64 = @as(u64, c.o_groups) * c.o_lora_rank * (@as(u64, c.n_heads) * c.head_dim / c.o_groups) * (2 + 4);
+    for ([_]Held{ m3_prompt, m3_decode, m5_verify }) |h| {
+        try testing.expect(h.reset >= nl * woa_layer);
+        try testing.expect(h.widest >= woa_layer and h.outside + h.widest < 2 * woa_layer + (256 << 20));
+    }
+    try testing.expect(m5_draft.reset >= n_st * woa_layer and m5_draft.widest < 2 * woa_layer);
+}
+
 test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every routed id through its lut and otherwise drafts as the full head" {
     const a = testing.allocator;
     var rig: Rig = undefined;

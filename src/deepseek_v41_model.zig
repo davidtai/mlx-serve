@@ -354,21 +354,33 @@ pub fn Model(comptime G: type) type {
             var shared: Tr.Share = .{};
             var mains: [8]T = undefined;
             var n_main: usize = 0;
+            // One wave per layer: what a layer builds is freed at its end, what
+            // the next layers read is carried (`Tr.Carry`).
+            var carry: Tr.Carry = .{};
+            errdefer carry.release(g);
+            errdefer for (mains[0..n_main]) |x| g.release(x);
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
+                const wave = g.mark();
                 if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows, n);
                 if (want_main and li.dspark_target) {
-                    mains[n_main] = try mainOf(g, h);
+                    mains[n_main] = g.keep(try mainOf(g, h));
                     n_main += 1;
                 }
                 const out = try Tr.layer(g, probe, c, rt, li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
                 h = out.h;
                 pm = out.pre_mix;
+                carry.persist(g, &h, &pm, &shared);
+                g.resetTo(wave);
             }
             for (st.layers) |*lc| lc.advance(n);
             st.offset += n;
             main_out.* = if (n_main > 0) try g.concat(mains[0..n_main], -1) else null;
-            return Tr.finalNorm(g, c, h, pm, self.norm_w);
+            const fin = try Tr.finalNorm(g, c, h, pm, self.norm_w);
+            // The tail's graph holds what it reads.
+            for (mains[0..n_main]) |x| g.release(x);
+            carry.release(g);
+            return fin;
         }
 
         /// The arrays a span fence settles: every lane's backing plus `extra`.
@@ -508,6 +520,10 @@ pub fn Model(comptime G: type) type {
                 rows[i] = try self.engramRowsFor(st, a, ids[sp[0]..sp[1]]);
                 shareds[i] = .{};
             }
+            // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
+            const carries = try a.alloc(Tr.Carry, nc);
+            @memset(carries, .{});
+            defer for (carries) |*k| k.release(g);
             const cap = moeRowCap(c, self.tier.chunk_target_bytes);
             const halves = try a.alloc(Tr.Half, nc);
             const xfs = try a.alloc(T, nc);
@@ -562,6 +578,7 @@ pub fn Model(comptime G: type) type {
                     i = j;
                 }
                 try g.evalAll(hs);
+                for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
                 g.reset();
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));
@@ -942,6 +959,34 @@ fn mlxSmoke(gpa: std.mem.Allocator, g: *ops.MlxOps, c: v41.Config, tier: routes.
     const mk = try m.mark(gpa, &st);
     defer gpa.free(mk.layers);
     try m.rollback(g, &st, mk);
+}
+
+test "dsv41 model: each layer of a forward is one wave, freed at the layer's end; the tail builds after the last" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const model_ = try TM.init(testing.allocator, &g, m.c, try routes.parse(&.{}, null), &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const ids = [_]u32{ 3, 10, 17, 24, 31, 38 };
+    // A verify-shaped forward (every row's logits and the DSpark taps), then a decode forward.
+    for ([_][]const u32{ &ids, ids[0..1] }) |span| {
+        const first: u32 = @intCast(g.nodes.items.len);
+        const waves0 = g.freed.items.len;
+        const r = try model_.forward(&g, &st, span, .{ .logits = .all, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+        const waves = g.freed.items[waves0..];
+        try testing.expectEqual(@as(usize, m.c.n_layers), waves.len);
+        var prev = first;
+        for (waves) |w| {
+            try testing.expect(w.from >= prev and w.to > w.from);
+            prev = w.to;
+        }
+        // The final norm, the head and the taps' concat come after the last wave.
+        try testing.expect(r.logits.? >= prev and r.main_hidden.? >= prev and r.hidden >= prev);
+    }
 }
 
 test "dsv41 model: the MLX instantiation of the model analyses (host, nothing runs)" {
