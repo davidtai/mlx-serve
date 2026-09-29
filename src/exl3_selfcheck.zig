@@ -101,6 +101,16 @@ pub fn runAll(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, rep
 /// naming the first failure) unless every check passes. Nothing may launch the kernels before.
 pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report, diag: ?*xk.Diag) !void {
     try runAll(a, reg, bound, report);
+    try judge(report, diag);
+}
+
+/// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming
+/// the first failing kernel / check / site) unless every result passed and the plan ran.
+pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
+    if (report.results.items.len == 0) {
+        if (diag) |d| d.len = (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check produced no result", .{}) catch unreachable).len;
+        return error.SelfCheckFailed;
+    }
     for (report.results.items) |r| {
         if (r.ok) continue;
         if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err })) |m| m.len else |_| d.buf.len;

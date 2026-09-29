@@ -15,6 +15,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const xk = @import("exl3_kernels.zig");
+const selfcheck = @import("exl3_selfcheck.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -1102,6 +1103,129 @@ pub fn DigXPrefill(comptime G: type) type {
     };
 }
 
+// ── Startup acceptance: the arm's one entry (registry, device self-check, typed handles) ──
+
+/// What the startup acceptance runs on.
+pub const Device = union(enum) {
+    /// the arm's GPU stream: every kernel is built on it and the self-check plan runs there
+    stream: mlx.mlx_stream,
+    /// host tests: no kernel object and no MLX array; the plan's results are scripted
+    stub: StubDevice,
+};
+
+/// A scripted device: every (kernel, check) of the plan passes, except `fail` when set.
+pub const StubDevice = struct {
+    fail: ?struct { kernel: Kernel, check: xk.Check } = null,
+};
+
+pub const StartupOptions = struct {
+    device: Device,
+    /// the texts the registry checks against the pin (production: the embedded ones)
+    texts: *const xk.Texts = &xk.embedded,
+    pin: []const u8 = xk.manifest_sha256,
+};
+
+/// The backend methods every route uses (the phase-3 contract); the prefill route adds its
+/// own (evalAll, asyncEval, concat, take, mark, resetTo) and checks them itself.
+const backend_methods = [_][]const u8{ "launch", "shapeOf", "dtypeOf", "hostArray", "keep", "release", "reshape", "astype" };
+
+/// The first route method `G` lacks, or null.
+pub fn missingBackendMethod(comptime G: type) ?[]const u8 {
+    inline for (backend_methods) |m| if (!@hasDecl(G, m)) return m;
+    return null;
+}
+
+/// The accepted registry on one device: the typed handles the arm keeps (heap-allocated: the
+/// backend's launcher and the routes point into it). `deinit` after the last launch drained.
+pub fn Accepted(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        a: Allocator,
+        reg: xk.Registry,
+        bound: xk.Bound,
+        /// the self-check plan's results (its receipt: `report.writeJsonLines(a)`)
+        report: selfcheck.Report,
+        gemv: Gemv(G),
+
+        /// The EXL3 decode GEMV as the caller's `GemvT` = { ctx, project_fn(ctx, g: *G, k, out_dim, xh,
+        /// ids, code) anyerror!G.T } (EagerChain's MlxGemv): xh f32 [rows, in] rotated, ids u32 [rows]
+        /// (each row's slot), code the projection's bank code; out_dim 2304 (gate / up) or 5120
+        /// (down); k 3 (the bank). The output is a launch output the backend owns.
+        pub fn gemvRoute(self: *const Self, comptime GemvT: type) GemvT {
+            return .{ .ctx = &self.gemv, .project_fn = GemvFn(G).project };
+        }
+
+        /// Releases the route statics, the kernels, the plan's results and the registry.
+        pub fn deinit(self: *Self, g: *G) void {
+            self.gemv.deinit(g);
+            self.bound.deinit();
+            self.report.deinit(self.a);
+            self.reg.deinit();
+            self.a.destroy(self);
+        }
+    };
+}
+
+fn GemvFn(comptime G: type) type {
+    return struct {
+        fn project(ctx: *const anyopaque, g: *G, k: u32, out_dim: u32, xh: G.T, ids: G.T, code: G.T) anyerror!G.T {
+            const r: *const Gemv(G) = @ptrCast(@alignCast(ctx));
+            if (k != xk.bank_ks[0]) return error.GemvKNotRegistered;
+            const proj: Proj = switch (out_dim) {
+                2304 => .gate,
+                5120 => .down,
+                else => return error.GemvOutDim,
+            };
+            return r.project(g, proj, xh, ids, code);
+        }
+    };
+}
+
+/// The stub device's plan: one scripted result per (kernel, check) of the registry's plan.
+fn stubPlan(a: Allocator, reg: *const xk.Registry, stub: StubDevice, report: *selfcheck.Report) !void {
+    for (&reg.entries) |*e| {
+        var it = e.checks.iterator();
+        while (it.next()) |c| {
+            const fails = if (stub.fail) |f| f.kernel == e.kernel and f.check == c else false;
+            try report.results.append(a, .{ .kernel = e.kernel, .check = c, .words = 1, .ok = !fails, .err = if (fails) "stub device: scripted failure" else "" });
+        }
+    }
+}
+
+/// The arm's one startup entry: builds the registry (every text against the pinned manifest),
+/// builds every kernel on the device, runs the device self-check plan (the KSELF plan of this
+/// registry, ~30 s and ~1.6 GB on the GPU: before the model loads) and judges it, points the
+/// backend's `launcher: ?*const xk.Bound` at the accepted kernels (when the backend has that
+/// field: `deepseek_v41_ops.MlxOps` at m1 c8411cf+), and builds the GEMV route's statics.
+/// Refused by name: a registry refusal (xk.Refusal: TextSha256Mismatch, ManifestNotPinned,
+/// LanePinMismatch, ...; `diag` names the text), NotGpuStream / KernelCreateFailed at bind,
+/// SelfCheckFailed (`diag` names the first failing kernel / check / site); a backend without a
+/// route method does not compile (the method is named).
+pub fn acceptAtStartup(comptime G: type, a: Allocator, g: *G, opts: StartupOptions, diag: *xk.Diag) !*Accepted(G) {
+    comptime {
+        if (missingBackendMethod(G)) |m| @compileError("exl3 kernel ops: the backend " ++ @typeName(G) ++ " lacks " ++ m ++ " (acceptAtStartup)");
+    }
+    const acc = try a.create(Accepted(G));
+    errdefer a.destroy(acc);
+    acc.* = .{ .a = a, .reg = undefined, .bound = undefined, .report = .{}, .gemv = undefined };
+    acc.reg = try xk.Registry.init(a, opts.texts, opts.pin, diag);
+    errdefer acc.reg.deinit();
+    acc.bound = switch (opts.device) {
+        .stream => |s| try acc.reg.bind(s, diag),
+        .stub => .{ .reg = &acc.reg, .stream = .{}, .kernels = @splat(.{}) },
+    };
+    errdefer acc.bound.deinit();
+    errdefer acc.report.deinit(a);
+    switch (opts.device) {
+        .stream => try selfcheck.runAll(a, &acc.reg, &acc.bound, &acc.report),
+        .stub => |st| try stubPlan(a, &acc.reg, st, &acc.report),
+    }
+    try selfcheck.judge(&acc.report, diag);
+    acc.gemv = try Gemv(G).init(g, &acc.reg);
+    if (@hasField(G, "launcher")) g.launcher = &acc.bound;
+    return acc;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1130,6 +1254,8 @@ const Trace = struct {
     held: std.ArrayList(T) = .empty,
     /// every keep, in order, with the number of resets before it (append-only)
     kept: std.ArrayList(struct { node: T, resets: u32 }) = .empty,
+    /// the model backend's kernel launcher (`MlxOps.launcher: ?*const xk.Bound`), set by acceptAtStartup
+    launcher: ?*const xk.Bound = null,
 
     fn deinit(t: *Trace) void {
         for (t.nodes.items) |n| t.a.free(n.bytes);
@@ -2005,4 +2131,99 @@ test "dsv41 kernels ops: prefill rows read by act_row take the same act words (t
         var k: usize = 0;
         while (k < ba.len) : (k += 4) try testing.expectEqual(@divTrunc(std.mem.readInt(i32, ba[k..][0..4], .little), 6), std.mem.readInt(i32, bb[k..][0..4], .little));
     }
+}
+
+// ── Startup acceptance (stub device) ──
+
+/// `deepseek_v41_experts.MlxGemv`'s shape on the trace backend.
+const TestGemv = struct {
+    ctx: *const anyopaque,
+    project_fn: *const fn (ctx: *const anyopaque, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) anyerror!Trace.T,
+
+    fn project(self: TestGemv, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) !Trace.T {
+        return self.project_fn(self.ctx, g, k, out_dim, xh, ids, code);
+    }
+};
+
+test "dsv41 kernels ops: acceptAtStartup (stub device) judges the plan, installs the launcher, hands out the GEMV route" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    const acc = try acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} } }, &diag);
+    // the plan: one result per (kernel, check) of the registry, all passed
+    var n: usize = 0;
+    for (&acc.reg.entries) |*e| n += e.checks.count();
+    try testing.expect(n >= 100);
+    try testing.expectEqual(n, acc.report.results.items.len);
+    try testing.expectEqual(@as(usize, 0), acc.report.failures());
+    const receipt = try acc.report.writeJsonLines(a);
+    defer a.free(receipt);
+    try testing.expectEqual(n, std.mem.count(u8, receipt, "\n"));
+    // the backend's launcher: the accepted kernels
+    try testing.expectEqual(@as(*const xk.Bound, &acc.bound), t.launcher.?);
+    try testing.expectEqual(&acc.reg, acc.bound.reg);
+    // the GEMV route through the caller's type: EagerChain's (k, out_dim, xh, ids, code) -> the lane's launch
+    const gemv = acc.gemvRoute(TestGemv);
+    try testing.expectEqual(@as(*const anyopaque, &acc.gemv), gemv.ctx);
+    for ([_]struct { e: *const Entry, out: u32, st: *const Statics(Trace) }{
+        .{ .e = acc.gemv.gu, .out = 2304, .st = &acc.gemv.gu_statics },
+        .{ .e = acc.gemv.dn, .out = 5120, .st = &acc.gemv.dn_statics },
+    }) |c| for (c.e.samples) |*s| {
+        const xh, const ids, const code = .{ try t.arg(c.e, "xh", &s.vars), try t.arg(c.e, "ids", &s.vars), try t.arg(c.e, "code", &s.vars) };
+        const z = try gemv.project(&t, 3, c.out, xh, ids, code);
+        var want: [9]Trace.T = undefined;
+        want[0..3].* = .{ xh, ids, code };
+        @memcpy(want[3..], c.st.arrays[3..9]);
+        try expectLaunch(t.back(1), c.e, s, &want);
+        try testing.expectEqual(t.back(1).outs[0], z);
+    };
+    const e = acc.gemv.gu;
+    const s = &e.samples[0];
+    const xh, const ids, const code = .{ try t.arg(e, "xh", &s.vars), try t.arg(e, "ids", &s.vars), try t.arg(e, "code", &s.vars) };
+    const launches = t.launches.items.len;
+    try testing.expectError(error.GemvKNotRegistered, gemv.project(&t, 2, 2304, xh, ids, code));
+    try testing.expectError(error.GemvOutDim, gemv.project(&t, 3, 1280, xh, ids, code));
+    try testing.expectEqual(launches, t.launches.items.len);
+    try testing.expect(t.keeps > 0);
+    acc.deinit(&t);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+}
+
+test "dsv41 kernels ops: acceptAtStartup refuses by name (text, pin, self-check) and a backend without a route method" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    // a self-check failure names its kernel and check; nothing is handed out
+    try testing.expectError(error.SelfCheckFailed, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{ .fail = .{ .kernel = .q3rc_router_tail__n128_top3, .check = .f64 } } } }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_router_tail__n128_top3 f64") != null);
+    try testing.expect(t.launcher == null);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+    // a text that is not the pinned manifest's
+    var texts = xk.embedded;
+    const k = Kernel.q3drc_mxfp8_fma_f32x;
+    const bad = try a.dupeSentinel(u8, xk.embedded.sources[@backingInt(k)], 0);
+    defer a.free(bad);
+    bad[bad.len / 3] ^= 0x04;
+    texts.sources[@backingInt(k)] = bad;
+    try testing.expectError(error.TextSha256Mismatch, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .texts = &texts }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), @tagName(k)) != null);
+    // another pin
+    try testing.expectError(error.ManifestNotPinned, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .pin = "0000000000000000000000000000000000000000000000000000000000000000" }, &diag));
+    try testing.expect(t.launcher == null);
+    // the route methods: the first one a backend lacks (acceptAtStartup names it at compile time)
+    try testing.expect(missingBackendMethod(Trace) == null);
+    try testing.expectEqualStrings("launch", missingBackendMethod(struct {}).?);
+    const NoRelease = struct {
+        pub const T = u32;
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn reshape() void {}
+        pub fn astype() void {}
+    };
+    try testing.expectEqualStrings("release", missingBackendMethod(NoRelease).?);
 }
