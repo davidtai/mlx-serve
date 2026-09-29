@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "156576ba2958e13e7216230163bf58548ab2c7fba6292e3cf12ecb1e9e5965d0";
+pub const manifest_sha256 = "8fe825e9a1c8001743a6d8585f07cf96aaba719d71c4c53d1a658d069f4529e4";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -21,7 +21,10 @@ pub const bank_codebook = "mul1";
 pub const bank_multiplier: u64 = 0x83DCD12D;
 pub const bank_ks = [_]u32{3};
 
-/// Every kernel of record; the tag is the kernel's MLX name and its file name.
+/// Every kernel of record; the tag is the kernel's MLX name and its file name. A variant
+/// `<base>__<variant>` (appended) is a registered text at other template values / input
+/// dtypes: the base's file, sha256, header and MLX name, its own recorded template, signature,
+/// launch and self-check (key: text sha256, template values, input dtypes).
 pub const Kernel = enum {
     dsv41_exl3_mul1h_k3_2304,
     dsv41_exl3_mul1h_k3_5120,
@@ -56,7 +59,27 @@ pub const Kernel = enum {
     mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64,
     mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd,
     mtplx_dsv41_fp_rope_h64_hd512_rd64_inv,
+    // DRAFTRC (record 3): the draft's template variants and the f32-x rcproj FMA text
+    q3rc_gate_part__n128,
+    q3rc_router_tail__n128_top3,
+    q3ht_combine__f32,
+    q3ht_collapse_norm__f32,
+    q3ht_combine_collapse_norm__f32,
+    q3ht_combine_collapse_norm__f32_rbf16,
+    q3drc_mxfp8_fma_f32x,
 };
+
+/// The text a tag runs: its own, or a variant's base (the part before "__").
+pub fn baseName(comptime name: []const u8) []const u8 {
+    return if (std.mem.indexOf(u8, name, "__")) |i| name[0..i] else name;
+}
+
+/// A variant's base kernel, null for a text of record.
+pub fn baseOf(k: Kernel) ?Kernel {
+    const name = @tagName(k);
+    const i = std.mem.indexOf(u8, name, "__") orelse return null;
+    return std.meta.stringToEnum(Kernel, name[0..i]);
+}
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
 pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail };
@@ -78,9 +101,10 @@ pub const embedded: Texts = .{
 };
 
 fn embedAll(comptime E: type, comptime prefix: []const u8) [std.meta.fieldNames(E).len][:0]const u8 {
+    @setEvalBranchQuota(100_000);
     const names = std.meta.fieldNames(E);
     var out: [names.len][:0]const u8 = undefined;
-    inline for (names, 0..) |name, i| out[i] = @embedFile(dir ++ prefix ++ name ++ ".metal");
+    inline for (names, 0..) |name, i| out[i] = @embedFile(dir ++ prefix ++ comptime baseName(name) ++ ".metal");
     return out;
 }
 
@@ -99,6 +123,7 @@ pub const Refusal = error{
     SchemaInvalid,
     MathModeNotSafe,
     GeometryInvalid,
+    VariantInvalid,
     NotGpuStream,
     KernelCreateFailed,
 };
@@ -197,6 +222,12 @@ pub const Sample = struct {
 
 pub const Entry = struct {
     kernel: Kernel,
+    /// the MLX kernel name (a variant's base tag)
+    mlx_name: [:0]const u8,
+    /// a variant's base kernel (null for a text of record)
+    variant_of: ?Kernel = null,
+    /// sha256 of the text (the variant key's first part)
+    text_sha256: [32]u8,
     family: []const u8,
     phase: []const u8,
     source: [:0]const u8,
@@ -376,6 +407,7 @@ pub const Registry = struct {
             const missing = it.next().?;
             return refuse(diag, error.MissingKernel, "exl3 kernels: the manifest does not list {t} ({d} of {d})", .{ missing, seen.count(), n_kernels });
         }
+        try checkVariants(&self.entries, diag);
     }
 
     /// Builds every kernel's mlx object on `stream`, once. Only the guarded path binds:
@@ -393,7 +425,7 @@ pub const Registry = struct {
             defer _ = mlx.mlx_vector_string_free(vin);
             const vout = mlx.mlx_vector_string_new_data(&out_names, e.outputs.len);
             defer _ = mlx.mlx_vector_string_free(vout);
-            b.kernels[i] = mlx.mlx_fast_metal_kernel_new(@tagName(e.kernel).ptr, vin, vout, e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous, false);
+            b.kernels[i] = mlx.mlx_fast_metal_kernel_new(e.mlx_name.ptr, vin, vout, e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous, false);
             if (b.kernels[i].ctx == null) return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
@@ -468,8 +500,10 @@ const JText = struct { id: ?[]const u8 = null, file: []const u8, sha256: []const
 const JPin = struct { symbol: []const u8, hash_of: []const u8, sha256: []const u8, join: ?[]const u8 = null };
 const JSelfCheck = struct { checks: []const []const u8, rows_max: u32 = 0 };
 const JSite = struct { name: []const u8, N: u32, K: u32, G: u32, XS: u32, XG: u32, YS: u32, YG: u32 };
+const JVariant = struct { of: []const u8, mlx_name: []const u8 };
 const JKernel = struct {
     name: []const u8,
+    variant: ?JVariant = null,
     family: []const u8,
     phase: []const u8,
     source: JText,
@@ -595,6 +629,50 @@ fn checkThreadgroup(tg: [3]u32, k: Kernel, diag: ?*Diag) Refusal!void {
         return refuse(diag, error.GeometryInvalid, "exl3 kernels: {t}: threadgroup {d}x{d}x{d}", .{ k, tg[0], tg[1], tg[2] });
 }
 
+fn sameTemplateShape(x: []const TemplateArg, y: []const TemplateArg) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p.name, q.name) or std.meta.activeTag(p.value) != std.meta.activeTag(q.value)) return false;
+    return true;
+}
+
+fn sameTemplateValues(x: []const TemplateArg, y: []const TemplateArg) bool {
+    for (x, y) |p, q| switch (p.value) {
+        .int => |v| if (v != q.value.int) return false,
+        .dtype => |v| if (v != q.value.dtype) return false,
+    };
+    return true;
+}
+
+fn sameInputDtypes(x: *const Entry, y: *const Entry) bool {
+    if (x.inputs.len != y.inputs.len) return false;
+    for (x.inputs, y.inputs) |p, q| if (p.dtype != q.dtype) return false;
+    return true;
+}
+
+/// Every variant: its base's text sha256 and header, the base's template names and kinds in
+/// order and its input names; and no two entries share (text sha256, header, template values,
+/// input dtypes): the instantiation MLX builds (the decmat mul1h / mul1 forms share a text and
+/// differ by header).
+fn checkVariants(entries: *const [n_kernels]Entry, diag: ?*Diag) Refusal!void {
+    for (entries) |*e| {
+        const b = &entries[@backingInt(e.variant_of orelse continue)];
+        if (!std.mem.eql(u8, &e.text_sha256, &b.text_sha256) or e.header != b.header)
+            return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: not the text of {t}", .{ e.kernel, b.kernel });
+        if (e.launch != .rule or b.launch != .rule or !sameTemplateShape(e.template, b.template))
+            return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: template names / kinds are not those of {t}", .{ e.kernel, b.kernel });
+        if (e.inputs.len != b.inputs.len) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
+        for (e.inputs, b.inputs) |p, q| if (!std.mem.eql(u8, p.name, q.name)) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
+    }
+    for (entries, 0..) |*x, i| for (entries[i + 1 ..]) |*y| {
+        if (!std.mem.eql(u8, &x.text_sha256, &y.text_sha256) or x.header != y.header or !sameInputDtypes(x, y)) continue;
+        const same = switch (x.launch) {
+            .rule => y.launch == .rule and sameTemplateShape(x.template, y.template) and sameTemplateValues(x.template, y.template),
+            .plans => true,
+        };
+        if (same) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t} and {t} are the same (text, template values, input dtypes)", .{ x.kernel, y.kernel });
+    };
+}
+
 fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, headers: [n_headers][:0]const u8, diag: ?*Diag) (Refusal || Allocator.Error)!Entry {
     const source = texts.sources[@backingInt(k)];
     try checkText(source, j.source, @tagName(k), diag);
@@ -606,8 +684,15 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, headers
     for (j.lane_pins) |p| try checkPin(p, source, hdr_text, k, diag);
     if (!std.mem.eql(u8, j.math_mode, "safe")) return refuse(diag, error.MathModeNotSafe, "exl3 kernels: {t}: math mode \"{s}\" (mlx-c binds only the safe default)", .{ k, j.math_mode });
     if (j.atomic_outputs) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: atomic outputs", .{k});
+    const base = baseOf(k);
+    if ((base == null) != (j.variant == null)) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: a variant tag needs a variant record and only a variant tag has one", .{k});
+    if (j.variant) |v| if (!std.mem.eql(u8, v.of, @tagName(base.?)) or !std.mem.eql(u8, v.mlx_name, @tagName(base.?)))
+        return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: variant of {s} named {s}, the tag says {t}", .{ k, v.of, v.mlx_name, base.? });
     var e: Entry = .{
         .kernel = k,
+        .mlx_name = @tagName(base orelse k),
+        .variant_of = base,
+        .text_sha256 = hexSha(j.source.sha256).?,
         .family = j.family,
         .phase = j.phase,
         .source = source,
@@ -829,7 +914,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 33), n_kernels);
+    try testing.expectEqual(@as(usize, 40), n_kernels);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -913,6 +998,85 @@ test "dsv41 kernels: every manifest refusal refuses, by name" {
         var diag: Diag = .{};
         try testing.expectError(c.want, Registry.init(a, &texts, &pin, &diag));
         try testing.expect(diag.len > 0);
+    }
+}
+
+test "dsv41 kernels: the DRAFTRC variants are their base texts at recorded template values and dtypes" {
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    const V = struct { k: Kernel, base: Kernel };
+    const vs = [_]V{
+        .{ .k = .q3rc_gate_part__n128, .base = .q3rc_gate_part },
+        .{ .k = .q3rc_router_tail__n128_top3, .base = .q3rc_router_tail },
+        .{ .k = .q3ht_combine__f32, .base = .q3ht_combine },
+        .{ .k = .q3ht_collapse_norm__f32, .base = .q3ht_collapse_norm },
+        .{ .k = .q3ht_combine_collapse_norm__f32, .base = .q3ht_combine_collapse_norm },
+        .{ .k = .q3ht_combine_collapse_norm__f32_rbf16, .base = .q3ht_combine_collapse_norm },
+    };
+    for (vs) |v| {
+        const e, const b = .{ reg.get(v.k), reg.get(v.base) };
+        try testing.expectEqual(@as(?Kernel, v.base), e.variant_of);
+        try testing.expectEqualStrings(@tagName(v.base), e.mlx_name);
+        try testing.expectEqualSlices(u8, &b.text_sha256, &e.text_sha256);
+        try testing.expectEqual(b.source.ptr, e.source.ptr);
+        try testing.expectEqual(b.header, e.header);
+    }
+    const tv = struct {
+        fn int(e: *const Entry, name: []const u8) i32 {
+            for (e.template) |x| if (std.mem.eql(u8, x.name, name)) return x.value.int;
+            unreachable;
+        }
+        fn dt(e: *const Entry, name: []const u8) mlx.mlx_dtype {
+            for (e.template) |x| if (std.mem.eql(u8, x.name, name)) return x.value.dtype;
+            unreachable;
+        }
+    };
+    try testing.expectEqual(@as(i32, 128), tv.int(reg.get(.q3rc_gate_part__n128), "N"));
+    try testing.expectEqual(@as(i32, 384), tv.int(reg.get(.q3rc_gate_part), "N"));
+    try testing.expectEqual(@as(i32, 3), tv.int(reg.get(.q3rc_router_tail__n128_top3), "TOPK"));
+    try testing.expectEqual(mlx.mlx_dtype.float32, tv.dt(reg.get(.q3ht_combine__f32), "OT"));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, tv.dt(reg.get(.q3ht_combine), "OT"));
+    // the two fused variants share template values and differ only by the residual's dtype
+    try testing.expectEqual(mlx.mlx_dtype.float32, reg.get(.q3ht_combine_collapse_norm__f32).inputs[1].dtype);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, reg.get(.q3ht_combine_collapse_norm__f32_rbf16).inputs[1].dtype);
+    // the f32-x text is a text of record (its own file and name), plans at the five verify sites
+    const f = reg.get(.q3drc_mxfp8_fma_f32x);
+    try testing.expectEqual(@as(?Kernel, null), f.variant_of);
+    try testing.expectEqualStrings("q3drc_mxfp8_fma_f32x", f.mlx_name);
+    try testing.expectEqual(mlx.mlx_dtype.float32, f.inputs[2].dtype);
+    try testing.expectEqual(@as(usize, 5), f.sites.len);
+    for (f.sites) |s| try testing.expect(reg.get(.q3rc_mxfp8_fma).site(s.name) != null);
+    try testing.expect(f.site("shared_w13") == null and f.site("main_proj") == null);
+}
+
+/// `text` with the first `needle` after `anchor` replaced (caller frees).
+fn replaceAfter(a: Allocator, text: []const u8, anchor: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const from = std.mem.indexOf(u8, text, anchor) orelse return error.NeedleMissing;
+    const at = from + (std.mem.indexOf(u8, text[from..], needle) orelse return error.NeedleMissing);
+    return std.mem.concat(a, u8, &.{ text[0..at], replacement, text[at + needle.len ..] });
+}
+
+test "dsv41 kernels: a variant that is not its base's text at new template values is refused, by name" {
+    const a = testing.allocator;
+    const Case = struct { anchor: []const u8, needle: []const u8, replacement: []const u8, names: []const u8 };
+    const cases = [_]Case{
+        // the base's own key (text, template values, input dtypes) twice
+        .{ .anchor = "\"name\": \"q3rc_gate_part__n128\"", .needle = "\"int\": 128,", .replacement = "\"int\": 384,", .names = "q3rc_gate_part and q3rc_gate_part__n128" },
+        // a variant record naming another base than its tag
+        .{ .anchor = "\"name\": \"q3rc_gate_part__n128\"", .needle = "\"mlx_name\": \"q3rc_gate_part\"", .replacement = "\"mlx_name\": \"q3rc_premix_part\"", .names = "q3rc_gate_part__n128" },
+        // a template kind that is not the base's
+        .{ .anchor = "\"name\": \"q3ht_combine__f32\"", .needle = "\"dtype\": \"float32\",\n     \"name\": \"OT\"", .replacement = "\"int\": 32,\n     \"name\": \"OT\"", .names = "q3ht_combine__f32" },
+    };
+    for (cases) |c| {
+        const m = try replaceAfter(a, embedded.manifest, c.anchor, c.needle, c.replacement);
+        defer a.free(m);
+        var texts = embedded;
+        texts.manifest = m;
+        const pin = shaHex(m);
+        var diag: Diag = .{};
+        try testing.expectError(error.VariantInvalid, Registry.init(a, &texts, &pin, &diag));
+        if (std.mem.indexOf(u8, diag.message(), c.names) == null) std.debug.print("diag: {s}\n", .{diag.message()});
+        try testing.expect(std.mem.indexOf(u8, diag.message(), c.names) != null);
     }
 }
 
