@@ -70,6 +70,10 @@ pub const Options = struct {
     /// Wired bytes at construction; null reads them now.
     wired_bytes: ?u64 = null,
     fixed_rows: ?u32 = null,
+    /// Rows chosen by the caller's native bill (`deepseek_v41_module.fillRows`): the stream's prefill
+    /// and decode rows per layer. The envelope admission still runs (AUTO, for its record); its rows
+    /// are not used. Exclusive with `fixed_rows`.
+    native_rows: ?NativeRows = null,
     allocation: expert_admission.Allocation = .prefill_excess,
     phase_reserve_bytes: u64 = pass2_phase_reserve_bytes,
     host_reserve_bytes: u64 = pass2_host_reserve_bytes,
@@ -94,6 +98,8 @@ pub const Options = struct {
     /// pinned by its sha256 at construction (default: the full head).
     draft_subset: ?dspark_head.SubsetPin = null,
 };
+
+pub const NativeRows = struct { prefill: u32, decode: u32 };
 
 /// The arm's construction up to the admitted rows: config, bank, plan. No
 /// slot memory yet (the caller owns `bank` and `draft_subset`).
@@ -154,8 +160,14 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     // Python engine resolves its own plan within it); a layer never
     // holds more rows than it has experts.
     const n_experts = bank.n_experts;
-    const prefill = @min(plan_.admission.prefill_capacity, n_experts);
-    const decode = @min(plan_.admission.decode_rows, n_experts);
+    var prefill = @min(plan_.admission.prefill_capacity, n_experts);
+    var decode = @min(plan_.admission.decode_rows, n_experts);
+    if (opt.native_rows) |nr| {
+        if (opt.fixed_rows != null) return refuse(diag, error.NativeRowsWithFixedRows, "admission: native rows and forced rows are exclusive", .{});
+        if (nr.prefill == 0 or nr.prefill > nr.decode or nr.decode > n_experts) return refuse(diag, error.InvalidNativeRows, "admission: native rows {d} prefill / {d} decode (1..{d})", .{ nr.prefill, nr.decode, n_experts });
+        prefill = nr.prefill;
+        decode = nr.decode;
+    }
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
     return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
 }

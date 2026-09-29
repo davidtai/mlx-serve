@@ -430,6 +430,9 @@ pub const ModelConfig = struct {
     expert_wide_depth: ?u8 = null,
     /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
     expert_wide_cold_rows: ?u8 = null,
+    /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
+    /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
+    expert_prefill_rows: ?u32 = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

@@ -352,7 +352,9 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .model_dir = config.expert_bank_dir.?,
         .envelope = envelope,
         .baseline_bytes = config.memory_baseline_bytes,
-        .fixed_rows = config.expert_rows,
+        .fixed_rows = if (config.expert_prefill_rows == null) config.expert_rows else null,
+        // Rows the caller's native bill filled (both set): the stream's rows, the envelope's record only.
+        .native_rows = if (config.expert_prefill_rows) |p| .{ .prefill = p, .decode = config.expert_rows orelse p } else null,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
         .lookahead = lookahead,
@@ -360,6 +362,30 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .wide_depth = config.expert_wide_depth orelse 1,
     };
 }
+
+/// A native bill in the fill's shape: each phase's billed bytes (the box baseline included) without its
+/// persistent slot rows, and one row on every routed layer (layers x the record); a phase's total at
+/// r rows is `fixed + r * per_row`.
+pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
+
+/// The native admission's fill: the most decode rows, and prefill rows under the prefill phase's
+/// bill, whose billed total stays within `ceiling_stop_bytes` of the ceiling (prefill <= decode <=
+/// the layer's experts). Refused by name when not even `min_fill_rows` fit.
+pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
+    const target = ceiling_bytes -| ceiling_stop_bytes;
+    const most = struct {
+        fn f(fixed: u64, t: u64, per_row: u64) u64 {
+            return if (fixed >= t) 0 else (t - fixed) / per_row;
+        }
+    }.f;
+    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
+    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
+    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
+    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
+}
+
+/// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
+pub const min_fill_rows = 16;
 
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
@@ -848,4 +874,57 @@ test "dsv41 module: the served request's forward schedule against the AR harness
     // The documented difference: the shapes (8-row prompt forwards vs one prompt forward, the last token at M = 1
     // after the phase change).
     try std.testing.expect(!std.mem.eql(u32, rows[0], rows[1]));
+}
+
+/// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
+/// baseline and the cell bill's phase totals at the envelope's 112 / 154 rows (decimal GB, 3 places).
+const fill_fixture = struct {
+    const record: u64 = 13_315_584;
+    const per_row: u64 = 40 * record;
+    const baseline: u64 = 13_408_305_152;
+    const prefill_total: u64 = 114_365_000_000;
+    const decode_total: u64 = 115_140_000_000;
+    const ceiling: u64 = 120_259_000_000;
+
+    fn at(base: u64) FillBill {
+        return .{ .prefill_fixed = prefill_total - 112 * per_row - baseline + base, .decode_fixed = decode_total - 154 * per_row - baseline + base, .per_row = per_row };
+    }
+};
+
+test "dsv41 module: the native fill reaches the stop's target within one row and never passes it" {
+    const f = fill_fixture;
+    const target = f.ceiling - ceiling_stop_bytes;
+    for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
+        const b = f.at(base);
+        const r = try fillRows(b, f.ceiling, 384);
+        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
+        try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
+        std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
+    }
+    // The measured baselines' rows (non-file ~9 GB, 11 GB, and the credited 13.4 GB).
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
+    // Capped at the layer's experts; refused by name when not even the floor fits.
+    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
+    try std.testing.expectEqual(@as(u32, 384), cap.decode);
+    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
+}
+
+test "dsv41 module: the envelope admission (the old rule) admits today's 154 decode rows at today's inputs" {
+    const f = fill_fixture;
+    const ceiling = boxCeiling(f.ceiling, 384);
+    const in: expert_admission.Inputs = .{
+        .baseline_bytes = f.baseline,
+        .wired_bytes = 3_389_000_000,
+        .record_bytes = f.record,
+        .phase_reserve_bytes = arm_mod.pass2_phase_reserve_bytes,
+        .lookahead_staging_bytes = expert_admission.lookaheadCharge(f.record, 2 * lookahead.budget, 16384),
+        .host_reserve_bytes = arm_mod.pass2_host_reserve_bytes,
+        .prefill_charge_bytes = arm_mod.pass2_prefill_charge_bytes,
+        .ceiling = ceiling,
+        .draft_pruned_bytes = 0,
+    };
+    const p = try expert_admission.Admission.plan(envelope, in);
+    std.debug.print("old rule: {d} prefill capacity / {d} decode rows\n", .{ p.admission.prefill_capacity, p.admission.decode_rows });
+    try std.testing.expectEqual(@as(u32, 154), p.admission.decode_rows);
+    try std.testing.expectEqual(@as(u32, 112), p.admission.prefill_capacity);
 }
