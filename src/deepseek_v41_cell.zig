@@ -61,8 +61,9 @@ pub fn run(comptime A: type, a: std.mem.Allocator, io: std.Io, arm: *A, g: *A.Ba
     try generated.append(a, try decode.prefill(arm, g, prompt));
     const prompt_eval = t0.untilNow(io, .boot);
     const io_after_prefill = arm.stream.stats();
-    const t1 = std.Io.Timestamp.now(io, .boot);
     try arm.grow(g);
+    // The phase change is in neither prompt_eval nor decode_wall: the Python harness grows in its prefill callback.
+    const t1 = std.Io.Timestamp.now(io, .boot);
     while (!try decode.cycle(arm, g, a, &generated)) {}
     const decode_wall = t1.untilNow(io, .boot);
     const pass_wall = t0.untilNow(io, .boot);
@@ -425,6 +426,8 @@ test "dsv41 cell: the stand-in cell on the bank at the admitted rows (the arm's 
     const model_dir = std.mem.span(std.c.getenv("DSV41_CELL_MODEL") orelse return error.SkipZigTest);
     const out = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    // The key lines start at column 0 (the test runner's name line has no newline).
+    std.debug.print("\n", .{});
     const a = testing.allocator;
     const io = std.testing.io;
     const envOf = struct {
