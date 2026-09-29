@@ -1,0 +1,631 @@
+//! The kernel-ops GPU gate: the Python lanes' own device outputs (a fixture written in a
+//! guarded window by R/exl3/runtime/dump_kernel_ops_fixture.py) replayed through the ported
+//! routes on the registry's kernels, every output word compared. Inputs are regenerated from
+//! the fixture's seeded generators (splitmix64, the dump's twins) and checked by sha256 first.
+//! GPU only: DSV41_KERNELS_GPU=1 and DSV41_KERNEL_OPS_FIXTURE=<dir> in a lock-holding window.
+
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const xk = @import("exl3_kernels.zig");
+const ops = @import("exl3_kernel_ops.zig");
+
+const Allocator = std.mem.Allocator;
+const Dtype = mlx.mlx_dtype;
+
+/// The routes' backend on real MLX arrays (the model's own backend plays this role there):
+/// arrays created here are freed by `reset`; kept arrays by `release`.
+pub const MlxG = struct {
+    pub const T = mlx.mlx_array;
+
+    a: Allocator,
+    s: mlx.mlx_stream,
+    bound: *const xk.Bound,
+    live: std.ArrayList(mlx.mlx_array) = .empty,
+
+    pub fn deinit(g: *MlxG) void {
+        g.reset();
+        g.live.deinit(g.a);
+    }
+
+    pub fn reset(g: *MlxG) void {
+        for (g.live.items) |x| _ = mlx.mlx_array_free(x);
+        g.live.clearRetainingCapacity();
+    }
+
+    fn track(g: *MlxG, x: T) !T {
+        g.live.append(g.a, x) catch |e| {
+            _ = mlx.mlx_array_free(x);
+            return e;
+        };
+        return x;
+    }
+
+    pub fn shapeOf(_: *MlxG, x: T) ops.Shape {
+        return .of(mlx.getShape(x));
+    }
+
+    pub fn dtypeOf(_: *MlxG, x: T) Dtype {
+        return mlx.mlx_array_dtype(x);
+    }
+
+    pub fn hostArray(g: *MlxG, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
+        const x = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), dt);
+        if (x.ctx == null) return error.MlxError;
+        return g.track(x);
+    }
+
+    pub fn keep(_: *MlxG, x: T) T {
+        var k = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&k, x);
+        return k;
+    }
+
+    pub fn release(_: *MlxG, x: T) void {
+        _ = mlx.mlx_array_free(x);
+    }
+
+    pub fn reshape(g: *MlxG, x: T, shape: []const c_int) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_reshape(&r, x, shape.ptr, shape.len, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn astype(g: *MlxG, x: T, dt: Dtype) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_astype(&r, x, dt, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn launch(g: *MlxG, k: xk.Kernel, inputs: []const T, cfg: *const xk.LaunchConfig, out: []T) !void {
+        try g.bound.apply(k, inputs, cfg, out);
+        for (out) |o| _ = try g.track(o);
+    }
+
+    pub fn evalAll(_: *MlxG, xs: []const T) !void {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_eval(v));
+    }
+
+    pub fn asyncEval(_: *MlxG, xs: []const T) !void {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
+    }
+
+    pub fn concat(g: *MlxG, xs: []const T, axis: c_int) !T {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_concatenate_axis(&r, v, axis, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn take(g: *MlxG, x: T, idx: T, axis: c_int) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_take_axis(&r, x, idx, axis, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    /// Row-contiguous host bytes of `x` (caller frees).
+    fn hostBytes(g: *MlxG, x: T) ![]u8 {
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, x, false, g.s));
+        try mlx.check(mlx.mlx_array_eval(c));
+        if (mlx.errorPending()) return error.MlxError;
+        const n = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
+        const p = mlx.mlx_array_data_uint8(c) orelse return error.MlxArrayDataNull;
+        return g.a.dupe(u8, p[0..n]);
+    }
+};
+
+// ── The fixture (dump_kernel_ops_fixture.py spec.json) ──
+
+const JGen = struct {
+    kind: []const u8,
+    seed: u64 = 0,
+    lo: f64 = 0,
+    hi: f64 = 0,
+    rows: []const u32 = &.{},
+    slots: []const u32 = &.{},
+    tiles: u32 = 0,
+    values: []const f64 = &.{},
+};
+const JArray = struct { name: []const u8, dtype: []const u8, shape: []const i64, gen: ?JGen = null, sha256: []const u8, file: ?[]const u8 = null };
+const JVars = struct { rows: u64 = 0, cap: u64 = 0, experts: u64 = 0 };
+const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, inputs: []const JArray, outputs: []const JArray };
+const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const JCase };
+
+const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
+const golden: u64 = 0x9E3779B97F4A7C15;
+
+fn sm(seed: u64, i: u64) u64 {
+    var z = seed +% (i + 1) *% golden;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+fn dtypeOf(name: []const u8) Dtype {
+    const map = [_]struct { []const u8, Dtype }{
+        .{ "float32", .float32 }, .{ "float16", .float16 }, .{ "bfloat16", .bfloat16 }, .{ "int16", .int16 },
+        .{ "int32", .int32 },     .{ "uint32", .uint32 },   .{ "uint8", .uint8 },
+    };
+    for (map) |m| if (std.mem.eql(u8, m[0], name)) return m[1];
+    unreachable;
+}
+
+fn size(dt: Dtype) usize {
+    return switch (dt) {
+        .uint8 => 1,
+        .int16, .float16, .bfloat16 => 2,
+        .int32, .uint32, .float32 => 4,
+        else => unreachable,
+    };
+}
+
+fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
+    switch (dt) {
+        .uint8 => b[i] = @truncate(v),
+        .int32, .uint32 => std.mem.writeInt(u32, b[i * 4 ..][0..4], @truncate(v), .little),
+        else => unreachable,
+    }
+}
+
+/// The bytes of one input, as the dump's `generate` builds them.
+fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
+    const b = try a.alloc(u8, n * size(dt));
+    errdefer a.free(b);
+    const kind = std.meta.stringToEnum(enum { bits, uniform, index, range, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
+    switch (kind) {
+        .bits => {
+            var w: usize = 0;
+            while (w * 8 < b.len) : (w += 1) {
+                var le: [8]u8 = undefined;
+                std.mem.writeInt(u64, &le, sm(gen.seed, w), .little);
+                const end = @min(b.len, w * 8 + 8);
+                @memcpy(b[w * 8 .. end], le[0 .. end - w * 8]);
+            }
+        },
+        .uniform => for (0..n) |i| {
+            const t = @as(f64, @floatFromInt(sm(gen.seed, i) >> 11)) * 0x1p-53;
+            const v: f32 = @floatCast(gen.lo + (gen.hi - gen.lo) * t);
+            switch (dt) {
+                .float32 => std.mem.writeInt(u32, b[i * 4 ..][0..4], @bitCast(v), .little),
+                .float16 => std.mem.writeInt(u16, b[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(v))), .little),
+                .bfloat16 => {
+                    const u: u64 = @as(u32, @bitCast(v));
+                    std.mem.writeInt(u16, b[i * 2 ..][0..2], @truncate((u + 0x7FFF + ((u >> 16) & 1)) >> 16), .little);
+                },
+                else => unreachable,
+            }
+        },
+        .index => for (0..n) |i| putInt(b, i, dt, sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi))),
+        .range => for (0..n) |i| putInt(b, i, dt, @as(u64, @intFromFloat(gen.lo)) + sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi - gen.lo))),
+        .wave_rhs => {
+            var r: usize = 0;
+            for (gen.rows, 0..) |rows, j| for (0..rows) |_| {
+                putInt(b, r, dt, j);
+                r += 1;
+            };
+        },
+        .wave_table => {
+            var ex: [ops.wave_max]ops.WaveExpert = undefined;
+            for (gen.slots, gen.rows, 0..) |s, r, j| ex[j] = .{ .slot = s, .rows = r };
+            const t = ops.digTable(ex[0..gen.slots.len], gen.tiles);
+            @memcpy(b, std.mem.sliceAsBytes(&t.table));
+        },
+        .slots16 => {
+            const t = ops.rebuildSlots(gen.slots);
+            @memcpy(b, std.mem.sliceAsBytes(&t));
+        },
+        .values => for (0..n) |i| std.mem.writeInt(u32, b[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(gen.values[i]))), .little),
+    }
+    return b;
+}
+
+fn hexEql(want: []const u8, bytes: []const u8) bool {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
+    const got = std.fmt.bytesToHex(d, .lower);
+    return std.mem.eql(u8, want, &got);
+}
+
+pub const Line = struct {
+    family: []const u8,
+    case: []const u8,
+    output: []const u8,
+    words: u64 = 0,
+    bad: u64 = 0,
+    ok: bool = false,
+    err: []const u8 = "",
+};
+
+/// One case: its inputs regenerated and checked, the routes run, every output compared.
+fn replayCase(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u8, c: *const JCase, lines: *std.ArrayList(Line)) !void {
+    var ins: std.StringHashMapUnmanaged(mlx.mlx_array) = .empty;
+    defer ins.deinit(a);
+    for (c.inputs) |*i| {
+        const dt = dtypeOf(i.dtype);
+        var shape: [8]c_int = undefined;
+        var n: usize = 1;
+        for (i.shape, 0..) |d, k| {
+            shape[k] = @intCast(d);
+            n *= @intCast(d);
+        }
+        const bytes = try generate(a, i.gen.?, dt, n);
+        defer a.free(bytes);
+        if (!hexEql(i.sha256, bytes)) {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input generator differs from the dump's" });
+            return;
+        }
+        try ins.put(a, i.name, try g.hostArray(bytes, shape[0..i.shape.len], dt));
+    }
+    var outs: [11]mlx.mlx_array = undefined;
+    const n_out = try runFamily(g, reg, c, &ins, &outs);
+    if (n_out != c.outputs.len) return error.FixtureOutputs;
+    const v = mlx.mlx_vector_array_new_data(&outs, n_out);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_eval(v));
+    for (c.outputs, outs[0..n_out]) |*o, got_arr| {
+        var line: Line = .{ .family = c.family, .case = c.case, .output = o.name };
+        const got = try g.hostBytes(got_arr);
+        defer a.free(got);
+        const path = try std.fs.path.join(a, &.{ dir, o.file.? });
+        defer a.free(path);
+        const want = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 30));
+        defer a.free(want);
+        const w = size(dtypeOf(o.dtype));
+        if (g.dtypeOf(got_arr) != dtypeOf(o.dtype) or got.len != want.len) {
+            line.err = "dtype or size differs";
+        } else {
+            line.words = got.len / w;
+            var k: usize = 0;
+            while (k < got.len) : (k += w) line.bad += @intFromBool(!std.mem.eql(u8, got[k..][0..w], want[k..][0..w]));
+            line.ok = line.bad == 0 and hexEql(o.sha256, want);
+        }
+        try lines.append(a, line);
+    }
+}
+
+fn in(ins: *std.StringHashMapUnmanaged(mlx.mlx_array), name: []const u8) mlx.mlx_array {
+    return ins.get(name).?;
+}
+
+/// The ported calls of one family, outputs in the dump's order.
+fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.StringHashMapUnmanaged(mlx.mlx_array), outs: *[11]mlx.mlx_array) !usize {
+    const f = c.family;
+    const eq = std.mem.eql;
+    if (eq(u8, f, "router")) {
+        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        defer r.deinit(g);
+        outs[0..2].* = try r.call(g, in(ins, "x"));
+        return 2;
+    }
+    if (eq(u8, f, "premix")) {
+        var r = try ops.Premix(MlxG).init(g, reg, in(ins, "w"), null);
+        defer r.deinit(g);
+        outs[0] = try r.call(g, in(ins, "x"));
+        return 1;
+    }
+    if (eq(u8, f, "sinkhorn")) {
+        var r = try ops.Sinkhorn(MlxG).init(g, reg);
+        defer r.deinit(g);
+        outs[0] = try r.call(g, in(ins, "comb"));
+        return 1;
+    }
+    if (eq(u8, f, "rcproj")) {
+        const site = std.meta.stringToEnum(ops.RcSite, c.site.?).?;
+        var r = try ops.RcProj(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        defer r.deinit(g);
+        outs[0] = try r.call(g, in(ins, "x"));
+        return 1;
+    }
+    if (eq(u8, f, "hctape")) {
+        const r = try ops.HcTape(MlxG).init(reg, .bfloat16, null);
+        const x, const rr, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
+        outs[0] = try r.combine(g, x, rr, post, comb);
+        outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
+        outs[4..8].* = try r.combineCollapseNorm(g, x, rr, post, comb, pre, w);
+        outs[8..11].* = try r.mixfin(g, in(ins, "mm"), in(ins, "ssq"), in(ins, "scale"), in(ins, "base"));
+        return 11;
+    }
+    if (eq(u8, f, "fused_proj")) {
+        var r = try ops.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
+        defer r.deinit(g);
+        const cos, const sin = .{ in(ins, "cos"), in(ins, "sin") };
+        outs[0] = try r.qNorm(g, in(ins, "x_q"));
+        outs[1] = try r.kvNormRope(g, in(ins, "x_kv"), cos, sin);
+        outs[2] = try r.ropeHeads(g, in(ins, "x_rope"), cos, sin, .fwd);
+        outs[3] = try r.ropeHeads(g, in(ins, "x_o"), cos, sin, .inv);
+        return 4;
+    }
+    if (eq(u8, f, "gemv")) {
+        var r = try ops.Gemv(MlxG).init(g, reg);
+        defer r.deinit(g);
+        const proj: ops.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
+        outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"));
+        return 1;
+    }
+    if (eq(u8, f, "prep")) {
+        const r = ops.RinPrep(MlxG).init(reg);
+        const ids = in(ins, "ids");
+        outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
+        outs[2] = try r.guEpi(g, in(ins, "zg"), in(ins, "zu"), in(ins, "rout_g"), in(ins, "rout_u"), ids);
+        outs[3] = try r.dinRin(g, in(ins, "hid"), in(ins, "rin_d"), ids);
+        outs[4] = try r.dpost(g, in(ins, "zd"), in(ins, "rout_d"), ids);
+        return 5;
+    }
+    const gate: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
+    const up: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
+    const down: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
+    if (eq(u8, f, "rebuild")) {
+        const r = ops.Rebuild(MlxG).init(reg);
+        outs[0..3].* = try r.call(g, gate, up, down, in(ins, "slots"), @intCast(c.vars.experts));
+        return 3;
+    }
+    if (eq(u8, f, "digx")) {
+        const r = ops.DigX(MlxG).init(reg);
+        const rhs = in(ins, "rhs");
+        const tgs_gu = try tableTgs(g, in(ins, "tbl_gu"));
+        const tgs_dn = try tableTgs(g, in(ins, "tbl_dn"));
+        const gu: ops.DigTableArray(MlxG) = .{ .tbl = in(ins, "tbl_gu"), .tgs = tgs_gu };
+        const x = try r.take2(g, in(ins, "act"), in(ins, "ridx"), rhs, gu.tbl, gate.rin, up.rin);
+        const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
+        const hd = try r.onePass(g, z[0], z[1], rhs, gu.tbl, gate.rout, up.rout, down.rin);
+        const zd = try r.gemmDown(g, hd, down.code, in(ins, "tbl_dn"), tgs_dn);
+        const o = try r.widen1(g, zd, rhs, in(ins, "tbl_dn"), down.rout);
+        const rx = try r.roundx(g, in(ins, "act_r"), rhs, gu.tbl, down.rin);
+        const w2 = try r.widen2(g, in(ins, "act_g"), in(ins, "act_u"), rhs, gu.tbl, gate.rout, up.rout);
+        outs[0..10].* = .{ x[0], x[1], z[0], z[1], hd, zd, o, rx, w2[0], w2[1] };
+        return 10;
+    }
+    return error.FixtureFamily;
+}
+
+/// A wave table's threadgroup count (entry 65), read back from its generated bytes.
+fn tableTgs(g: *MlxG, tbl: mlx.mlx_array) !u32 {
+    const b = try g.hostBytes(tbl);
+    defer g.a.free(b);
+    return @intCast(std.mem.readInt(i32, b[65 * 4 ..][0..4], .little));
+}
+
+fn wanted(filter: ?[]const u8, family: []const u8) bool {
+    const f = filter orelse return true;
+    var it = std.mem.splitScalar(u8, f, ',');
+    while (it.next()) |name| if (std.mem.eql(u8, name, family) or std.mem.eql(u8, name, "all")) return true;
+    return false;
+}
+
+// ── The prefill wave fixture (dump_prefill_waves.py spec.json, window PF) ──
+
+const PShape = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };
+const PCall = struct { name: []const u8, a_rows: u32, slots: []const u32, act: JArray, output: JArray };
+const PCase = struct { family: []const u8, case: []const u8, shape: PShape, cap: u32, inputs: []const JArray, calls: []const PCall };
+const PSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const PCase };
+const prefill_format = "mlx-serve-exl3-prefill-waves-fixture-v1";
+
+/// An input regenerated from its generator; null when its bytes are not the dump's (sha256).
+fn regen(a: Allocator, g: *MlxG, i: *const JArray) !?mlx.mlx_array {
+    const dt = dtypeOf(i.dtype);
+    var shape: [8]c_int = undefined;
+    var n: usize = 1;
+    for (i.shape, 0..) |d, k| {
+        shape[k] = @intCast(d);
+        n *= @intCast(d);
+    }
+    const bytes = try generate(a, i.gen.?, dt, n);
+    defer a.free(bytes);
+    if (!hexEql(i.sha256, bytes)) return null;
+    return try g.hostArray(bytes, shape[0..i.shape.len], dt);
+}
+
+/// One case: the bank and each call's act regenerated and checked, the route's calls in order on
+/// one route (then its prefill boundary), every call's result compared with the lane's, word for word.
+fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u8, c: *const PCase, lines: *std.ArrayList(Line), diag: *xk.Diag) !void {
+    var ins: std.StringHashMapUnmanaged(mlx.mlx_array) = .empty;
+    defer ins.deinit(a);
+    for (c.inputs) |*i| {
+        const x = try regen(a, g, i) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input generator differs from the dump's" });
+            return;
+        };
+        try ins.put(a, i.name, x);
+    }
+    const P = ops.ProjArrays(mlx.mlx_array);
+    const bank: ops.BankArrays(mlx.mlx_array) = .{
+        .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin") },
+        .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin") },
+        .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin") },
+    };
+    try ops.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
+    try ops.checkBank(MlxG, g, reg, .up, bank.up, diag);
+    try ops.checkBank(MlxG, g, reg, .down, bank.down, diag);
+    const shape: ops.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
+    var r = try ops.DigXPrefill(MlxG).init(a, reg, shape, diag);
+    defer r.deinit(g);
+    var results: std.ArrayList(mlx.mlx_array) = .empty;
+    defer results.deinit(a);
+    for (c.calls) |*cl| {
+        const act = try regen(a, g, &cl.act) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = cl.name, .err = "act generator differs from the dump's" });
+            return;
+        };
+        try results.append(a, try r.call(g, act, .{ .slot = cl.slots }, bank));
+    }
+    try r.finish(g);
+    try g.evalAll(results.items);
+    for (c.calls, results.items) |*cl, got_arr| {
+        const o = &cl.output;
+        var line: Line = .{ .family = c.family, .case = c.case, .output = cl.name };
+        const got = try g.hostBytes(got_arr);
+        defer a.free(got);
+        const path = try std.fs.path.join(a, &.{ dir, o.file.? });
+        defer a.free(path);
+        const want = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 31));
+        defer a.free(want);
+        if (g.dtypeOf(got_arr) != dtypeOf(o.dtype) or got.len != want.len) {
+            line.err = "dtype or size differs";
+        } else {
+            line.words = got.len / 4;
+            var k: usize = 0;
+            while (k < got.len) : (k += 4) line.bad += @intFromBool(!std.mem.eql(u8, got[k..][0..4], want[k..][0..4]));
+            line.ok = line.bad == 0 and hexEql(o.sha256, want);
+        }
+        try lines.append(a, line);
+    }
+}
+
+const testing = std.testing;
+
+// The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1,
+// DSV41_KERNEL_OPS_FIXTURE=<fixture dir>; DSV41_KERNEL_OPS_FAMILIES=<a,b|all> narrows it,
+// DSV41_KERNEL_OPS_RECEIPT=<path> keeps the per-output JSON lines.
+test "dsv41 kernels ops gpu: every route reproduces its lane's own device output (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_OPS_FIXTURE") orelse return error.SkipZigTest);
+    const filter: ?[]const u8 = if (std.c.getenv("DSV41_KERNEL_OPS_FAMILIES")) |f| std.mem.span(f) else null;
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    const spec_path = try std.fs.path.join(a, &.{ dir, "spec.json" });
+    defer a.free(spec_path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, spec_path, a, .limited(16 << 20));
+    defer a.free(text);
+    const parsed = try std.json.parseFromSlice(JSpec, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const spec = parsed.value;
+    try testing.expectEqualStrings(fixture_format, spec.format);
+    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
+    var diag: xk.Diag = .{};
+    var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
+        std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    var lines: std.ArrayList(Line) = .empty;
+    defer lines.deinit(a);
+    var cases: usize = 0;
+    for (spec.cases) |*c| {
+        if (!wanted(filter, c.family)) continue;
+        cases += 1;
+        replayCase(a, &g, &reg, dir, c, &lines) catch |e| {
+            var buf: [256]u8 = undefined;
+            const msg = mlx.takeError(&buf) orelse "";
+            std.debug.print("[kernel ops gate] {s} {s}: {t} {s}\n", .{ c.family, c.case, e, msg });
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = "", .err = @errorName(e) });
+        };
+        g.reset();
+    }
+    var failed: usize = 0;
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(a);
+    for (lines.items) |l| {
+        failed += @intFromBool(!l.ok);
+        try j.print(a, "{{\"family\":\"{s}\",\"case\":\"{s}\",\"output\":\"{s}\",\"words\":{d},\"bad\":{d},\"ok\":{},\"err\":\"{s}\"}}\n", .{ l.family, l.case, l.output, l.words, l.bad, l.ok, l.err });
+    }
+    std.debug.print("{s}", .{j.items});
+    if (std.c.getenv("DSV41_KERNEL_OPS_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
+    std.debug.print("[kernel ops gate] {d} cases, {d} outputs, {d} failed\n", .{ cases, lines.items.len, failed });
+    try testing.expect(cases > 0);
+    try testing.expectEqual(@as(usize, 0), failed);
+}
+
+// The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
+// DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
+test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_PREFILL_FIXTURE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    const spec_path = try std.fs.path.join(a, &.{ dir, "spec.json" });
+    defer a.free(spec_path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, spec_path, a, .limited(16 << 20));
+    defer a.free(text);
+    const parsed = try std.json.parseFromSlice(PSpec, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const spec = parsed.value;
+    try testing.expectEqualStrings(prefill_format, spec.format);
+    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
+    var diag: xk.Diag = .{};
+    var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
+        std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    var lines: std.ArrayList(Line) = .empty;
+    defer lines.deinit(a);
+    for (spec.cases) |*c| {
+        replayPrefill(a, &g, &reg, dir, c, &lines, &diag) catch |e| {
+            var buf: [256]u8 = undefined;
+            const msg = mlx.takeError(&buf) orelse "";
+            std.debug.print("[kernel prefill gate] {s}: {t} {s} {s}\n", .{ c.case, e, msg, diag.message() });
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = "", .err = @errorName(e) });
+        };
+        g.reset();
+    }
+    var failed: usize = 0;
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(a);
+    for (lines.items) |l| {
+        failed += @intFromBool(!l.ok);
+        try j.print(a, "{{\"family\":\"{s}\",\"case\":\"{s}\",\"call\":\"{s}\",\"words\":{d},\"bad\":{d},\"ok\":{},\"err\":\"{s}\"}}\n", .{ l.family, l.case, l.output, l.words, l.bad, l.ok, l.err });
+    }
+    std.debug.print("{s}", .{j.items});
+    if (std.c.getenv("DSV41_KERNEL_PREFILL_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
+    std.debug.print("[kernel prefill gate] {d} cases, {d} calls, {d} failed\n", .{ spec.cases.len, lines.items.len, failed });
+    try testing.expect(spec.cases.len > 0);
+    try testing.expectEqual(@as(usize, 0), failed);
+}
+
+test "dsv41 kernels ops: the fixture generators are the dump's (sha256 of its --golden cases)" {
+    const a = testing.allocator;
+    const cases = [_]struct { JGen, Dtype, usize, []const u8 }{
+        .{ .{ .kind = "bits", .seed = 11 }, .uint8, 37, "83e82e581b5636875ba0a57d454acc2de295c61eb916838277834128e144a6dd" },
+        .{ .{ .kind = "bits", .seed = 12 }, .int16, 15, "a6e7271b92ce8247a1e92589fe17653b23a7a8bb7ea59ab63b86facf00561c15" },
+        .{ .{ .kind = "uniform", .seed = 13, .lo = -1, .hi = 1 }, .float32, 9, "c0cf7502358cba5ade2fa5177a4208979444cc8d6ea99c8d65acbecae8321582" },
+        .{ .{ .kind = "uniform", .seed = 14, .lo = -0.1, .hi = 0.1 }, .float16, 9, "9e7c8144bd6900bfdc81408800a4c77b9361857ec3976ae04210637dd1f77cc7" },
+        .{ .{ .kind = "uniform", .seed = 15, .lo = -2, .hi = 2 }, .bfloat16, 9, "6b080ede7166f2356114342d02f7f4dc2748a99f638ce8e42edc1970ee6906c7" },
+        .{ .{ .kind = "uniform", .seed = 16, .lo = 1e3, .hi = 1e5 }, .float32, 4, "8d14c13205546afac9e4fe76dd954a3eb0aea86a5b49fdba335ee50c9785a48e" },
+        .{ .{ .kind = "index", .seed = 17, .hi = 4 }, .uint32, 7, "99b96e18a705b3317b58dd3060a7b821e2ccf09e2e0b20a115c9b892a7ef46eb" },
+        .{ .{ .kind = "index", .seed = 18, .hi = 160 }, .int32, 7, "9e5c1c1d0e3e5585bc0d757bac84819debfa61f1169c2d3b9d8dfc0eea209113" },
+        .{ .{ .kind = "range", .seed = 19, .lo = 112, .hi = 125 }, .uint8, 11, "c262ec63d66f8749a41f817211f3d5e28baaf7e71bd12b9b9cc27aa6d9fdc887" },
+        .{ .{ .kind = "wave_rhs", .rows = &.{ 70, 37, 20 } }, .uint32, 127, "72ae2751e9e0066acd9e415b3ac7fa451dbf145597204f4f95a52ed16b0d40c3" },
+        .{ .{ .kind = "wave_table", .slots = &.{ 3, 0, 2 }, .rows = &.{ 70, 37, 20 }, .tiles = 72 }, .int32, 80, "e7c9e15972414d0b85f223fc695913b94650858ba19f877f499ff124961b2968" },
+        .{ .{ .kind = "slots16", .slots = &.{ 3, 1 } }, .int32, 16, "631b74d731b6e3635ad3bf3bb463aba6f2c678e26f9aa0fb5f5ca4b6d1d29f2f" },
+        .{ .{ .kind = "values", .values = &.{ 0.3, 0.7, 1.1 } }, .float32, 3, "bcadc79e95123af764e6813ecf10b40cab57dafc8ef17f8f60118dfcf23ccbfd" },
+    };
+    for (cases) |c| {
+        const b = try generate(a, c[0], c[1], c[2]);
+        defer a.free(b);
+        if (!hexEql(c[3], b)) std.debug.print("generator {s} {t} differs from the dump's\n", .{ c[0].kind, c[1] });
+        try testing.expect(hexEql(c[3], b));
+    }
+    // the registry's golden-plane stream is the same splitmix64 (state += golden before each output)
+    var st: u64 = 0x5EED0001;
+    for (0..4) |i| try testing.expectEqual(xk.splitmix64(&st), sm(0x5EED0001, i));
+}
