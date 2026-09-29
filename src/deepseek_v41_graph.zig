@@ -159,11 +159,11 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// A dense `nn.Linear` without bias: `x @ W.T`.
-        fn linear(g: *G, x: T, w: T) !T {
+        pub fn linear(g: *G, x: T, w: T) !T {
             return g.matmul(x, try g.transpose(w));
         }
 
-        fn qlinear(g: *G, x: T, q: Q(T)) !T {
+        pub fn qlinear(g: *G, x: T, q: Q(T)) !T {
             return g.qmm(x, q.w, q.s, q.mode);
         }
 
@@ -495,7 +495,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `Attention._sparse_attend_oneshot` (f32 score path): one softmax over
         /// window + compressed rows with the per-head value-0 sink column.
-        fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
+        pub fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
             const qs = g.shapeOf(q);
             const H: c_int = qs.d[2];
             const tk = g.shapeOf(keys).dim(1);
@@ -656,7 +656,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// The query-RoPE removal, grouped o-LoRA and `wo_b`. `flat` keeps the
         /// compiled tape's flatten / unflatten pair (the eager body reshapes once).
-        fn outProj(g: *G, c: *const v41.Config, o0: T, cs: CosSin, w_ol: T, wo_b: Q(T), flat: bool) !T {
+        pub fn outProj(g: *G, c: *const v41.Config, o0: T, cs: CosSin, w_ol: T, wo_b: Q(T), flat: bool) !T {
             const s0 = g.shapeOf(o0);
             const G_: c_int = @intCast(c.o_groups);
             var o1 = try ropeLast(g, o0, cs, true);
@@ -668,7 +668,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// The grouped `wo_a` as `[g, rank, in]`: bound once in f32 (W97), else
         /// dequantized per call (bf16) as `_o_lora_dense_weight`.
-        fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
+        pub fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
             if (w.wo_a_dense) |d| return d;
             return g.reshape(try g.dequantize(w.wo_a.w, w.wo_a.s, w.wo_a.mode), &.{ @intCast(c.o_groups), @intCast(c.o_lora_rank), -1 });
         }
@@ -847,7 +847,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
         /// attention RMSNorm. Out: attention input, pre, post, comb.
-        fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
+        pub fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
             const m = try hcMixes(g, c, h, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
             return .{ x, m.pre, m.post, m.comb };
@@ -855,7 +855,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_ffn_prep_impl`: the attention HC post, the ffn mixes, collapse and
         /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
-        fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+        pub fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
             const m = try hcMixes(g, c, h1, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
