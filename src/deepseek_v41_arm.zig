@@ -203,6 +203,8 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null };
 
         pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
+            // The hook's predictor feeds the stream's read-ahead: the route needs the stream's class.
+            if (routes.lookahead and opt.lookahead == null) return refuse(diag, error.LookaheadRouteWithoutClass, "arm: the hook predicts the next layer's reads, the stream has no lookahead class", .{});
             const self = try a.create(Self);
             errdefer a.destroy(self);
             var p = try planRows(a, io, opt, diag);
@@ -518,7 +520,13 @@ pub fn StandIn(comptime A: type) type {
 
         /// The trace backend reads the routing barrier's ids from here.
         pub fn bind(self: *Self, g: *G) void {
-            if (G == ops.TraceOps) g.host_values = .{ .ctx = self, .ids = hostIds, .argmax = hostArgmax };
+            if (G == ops.TraceOps) g.host_values = .{ .ctx = self, .ids = hostIds, .argmax = hostArgmax, .f32s = hostScores };
+        }
+
+        /// The lookahead predictor's next-layer scores (a hook with `.lookahead`).
+        fn hostScores(ctx: *anyopaque, out: []f32) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*v, i| v.* = @floatFromInt(mix(self.seed ^ mix(self.forwards) ^ mix(i)) % 1024);
         }
 
         fn hostIds(ctx: *anyopaque, out: []u16) anyerror!void {
@@ -657,14 +665,22 @@ pub const TestModel = struct {
     pub const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 5 };
 
     pub fn create(with_bank: bool) !*TestModel {
+        return createWith(with_bank, 4);
+    }
+
+    /// `n_experts` routed experts per layer (the lookahead selector needs >= 6).
+    pub fn createWith(with_bank: bool, n_experts: u32) !*TestModel {
         const a = testing.allocator;
         const self = try a.create(TestModel);
         errdefer a.destroy(self);
         self.* = .{ .tmp = std.testing.tmpDir(.{}), .image = &.{} };
         errdefer self.tmp.cleanup();
-        if (with_bank) self.image = try expert_bank.writeSynth(a, &self.tmp, .{ .n_experts = 4, .k = &.{ 3, 3, 3, 3, 3 } });
+        if (with_bank) self.image = try expert_bank.writeSynth(a, &self.tmp, .{ .n_experts = n_experts, .k = &.{ 3, 3, 3, 3, 3 } });
         errdefer a.free(self.image);
-        const cfg = try v41.testConfigJson(a, .mini);
+        const mini = try v41.testConfigJson(a, .mini);
+        defer a.free(mini);
+        var nbuf: [32]u8 = undefined;
+        const cfg = try std.mem.replaceOwned(u8, a, mini, "\"n_routed_experts\":4,", try std.fmt.bufPrint(&nbuf, "\"n_routed_experts\":{d},", .{n_experts}));
         defer a.free(cfg);
         try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = cfg });
         self.root = try expert_bank.tmpRoot(&self.tmp, &self.root_buf);
@@ -817,4 +833,39 @@ test "dsv41 arm: the stand-in routes every layer of every forward through the ho
     try testing.expectEqual(@as(u64, 0), ss.transient_loads);
     try testing.expectEqual(ss.persistent_loads, ss.expert_cache_misses);
     try testing.expectEqual(ss.persistent_loads * 2880, ss.expert_bytes_read);
+}
+
+test "dsv41 arm: a lookahead hook routes its scores through the real stream before and after the phase change" {
+    const tm = try TestModel.createWith(true, 8);
+    defer tm.destroy();
+    var g = ops.TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const a = testing.allocator;
+    var diag: Diag = .{};
+    const LArm = ArmWith(ops.TraceOps, StandInMath(ops.TraceOps), .{ .lookahead = true });
+    var gates: [5]LArm.Hook.Gate = undefined;
+    for (&gates) |*gt| gt.* = .{ .w = try g.input(&.{ 8, 64 }, .bfloat16), .bias = try g.input(&.{8}, .float32) };
+    var o = tm.options();
+    // No lookahead class: refused at construction, by name.
+    try testing.expectError(error.LookaheadRouteWithoutClass, LArm.initHooked(a, std.testing.io, &g, {}, o, .{ .gates = &gates }, &diag));
+    o.implemented.n_experts = 8;
+    o.lookahead = .{ .k = 6, .budget = 1, .chunks = 1, .preread = false };
+    const arm = LArm.initHooked(a, std.testing.io, &g, {}, o, .{ .gates = &gates }, &diag) catch |e| {
+        std.debug.print("dsv41 arm: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer arm.deinit();
+    var d = StandIn(LArm).init(7, 3, 2);
+    d.bind(&g);
+    // Prefill-phase routes carry the predictor's scores (the warm-up's): read, not acted on.
+    _ = try d.prefill(arm, &g, &.{ 1, 2, 3, 4, 5, 6, 7 });
+    try testing.expectEqual(@as(u64, 3 * 5), arm.stream.stats().route_calls);
+    try testing.expectEqual(@as(u64, 0), arm.stream.stats().spec_issued);
+    try arm.grow(&g);
+    try testing.expect(arm.stream.route_lookahead);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    _ = try d.cycle(arm, &g, a, &out);
+    _ = try d.cycle(arm, &g, a, &out);
+    try testing.expectEqual(@as(u64, 5 * 5), arm.stream.stats().route_calls);
 }
