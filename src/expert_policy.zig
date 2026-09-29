@@ -42,6 +42,8 @@ pub const Plan = struct {
     n_loads: u32 = 0,
     /// Persistent loads in admission order, then transient loads.
     loads: [max_route_ids]Load = undefined,
+    /// The persistent loads: `loads[0..n_persistent]`.
+    n_persistent: u32 = 0,
     n_evictions: u32 = 0,
     evictions: [max_route_ids]Eviction = undefined,
 
@@ -340,6 +342,7 @@ pub const LayerPolicy = struct {
                 }
             },
         }
+        out.n_persistent = out.n_loads;
         for (transient_buf[0..n_transient], 0..) |e, k| {
             out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + @as(u32, @intCast(k)), .persistent = false };
             out.n_loads += 1;

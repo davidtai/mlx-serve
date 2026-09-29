@@ -77,6 +77,7 @@ pub const Diag = struct {
 pub const Refusal = error{
     BankDirNotAbsolute,
     ManifestMissing,
+    ManifestOpen,
     ManifestSyntax,
     ManifestFormat,
     CodebookNotImplemented,
@@ -535,6 +536,9 @@ const ManifestSource = struct {
             else => |other| return other,
         };
         errdefer file.close(io);
+        // A bank read like the records': streamed once, past the page cache.
+        if (std.c.fcntl(file.handle, std.c.F.NOCACHE, @as(c_int, 1)) != 0)
+            return refuse(diag, error.ManifestOpen, "{s}: F_NOCACHE refused", .{name});
         const self = try a.create(ManifestSource);
         errdefer a.destroy(self);
         const buf = try a.alloc(u8, 1 << 16);
