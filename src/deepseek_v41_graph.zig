@@ -332,7 +332,10 @@ pub fn Trunk(comptime G: type) type {
                     // Baked: 64 heads x 512, RoPE 64, the q latent 1280 (the kv latent = head_dim).
                     if (c.n_heads != 64 or c.head_dim != 512 or c.rope_head_dim != 64 or c.q_lora_rank != 1280) return error.FusedProjGeometry;
                     try k.fused.ensureTotalCapacity(gpa, layers.len);
-                    for (layers) |*w| k.fused.appendAssumeCapacity(kr.FusedProj(G).init(g, reg, w.q_norm, w.kv_norm, null) catch |e| return if (e == error.RouteInput) error.FusedProjGeometry else e);
+                    // The fused RMSNorms bind the model's eps: the route takes the registered 1e-20 only.
+                    const eps: f32 = @floatCast(c.rms_norm_eps);
+                    if (eps != @as(f32, 1e-20)) return error.FusedProjEps;
+                    for (layers) |*w| k.fused.appendAssumeCapacity(kr.FusedProj(G).init(g, reg, w.q_norm, w.kv_norm, eps, null) catch |e| return if (e == error.RouteInput) error.FusedProjGeometry else e);
                 }
                 return k;
             }
@@ -1910,6 +1913,9 @@ test "dsv41 graph: the K36 fused glue binds per layer beside RCPROJ, takes the v
     var bad = c;
     bad.n_heads = 32;
     try testing.expectError(error.FusedProjGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_fused_proj = true, .rc_proj = true }, &ws));
+    bad = c;
+    bad.rms_norm_eps = 1e-6;
+    try testing.expectError(error.FusedProjEps, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_fused_proj = true, .rc_proj = true }, &ws));
     const rt: Routes = .{ .rc_proj = true, .rc_fused_proj = true, .selected_keys = true };
     var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &ws);
     defer k.deinit(&g);
