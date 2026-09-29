@@ -195,10 +195,16 @@ pub fn Router(comptime G: type) type {
         w: G.T,
         bias: G.T,
 
-        /// `w` the gate weight (bf16 [384, 5120]), `bias` the selection bias (f32 [384]).
+        /// `w` the gate weight (bf16 [N, 5120]), `bias` the selection bias (f32 [N]): N 384 = the
+        /// verify router (top-6), N 128 = the DSpark draft router (DRAFTRC member router: the
+        /// __n128 / __n128_top3 variants, top-3). Another N is refused (RouteInput).
         pub fn init(g: *G, reg: *const xk.Registry, w: G.T, bias: G.T, diag: ?*xk.Diag) Refusal!Self {
-            const part = reg.get(.q3rc_gate_part);
-            const tail = reg.get(.q3rc_router_tail);
+            const n = rowsOf(G, g, w, 0);
+            const part, const tail = switch (n) {
+                384 => .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) },
+                128 => .{ reg.get(.q3rc_gate_part__n128), reg.get(.q3rc_router_tail__n128_top3) },
+                else => return refuse(diag, error.RouteInput, "exl3 kernel ops: a router of {d} experts (the registry carries 384 and the draft's 128)", .{n}),
+            };
             try expectInput(G, g, part, "w", w, &no_vars, diag);
             try expectInput(G, g, tail, "bias", bias, &no_vars, diag);
             return .{ .part = part, .tail = tail, .w = g.keep(w), .bias = g.keep(bias) };
@@ -214,7 +220,7 @@ pub fn Router(comptime G: type) type {
             return self.call(g, try g.astype(xf, .float32));
         }
 
-        /// x [M, 5120] f32 -> (weights [M, 6] f32, indices [M, 6] i32).
+        /// x [M, 5120] f32 -> (weights [M, top-k] f32, indices [M, top-k] i32): top-6 / top-3.
         pub fn call(self: *const Self, g: *G, x: G.T) ![2]G.T {
             const vars = rowsVars(rowsOf(G, g, x, 0));
             var part: [1]G.T = undefined;
@@ -387,30 +393,115 @@ pub fn RcProj(comptime G: type) type {
     };
 }
 
+// ── DRAFTRC proj (DSV41_DECODE_DRAFTRC member proj): the DSpark draft block's rcproj sites ──
+
+/// The draft's rcproj sites (`q3_decode_draftrc_candidate.DRAFT_SHAPES`): the verify sites the
+/// draft stages share, and the draft-only main_proj / shared expert.
+pub const DraftSite = enum { wq_a, wkv, wq_b, wo_b, woa, main_proj, shared_w13, shared_w2 };
+
+/// One draft site at one x dtype (`DraftProjKernels.run`): bf16 x -> the registered FMA text
+/// (q3rc_mxfp8_fma at the verify sites, its plan variant q3rc_mxfp8_fma__draft at the
+/// draft-only sites), f32 x -> q3drc_mxfp8_fma_f32x; the output has x's dtype; a plan per M =
+/// 1..8 at the site's pinned geometry. The dtype is the call site's (fixed at construction).
+pub fn DraftProj(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        site: DraftSite,
+        plans: [max_rows]LaunchConfig,
+        w: G.T,
+        scales: G.T,
+
+        /// `x_dtype` bf16 or f32 (the call site's activations), `w` the packed mxfp8 weight (u32
+        /// [G N, K / 4]), `scales` its e8m0 scales (u8 [G N, K / 32]).
+        pub fn init(g: *G, reg: *const xk.Registry, site: DraftSite, x_dtype: Dtype, w: G.T, scales: G.T, diag: ?*xk.Diag) Refusal!Self {
+            const draft_only = switch (site) {
+                .main_proj, .shared_w13, .shared_w2 => true,
+                else => false,
+            };
+            const e = switch (x_dtype) {
+                .bfloat16 => reg.get(if (draft_only) .q3rc_mxfp8_fma__draft else .q3rc_mxfp8_fma),
+                .float32 => reg.get(.q3drc_mxfp8_fma_f32x),
+                else => return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: draft {t} at x {t}: the registry carries bf16 and f32 x", .{ site, x_dtype }),
+            };
+            const s = e.site(@tagName(site)) orelse unreachable;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(s, &vars);
+            try expectInput(G, g, e, "w", w, &vars, diag);
+            try expectInput(G, g, e, "scales", scales, &vars, diag);
+            var r: Self = .{ .e = e, .site = site, .plans = undefined, .w = undefined, .scales = undefined };
+            for (0..max_rows) |i| {
+                vars.set(.rows, i + 1);
+                r.plans[i] = xk.launchFor(e, &vars, @tagName(site)) catch unreachable;
+            }
+            r.w = g.keep(w);
+            r.scales = g.keep(scales);
+            return r;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            g.release(self.w);
+            g.release(self.scales);
+        }
+
+        /// The draft's `QuantizedLinear.__call__` seam (`Tr.qlinear`): x [..., G K] with 1..8 rows ->
+        /// y [..., G N] at x's dtype.
+        pub fn linear(self: *const Self, g: *G, x: G.T) !G.T {
+            const sh = dims(G, g, x);
+            const lead = sh.slice()[0 .. sh.n - 1];
+            var m: c_int = 1;
+            for (lead) |d| m *= d;
+            const y = try self.call(g, try g.reshape(x, &.{ m, sh.slice()[sh.n - 1] }));
+            var shape: Shape = .of(lead);
+            shape.d[shape.n] = @intCast(self.plans[0].out_shapes[0][1]);
+            shape.n += 1;
+            return g.reshape(y, shape.slice());
+        }
+
+        /// x [M, G K] (row-contiguous, the construction dtype), M = 1..8 -> y [M, G N].
+        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
+            const m = rowsOf(G, g, x, 0);
+            if (m < 1 or m > max_rows) return error.RowsOutOfPlan;
+            var out: [1]G.T = undefined;
+            try g.launch(self.e.kernel, &.{ self.w, self.scales, x }, &self.plans[m - 1], &out);
+            return out[0];
+        }
+    };
+}
+
 // ── HCTAPE (DSV41_DECODE_HCTAPE = all) ──
 
-/// The verify barrier's HC tail kernels: `HcTapeKernels` (combine, collapse_norm,
-/// combine_collapse_norm, mixfin). The stream dtype is a template (OT); the registry carries
-/// the tier's bf16 stream only.
+/// The HC tail kernels: `HcTapeKernels` (combine, collapse_norm, combine_collapse_norm,
+/// mixfin). The stream dtype is a template (OT): bf16 = the verify barrier's texts, f32 = the
+/// DSpark draft stages' variants (DRAFTRC member tape; the norm weight stays bf16).
 pub fn HcTape(comptime G: type) type {
     return struct {
         const Self = @This();
         combine_e: *const Entry,
         collapse_e: *const Entry,
         fused_e: *const Entry,
+        /// the f32 stream's fused call with a bf16 residual (the draft's stage-0 first ffn prep)
+        fused_rbf16_e: ?*const Entry,
         mixfin_e: *const Entry,
 
         pub fn init(reg: *const xk.Registry, stream: Dtype, diag: ?*xk.Diag) Refusal!Self {
-            const combine_e = reg.get(.q3ht_combine);
-            const ot = for (combine_e.template) |t| {
-                if (std.mem.eql(u8, t.name, "OT")) break t.value.dtype;
-            } else unreachable;
-            if (stream != ot) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries OT {t} only", .{ stream, ot });
-            return .{
-                .combine_e = combine_e,
-                .collapse_e = reg.get(.q3ht_collapse_norm),
-                .fused_e = reg.get(.q3ht_combine_collapse_norm),
-                .mixfin_e = reg.get(.q3ht_mixfin),
+            return switch (stream) {
+                .bfloat16 => .{
+                    .combine_e = reg.get(.q3ht_combine),
+                    .collapse_e = reg.get(.q3ht_collapse_norm),
+                    .fused_e = reg.get(.q3ht_combine_collapse_norm),
+                    .fused_rbf16_e = null,
+                    .mixfin_e = reg.get(.q3ht_mixfin),
+                },
+                .float32 => .{
+                    .combine_e = reg.get(.q3ht_combine__f32),
+                    .collapse_e = reg.get(.q3ht_collapse_norm__f32),
+                    .fused_e = reg.get(.q3ht_combine_collapse_norm__f32),
+                    .fused_rbf16_e = reg.get(.q3ht_combine_collapse_norm__f32_rbf16),
+                    .mixfin_e = reg.get(.q3ht_mixfin),
+                },
+                else => refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries bf16 and f32", .{stream}),
             };
         }
 
@@ -435,6 +526,16 @@ pub fn HcTape(comptime G: type) type {
             const vars = rowsVars(rowsOf(G, g, x, 0));
             var out: [4]G.T = undefined;
             try launchRule(G, g, self.fused_e, &vars, &.{ x, r, post, comb, pre, w }, &out);
+            return out;
+        }
+
+        /// The f32 stream's fused call on a bf16 residual r [M, 4, D] (x f32): the draft's stage-0
+        /// first ffn prep. A bf16-stream route has no such call (TemplateNotRegistered).
+        pub fn combineCollapseNormResidualBf16(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T, pre: G.T, w: G.T) ![4]G.T {
+            const e = self.fused_rbf16_e orelse return error.TemplateNotRegistered;
+            const vars = rowsVars(rowsOf(G, g, x, 0));
+            var out: [4]G.T = undefined;
+            try launchRule(G, g, e, &vars, &.{ x, r, post, comb, pre, w }, &out);
             return out;
         }
 
@@ -1652,7 +1753,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     for (t.launches.items) |l| hit.insert(l.k);
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
-    // only) and the DRAFTRC entries (their routes land with the model lane's draft block, M4)
+    // only) and the DRAFTRC entries (the draft routes' own test covers those)
     for (reg.entries) |e| {
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_");
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
@@ -1676,7 +1777,7 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
     const sc = try t.node(&.{ 1280, 40 }, .uint8, &.{});
     try testing.expectError(error.RouteInput, RcProj(Trace).init(&t, &reg, .wq_a, w, sc, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_mxfp8_fma input scales") != null);
-    try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&reg, .float32, &diag));
+    try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&reg, .float16, &diag));
     const qn32 = try t.node(&.{1280}, .float32, &.{});
     try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn32, try t.node(&.{512}, .bfloat16, &.{}), &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280 input weight") != null);
@@ -2226,4 +2327,85 @@ test "dsv41 kernels ops: acceptAtStartup refuses by name (text, pin, self-check)
         pub fn astype() void {}
     };
     try testing.expectEqualStrings("release", missingBackendMethod(NoRelease).?);
+}
+
+test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the lane's own sizes, by site and dtype" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    // proj: every draft site at both x dtypes (the entry the dtype and site select)
+    for (std.enums.values(DraftSite)) |site| for ([_]Dtype{ .bfloat16, .float32 }) |dt| {
+        const draft_only = site == .main_proj or site == .shared_w13 or site == .shared_w2;
+        const want_k: Kernel = if (dt == .float32) .q3drc_mxfp8_fma_f32x else if (draft_only) .q3rc_mxfp8_fma__draft else .q3rc_mxfp8_fma;
+        const e = reg.get(want_k);
+        const s0 = sampleAt(e, @tagName(site), 1);
+        const w, const sc = .{ try t.arg(e, "w", &s0.vars), try t.arg(e, "scales", &s0.vars) };
+        var r = try DraftProj(Trace).init(&t, &reg, site, dt, w, sc, &diag);
+        defer r.deinit(&t);
+        try testing.expectEqual(want_k, r.e.kernel);
+        var n: usize = 0;
+        for (e.samples) |*s| {
+            if (!std.mem.eql(u8, s.site.?, @tagName(site))) continue;
+            const x = try t.arg(e, "x", &s.vars);
+            try testing.expectEqual(dt, t.dtypeOf(x));
+            _ = try r.call(&t, x);
+            try expectLaunch(t.back(1), e, s, &.{ w, sc, x });
+            n += 1;
+        }
+        try testing.expect(n >= 3);
+        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, dt, &.{})));
+    };
+    // router: the draft gate weight (N 128) selects the N 128 / top-3 variants
+    {
+        const pe, const te = .{ reg.get(.q3rc_gate_part__n128), reg.get(.q3rc_router_tail__n128_top3) };
+        const w, const bias = .{ try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars) };
+        var r = try Router(Trace).init(&t, &reg, w, bias, &diag);
+        defer r.deinit(&t);
+        for (pe.samples) |*s| {
+            const x = try t.arg(pe, "x", &s.vars);
+            const out = try r.call(&t, x);
+            try expectLaunch(t.back(2), pe, s, &.{ x, w });
+            try expectLaunch(t.back(1), te, sampleAt(te, null, s.vars.get(.rows)), &.{ t.back(2).outs[0], bias });
+            try testing.expectEqual(@as(c_int, 3), t.shapeOf(out[0]).d[1]);
+        }
+        const w200 = try t.node(&.{ 200, 5120 }, .bfloat16, &.{});
+        try testing.expectError(error.RouteInput, Router(Trace).init(&t, &reg, w200, bias, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "a router of 200 experts") != null);
+    }
+    // tape: the f32 stream's variants, and the f32-x / bf16-residual fused call
+    {
+        const ce, const le, const fe, const fr = .{ reg.get(.q3ht_combine__f32), reg.get(.q3ht_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32_rbf16) };
+        const r = try HcTape(Trace).init(&reg, .float32, &diag);
+        for (ce.samples) |*s| {
+            const v = &s.vars;
+            const x, const rr, const post, const comb = .{ try t.arg(ce, "x", v), try t.arg(ce, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v) };
+            const pre, const w = .{ try t.arg(fe, "pre", v), try t.arg(fe, "w", v) };
+            const rb = try t.arg(fr, "r", v);
+            _ = try r.combine(&t, x, rr, post, comb);
+            try expectLaunch(t.back(1), ce, s, &.{ x, rr, post, comb });
+            _ = try r.collapseNorm(&t, rr, pre, w);
+            try expectLaunch(t.back(1), le, sampleAt(le, null, v.get(.rows)), &.{ rr, pre, w });
+            _ = try r.combineCollapseNorm(&t, x, rr, post, comb, pre, w);
+            try expectLaunch(t.back(1), fe, sampleAt(fe, null, v.get(.rows)), &.{ x, rr, post, comb, pre, w });
+            _ = try r.combineCollapseNormResidualBf16(&t, x, rb, post, comb, pre, w);
+            try expectLaunch(t.back(1), fr, sampleAt(fr, null, v.get(.rows)), &.{ x, rb, post, comb, pre, w });
+        }
+        const b = try HcTape(Trace).init(&reg, .bfloat16, &diag);
+        const v = &ce.samples[0].vars;
+        try testing.expectError(error.TemplateNotRegistered, b.combineCollapseNormResidualBf16(&t, try t.arg(ce, "x", v), try t.arg(fr, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v), try t.arg(fe, "pre", v), try t.arg(fe, "w", v)));
+    }
+    // every DRAFTRC entry is some route's
+    var hit: std.EnumSet(Kernel) = .empty;
+    for (t.launches.items) |l| hit.insert(l.k);
+    for (&reg.entries) |*e| if (std.mem.startsWith(u8, e.family, "draftrc_")) try testing.expect(hit.contains(e.kernel));
+    // refusals: another x dtype, a weight of another site
+    const fe = reg.get(.q3drc_mxfp8_fma_f32x);
+    const s0 = sampleAt(fe, "wq_a", 1);
+    const w, const sc = .{ try t.arg(fe, "w", &s0.vars), try t.arg(fe, "scales", &s0.vars) };
+    try testing.expectError(error.TemplateNotRegistered, DraftProj(Trace).init(&t, &reg, .wq_a, .float16, w, sc, &diag));
+    try testing.expectError(error.RouteInput, DraftProj(Trace).init(&t, &reg, .main_proj, .float32, w, sc, &diag));
+    try testing.expectEqual(@as(isize, 0), t.keeps);
 }
