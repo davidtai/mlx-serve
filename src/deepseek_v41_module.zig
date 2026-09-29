@@ -123,7 +123,7 @@ pub const Module = struct {
         errdefer self.dropKernels();
         _ = mlx.mlx_clear_cache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
-        _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
+        _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
         errdefer setCacheLimit(self.prev_cache_limit);
         self.arm = if (config.expert_event_gates orelse false)
             .{ .event_gates = try self.buildArm(AGated, io, config, weights, s, ceiling, try expert_event.createMetal(), &diag) }
@@ -158,6 +158,16 @@ pub const Module = struct {
         errdefer gpa.free(self.warm_peaks);
         _ = mlx.mlx_clear_cache();
         log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B (W97)", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        // The bill against the warm-up's measured peak (C4 G7): the widest decode-width wave, the tier's head.
+        if (config.dsv41_prefill) |bill| {
+            const bt: v41.PrefillBill.Tier = switch (config.numeric_tier orelse .served) {
+                .stock => .stock,
+                .served => .served,
+            };
+            const billed = bill.waveBytes(M.scratch_rows, M.scratch_rows, bt) + (if (bt == .stock) bill.head_promotion_bytes else 0);
+            const measured = std.mem.max(u64, self.warm_peaks);
+            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
+        }
         return self;
     }
 
@@ -325,6 +335,15 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
     return out;
 }
 
+/// The allocator cache the prefill holds: the tier of record's 4 GiB (its CACHE_GIB, charged in the arm's
+/// prefill charge), the stock tier the envelope's own.
+pub fn prefillCacheLimit(t: @import("model_settings.zig").NumericTier) usize {
+    return switch (t) {
+        .served => 4 << 30,
+        .stock => envelope.prefill_cache_bytes,
+    };
+}
+
 fn setCacheLimit(limit: usize) void {
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, limit);
@@ -389,6 +408,12 @@ fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const mode
         gt.* = .{ .w = w.?, .bias = b.? };
     }
     return gates;
+}
+
+test "dsv41 module: each tier's prefill allocator cache is inside what the admission charges the prefill" {
+    const charged = envelope.prefill_cache_bytes + arm_mod.pass2_prefill_charge_bytes;
+    try std.testing.expect(prefillCacheLimit(.served) <= charged and prefillCacheLimit(.stock) <= charged);
+    try std.testing.expectEqual(@as(usize, envelope.prefill_cache_bytes), prefillCacheLimit(.stock));
 }
 
 test "dsv41 module: a request's bounded lanes hold its reservation, else the prompt plus the shell's headroom, plus a verify block" {
