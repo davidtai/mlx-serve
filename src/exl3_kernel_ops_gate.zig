@@ -97,6 +97,21 @@ pub const MlxG = struct {
         for (out) |o| _ = try g.track(o);
     }
 
+    pub const Prepared = xk.Prepared;
+
+    pub fn prepareLaunch(g: *MlxG, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        return g.bound.prepare(k, cfg);
+    }
+
+    pub fn launchPrepared(g: *MlxG, p: *const Prepared, inputs: []const T, out: []T) !void {
+        try g.bound.applyPrepared(p, inputs, out);
+        for (out) |o| _ = try g.track(o);
+    }
+
+    pub fn releasePrepared(_: *MlxG, p: *Prepared) void {
+        p.deinit();
+    }
+
     pub fn evalAll(_: *MlxG, xs: []const T) !void {
         const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(v);
@@ -340,12 +355,15 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 6;
     }
     if (eq(u8, f, "draft_tape")) {
-        const r = try ops.HcTape(MlxG).init(reg, .float32, null);
+        var r = try ops.HcTape(MlxG).init(g, reg, .float32, null);
+        defer r.deinit(g);
+        var mixed = try ops.HcTapeMixed(MlxG).init(g, reg, null);
+        defer mixed.deinit(g);
         const x, const rr, const rb, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "rb"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
         outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
         outs[4..8].* = try r.combineCollapseNorm(g, x, rr, post, comb, pre, w);
-        outs[8..12].* = try r.combineCollapseNormResidualBf16(g, x, rb, post, comb, pre, w);
+        outs[8..12].* = try mixed.call(g, x, rb, post, comb, pre, w);
         return 12;
     }
     if (eq(u8, f, "router")) {
@@ -374,7 +392,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "hctape")) {
-        const r = try ops.HcTape(MlxG).init(reg, .bfloat16, null);
+        var r = try ops.HcTape(MlxG).init(g, reg, .bfloat16, null);
+        defer r.deinit(g);
         const x, const rr, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
         outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
@@ -400,7 +419,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "prep")) {
-        const r = ops.RinPrep(MlxG).init(reg);
+        var r = try ops.RinPrep(MlxG).init(g, reg);
+        defer r.deinit(g);
         const ids = in(ins, "ids");
         outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
         outs[2] = try r.guEpi(g, in(ins, "zg"), in(ins, "zu"), in(ins, "rout_g"), in(ins, "rout_u"), ids);
