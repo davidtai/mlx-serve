@@ -122,6 +122,12 @@ fn freeFrom(comptime E: type, list: *std.ArrayList(E), from: usize, comptime fre
     list.shrinkRetainingCapacity(from);
 }
 
+/// The compiled regions a model builds at construction (`prepareTape`), one
+/// closure per region and context (the trunk's config, the draft head's).
+pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence };
+const n_regions = std.meta.fieldNames(Region).len;
+const contexts_per_region = 2;
+
 // ── MLX backend ──
 
 pub const MlxOps = struct {
@@ -138,11 +144,15 @@ pub const MlxOps = struct {
     stream_box: *mlx.mlx_stream,
     /// Compiled trunk regions, one per (region type, construction context).
     tapes: std.ArrayList(TapeEntry) = .empty,
+    /// Each region's closures by context, filled by `prepareTape`.
+    regions: [n_regions][contexts_per_region]RegionSlot = @splat(@splat(.{})),
     /// A region's tracing context: borrows the owner's stream and closures.
     is_child: bool = false,
     /// The kernels lane's pinned registry, bound on this stream (`launch`); set
     /// once, before any kernel route is built.
     launcher: ?*const xk.Bound = null,
+
+    const RegionSlot = struct { ctx: ?*const anyopaque = null, compiled: mlx.mlx_closure = .{} };
 
     const TapeEntry = struct {
         key: usize,
@@ -205,14 +215,23 @@ pub const MlxOps = struct {
         p.deinit();
     }
 
-    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
-    /// once per input signature, replayed after. `ctx` carries the region's
-    /// structural constants and must outlive the backend.
+    /// Compiles region `Body` for context `ctx` (at construction; idempotent).
+    /// `ctx` carries the region's structural constants and must outlive the backend.
+    pub fn prepareTape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx) !void {
+        const slots = &g.regions[@intFromEnum(Body.region)];
+        for (slots) |sl| if (sl.ctx == @as(*const anyopaque, ctx)) return;
+        const free = for (slots) |*sl| {
+            if (sl.ctx == null) break sl;
+        } else return error.RegionContextsFull;
+        free.* = .{ .ctx = ctx, .compiled = try g.buildTape(Body, ctx, @intFromPtr(@typeName(Body).ptr)) };
+    }
+
+    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`, prepared
+    /// at construction: traced once per input signature, replayed after.
     pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
-        const key = @intFromPtr(@typeName(Body).ptr);
-        const compiled = for (g.tapes.items) |t| {
-            if (t.key == key and t.ctx == @as(*const anyopaque, ctx)) break t.compiled;
-        } else try g.buildTape(Body, ctx, key);
+        const compiled = for (g.regions[@intFromEnum(Body.region)]) |sl| {
+            if (sl.ctx == @as(*const anyopaque, ctx)) break sl.compiled;
+        } else return error.RegionNotPrepared;
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
@@ -1035,6 +1054,8 @@ pub const TraceOps = struct {
     /// Launches of prepared configs, and the prepared configs not yet released.
     prepared_launches: usize = 0,
     prepared_live: usize = 0,
+    /// The regions `prepareTape` compiled, by context.
+    regions: [n_regions][contexts_per_region]?*const anyopaque = @splat(@splat(null)),
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1200,7 +1221,21 @@ pub const TraceOps = struct {
     }
 
     /// The region runs inline between two markers (a test pins its boundary).
+    /// Records that region `Body` is compiled for `ctx` (the MLX backend's construction step).
+    pub fn prepareTape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx) !void {
+        const slots = &g.regions[@intFromEnum(Body.region)];
+        for (slots) |sl| if (sl == @as(?*const anyopaque, ctx)) return;
+        for (slots) |*sl| if (sl.* == null) {
+            sl.* = ctx;
+            return;
+        };
+        return error.RegionContextsFull;
+    }
+
     pub fn tape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
+        for (g.regions[@intFromEnum(Body.region)]) |sl| {
+            if (sl == @as(?*const anyopaque, ctx)) break;
+        } else return error.RegionNotPrepared;
         _ = try g.push(.tape_begin, .bool_, .{});
         try Body.run(g, ctx, inputs, out);
         _ = try g.push(.tape_end, .bool_, .{});

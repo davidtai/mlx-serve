@@ -124,6 +124,7 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
+            try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
         }

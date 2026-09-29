@@ -1,5 +1,5 @@
-//! The DSpark draft head (Python `deepseek_v41_dspark.DSparkHead`, the eager
-//! path: draft compile K33 off). Three stages under `mtp.{0,1,2}`, each a V4.1
+//! The DSpark draft head (Python `deepseek_v41_dspark.DSparkHead`; K33 draft
+//! compile when the routes set `draft_rows`). Three stages under `mtp.{0,1,2}`, each a V4.1
 //! decoder block whose attention is a pure sliding window over the backbone's
 //! committed main hiddens (`Cache`, seeded by `seedMain`) plus the block's own
 //! draft rows, and whose MoE is its own 128-expert top-3 mxfp4 switch, resident
@@ -58,8 +58,47 @@ pub fn Head(comptime G: type) type {
             conf: T,
         };
 
-        /// The stages run the eager bodies (K33 draft compile is not ported): no trunk lever applies.
-        const stage_routes: graph.Routes = .{};
+        /// K33 (`MTPLX_DSV41_DRAFT_COMPILE`): at rows <= `draft_rows` the stages
+        /// replay compiled regions (the backbone's K22 / K4 ones, the draft's
+        /// main-KV, markov step and confidence), byte-identical to the eager
+        /// bodies; 0 runs the eager bodies. The regions are built at `init`.
+        pub const DraftKv = struct {
+            pub const region: ops.Region = .draft_kv;
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            /// in main_x, cos, sin, kv_norm, wkv (words, scales): `rope(rmsnorm(wkv(m)))`.
+            pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
+                const kv = try Tr.rmsnorm(g, try g.qmm(in[0], in[4], in[5], .mxfp8), in[3], c.rms_norm_eps);
+                out[0] = try Tr.ropeLast(g, kv, .{ .cos = in[1], .sin = in[2] }, false);
+            }
+        };
+
+        pub const MarkovStep = struct {
+            pub const region: ops.Region = .markov_step;
+            pub const Ctx = v41.Config;
+            pub const n_out = 3;
+            /// in token, base row, markov embed, markov head: out (logits row, embed, argmax).
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                const me = try Tr.embed(g, in[2], in[0]);
+                const li = try g.add(in[1], try Tr.linear(g, me, in[3]));
+                out[0] = li;
+                out[1] = me;
+                out[2] = try g.argmax(li, -1);
+            }
+        };
+
+        pub const Confidence = struct {
+            pub const region: ops.Region = .confidence;
+            pub const Ctx = v41.Config;
+            pub const n_out = 1;
+            /// in hidden, markov embed, proj: `(concat(h, me).f32 @ w.f32.T)` without its last axis.
+            pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+                const h = try g.astype(try g.concat(&.{ in[0], in[1] }, -1), .float32);
+                const conf = try g.matmul(h, try g.transpose(try g.astype(in[2], .float32)));
+                const s = g.shapeOf(conf);
+                out[0] = try g.reshape(conf, s.slice()[0 .. s.n - 1]);
+            }
+        };
 
         gpa: std.mem.Allocator,
         c: v41.Config,
@@ -67,6 +106,8 @@ pub fn Head(comptime G: type) type {
         mc: v41.Config,
         /// The head codec shared with the target (`Routes.head`: f32, bf16 or mxfp8).
         rt: graph.Routes,
+        /// The stages' routes: K22 / K4 at rows <= `rt.draft_rows` when K33 is on.
+        stage_rt: graph.Routes,
         stages: []Stage,
         main_proj: Q,
         main_norm: T,
@@ -87,7 +128,8 @@ pub fn Head(comptime G: type) type {
             var mc = c;
             mc.n_routed_experts = ds.n_routed_experts;
             mc.n_experts_per_tok = ds.n_experts_per_tok;
-            self.* = .{ .gpa = gpa, .c = c, .mc = mc, .rt = rt, .stages = &.{}, .main_proj = undefined, .main_norm = undefined, .norm = undefined, .markov_embed = undefined, .markov_head = undefined, .conf_proj = undefined, .inv_swa = undefined };
+            const stage_rt: graph.Routes = if (rt.draft_rows > 0) .{ .attn_rows = rt.draft_rows, .hc_rows = rt.draft_rows } else .{};
+            self.* = .{ .gpa = gpa, .c = c, .mc = mc, .rt = rt, .stage_rt = stage_rt, .stages = &.{}, .main_proj = undefined, .main_norm = undefined, .norm = undefined, .markov_embed = undefined, .markov_head = undefined, .conf_proj = undefined, .inv_swa = undefined };
             errdefer self.deinitOwned(g);
             self.stages = try gpa.alloc(Stage, ds.n_stages);
             errdefer gpa.free(self.stages);
@@ -123,6 +165,10 @@ pub fn Head(comptime G: type) type {
             self.markov_head = try need(lookup, try std.fmt.bufPrint(&b, "mtp.{d}.markov_head.head.weight", .{last}));
             self.conf_proj = try need(lookup, try std.fmt.bufPrint(&b, "mtp.{d}.confidence_head.proj.weight", .{last}));
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, &self.c));
+            if (rt.draft_rows > 0) {
+                try Tr.prepareRegions(g, &self.mc, &self.stage_rt, false);
+                inline for (.{ DraftKv, MarkovStep, Confidence }) |B| try g.prepareTape(B, &self.mc);
+            }
             try g.evalAll(self.owned.items);
             return self;
         }
@@ -189,7 +235,14 @@ pub fn Head(comptime G: type) type {
         fn attention(self: *const Self, g: *G, st: *const Stage, x: T, main_x: T, cache: *const Cache) !T {
             const c = &self.c;
             const w = &st.w;
-            const main_kv = try self.mainKv(g, st, main_x, cache.offset);
+            const S = g.shapeOf(main_x).dim(1);
+            const main_kv = if (g.shapeOf(main_x).dim(0) * S <= @as(c_int, @intCast(self.rt.draft_rows))) blk: {
+                const mpos = try g.arange(@floatFromInt(cache.offset), @floatFromInt(cache.offset + @as(u32, @intCast(S))), 1, .int32);
+                const mcs = try Tr.cosSin(g, self.inv_swa, mpos);
+                var o: [1]T = undefined;
+                try g.tape(DraftKv, &self.mc, &.{ main_x, mcs.cos, mcs.sin, w.kv_norm, w.wkv.w, w.wkv.s }, &o);
+                break :blk o[0];
+            } else try self.mainKv(g, st, main_x, cache.offset);
             var win = if (cache.window) |wd| try g.concat(&.{ wd, main_kv }, 1) else main_kv;
             const ws = g.shapeOf(win);
             const wr = ws.dim(1);
@@ -202,13 +255,29 @@ pub fn Head(comptime G: type) type {
             const base = cache.offset + @as(u32, @intCast(g.shapeOf(main_x).dim(1)));
             const dpos = try g.arange(@floatFromInt(base), @floatFromInt(base + @as(u32, @intCast(t))), 1, .int32);
             const cs = try Tr.cosSin(g, self.inv_swa, dpos);
-            const qr = try Tr.rmsnorm(g, try Tr.qlinear(g, x, w.wq_a), w.q_norm, c.rms_norm_eps);
-            const q = try Tr.ropeLast(g, try g.reshape(try Tr.qlinear(g, qr, w.wq_b), &.{ b, t, @intCast(c.n_heads), @intCast(c.head_dim) }), cs, false);
-            const kv = try Tr.ropeLast(g, try Tr.rmsnorm(g, try Tr.qlinear(g, x, w.wkv), w.kv_norm, c.rms_norm_eps), cs, false);
+            const compiled = b * t <= @as(c_int, @intCast(self.rt.draft_rows));
+            var q: T = undefined;
+            var kv: T = undefined;
+            if (compiled) {
+                var o3: [3]T = undefined;
+                try g.tape(Tr.QkvPrep, &self.mc, &.{ x, cs.cos, cs.sin, w.q_norm, w.kv_norm, w.wq_a.w, w.wq_a.s, w.wq_b.w, w.wq_b.s, w.wkv.w, w.wkv.s }, &o3);
+                q = o3[0];
+                kv = o3[2];
+            } else {
+                const qr = try Tr.rmsnorm(g, try Tr.qlinear(g, x, w.wq_a), w.q_norm, c.rms_norm_eps);
+                q = try Tr.ropeLast(g, try g.reshape(try Tr.qlinear(g, qr, w.wq_b), &.{ b, t, @intCast(c.n_heads), @intCast(c.head_dim) }), cs, false);
+                kv = try Tr.ropeLast(g, try Tr.rmsnorm(g, try Tr.qlinear(g, x, w.wkv), w.kv_norm, c.rms_norm_eps), cs, false);
+            }
             const keys = try g.concat(&.{ win, kv }, 1);
             const attend = try g.ones(&.{ b, t, wp + t }, .bool_);
             const o = try Tr.sparseAttend(g, c, w, q, keys, attend);
-            return Tr.outProj(g, c, o, cs, try Tr.woaDense(g, c, w), w.wo_b, false);
+            const w_ol = try Tr.woaDense(g, c, w);
+            if (compiled) {
+                var o1: [1]T = undefined;
+                try g.tape(Tr.OutPrep, &self.mc, &.{ o, cs.cos, cs.sin, w_ol, w.wo_b.w, w.wo_b.s }, &o1);
+                return o1[0];
+            }
+            return Tr.outProj(g, c, o, cs, w_ol, w.wo_b, false);
         }
 
         /// The stage's resident `SwitchGLU` with `ClampedSwiGLU` (mlx_lm arg order:
@@ -244,10 +313,23 @@ pub fn Head(comptime G: type) type {
         fn stage(self: *const Self, g: *G, st: *const Stage, h: T, pre_mix: T, main_x: T, cache: *const Cache) !Tr.Out {
             const c = &self.c;
             const w = &st.w;
-            const a = try Tr.hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
+            const sh = g.shapeOf(h);
+            const use = sh.d[0] * sh.d[1] <= @as(c_int, @intCast(self.stage_rt.hc_rows));
+            var a: [4]T = undefined;
+            if (use) {
+                try g.tape(Tr.HcAttnPrep, &self.mc, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
+            } else a = try Tr.hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
             const ao = try self.attention(g, st, a[0], main_x, cache);
-            const f = try Tr.hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
-            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &stage_routes, w, f[0], Resident{ .ex = &st.experts, .limit = c.swiglu_limit });
+            var f: [5]T = undefined;
+            if (use) {
+                try g.tape(Tr.HcFfnPrep, &self.mc, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
+            } else f = try Tr.hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, w, f[0], Resident{ .ex = &st.experts, .limit = c.swiglu_limit });
+            if (use) {
+                var o: [1]T = undefined;
+                try g.tape(Tr.HcPost, &self.mc, &.{ mo, f[1], f[2], f[3] }, &o);
+                return .{ .h = o[0], .pre_mix = f[4] };
+            }
             return .{ .h = try Tr.hcPost(g, mo, f[1], f[2], f[3]), .pre_mix = f[4] };
         }
 
@@ -276,20 +358,37 @@ pub fn Head(comptime G: type) type {
             var outs: [64]T = undefined;
             var logit_cols: [64]T = undefined;
             var embeds: [64]T = undefined;
-            for (0..ds.block_size) |i| {
-                const me = try Tr.embed(g, self.markov_embed, prev);
-                const bias = try Tr.linear(g, me, self.markov_head);
+            var inputs: [64]T = undefined;
+            const n: usize = ds.block_size;
+            const compiled = bs <= @as(c_int, @intCast(self.rt.draft_rows));
+            for (0..n) |i| {
                 const row = try g.reshape(try g.slice(base, &.{ 0, @intCast(i), 0 }, &.{ 1, @intCast(i + 1), vocab }, &.{ 1, 1, 1 }), &.{ 1, vocab });
-                const li = try g.add(row, bias);
-                logit_cols[i] = li;
-                embeds[i] = me;
-                prev = try g.argmax(li, -1);
+                inputs[i] = prev;
+                if (compiled) {
+                    var o3: [3]T = undefined;
+                    try g.tape(MarkovStep, &self.mc, &.{ prev, row, self.markov_embed, self.markov_head }, &o3);
+                    logit_cols[i] = o3[0];
+                    prev = o3[2];
+                } else {
+                    const me = try Tr.embed(g, self.markov_embed, prev);
+                    const li = try g.add(row, try Tr.linear(g, me, self.markov_head));
+                    logit_cols[i] = li;
+                    embeds[i] = me;
+                    prev = try g.argmax(li, -1);
+                }
                 outs[i] = prev;
             }
-            const n: usize = ds.block_size;
-            const markov = try g.stack(embeds[0..n], 1);
-            const hcat = try g.astype(try g.concat(&.{ x, markov }, -1), .float32);
-            const conf = try g.matmul(hcat, try g.transpose(try g.astype(self.conf_proj, .float32)));
+            const conf = if (compiled) blk: {
+                // One gather over the block's markov inputs (the eager path's per-step embeds).
+                const me = try Tr.embed(g, self.markov_embed, try g.stack(inputs[0..n], 1));
+                var o: [1]T = undefined;
+                try g.tape(Confidence, &self.mc, &.{ x, me, self.conf_proj }, &o);
+                break :blk o[0];
+            } else blk: {
+                const markov = try g.stack(embeds[0..n], 1);
+                const hcat = try g.astype(try g.concat(&.{ x, markov }, -1), .float32);
+                break :blk try g.matmul(hcat, try g.transpose(try g.astype(self.conf_proj, .float32)));
+            };
             return .{
                 .ids = try g.stack(outs[0..n], 1),
                 .logits = try g.stack(logit_cols[0..n], 1),

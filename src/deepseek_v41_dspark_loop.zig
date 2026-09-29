@@ -445,6 +445,49 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
 }
 
+test "dsv41 dspark loop: the K33 draft block replays the eager one from regions built at construction" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    const n_st = rig.head.nStages();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..n_st], .{ .lookup = null, .max_tokens = 8 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    // A K33 head over the same residents (its regions are built here, at construction).
+    const k33 = try Loop(TraceOps).H.init(a, &rig.g, rig.m.c, .{ .draft_rows = graph.draft_compile_max_rows }, &rig.lookup);
+    defer k33.deinit(&rig.g);
+    const e0 = rig.g.nodes.items.len;
+    const de = try rig.head.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed_w, rig.model.head);
+    const e1 = rig.g.nodes.items.len;
+    const dk = try k33.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed_w, rig.model.head);
+    const e2 = rig.g.nodes.items.len;
+    inline for (.{ "ids", "logits", "conf" }) |f| {
+        try testing.expect(rig.g.shapeOf(@field(de, f)).eql(rig.g.shapeOf(@field(dk, f))));
+        try testing.expectEqual(rig.g.dtypeOf(@field(de, f)), rig.g.dtypeOf(@field(dk, f)));
+    }
+    const count = struct {
+        fn f(g: *const TraceOps, from: usize, to: usize, op: ops.Op) usize {
+            var n: usize = 0;
+            for (g.nodes.items[from..to]) |nd| n += @intFromBool(nd.op == op);
+            return n;
+        }
+    }.f;
+    // Eager: no region. K33: per stage the HC attention prep, the main KV, the QKV and
+    // output prep, the HC ffn prep, the gate prefix, the MoE combine and the HC post;
+    // then a markov step per draft and the confidence.
+    try testing.expectEqual(@as(usize, 0), count(&rig.g, e0, e1, .tape_begin));
+    try testing.expectEqual(8 * n_st + rig.head.blockSize() + 1, count(&rig.g, e1, e2, .tape_begin));
+    // The regions hold the eager body's heavy ops.
+    inline for (.{ ops.Op.qmm, ops.Op.gather_qmm, ops.Op.softmax, ops.Op.argmax, ops.Op.matmul }) |op| {
+        try testing.expectEqual(count(&rig.g, e0, e1, op), count(&rig.g, e1, e2, op));
+    }
+}
+
 test "dsv41 dspark loop: typical flags accept what the argmax rejects; the correction stays the argmax" {
     const a = testing.allocator;
     var rig: Rig = undefined;

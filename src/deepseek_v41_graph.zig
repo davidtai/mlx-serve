@@ -82,16 +82,20 @@ pub fn Shared(comptime T: type) type {
 pub const Routes = struct {
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
-    /// W97: the K30 core compiled at rows <= 8, the selection padded to index_topk.
-    attn_core_compile: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
     lean_prefill_score: bool = false,
-    /// K22: attention qkv / out prep, gate prefix and MoE combine compiled at rows <= 32.
-    attn_compile: bool = false,
-    /// K4: the Hyper-Connection prep and combine compiled at rows <= 7.
-    hc_compile: bool = false,
-    /// K35: the layer's small stages as three compiled segments at rows <= 7.
-    small_stages: bool = false,
+    /// The compiled regions, each at rows <= its bound (0: the route is off; the
+    /// on value is the lane's cap): a call tests its rows only.
+    /// W97: the K30 core (the selection then padded to index_topk).
+    core_rows: u32 = 0,
+    /// K22: attention qkv / out prep, gate prefix and MoE combine.
+    attn_rows: u32 = 0,
+    /// K4: the Hyper-Connection prep and combine.
+    hc_rows: u32 = 0,
+    /// K35: the layer's small stages as three segments.
+    small_rows: u32 = 0,
+    /// K33: the DSpark draft stages' pure chains (the draft head applies it).
+    draft_rows: u32 = 0,
     /// W97: wo_a dequantized to f32 once at binding (byte-identical).
     wo_a_f32: bool = false,
     head: Head = .f32,
@@ -105,6 +109,7 @@ pub const attn_compile_max_rows = 32;
 pub const core_compile_max_rows = 8;
 pub const hc_compile_max_rows = 7;
 pub const small_stages_max_rows = 7;
+pub const draft_compile_max_rows = 32;
 
 /// A probe that records nothing (serving).
 pub const NoProbe = struct {
@@ -481,7 +486,7 @@ pub fn Trunk(comptime G: type) type {
                 mask = sel.mask;
                 if (rt.selected_keys) {
                     // A fixed-shape core pads the selection to index_topk.
-                    const k: c_int = if (rt.attn_core_compile) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
+                    const k: c_int = if (rt.core_rows > 0) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
                     shared.selected_idx = try maskToTopkIdx(g, mask, k);
                     try p.put("attn.selected_idx", shared.selected_idx.?);
                 }
@@ -592,7 +597,7 @@ pub fn Trunk(comptime G: type) type {
                 kvg = try g.concat(&.{ kvg, try gatherRows(g, comp_kv.?, comp_idx.?, cv) }, 2);
                 valid = try g.concat(&.{ valid, cv }, 2);
             }
-            if (rt.attn_core_compile and b * s <= core_compile_max_rows) {
+            if (b * s <= rt.core_rows) {
                 var o: [1]T = undefined;
                 try g.tape(AttnCore, c, &.{ q, kvg, valid, w.attn_sink }, &o);
                 return o[0];
@@ -619,6 +624,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// W97 `_attn_core_compiled`: in q, kvg, valid, sink.
         const AttnCore = struct {
+            pub const region: ops.Region = .attn_core;
             pub const Ctx = v41.Config;
             pub const n_out = 1;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
@@ -628,7 +634,8 @@ pub fn Trunk(comptime G: type) type {
 
         /// K22 `_attn_qkv_prep_impl`: in x, qcos, qsin, q_norm, kv_norm, then
         /// wq_a, wq_b, wkv as (words, scales); out q, qr, kv_new.
-        const QkvPrep = struct {
+        pub const QkvPrep = struct {
+            pub const region: ops.Region = .qkv_prep;
             pub const Ctx = v41.Config;
             pub const n_out = 3;
             pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
@@ -646,7 +653,8 @@ pub fn Trunk(comptime G: type) type {
 
         /// K22 `_attn_out_prep_impl`: in o, qcos, qsin, the dense grouped wo_a,
         /// wo_b (words, scales); out the attention output.
-        const OutPrep = struct {
+        pub const OutPrep = struct {
+            pub const region: ops.Region = .out_prep;
             pub const Ctx = v41.Config;
             pub const n_out = 1;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
@@ -689,7 +697,7 @@ pub fn Trunk(comptime G: type) type {
             const s = sh.d[1];
             const H: c_int = @intCast(c.n_heads);
             const hd: c_int = @intCast(c.head_dim);
-            const compiled = rt.attn_compile and b * s <= attn_compile_max_rows;
+            const compiled = b * s <= rt.attn_rows;
             const cs = try cosSin(g, inv_freq, positions);
             var q: T = undefined;
             var qr: T = undefined;
@@ -769,6 +777,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// K22 `_gate_prefix_impl`: in xf, gate weight, bias; out scores, biased.
         const GatePrefix = struct {
+            pub const region: ops.Region = .gate_prefix;
             pub const Ctx = v41.Config;
             pub const n_out = 2;
             pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
@@ -781,7 +790,7 @@ pub fn Trunk(comptime G: type) type {
         /// rows <= 32; the selection eager, it feeds the routing barrier).
         pub fn router(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, xf: T) !Route {
             var pre: [2]T = undefined;
-            if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) {
+            if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
                 try g.tape(GatePrefix, c, &.{ xf, w.gate_w, w.gate_bias }, &pre);
             } else {
                 const e = try gatePrefix(g, xf, w.gate_w, w.gate_bias);
@@ -819,6 +828,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// K22 `_moe_combine`: in routed, weights, shared.
         const MoeCombine = struct {
+            pub const region: ops.Region = .moe_combine;
             pub const Ctx = v41.Config;
             pub const n_out = 1;
             pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
@@ -837,7 +847,7 @@ pub fn Trunk(comptime G: type) type {
             try p.put("moe.routed", ro);
             const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
-            const y = if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) blk: {
+            const y = if (g.shapeOf(xf).dim(0) <= rt.attn_rows) blk: {
                 var o: [1]T = undefined;
                 try g.tape(MoeCombine, c, &.{ ro, r.weights, shared }, &o);
                 break :blk o[0];
@@ -863,7 +873,8 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// K4 / K35 seg1: in h, pre_mix, attn fn, base, scale, attn norm.
-        const HcAttnPrep = struct {
+        pub const HcAttnPrep = struct {
+            pub const region: ops.Region = .hc_attn_prep;
             pub const Ctx = v41.Config;
             pub const n_out = 4;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
@@ -872,7 +883,8 @@ pub fn Trunk(comptime G: type) type {
         };
 
         /// K4 ffn prep: in attn out, residual, attn pre, post, comb, ffn fn, base, scale, ffn norm.
-        const HcFfnPrep = struct {
+        pub const HcFfnPrep = struct {
+            pub const region: ops.Region = .hc_ffn_prep;
             pub const Ctx = v41.Config;
             pub const n_out = 5;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
@@ -881,7 +893,8 @@ pub fn Trunk(comptime G: type) type {
         };
 
         /// K4 moe combine (`_hc_post_impl`): in moe output, residual, ffn post, ffn comb.
-        const HcPost = struct {
+        pub const HcPost = struct {
+            pub const region: ops.Region = .hc_post;
             pub const Ctx = v41.Config;
             pub const n_out = 1;
             pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
@@ -893,6 +906,7 @@ pub fn Trunk(comptime G: type) type {
         /// HcFfnPrep inputs, gate weight, gate bias, then shared w1, w3, w2 as
         /// (words, scales). Out: xf, weights, indices, shared, h1, ffn post, ffn comb, ffn pre.
         const Seg2 = struct {
+            pub const region: ops.Region = .seg2;
             pub const Ctx = v41.Config;
             pub const n_out = 8;
             pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
@@ -908,6 +922,7 @@ pub fn Trunk(comptime G: type) type {
         /// K35 seg3: the MoE combine folded into the ffn HC post. In routed,
         /// weights, shared, residual, ffn post, ffn comb.
         const Seg3 = struct {
+            pub const region: ops.Region = .seg3;
             pub const Ctx = v41.Config;
             pub const n_out = 1;
             pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
@@ -918,13 +933,24 @@ pub fn Trunk(comptime G: type) type {
             }
         };
 
+        /// Builds every compiled region the routes use, for context `c` (once, at
+        /// construction: no region compiles inside a forward; a call finds its
+        /// closure by region and context).
+        pub fn prepareRegions(g: *G, c: *const v41.Config, rt: *const Routes, layer_major: bool) !void {
+            if (rt.core_rows > 0) try g.prepareTape(AttnCore, c);
+            if (rt.attn_rows > 0) inline for (.{ QkvPrep, OutPrep, GatePrefix, MoeCombine }) |B| try g.prepareTape(B, c);
+            if (rt.hc_rows > 0) inline for (.{ HcAttnPrep, HcFfnPrep, HcPost }) |B| try g.prepareTape(B, c);
+            if (rt.small_rows > 0) inline for (.{ HcAttnPrep, Seg2, Seg3, HcPost }) |B| try g.prepareTape(B, c);
+            if (layer_major) try g.prepareTape(HcPost, c);
+        }
+
         /// `DecoderLayer.__call__`: attention and MoE, each inside a
         /// Hyper-Connection pre / post, the pre mix threaded across sublayers.
         /// At decode / verify rows K35 runs three compiled segments; K4 compiles
         /// the HC prep / combine; the eager body otherwise.
         pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
             const rows = rowsOf(g, h, 2);
-            if (rt.small_stages and rows <= small_stages_max_rows) {
+            if (rows <= rt.small_rows) {
                 var s1: [4]T = undefined;
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &s1);
                 try p.put("attn.x", s1[0]);
@@ -945,7 +971,7 @@ pub fn Trunk(comptime G: type) type {
             const half = try attnAndMoeInput(g, p, c, rt, li, w, inv_freq, h, pre_mix, positions, cache, shared);
             const mo = try moe(g, p, c, rt, w, half.moe_in, routed);
             try p.put("moe.y", mo);
-            const out = if (rt.hc_compile and rows <= hc_compile_max_rows) blk: {
+            const out = if (rows <= rt.hc_rows) blk: {
                 var o: [1]T = undefined;
                 try g.tape(HcPost, c, &.{ mo, half.h1, half.post, half.comb }, &o);
                 break :blk o[0];
@@ -962,7 +988,7 @@ pub fn Trunk(comptime G: type) type {
         /// (which writes this layer's KV), the ffn mixes and the MoE input
         /// (K4 compiles both HC preps at rows <= 7).
         pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
-            const hc_tape = rt.hc_compile and rowsOf(g, h, 2) <= hc_compile_max_rows;
+            const hc_tape = rowsOf(g, h, 2) <= rt.hc_rows;
             var a: [4]T = undefined;
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
@@ -993,7 +1019,7 @@ pub fn Trunk(comptime G: type) type {
         pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, ro: T, weights: T, xf: T) !T {
             const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
-            if (rt.attn_compile and g.shapeOf(xf).dim(0) <= attn_compile_max_rows) {
+            if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
                 var o: [1]T = undefined;
                 try g.tape(MoeCombine, c, &.{ ro, weights, shared }, &o);
                 return o[0];
@@ -1526,13 +1552,18 @@ test "dsv41 graph: K30 selected keys gather each query's window and selected row
     try expectShape(&g, published[3].?, &.{ 1, 9, 4 }, .int32);
     try testing.expect(published[4].? != published[3].?);
     // The core compile pads the selection to index_topk and runs as one region at decode rows.
-    const rtc: Routes = .{ .selected_keys = true, .attn_core_compile = true };
+    const rtc: Routes = .{ .selected_keys = true, .core_rows = core_compile_max_rows };
     const w1 = try traceLayerW(&g, &c, c.layers[1]);
     var cache1 = Tr.Cache.init(c.layers[1], c.window, .{});
     defer cache1.deinit(&g);
     var sh1: Tr.Share = .{};
+    try testing.expectError(error.RegionNotPrepared, Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache1, &sh1));
+    try Tr.prepareRegions(&g, &c, &rtc, false);
+    var cache2 = Tr.Cache.init(c.layers[1], c.window, .{});
+    defer cache2.deinit(&g);
+    var sh2: Tr.Share = .{};
     const mark = g.nodes.items.len;
-    _ = try Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache1, &sh1);
+    _ = try Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache2, &sh2);
     const seq = try g.opsSince(testing.allocator, mark);
     defer testing.allocator.free(seq);
     try testing.expectEqual(@as(usize, 1), std.mem.count(ops.Op, seq, &.{.tape_begin}));
@@ -1557,6 +1588,7 @@ fn layerOps(rt: *const Routes, rows: c_int) ![]ops.Op {
     var cache = Tr.Cache.init(li, c.window, .{});
     defer cache.deinit(&g);
     var shared: Tr.Share = .{};
+    try Tr.prepareRegions(&g, &c, rt, false);
     const mark = g.nodes.items.len;
     _ = try Tr.layer(&g, NoProbe{}, &c, rt, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
     return g.opsSince(testing.allocator, mark);
@@ -1568,7 +1600,7 @@ test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only 
     defer testing.allocator.free(eager);
     try testing.expectEqual(@as(usize, 0), std.mem.count(O, eager, &.{.tape_begin}));
     // K22 + K4 at one row: 4 + 3 tapes over the same ops, plus the out tape's flatten reshape.
-    const k22k4 = try layerOps(&.{ .attn_compile = true, .hc_compile = true }, 1);
+    const k22k4 = try layerOps(&.{ .attn_rows = attn_compile_max_rows, .hc_rows = hc_compile_max_rows }, 1);
     defer testing.allocator.free(k22k4);
     var want = countOps(eager);
     want[@backingInt(O.reshape)] += 1;
@@ -1578,7 +1610,7 @@ test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only 
     got[@backingInt(O.tape_end)] = 0;
     try testing.expectEqual(want, got);
     // K35 at one row: three segments (+ the attention's own K22 tapes) over the same multiset.
-    const k35 = try layerOps(&.{ .small_stages = true, .attn_compile = true }, 1);
+    const k35 = try layerOps(&.{ .small_rows = small_stages_max_rows, .attn_rows = attn_compile_max_rows }, 1);
     defer testing.allocator.free(k35);
     got = countOps(k35);
     try testing.expectEqual(@as(u32, 3 + 2), got[@backingInt(O.tape_begin)]);
@@ -1586,10 +1618,10 @@ test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only 
     got[@backingInt(O.tape_end)] = 0;
     try testing.expectEqual(want, got);
     // Past the row caps the eager body runs: K4 / K35 stop at 7 rows, K22 at 32.
-    const wide = try layerOps(&.{ .attn_compile = true, .hc_compile = true, .small_stages = true }, 8);
+    const wide = try layerOps(&.{ .attn_rows = attn_compile_max_rows, .hc_rows = hc_compile_max_rows, .small_rows = small_stages_max_rows }, 8);
     defer testing.allocator.free(wide);
     try testing.expectEqual(@as(usize, 4), std.mem.count(O, wide, &.{.tape_begin}));
-    const prefill = try layerOps(&.{ .attn_compile = true, .hc_compile = true, .small_stages = true }, 33);
+    const prefill = try layerOps(&.{ .attn_rows = attn_compile_max_rows, .hc_rows = hc_compile_max_rows, .small_rows = small_stages_max_rows }, 33);
     defer testing.allocator.free(prefill);
     try testing.expectEqual(@as(usize, 0), std.mem.count(O, prefill, &.{.tape_begin}));
 }
