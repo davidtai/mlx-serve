@@ -220,6 +220,15 @@ pub const StreamSource = struct {
         return self.stream.grow(decode_rows);
     }
 
+    pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
+        return self.stream.seedPrefill(layer, ids);
+    }
+
+    /// Prefill routes one layer may hold live at once (`Stream.Options.wide_depth`).
+    pub fn wideDepth(self: *const StreamSource) u8 {
+        return self.stream.wide_depth;
+    }
+
     pub fn stats(self: *StreamSource) Stats {
         return self.stream.stats();
     }
@@ -597,6 +606,8 @@ pub fn QuantMath(comptime G: type, comptime Q: type) type {
     return struct {
         const Self = @This();
         const T = G.T;
+        /// The widest decode-lane call (`gateUp` / `down`).
+        pub const max_decode_rows: u32 = Q.max_decode_rows;
         q: *Q,
 
         pub fn init(q: *Q, _: *const v41.Config) Self {
@@ -628,6 +639,7 @@ pub fn WithPrefillRoutes(comptime G: type, comptime D: type, comptime P: type) t
     return struct {
         const Self = @This();
         const T = G.T;
+        pub const max_decode_rows: u32 = if (@hasDecl(D, "max_decode_rows")) D.max_decode_rows else max_route_ids;
         d: D,
         routes: []P,
 
@@ -706,6 +718,25 @@ pub const Routes = struct {
     prefill: bool = false,
 };
 
+/// The wide lane's read schedule, chosen at construction (`Options.wide`; both
+/// exact: the same rows, slots and kernels, only the order and timing of reads
+/// and evals change).
+pub const Wide = struct {
+        /// Each call seeds its layer's residency with its own ids (the most
+        /// routed experts protected in the persistent rows), feeds its groups
+        /// hottest first, and drains each group once (its banks' waves queued).
+        feed: bool = false,
+    /// Groups in flight: 2 routes (reads) the next group before this
+    /// group's waves (the source's `wideDepth` must allow it).
+    depth: u8 = 1,
+    /// Experts with at most this many rows in the call run the decode lane's
+    /// math (the GEMV, in chunks of the math's `max_decode_rows`) after their
+    /// bank's wide waves, not the wide route (0: none). ROUNDING-CLASS against
+    /// the wide route: its own reference family.
+    cold_rows: u8 = 0,
+    pub const max_cold_rows = 8;
+};
+
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
 /// bound once at `init` (base, transient) and at `grow` (the grown rows).
@@ -741,8 +772,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// The backend the banks were bound on.
         g: *G,
         wide: WideScratch = .{},
+        /// The wide lane's read schedule (`Options.wide`).
+        wide_route: Wide = .{},
 
-        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null };
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{} };
 
         /// The wide lane's host scratch, reused across calls.
         const WideScratch = struct {
@@ -750,6 +783,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// Per expert: its index in `distinct`, or -1.
             first: std.ArrayList(i32) = .empty,
             distinct: std.ArrayList(u16) = .empty,
+            /// Per expert: its rows in the call (the feed's order).
+            count: std.ArrayList(u32) = .empty,
+            cold_slot: std.ArrayList(u32) = .empty,
+            cold_act: std.ArrayList(u32) = .empty,
+            cold_pos: std.ArrayList(u32) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act_row: std.ArrayList(u32) = .empty,
             pos: std.ArrayList(u32) = .empty,
@@ -757,7 +795,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             kept: std.ArrayList(T) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
             }
         };
 
@@ -770,13 +808,23 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (@as(u64, decode_forward_rows) * c.n_experts_per_tok > max_route_ids) return error.DecodeRowsWiderThanRoute;
             if (routes.lookahead and opt.gates.len != c.n_layers) return error.LookaheadNeedsGates;
             if (routes.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
+            const wr = opt.wide;
+            if (wr.depth < 1 or wr.depth > expert_stream.max_wide_depth) return error.InvalidWideRoute;
+            if ((wr.feed or wr.depth > 1 or wr.cold_rows > 0) and !routes.prefill) return error.InvalidWideRoute;
+            if (wr.cold_rows > Wide.max_cold_rows) return error.InvalidWideRoute;
+            if (wr.feed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
+            if (wr.depth > 1) {
+                if (comptime @hasDecl(S, "wideDepth")) {
+                    if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
+                } else return error.WideDepthExceedsSource;
+            }
             const banks = try a.alloc([n_banks]?Arrays, c.n_layers);
             errdefer a.free(banks);
             for (banks, 0..) |*b, l| {
                 b.* = @splat(null);
                 for ([_]BankKind{ .base, .transient }) |kind| b[@backingInt(kind)] = try bind(g, source, @intCast(l), kind);
             }
-            var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g };
+            var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g, .wide_route = wr };
             if (opt.event) |e| self.event = e;
             return self;
         }
@@ -1011,7 +1059,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// next route may refill those slots); the outputs joined in the
         /// router's order, `[n, k, hidden]` f32. The DIG kernels read bf16
         /// activations (the lane of record's MoE input): another dtype is
-        /// rounded to bf16 once, here.
+        /// rounded to bf16 once, here. `Options.wide.feed` seeds the layer from
+        /// the call, orders the groups hottest first and drains each group once;
+        /// `Options.wide.depth` 2 routes group g + 1 (its reads) before group g's waves.
         fn runWide(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
             const a = self.a;
             const w = &self.wide;
@@ -1019,6 +1069,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
             if (n_ids < wide_min_ids) return error.WideLaneUnderMinIds;
+            const feed = self.wide_route.feed;
+            const depth: usize = self.wide_route.depth;
+            const cold: u32 = self.wide_route.cold_rows;
+            const cold_chunk: usize = if (@hasDecl(M, "max_decode_rows")) M.max_decode_rows else max_route_ids;
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
             try w.first.resize(a, self.n_experts);
@@ -1028,47 +1082,110 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 w.first.items[e] = @intCast(w.distinct.items.len);
                 try w.distinct.append(a, e);
             };
+            if (feed or cold > 0) {
+                try w.count.resize(a, self.n_experts);
+                @memset(w.count.items, 0);
+                for (w.ids.items) |e| w.count.items[e] += 1;
+            }
+            if (feed) {
+                // The call's residency seed, then its experts hottest first (ties by id).
+                if (comptime @hasDecl(S, "seedPrefill")) try self.source.seedPrefill(layer, w.ids.items) else unreachable;
+                std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
+                    fn lt(c: []const u32, x: u16, y: u16) bool {
+                        return if (c[x] != c[y]) c[x] > c[y] else x < y;
+                    }
+                }.lt);
+                for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
+            }
             const act = if (g.dtypeOf(xf) == .bfloat16) xf else try g.astype(xf, .bfloat16);
             w.pos.clearRetainingCapacity();
             w.kept.clearRetainingCapacity();
+            const n_distinct = w.distinct.items.len;
+            const n_groups = (n_distinct + max_route_ids - 1) / max_route_ids;
+            // The live groups' calls, by group index mod `depth` (read ahead up to `depth` groups).
+            var calls: [expert_stream.max_wide_depth]?*S.Call = @splat(null);
             errdefer {
+                for (&calls) |*c| if (c.*) |cl| {
+                    self.source.release(cl);
+                    c.* = null;
+                };
                 for (w.kept.items) |x| g.release(x);
                 w.kept.clearRetainingCapacity();
             }
-            var start: usize = 0;
-            while (start < w.distinct.items.len) {
-                const group = w.distinct.items[start..@min(start + max_route_ids, w.distinct.items.len)];
-                const call = try self.source.route(layer, group, &.{});
-                var released = false;
-                errdefer if (!released) self.source.release(call);
+            const groupOf = struct {
+                fn f(d: []const u16, gi: usize) []const u16 {
+                    return d[gi * max_route_ids .. @min((gi + 1) * max_route_ids, d.len)];
+                }
+            }.f;
+            for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi), &.{});
+            for (0..n_groups) |gi| {
+                const start = gi * max_route_ids;
+                const group = groupOf(w.distinct.items, gi);
+                const call = calls[gi % depth].?;
                 const sv = self.source.served(call);
                 for (0..sv.n_parts) |p| {
                     try self.source.waitGu(call, @intCast(p));
                     try self.source.waitDown(call, @intCast(p));
                 }
+                const k0 = w.kept.items.len;
                 for ([_]BankKind{ .base, .ext, .transient }) |kind| {
+                    const kb = w.kept.items.len;
                     w.slot.clearRetainingCapacity();
                     w.act_row.clearRetainingCapacity();
+                    w.cold_slot.clearRetainingCapacity();
+                    w.cold_act.clearRetainingCapacity();
+                    w.cold_pos.clearRetainingCapacity();
                     for (w.ids.items, 0..) |e, row| {
-                        const gi: usize = @intCast(w.first.items[e]);
-                        if (gi < start or gi >= start + group.len) continue;
-                        const ref = sv.refs[gi - start];
+                        const fi: usize = @intCast(w.first.items[e]);
+                        if (fi < start or fi >= start + group.len) continue;
+                        const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
+                        const act_row: u32 = @intCast(row / @as(usize, k));
+                        if (cold > 0 and w.count.items[e] <= cold) {
+                            try w.cold_slot.append(a, ref.row);
+                            try w.cold_act.append(a, act_row);
+                            try w.cold_pos.append(a, @intCast(row));
+                            continue;
+                        }
                         try w.slot.append(a, ref.row);
-                        try w.act_row.append(a, @intCast(row / @as(usize, k)));
+                        try w.act_row.append(a, act_row);
                         try w.pos.append(a, @intCast(row));
                     }
-                    if (w.slot.items.len == 0) continue;
+                    if (w.slot.items.len == 0 and w.cold_slot.items.len == 0) continue;
                     const b = self.banks[layer][@backingInt(kind)].?;
-                    try w.kept.ensureUnusedCapacity(a, 1);
-                    const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
-                    w.kept.appendAssumeCapacity(y);
+                    const hot = w.slot.items.len > 0;
+                    if (hot) {
+                        try w.kept.ensureUnusedCapacity(a, 1);
+                        const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
+                        w.kept.appendAssumeCapacity(y);
+                    }
+                    // Cold rows: the decode GEMV over their slots, encoded after the bank's wide waves
+                    // (the act-row index is built right before its take).
+                    var c0: usize = 0;
+                    while (c0 < w.cold_slot.items.len) : (c0 += cold_chunk) {
+                        const c1 = @min(c0 + cold_chunk, w.cold_slot.items.len);
+                        const m: c_int = @intCast(c1 - c0);
+                        const ar = try g.hostArray(std.mem.sliceAsBytes(w.cold_act.items[c0..c1]), &.{m}, .uint32);
+                        const xs = try g.take(act, ar, 0);
+                        const sid = try g.hostArray(std.mem.sliceAsBytes(w.cold_slot.items[c0..c1]), &.{m}, .uint32);
+                        const h = try self.math.gateUp(g, xs, sid, b.gate, b.up);
+                        try w.kept.ensureUnusedCapacity(a, 1);
+                        w.kept.appendAssumeCapacity(g.keep(try self.math.down(g, h, sid, b.down)));
+                        try w.pos.appendSlice(a, w.cold_pos.items[c0..c1]);
+                    }
+                    if (!feed) {
+                        if (hot) try self.math.finishPrefill(g);
+                        try g.evalAll(w.kept.items[kb..]);
+                    }
+                }
+                // Feed: the group's banks queued back to back, one drain before its slots go back.
+                if (feed) {
                     try self.math.finishPrefill(g);
-                    try g.evalAll(&.{y});
+                    try g.evalAll(w.kept.items[k0..]);
                 }
                 self.source.release(call);
-                released = true;
-                start += group.len;
+                calls[gi % depth] = null;
+                if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
             }
             // `take(concatenate(outputs), argsort(positions))`, the permutation made on the host.
             const joined = try g.concat(w.kept.items, 0);
@@ -1364,6 +1481,22 @@ test "dsv41 experts: a wide call routes its experts in groups and runs each bank
     try testing.expectEqual(@as(usize, n_groups), std.mem.count(u8, kinds, "R"));
     try testing.expectEqual(@as(usize, n_groups), std.mem.count(u8, kinds, "r"));
     try testing.expectEqual(std.mem.count(u8, kinds, "g"), std.mem.count(u8, kinds, "d"));
+    // The default wide route (no feed, depth 1): one group live at a time, and one finish + eval
+    // per bank call (the schedule before the wide routes existed).
+    var open = false;
+    for (kinds) |kd| switch (kd) {
+        'R' => {
+            try testing.expect(!open);
+            open = true;
+        },
+        'r' => {
+            try testing.expect(open);
+            open = false;
+        },
+        else => {},
+    };
+    try testing.expect(!open);
+    try testing.expectEqual(rrs[0].calls.items.len, g.evals.items.len);
 
     // Each recorded call is exactly its group's rows in one bank, in routed order, read
     // from the slot the source serves the expert in, after the group's waits and before
@@ -1925,4 +2058,312 @@ test "dsv41 experts: the scores the hook passes reproduce the streamer's read-ah
     try testing.expectEqual(f.scores_rows * f.experts, replay.at);
     try ex.flush();
     std.debug.print("dsv41 experts: {d} layer calls through the hook with lookahead scores; {d} read-ahead picks equal the streamer's\n", .{ f.calls.len, n_picks });
+}
+
+/// A wide-lane route over a real Stream (trace backend) that names, per call row, the expert
+/// whose record its slot holds (verified byte for byte) and its act row; and records the live
+/// routes and the evals so far at the call.
+const StreamRec = struct {
+    a: std.mem.Allocator,
+    recs: std.ArrayList(Rec) = .empty,
+    finishes: u32 = 0,
+
+    var stream: ?*expert_stream.Stream = null;
+    var bank: ?*const SynthBank = null;
+    /// The hook's bound banks of the layer (to name a call's bank kind).
+    var base_code: u32 = 0;
+    var transient_code: u32 = 0;
+
+    const Rec = struct { experts: []u16, act_row: []u32, base: bool, live: u32, evals: usize };
+
+    fn init(a: std.mem.Allocator) StreamRec {
+        return .{ .a = a };
+    }
+
+    fn deinit(self: *StreamRec, _: *TraceOps) void {
+        for (self.recs.items) |r| {
+            self.a.free(r.experts);
+            self.a.free(r.act_row);
+        }
+        self.recs.deinit(self.a);
+    }
+
+    fn expertIn(s: *expert_stream.Stream, sb: *const SynthBank, slot: u32) !u16 {
+        const geom = &sb.bank.layers[0];
+        for (0..sb.bank.n_experts) |e| {
+            const off = sb.bank.recordOffset(0, @intCast(e));
+            const held = for (geom.segments, 0..) |seg, c| {
+                if (!std.mem.eql(u8, sb.image[off + seg.offset ..][0..seg.length], s.slotRow(0, slot, @fromBackingInt(@intCast(c)))[0..seg.length])) break false;
+            } else true;
+            if (held) return @intCast(e);
+        }
+        return error.SlotHoldsNoRecord;
+    }
+
+    pub fn call(self: *StreamRec, g: *TraceOps, act: u32, rows: quant.PrefillRows, b: BankArraysOf(u32)) !u32 {
+        const s = stream.?;
+        const base = b.gate.code == base_code;
+        if (!base and b.gate.code != transient_code) return error.UnknownBank;
+        const cap = s.layers[0].policy.capacity;
+        const experts = try self.a.alloc(u16, rows.slot.len);
+        errdefer self.a.free(experts);
+        for (rows.slot, experts) |r, *e| e.* = try expertIn(s, bank.?, if (base) r else cap + r);
+        var live: u32 = 0;
+        for (&s.routes) |*r| live += @intFromBool(r.state == .live);
+        try self.recs.append(self.a, .{ .experts = experts, .act_row = try self.a.dupe(u32, rows.act_row.?), .base = base, .live = live, .evals = g.evals.items.len });
+        return g.input(&.{ @intCast(rows.slot.len), g.shapeOf(act).d[1] }, .float32);
+    }
+
+    pub fn finish(self: *StreamRec, _: *TraceOps) !void {
+        self.finishes += 1;
+    }
+};
+
+test "dsv41 experts: the wide feed and read-ahead serve every routed row from its record, hottest first, one drain per group, reads ahead" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    // 60 tokens x top-6, expert j of a token in band j (distinct in a row): 64 experts routed 3..15 times.
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| {
+        const t = i / k;
+        const j = i % k;
+        e.* = @intCast(j * 20 + (t * (j + 3)) % 20);
+    }
+    var count: [128]u32 = @splat(0);
+    for (ids) |e| count[e] += 1;
+    var hot: [128]u16 = undefined;
+    var n_distinct: usize = 0;
+    for (0..128) |e| if (count[e] > 0) {
+        hot[n_distinct] = @intCast(e);
+        n_distinct += 1;
+    };
+    try testing.expectEqual(@as(usize, 64), n_distinct);
+    std.sort.pdq(u16, hot[0..n_distinct], @as([]const u32, &count), struct {
+        fn lt(cn: []const u32, x: u16, y: u16) bool {
+            return if (cn[x] != cn[y]) cn[x] > cn[y] else x < y;
+        }
+    }.lt);
+    var first_seen: [128]bool = @splat(false);
+    var appear: [128]u16 = undefined;
+    var n_app: usize = 0;
+    for (ids) |e| if (!first_seen[e]) {
+        first_seen[e] = true;
+        appear[n_app] = e;
+        n_app += 1;
+    };
+
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    for ([_]Wide{ .{}, .{ .feed = true }, .{ .depth = 2 }, .{ .feed = true, .depth = 2 } }) |wide| {
+        const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = wide.depth, .transient_rows = @as(u32, wide.depth) * max_route_ids });
+        defer s.deinit();
+        StreamRec.stream = s;
+        defer StreamRec.stream = null;
+        var src = StreamSource.init(s);
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var rrs = [_]StreamRec{StreamRec.init(a)};
+        defer rrs[0].deinit(&g);
+        const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+        var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = wide });
+        defer ex.deinit();
+        StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+        StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+        var script: Script = .{ .calls = &.{&ids} };
+        g.host_values = script.values();
+        const evals0 = g.evals.items.len;
+        _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+        try ex.flush();
+        const recs = rrs[0].recs.items;
+
+        // Exact: every routed row once, computed from its own expert's record with its token.
+        var seen: [n * k]bool = @splat(false);
+        for (recs) |r| for (r.experts, r.act_row) |e, t| {
+            const row = for (0..k) |j| {
+                const i = t * k + j;
+                if (ids[i] == e and !seen[i]) break i;
+            } else return error.RowNotRouted;
+            seen[row] = true;
+        };
+        for (seen) |x| try testing.expect(x);
+        // Every distinct record read once (the call starts from empty rows).
+        try testing.expectEqual(@as(u64, n_distinct * sb.bank.layers[0].logical_bytes), s.stats().expert_bytes_read);
+        try testing.expectEqual(@as(u64, 2), s.stats().route_calls);
+
+        // The groups: the first 48 of the feed order (hottest first) or of first appearance.
+        const order: []const u16 = if (wide.feed) hot[0..n_distinct] else appear[0..n_app];
+        var in_first: [128]bool = @splat(false);
+        for (order[0..max_route_ids]) |e| in_first[e] = true;
+        var second_started = false;
+        for (recs) |r| {
+            const grp0 = in_first[r.experts[0]];
+            for (r.experts) |e| try testing.expectEqual(grp0, in_first[e]);
+            if (!grp0) second_started = true else try testing.expect(!second_started);
+            // Group 0's waves run with group 1 already routed (its reads issued) at depth 2.
+            if (grp0) try testing.expectEqual(@as(u32, wide.depth), r.live) else try testing.expectEqual(@as(u32, 1), r.live);
+        }
+        // Drains: one per group with the feed, else one per bank call.
+        const drains = g.evals.items.len - evals0;
+        try testing.expectEqual(if (wide.feed) @as(usize, 2) else recs.len, drains);
+        try testing.expectEqual(@as(u32, @intCast(if (wide.feed) 2 else recs.len)), rrs[0].finishes);
+        // The feed's seed: the persistent rows hold the 16 hottest (protected), the rest transient.
+        if (wide.feed) {
+            var in_top: [128]bool = @splat(false);
+            for (hot[0..16]) |e| in_top[e] = true;
+            for (recs) |r| for (r.experts) |e| try testing.expectEqual(in_top[e], r.base);
+        }
+    }
+}
+
+test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 4, 4 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 } });
+    defer s.deinit();
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const c = testConfig(64, 32, 2);
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    var rrs = [_]StreamRec{ StreamRec.init(a), StreamRec.init(a) };
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    try testing.expectError(error.WideDepthExceedsSource, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 2 } }));
+    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 3 } }));
+    const Plain = ExpertsWith(TraceOps, StreamSource, Math, .{});
+    try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .feed = true } }));
+}
+
+/// Decode-lane math that records each gateUp call's bank, the expert whose record each slot
+/// holds at the call (StreamRec's stream and bank) and the act rows (the act-row index is the
+/// host array made right before the call's `take`), in calls of <= 8 rows.
+const ColdRec = struct {
+    inner: TraceMath,
+    pub const max_decode_rows: u32 = 8;
+    var log: std.ArrayList(Call) = .empty;
+    const Call = struct { code: u32, experts: []u16, act_row: []u32, evals: usize };
+
+    fn reset(a: std.mem.Allocator) void {
+        for (log.items) |c| {
+            a.free(c.experts);
+            a.free(c.act_row);
+        }
+        log.clearAndFree(a);
+    }
+
+    pub fn gateUp(self: *const ColdRec, g: *TraceOps, x: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
+        const slots = std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(g.hostBytesOf(ids) orelse return error.NoHostBytes)));
+        const acts = g.hostBytesOf(x - 1) orelse return error.NoHostBytes;
+        const s = StreamRec.stream.?;
+        const base = gate.code == StreamRec.base_code;
+        const experts = try g.gpa.alloc(u16, slots.len);
+        errdefer g.gpa.free(experts);
+        for (slots, experts) |slot, *e| e.* = try StreamRec.expertIn(s, StreamRec.bank.?, if (base) slot else s.layers[0].policy.capacity + slot);
+        try log.append(g.gpa, .{
+            .code = gate.code,
+            .experts = experts,
+            .act_row = try g.gpa.dupe(u32, std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(acts)))),
+            .evals = g.evals.items.len,
+        });
+        return self.inner.gateUp(g, x, ids, gate, up);
+    }
+
+    pub fn down(self: *const ColdRec, g: *TraceOps, h: u32, ids: u32, d: ProjOf(u32)) !u32 {
+        return self.inner.down(g, h, ids, d);
+    }
+};
+
+test "dsv41 experts: cold rows run the decode lane over their own records after their bank's wide waves, every row once" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast((i % k) * 20 + ((i / k) * ((i % k) + 3)) % 20);
+    var count: [128]u32 = @splat(0);
+    for (ids) |e| count[e] += 1;
+    const Math = WithPrefillRoutes(TraceOps, ColdRec, StreamRec);
+    try testing.expectEqual(@as(u32, 8), Math.max_decode_rows);
+    for ([_]Wide{ .{ .cold_rows = 3 }, .{ .cold_rows = 3, .feed = true, .depth = 2 } }) |wide| {
+        const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = wide.depth, .transient_rows = @as(u32, wide.depth) * max_route_ids });
+        defer s.deinit();
+        StreamRec.stream = s;
+        defer StreamRec.stream = null;
+        var src = StreamSource.init(s);
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        g.record_host = true;
+        defer ColdRec.reset(a);
+        var rrs = [_]StreamRec{StreamRec.init(a)};
+        defer rrs[0].deinit(&g);
+        const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+        var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .inner = .{ .hidden = 64, .inter = 32 } }, .routes = &rrs }, &c, .{ .wide = wide });
+        defer ex.deinit();
+        const base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+        StreamRec.base_code = base_code;
+        StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+        var script: Script = .{ .calls = &.{&ids} };
+        g.host_values = script.values();
+        _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+        try ex.flush();
+
+        // Every routed row once: the wide route's rows are the hot experts', the decode lane's the cold ones'.
+        var seen: [n * k]bool = @splat(false);
+        const mark = struct {
+            fn f(sn: *[n * k]bool, idv: []const u16, e: u16, t: u32) !void {
+                for (0..k) |j| {
+                    const i = t * k + j;
+                    if (idv[i] == e and !sn[i]) {
+                        sn[i] = true;
+                        return;
+                    }
+                }
+                return error.RowNotRouted;
+            }
+        }.f;
+        for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+            try testing.expect(count[e] > 3);
+            try mark(&seen, &ids, e, t);
+        };
+        var cold_calls: usize = 0;
+        for (ColdRec.log.items) |cl| {
+            try testing.expect(cl.experts.len >= 1 and cl.experts.len <= 8);
+            for (cl.experts, cl.act_row) |e, t| {
+                try testing.expectEqual(@as(u32, 3), count[e]);
+                try mark(&seen, &ids, e, t);
+            }
+            cold_calls += 1;
+        }
+        for (seen) |x| try testing.expect(x);
+        // 40 experts routed 3 times: 120 cold rows in calls of at most 8.
+        var cold_rows: usize = 0;
+        for (ColdRec.log.items) |cl| cold_rows += cl.experts.len;
+        try testing.expectEqual(@as(usize, 120), cold_rows);
+        try testing.expect(cold_calls >= 15);
+        try testing.expectEqual(@as(u64, 64 * sb.bank.layers[0].logical_bytes), s.stats().expert_bytes_read);
+    }
+    // A cold threshold past the bound, or without the wide lane, is refused at construction.
+    {
+        const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 } });
+        defer s.deinit();
+        var src = StreamSource.init(s);
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var rrs = [_]StreamRec{StreamRec.init(a)};
+        const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+        try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .inner = .{ .hidden = 64, .inter = 32 } }, .routes = &rrs }, &c, .{ .wide = .{ .cold_rows = Wide.max_cold_rows + 1 } }));
+        const Plain = ExpertsWith(TraceOps, StreamSource, Math, .{});
+        try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .inner = .{ .hidden = 64, .inter = 32 } }, .routes = &rrs }, &c, .{ .wide = .{ .cold_rows = 2 } }));
+    }
 }

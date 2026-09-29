@@ -423,6 +423,13 @@ pub const ModelConfig = struct {
     expert_event_gates: ?bool = null,
     /// A module-owned arch's numerics, chosen at construction (the `numeric_tier` model setting; null = served).
     numeric_tier: ?@import("model_settings.zig").NumericTier = null,
+    /// A module-owned arch's prompt pass layer by layer (the `layer_major_prefill` model setting; null = off).
+    layer_major_prefill: ?bool = null,
+    /// A streamed-expert model's wide prefill read schedule (`expert_wide_feed` / `expert_wide_depth`; null = off / 1).
+    expert_wide_feed: ?bool = null,
+    expert_wide_depth: ?u8 = null,
+    /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
+    expert_wide_cold_rows: ?u8 = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

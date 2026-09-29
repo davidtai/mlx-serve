@@ -31,6 +31,7 @@ const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
+const expert_policy = @import("expert_policy.zig");
 const dspark_head = @import("deepseek_v41_dspark_head.zig");
 
 /// The receipt's `decode_binding`: which loop drove the cell.
@@ -81,6 +82,10 @@ pub const Options = struct {
     lookahead: ?expert_stream.Lookahead = null,
     event: ?expert_stream.Event = null,
     pool: expert_io.Options = .{ .tickets = 1024 },
+    /// Prefill routes one layer holds live at once (the wide lane's read-ahead):
+    /// each one past the first adds a window of `max_route_ids` transient rows,
+    /// charged by the admission (`Inputs.wide_window_bytes`).
+    wide_depth: u8 = 1,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -136,6 +141,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         .allocation = opt.allocation,
         .phase_reserve_bytes = opt.phase_reserve_bytes,
         .lookahead_staging_bytes = if (opt.lookahead) |la| expert_admission.lookaheadCharge(record, 2 * la.budget, std.heap.pageSize()) else 0,
+        .wide_window_bytes = wideWindowBytes(opt.wide_depth, record),
         .host_reserve_bytes = opt.host_reserve_bytes,
         .prefill_charge_bytes = opt.prefill_charge_bytes,
         .peak_fill = opt.peak_fill,
@@ -152,6 +158,11 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     const decode = @min(plan_.admission.decode_rows, n_experts);
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
     return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
+}
+
+/// The transient rows past the first window (`Options.wide_depth`).
+pub fn wideWindowBytes(depth: u8, record: u64) u64 {
+    return @as(u64, depth -| 1) * expert_policy.max_route_ids * record;
 }
 
 /// The arm over graph backend `G` (`MlxOps` serving, `TraceOps` host tests)
@@ -200,7 +211,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         /// The hook's construction inputs the arm's routes need beyond `Options`: every routed layer's gate
         /// (`.lookahead`: the predictor reads the next layer's) and the stream's event (`.gated`).
-        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null };
+        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null, wide: xp.Wide = .{} };
 
         pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
             // The hook's predictor feeds the stream's read-ahead: the route needs the stream's class.
@@ -237,10 +248,14 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .lookahead = opt.lookahead,
                 .event = opt.event,
                 .pool = opt.pool,
+                .wide_depth = opt.wide_depth,
+                .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
-            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .gates = hx.gates, .event = hx.event }) catch |e|
+            // The wide read-ahead's windows are the stream's (one transient window per group in flight).
+            if (hx.wide.depth > opt.wide_depth) return refuse(diag, error.WideDepthExceedsStream, "arm: the hook reads {d} groups ahead, the stream holds {d} windows", .{ hx.wide.depth, opt.wide_depth });
+            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .gates = hx.gates, .event = hx.event, .wide = hx.wide }) catch |e|
                 return refuse(diag, e, "routed-expert hook: {s}", .{@errorName(e)});
             return self;
         }

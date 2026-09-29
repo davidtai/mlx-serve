@@ -110,6 +110,10 @@ pub const Module = struct {
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig, weights: *model_io.Weights, s: mlx.mlx_stream) !*Module {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
+        const layer_major = layerMajor(config) catch |e| {
+            log.err("prefill routes refused: {s}", .{@errorName(e)});
+            return e;
+        };
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
@@ -144,8 +148,9 @@ pub const Module = struct {
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
-        const tier = numericTier(config.numeric_tier orelse .served);
-        log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
+        var tier = numericTier(config.numeric_tier orelse .served);
+        tier.layer_major = layer_major;
+        log.info("numeric tier: {t}; prefill layer-major {}, wide feed {}, wide depth {d}, cold rows {d}", .{ config.numeric_tier orelse .served, tier.layer_major, config.expert_wide_feed orelse false, config.expert_wide_depth orelse 1, config.expert_wide_cold_rows orelse 0 });
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         const subset = switch (self.arm) {
@@ -182,7 +187,7 @@ pub const Module = struct {
         errdefer gpa.free(gates);
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wideRoute(config) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
@@ -304,6 +309,24 @@ pub const Module = struct {
     }
 };
 
+/// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
+/// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
+pub const layer_major_billed = true;
+
+/// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
+/// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
+pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockTier, LayerMajorNotBilled }!bool {
+    if (!(config.layer_major_prefill orelse false)) return false;
+    if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
+    if (!layer_major_billed) return error.LayerMajorNotBilled;
+    return true;
+}
+
+/// The wide prefill calls' read schedule from the model settings (off by default).
+pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
+    return .{ .feed = config.expert_wide_feed orelse false, .depth = config.expert_wide_depth orelse 1, .cold_rows = config.expert_wide_cold_rows orelse 0 };
+}
+
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
 /// decode-width (8 rows: no rounding-class wide lane); `served` is the tier of record (its DIG-X prefill).
 pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
@@ -334,6 +357,7 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .draft_pruned_bytes = 0,
         .lookahead = lookahead,
         .ceiling = ceiling,
+        .wide_depth = config.expert_wide_depth orelse 1,
     };
 }
 
@@ -444,6 +468,26 @@ test "dsv41 module: a request's bounded lanes hold its reservation, else the pro
     try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), Module.maxPositions(16384, 0));
     // A reservation (prompt + budget + chunk) is the bound.
     try std.testing.expectEqual(@as(u32, 40000 + 8), Module.maxPositions(32768, 40000));
+}
+
+test "dsv41 module: the prefill routes are off by default; layer-major is refused on the stock tier and until billed" {
+    var c: model_io.ModelConfig = undefined;
+    c.layer_major_prefill = null;
+    c.numeric_tier = null;
+    c.expert_wide_feed = null;
+    c.expert_wide_depth = null;
+    c.expert_wide_cold_rows = null;
+    try std.testing.expect(!try layerMajor(&c));
+    try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));
+    c.layer_major_prefill = true;
+    c.numeric_tier = .stock;
+    try std.testing.expectError(error.LayerMajorOnStockTier, layerMajor(&c));
+    c.numeric_tier = .served;
+    if (layer_major_billed) try std.testing.expect(try layerMajor(&c)) else try std.testing.expectError(error.LayerMajorNotBilled, layerMajor(&c));
+    c.expert_wide_feed = true;
+    c.expert_wide_depth = 2;
+    c.expert_wide_cold_rows = 2;
+    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2, .cold_rows = 2 }, wideRoute(&c));
 }
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
