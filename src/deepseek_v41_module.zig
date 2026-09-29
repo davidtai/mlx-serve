@@ -180,17 +180,9 @@ pub const Module = struct {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, .{
-            .model_dir = config.expert_bank_dir.?,
-            .envelope = envelope,
-            .baseline_bytes = config.memory_baseline_bytes,
-            .fixed_rows = config.expert_rows,
-            .slot_memory = .{ .mlx = s },
-            .draft_pruned_bytes = 0,
-            .lookahead = lookahead,
-            .ceiling = ceiling,
-            .event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null,
-        }, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
+        var opts = armOptions(config, ceiling, .{ .mlx = s });
+        opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
@@ -330,6 +322,21 @@ pub const ceiling_stop_bytes: u64 = 2_000_000_000;
 
 /// The box a streamed-expert admission fits under a memory ceiling (the GPU's working set by default):
 /// the peak `ceiling_stop_bytes` under it, every layer up to its expert count.
+/// The arm's construction options from the shell's config (the admission's inputs): the module builds
+/// with them, and a host bill plans the same rows with them (`slot_memory = .host`).
+pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission.Ceiling, slot_memory: expert_stream.SlotMemory) arm_mod.Options {
+    return .{
+        .model_dir = config.expert_bank_dir.?,
+        .envelope = envelope,
+        .baseline_bytes = config.memory_baseline_bytes,
+        .fixed_rows = config.expert_rows,
+        .slot_memory = slot_memory,
+        .draft_pruned_bytes = 0,
+        .lookahead = lookahead,
+        .ceiling = ceiling,
+    };
+}
+
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
 }

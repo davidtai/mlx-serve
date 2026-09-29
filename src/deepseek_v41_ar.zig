@@ -26,6 +26,7 @@ const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
+const expert_admission = @import("expert_admission.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -455,8 +456,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const inputs = try cellInputs(a, io, prompt_path, bank_dir);
     const prompt = inputs.prompt;
     var config = inputs.config;
-    if (std.c.getenv("DSV41_CELL_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
-    if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    try cellConfig(&config);
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
 
@@ -577,6 +577,157 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     });
 }
 
+/// The window's admission inputs on the shell's config, from the environment the runner sets:
+/// DSV41_CELL_BASELINE_GB (the guard's box baseline, required), DSV41_CELL_CEILING_GB (the box the
+/// admission fits, required: the window and the bill plan the same rows) and DSV41_CELL_ROWS (a
+/// forced decode row count; unset = the admission's fill).
+fn cellConfig(config: *model.ModelConfig) !void {
+    const gb = struct {
+        fn of(name: [*:0]const u8) !?u64 {
+            const v = std.c.getenv(name) orelse return null;
+            return @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+        }
+    }.of;
+    config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
+    config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
+    if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+}
+
+/// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
+/// admission the module builds with (`Module.armOptions` at the same config) and the arch's prefill
+/// bill (`v41.PrefillBill`, its wave pinned by the served 16K trace test): the prompt phase and the
+/// decode phase over the box baseline. `processBound` is what the child may hold above the baseline.
+pub const CellBill = struct {
+    baseline: u64,
+    prefill_rows: u32,
+    decode_rows: u32,
+    /// (layers x rows + the transient bank's max_route_ids rows) x the bank's record.
+    slot_prefill: u64,
+    slot_decode: u64,
+    lookahead_staging: u64,
+    /// Every resident tensor the index names (trunk, head, embedding, the DSpark head); the
+    /// embedding leaves the device at the prompt fence (decode phase).
+    residents: u64,
+    embedding: u64,
+    /// The Engram sidecar's residents and its row caches (host).
+    engram: u64,
+    /// The prompt pass's widest wave x 5 / 4 (`PrefillBill.bytes`' margin).
+    prefill_wave: u64,
+    /// The request's bounded KV (the served ring + the sources' lanes) for prompt + max_tokens + a block.
+    kv: u64,
+    /// The served tier's prefill allocator cache (4 GiB, D5) and the decode charge.
+    prefill_cache: u64,
+    decode_cache: u64,
+    /// A verify forward's wave (8 rows) with its index chain over every position, and the draft block's.
+    decode_wave: u64,
+    draft_wave: u64,
+    /// The admission's host reserve (pools, tables, the token map, the process).
+    host_reserve: u64,
+
+    pub fn prefillTotal(b: CellBill) u64 {
+        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve;
+    }
+
+    pub fn decodeTotal(b: CellBill) u64 {
+        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve;
+    }
+
+    pub fn processBound(b: CellBill) u64 {
+        return @max(b.prefillTotal(), b.decodeTotal()) - b.baseline;
+    }
+};
+
+pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
+    const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
+    var vd: v41.Diag = .{};
+    errdefer if (vd.len > 0) std.debug.print("dsv41 served cell bill: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, io, dir, &vd);
+    const ceiling = module.boxCeiling(config.memory_ceiling_bytes orelse return error.CellCeilingMissing, c.n_routed_experts);
+    var diag: arm_mod.Diag = .{};
+    // The wired bytes the module reads at construction (vm_stat) are the window's: the runner measures
+    // them after the guard unloaded the service and passes DSV41_CELL_WIRED_GB (unset: read now).
+    var opts = module.armOptions(config, ceiling, .host);
+    if (std.c.getenv("DSV41_CELL_WIRED_GB")) |v| opts.wired_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
+        std.debug.print("dsv41 served cell bill: refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    defer if (p.draft_subset) |*x| x.deinit();
+    const rec = p.inputs.record_bytes;
+    const transient: u64 = xp.max_route_ids;
+    var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
+    defer ck.deinit();
+    const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
+    const epath = try std.fmt.allocPrint(a, "{s}/engram/engram-residents.safetensors", .{dir});
+    var eck = try v41.Checkpoint.openFile(a, epath, &vd);
+    defer eck.deinit();
+    const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
+    const bill = v41.PrefillBill.of(&c);
+    const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
+    const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
+    // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
+    const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
+    return .{
+        .baseline = config.memory_baseline_bytes.?,
+        .prefill_rows = p.prefill_rows,
+        .decode_rows = p.decode_rows,
+        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient) * rec,
+        .lookahead_staging = p.inputs.lookahead_staging_bytes,
+        .residents = m.totalBytes(),
+        .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
+        .engram = em.totalBytes() + engram.row_cache_host_bytes,
+        .prefill_wave = bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
+        .prefill_cache = module.prefillCacheLimit(.served),
+        .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
+        .decode_wave = decode_wave,
+        .draft_wave = decode_wave,
+        .host_reserve = p.inputs.host_reserve_bytes,
+    };
+}
+
+fn printBill(b: CellBill) void {
+    const gb = struct {
+        fn f(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e9;
+        }
+    }.f;
+    std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
+    const T = struct { name: []const u8, p: u64, d: u64 };
+    for ([_]T{
+        .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
+        .{ .name = "slot banks (layers x rows + 48) x record", .p = b.slot_prefill, .d = b.slot_decode },
+        .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
+        .{ .name = "residents (the embedding off at the fence)", .p = b.residents, .d = b.residents - b.embedding },
+        .{ .name = "Engram residents + row caches", .p = b.engram, .d = b.engram },
+        .{ .name = "prompt wave x 5/4 (PrefillBill) / verify + draft waves", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
+        .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
+        .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
+        .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
+    }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
+    std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()) });
+}
+
+// The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
+// DSV41_CELL_CEILING_GB [DSV41_CELL_WIRED_GB] [DSV41_CELL_ROWS] [DSV41_CELL_MAX_TOKENS]: the cell's bill at the rows the window
+// will admit, printed as a table and one DSV41_CELL_BILL json line.
+test "dsv41 served cell: the cell's bill on the host (the window's admission, every term)" {
+    if (std.c.getenv("DSV41_CELL_BILL") == null) return error.SkipZigTest;
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    try cellConfig(&config);
+    const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
+    const b = try cellBill(a, testing.io, &config, 16384, max_tokens);
+    printBill(b);
+    try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
+}
+
 fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(t.untilNow(io, .boot).nanoseconds)) / 1e9;
 }
@@ -606,6 +757,9 @@ test "dsv41 served cell: the window's inputs pass on the host (the standard prom
     try testing.expectEqualStrings("1a45b35bae742fae0e26d4f40ee0dc1093a2038e5b514460a4f02e9e56d74565", &sha);
     try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
     try testing.expectEqual(@as(usize, 16384 + 1024 + mdl.Model(ops.MlxOps).scratch_rows), module.Module.maxPositions(16384, 16384 + 1024));
+    // The admission inputs come from the runner's environment (refused by name without them).
+    var cfg = inputs.config;
+    if (std.c.getenv("DSV41_CELL_BASELINE_GB") == null) try testing.expectError(error.CellBaselineMissing, cellConfig(&cfg));
     const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
     const json = try std.json.Stringify.valueAlloc(a, rec, .{});
     try testing.expect(std.mem.indexOf(u8, json, "\"decode_rows_per_layer\":2") != null);
