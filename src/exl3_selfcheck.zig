@@ -544,6 +544,49 @@ fn checkRowInvariance(h: *H, k: Kernel) !void {
     }
 }
 
+/// MLX binds a custom-kernel input of fewer than 8 elements as `const constant T*` (else
+/// `const device T*`) and names the program by that binding (lib/mlx-src/mlx/backend/common/
+/// metal_kernel.cpp:18, :102, :318): the binding is part of the MLX program a call runs.
+const mlx_constant_elems = 8;
+
+/// The row counts rowInvariance calls `e` at (bit m), for the rows_max call's `vars`: 1..rows_max,
+/// less every m at which a rows input would bind `constant` while the rows_max call and every
+/// launch the lane made (`e.samples`) bind it `device`. Such a call runs an MLX program the lane
+/// never launches, which its text need not even compile: header_pf_hc's q3pf_ld reads `device`
+/// pointers only, so q3pf_hc_pre_norm at 1 row (pre [1, 1, 4] f32, 4 elements) is refused by the
+/// Metal compiler, and its lane routes rows >= 32. The self-check feeds the production bindings.
+pub fn rowPlan(e: *const Entry, vars: *const Vars) error{RowsMaxOutOfPlan}!u64 {
+    const rmax: usize = e.rows_max;
+    if (rmax == 0 or rmax > 63) return error.RowsMaxOutOfPlan;
+    var plan: u64 = (@as(u64, 1) << @intCast(rmax + 1)) - 2;
+    for (e.inputs) |*arg| {
+        if (arg.role != .rows) continue;
+        var shape: [xk.max_rank]c_int = undefined;
+        const full = argShape(arg, vars, &shape);
+        const along: usize = @intCast(shape[arg.row_axis]);
+        if (full < mlx_constant_elems or along == 0 or laneBindsConstant(e, arg, vars)) continue;
+        for (1..rmax) |m| {
+            if (full / along * m < mlx_constant_elems) plan &= ~(@as(u64, 1) << @intCast(m));
+        }
+    }
+    return plan;
+}
+
+/// Whether one of the lane's launch samples binds `arg` as `constant` (the sample's vars over
+/// the check's; seq follows rows when the sample does not name it).
+fn laneBindsConstant(e: *const Entry, arg: *const xk.Arg, vars: *const Vars) bool {
+    for (e.samples) |*s| {
+        var v = vars.*;
+        for (std.enums.values(Var)) |x| {
+            if (s.vars.get(x) != 0) v.set(x, s.vars.get(x));
+        }
+        if (s.vars.get(.seq) == 0) v.set(.seq, v.get(.rows));
+        var shape: [xk.max_rank]c_int = undefined;
+        if (argShape(arg, &v, &shape) < mlx_constant_elems) return true;
+    }
+    return false;
+}
+
 fn sliceRows(h: *H, sc: *Scope, arr: mlx.mlx_array, arg: *const xk.Arg, vars: *const Vars, slot: usize, m: usize) !mlx.mlx_array {
     var start: [xk.max_rank]c_int = @splat(0);
     var stop: [xk.max_rank]c_int = undefined;
@@ -585,6 +628,7 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
     vars.set(.rows, rmax);
     const wave = Wave.even(vars.get(.experts), rmax, vars.get(.cap));
     var ins = try genAll(h, &once, e, &vars, site, &wave);
+    const plan = try rowPlan(e, &vars);
     for (0..sets) |set| {
         var sc: Scope = .{ .a = h.a };
         defer sc.deinit();
@@ -602,6 +646,7 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
             n_host += 1;
         }
         for (1..rmax + 1) |m| {
+            if (plan & (@as(u64, 1) << @intCast(m)) == 0) continue;
             for (0..rmax - m + 1) |slot| {
                 var sc2: Scope = .{ .a = h.a };
                 defer sc2.deinit();
@@ -1775,6 +1820,55 @@ test "dsv41 kernels: a raised self-check's receipt line carries the MLX message,
     try testing.expect(!parsed.value.ok);
     try testing.expectEqualStrings("", it.next().?);
     try testing.expect(it.next() == null);
+}
+
+test "dsv41 kernels: row invariance calls only the MLX programs the lane launches (constant vs device binding)" {
+    var diag: xk.Diag = .{};
+    var reg = xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
+        std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer reg.deinit();
+    const all: u64 = 0b1_1111_1110; // m = 1..8
+    // the HC pre-norm at 1 row: pre [1, 1, 4] f32 binds `constant`, the lane's rows 32 / 183 / 953
+    // and the check's 8 rows bind `device` (q3pf_ld takes device pointers only): m = 1 is not called
+    inline for (.{ Kernel.q3pf_hc_pre_norm, Kernel.q3pf_hc_pre_norm__f32 }) |k| {
+        const e = reg.get(k);
+        try testing.expectEqual(@as(u32, 8), e.rows_max);
+        var vars = defaultVars(e);
+        vars.set(.rows, e.rows_max);
+        try testing.expectEqual(all & ~@as(u64, 0b10), try rowPlan(e, &vars));
+    }
+    // HCTAPE's collapse norm reads a 4-element pre at 1 row too, but its lane launches that
+    // `constant` program (decode, rows 1..8): m = 1 stays
+    {
+        const e = reg.get(.q3ht_collapse_norm);
+        var vars = defaultVars(e);
+        vars.set(.rows, e.rows_max);
+        try testing.expectEqual(all, try rowPlan(e, &vars));
+    }
+    // registry-wide: every plan keeps its rows_max call; the prefill-batch-2 texts whose lanes
+    // start above 8 rows are the only ones that lose a call
+    var reduced: std.EnumSet(Kernel) = .empty;
+    for (&reg.entries) |*e| {
+        if (!e.checks.contains(.row_invariance)) continue;
+        const n_sites = @max(e.sites.len, 1);
+        for (0..n_sites) |si| {
+            var vars = defaultVars(e);
+            vars.set(.rows, e.rows_max);
+            if (e.sites.len > 0) xk.siteVars(&e.sites[si], &vars);
+            const plan = try rowPlan(e, &vars);
+            try testing.expect(plan & (@as(u64, 1) << @intCast(e.rows_max)) != 0);
+            if (plan != (@as(u64, 1) << @intCast(e.rows_max + 1)) - 2) reduced.insert(e.kernel);
+        }
+    }
+    var want: std.EnumSet(Kernel) = .empty;
+    inline for (.{ Kernel.q3pf_hc_pre_norm, Kernel.q3pf_hc_pre_norm__f32, Kernel.q3_ph_index_score, Kernel.q3sk_combine }) |k| want.insert(k);
+    if (!reduced.eql(want)) {
+        var it = reduced.iterator();
+        while (it.next()) |k| std.debug.print("row plan reduced: {t}\n", .{k});
+    }
+    try testing.expect(reduced.eql(want));
 }
 
 test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not one f64-rounded word" {
