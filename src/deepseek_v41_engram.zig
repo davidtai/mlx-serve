@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
+const row_cache = @import("row_cache.zig");
 
 pub const max_ngram = 8;
 pub const max_heads = 16;
@@ -190,6 +191,36 @@ pub fn readRows(fd: std.c.fd_t, bank: *const Bank, rows: []const i64, codes: []u
     }
 }
 
+/// The lane of record's Engram row budget per bank (its MTPLX_ENGRAM_CACHE_LIMIT).
+pub const row_cache_bytes_per_bank: u64 = 64 << 20;
+
+/// The lane's miss reads (tcq_runner/packed/native_engram.py, engramfetch/): in decode, 16
+/// workers take consecutive slices of the requests; in the prefill, 64 reads are in flight
+/// in ascending order; a request is at most 256 rows; a verify lookahead covers 8 rows.
+pub const decode_read_workers = 16;
+pub const prefill_read_depth = 64;
+pub const read_chunk_rows = 256;
+pub const max_verify_rows = 8;
+
+/// The request phase the reads follow, set by the row source's owner at the prefill boundary.
+pub const Phase = enum { prefill, decode };
+
+/// The Engram row caches' host bytes for the session: the two banks of 264-byte
+/// records, one cache of `row_cache_bytes_per_bank` each.
+pub const row_cache_host_bytes: u64 = 2 * row_cache.hostBytes(264, row_cache_bytes_per_bank);
+
+/// The Engram reads' host charge (the admission's term) for gathers of at most `max_rows`
+/// positions (the prefill chunk): the caches, each cache's gather scratch (24 lookups per
+/// position) and lookahead, and the pools' thread stacks.
+pub fn hostChargeBytes(max_rows: u32) u64 {
+    const lookups: u64 = @as(u64, @max(max_rows, max_verify_rows)) * 24;
+    const index = @as(u64, row_cache.indexCapacity(@intCast(lookups))) * (@sizeOf(u64) + @sizeOf(u32) + 1);
+    const per_lookup = 264 + @sizeOf(row_cache.Request) + @sizeOf(u64) + 3 * @sizeOf(u32) + 16;
+    const lookahead = max_verify_rows * 24 * 264;
+    const stacks = (decode_read_workers + prefill_read_depth) * row_cache.ReadPool.stack_bytes;
+    return row_cache_host_bytes + 2 * (lookups * per_lookup + index + lookahead) + stacks;
+}
+
 /// Construction-time refusals of the row source (one named error each; the
 /// message says which field or file).
 pub const Refusal = error{ EngramManifest, EngramTokenMap, EngramBankFile };
@@ -278,6 +309,20 @@ pub const RowSource = struct {
     bank: Bank,
     map: TokenMap,
     fds: [max_layers]std.c.fd_t = @splat(-1),
+    /// One resident-row cache per bank (heap: `read` takes a const source).
+    caches: [max_layers]?*row_cache.RowCache = @splat(null),
+    lane: ?*Lane = null,
+
+    /// The reads' pools and the verify forward in progress.
+    const Lane = struct {
+        phase: Phase = .prefill,
+        decode_pool: *row_cache.ReadPool,
+        prefill_pool: *row_cache.ReadPool,
+        /// The verify forward's rows and its first group's (0: no split forward open).
+        rows: u32 = 0,
+        split: u32 = 0,
+        bank_rows: [max_verify_rows * max_cols]i64 = undefined,
+    };
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, bank_dir: []const u8, map_path: []const u8, c: *const v41.Config, diag: ?*v41.Diag) !RowSource {
         var self: RowSource = .{ .arena = std.heap.ArenaAllocator.init(gpa), .hashing = undefined, .bank = undefined, .map = undefined };
@@ -304,14 +349,63 @@ pub const RowSource = struct {
             if (std.c.fstat(fd, &st) != 0) return refuse(diag, error.EngramBankFile, "{s}: fstat failed", .{path});
             const want = self.bank.rows[i] * self.bank.record_bytes;
             if (@as(u64, @intCast(st.size)) != want) return refuse(diag, error.EngramBankFile, "{s}: {d} bytes, the manifest's {d} rows x {d} need {d}", .{ path, st.size, self.bank.rows[i], self.bank.record_bytes, want });
+            const cache = try gpa.create(row_cache.RowCache);
+            errdefer gpa.destroy(cache);
+            cache.* = try row_cache.RowCache.init(gpa, .{ .fd = fd, .record_bytes = self.bank.record_bytes, .rows = self.bank.rows[i] }, row_cache_bytes_per_bank, max_verify_rows * self.hashing.cols());
+            self.caches[i] = cache;
         }
+        const lane = try gpa.create(Lane);
+        errdefer gpa.destroy(lane);
+        const dp = try row_cache.ReadPool.create(gpa, decode_read_workers);
+        errdefer dp.destroy();
+        lane.* = .{ .decode_pool = dp, .prefill_pool = try row_cache.ReadPool.create(gpa, prefill_read_depth) };
+        self.lane = lane;
         return self;
+    }
+
+    /// The reads' phase (between forwards): the prefill's pool, or decode's pool with
+    /// Python's verify schedule. Ends any lookahead left open.
+    pub fn setPhase(self: *const RowSource, p: Phase) !void {
+        try self.settleAll();
+        self.lane.?.phase = p;
+    }
+
+    fn route(self: *const RowSource) row_cache.Route {
+        const l = self.lane.?;
+        return switch (l.phase) {
+            .prefill => .{ .pool = l.prefill_pool, .spread = .{ .cursor = prefill_read_depth }, .read_limit = read_chunk_rows },
+            .decode => .{ .pool = l.decode_pool, .spread = .{ .slices = decode_read_workers }, .read_limit = read_chunk_rows },
+        };
+    }
+
+    /// Python `after_groups`: every bank's lookahead read and released.
+    fn settleAll(self: *const RowSource) !void {
+        const l = self.lane.?;
+        l.rows = 0;
+        l.split = 0;
+        for (self.caches) |c| if (c) |x| try x.settle();
+    }
+
+    /// The banks' row-cache statistics (Python's `cache.stats`).
+    pub fn cacheStats(self: *const RowSource, li: usize) row_cache.Stats {
+        return self.caches[li].?.stats;
     }
 
     pub fn deinit(self: *RowSource) void {
         for (self.fds) |fd| if (fd >= 0) {
             _ = std.c.close(fd);
         };
+        for (self.caches) |c| if (c) |x| {
+            const gpa = x.gpa;
+            x.deinit();
+            gpa.destroy(x);
+        };
+        if (self.lane) |l| {
+            const gpa = l.decode_pool.gpa;
+            l.decode_pool.destroy();
+            l.prefill_pool.destroy();
+            gpa.destroy(l);
+        }
         self.arena.deinit();
     }
 
@@ -320,9 +414,25 @@ pub const RowSource = struct {
         return self.hashing.n_layers * self.hashing.cols();
     }
 
-    /// `NgramHashState.advance` for one sequence: `out` gets `[ids][n_layers][cols]`.
+    /// `NgramHashState.advance` for one sequence: `out` gets `[ids][n_layers][cols]`. In
+    /// decode a span of more than four rows is Python's split verify: two groups (the first
+    /// the larger half), both banks' missing rows read ahead now (`before_groups`).
     pub fn advance(self: *const RowSource, gpa: std.mem.Allocator, st: *HashState, ids: []const u32, out: []i64) !void {
-        return st.advance(gpa, &self.hashing, self.map.ids, ids, null, out);
+        try st.advance(gpa, &self.hashing, self.map.ids, ids, null, out);
+        const l = self.lane.?;
+        if (l.phase != .decode) return;
+        try self.settleAll();
+        if (ids.len <= 4) return;
+        if (ids.len > max_verify_rows) return error.EngramVerifyRows;
+        const cols = self.hashing.cols();
+        const nl = self.hashing.n_layers;
+        const br = l.bank_rows[0 .. ids.len * cols];
+        for (0..nl) |li| {
+            for (0..ids.len) |t| @memcpy(br[t * cols ..][0..cols], out[(t * nl + li) * cols ..][0..cols]);
+            try self.caches[li].?.lookahead(br, self.route());
+        }
+        l.rows = @intCast(ids.len);
+        l.split = @intCast((ids.len + 1) / 2);
     }
 
     /// Layer slot `li`'s records for the `n` positions of `rows` (`advance`'s
@@ -335,11 +445,34 @@ pub const RowSource = struct {
         return self.readIds(li, ids_buf[0 .. n * cols], codes, scales);
     }
 
-    /// The records of row ids `ids` of layer slot `li`.
+    /// The records of row ids `ids` of layer slot `li`, through the bank's row cache: one
+    /// gather, or in a split verify forward one per group; its last bank settles it.
     pub fn readIds(self: *const RowSource, li: usize, ids: []const i64, codes: []u8, scales: []u8) !void {
-        for (ids) |r| if (r < 0 or @as(u64, @intCast(r)) >= self.bank.rows[li]) return error.RowOutOfRange;
-        return readRows(self.fds[li], &self.bank, ids, codes, scales);
+        const hd: usize = self.bank.head_dim;
+        const c = self.caches[li].?;
+        const l = self.lane.?;
+        const r = self.route();
+        const cols = self.hashing.cols();
+        var sink: Split = .{ .codes = codes, .scales = scales, .head_dim = hd };
+        if (l.split == 0 or ids.len != l.rows * cols) return c.gather(ids, &sink, r);
+        const na = l.split * cols;
+        try c.gather(ids[0..na], &sink, r);
+        var tail: Split = .{ .codes = codes[na * hd ..], .scales = scales[na * (hd / 32) ..], .head_dim = hd };
+        try c.gather(ids[na..], &tail, r);
+        if (li + 1 == self.hashing.n_layers) try self.settleAll();
     }
+
+    /// A record's codes and scales into the forward's two buffers.
+    const Split = struct {
+        codes: []u8,
+        scales: []u8,
+        head_dim: usize,
+        pub fn put(t: *Split, i: usize, rec: []const u8) void {
+            const hd = t.head_dim;
+            @memcpy(t.codes[i * hd ..][0..hd], rec[0..hd]);
+            @memcpy(t.scales[i * (hd / 32) ..][0 .. hd / 32], rec[hd..]);
+        }
+    };
 };
 
 const testing = std.testing;
@@ -632,4 +765,244 @@ test "dsv41 engram: the real bank's row source hashes and reads like the Python 
         try testing.expectEqualStrings(r.sha256, &std.fmt.bytesToHex(d.finalResult(), .lower));
     }
     std.debug.print("dsv41 engram: row source over {d} rows x {d} layers; {d} positions and {d} records equal the oracle\n", .{ src.bank.rows[0], src.hashing.n_layers, fx.ids.len, fx.bytes.len });
+}
+
+fn msSince(t: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t.untilNow(testing.io, .boot).nanoseconds)) / 1e6;
+}
+
+/// The two Engram files' page-cache residency (mincore).
+fn engramResident(src: *const RowSource, bank_dir: []const u8) !u64 {
+    const nocache = @import("nocache_reader.zig");
+    var sum: u64 = 0;
+    var buf: [1024]u8 = undefined;
+    for (0..src.hashing.n_layers) |i| sum += try nocache.residentBytes(try std.fmt.bufPrintSentinel(&buf, "{s}/engram/{s}", .{ bank_dir, src.bank.files[i] }, 0));
+    return sum;
+}
+
+/// Little-endian reader over the replay's binary forwards file.
+const ReplayBin = struct {
+    b: []const u8,
+    at: usize = 0,
+    fn int(r: *ReplayBin, comptime T: type) T {
+        const v = std.mem.readInt(T, r.b[r.at..][0..@sizeOf(T)], .little);
+        r.at += @sizeOf(T);
+        return v;
+    }
+};
+
+// DSV41_BANK=<bank> DSV41_ENGRAM_TOKEN_MAP=<map> DSV41_ENGRAM_REPLAY=<engram_replay.py json>:
+// the lane's gathers (Python's hash, schedule and cache) replayed through the port.
+test "dsv41 engram: the lane's gather sequence replays through the port with Python's stats and bytes" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    const replay = std.mem.span(std.c.getenv("DSV41_ENGRAM_REPLAY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("refused: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(gpa, testing.io, bank_dir, &diag);
+    const Py = struct { stats: []const row_cache.Stats, bytes_read: u64, sha256: []const u8 };
+    const Seq = struct { name: []const u8, bin: []const u8, forwards: u32, gathers: u32, lookups: u64, python: Py };
+    const doc = try std.json.parseFromSliceLeaky(struct { format: []const u8, sequences: []const Seq }, a, try std.Io.Dir.cwd().readFileAlloc(testing.io, replay, a, .limited(64 << 20)), .{ .ignore_unknown_fields = true });
+    try testing.expectEqualStrings("mlx-serve-dsv41-engram-replay-v2", doc.format);
+    for (doc.sequences) |seq| {
+        var src = try RowSource.open(gpa, testing.io, bank_dir, map_path, &c, &diag);
+        defer src.deinit();
+        const resident0 = try engramResident(&src, bank_dir);
+        const nl = src.hashing.n_layers;
+        const cols = src.hashing.cols();
+        const hd: usize = src.bank.head_dim;
+        var rb: ReplayBin = .{ .b = try std.Io.Dir.cwd().readFileAlloc(testing.io, seq.bin, a, .limited(1 << 30)) };
+        const n_fw = rb.int(u32);
+        try testing.expectEqual(seq.forwards, n_fw);
+        var st: HashState = .{};
+        defer st.deinit(gpa);
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        var phase: Phase = .prefill;
+        var ms: [2]f64 = .{ 0, 0 };
+        var forwards: [2]u32 = .{ 0, 0 };
+        var max_ms: [2]f64 = .{ 0, 0 };
+        var gathers: u64 = 0;
+        for (0..n_fw) |_| {
+            const ph: Phase = if (rb.int(u8) == 1) .decode else .prefill;
+            const n = rb.int(u32);
+            const trim = rb.int(u32);
+            const ids = try a.alloc(u32, n);
+            for (ids) |*t| t.* = rb.int(u32);
+            // Python's gathers of this forward, concatenated per layer (group A then B).
+            const want = try a.alloc(i64, n * cols * nl);
+            var fill: [max_layers]usize = @splat(0);
+            const ng = rb.int(u32);
+            gathers += ng;
+            for (0..ng) |_| {
+                const li = rb.int(u32);
+                const k = rb.int(u32);
+                for (0..k) |_| {
+                    want[li * n * cols + fill[li]] = rb.int(i64);
+                    fill[li] += 1;
+                }
+            }
+            if (ph != phase) {
+                try src.setPhase(ph);
+                phase = ph;
+            }
+            const out = try a.alloc(i64, n * nl * cols);
+            const ids_buf = try a.alloc(i64, n * cols);
+            const codes = try a.alloc(u8, n * cols * hd);
+            const scales = try a.alloc(u8, n * cols * (hd / 32));
+            const t0 = std.Io.Timestamp.now(testing.io, .boot);
+            try src.advance(gpa, &st, ids, out);
+            for (0..nl) |li| {
+                try src.read(li, out, n, ids_buf, codes, scales);
+                try testing.expectEqualSlices(i64, want[li * n * cols ..][0 .. n * cols], ids_buf[0 .. n * cols]);
+                for (0..n * cols) |r| {
+                    sha.update(codes[r * hd ..][0..hd]);
+                    sha.update(scales[r * (hd / 32) ..][0 .. hd / 32]);
+                }
+            }
+            const f = @intFromEnum(ph);
+            const dt = msSince(t0);
+            ms[f] += dt;
+            max_ms[f] = @max(max_ms[f], dt);
+            forwards[f] += 1;
+            if (trim > 0) st.trim(trim);
+        }
+        try testing.expectEqual(rb.b.len, rb.at);
+        try testing.expectEqual(@as(u64, seq.gathers), gathers);
+        var bytes: u64 = 0;
+        for (0..nl) |li| {
+            const s = src.cacheStats(li);
+            testing.expectEqual(seq.python.stats[li], s) catch |e| {
+                std.debug.print("{s} bank {d}: python {any}\n  port {any}\n", .{ seq.name, li, seq.python.stats[li], s });
+                return e;
+            };
+            bytes += s.rows_read * src.bank.record_bytes;
+        }
+        try testing.expectEqual(seq.python.bytes_read, bytes);
+        const hex = std.fmt.bytesToHex(sha.finalResult(), .lower);
+        try testing.expectEqualStrings(seq.python.sha256, &hex);
+        const resident1 = try engramResident(&src, bank_dir);
+        std.debug.print("\nDSV41_ENGRAM_REPLAY {s}: {d} forwards, {d} gathers, {d} lookups; bank 1 {any}; bank 14 {any}; {d} B read; sha256 {s} (= Python); " ++
+            "prefill {d} forwards {d:.1} ms (max {d:.2}); decode {d} forwards {d:.1} ms (max {d:.2}, mean {d:.3}); Engram page cache {d} -> {d} B\n", .{
+            seq.name,   seq.forwards,  seq.gathers,  seq.lookups,   src.cacheStats(0), src.cacheStats(1), bytes, hex[0..16],
+            forwards[0], ms[0],        max_ms[0],    forwards[1],   ms[1],             max_ms[1],         ms[1] / @as(f64, @floatFromInt(@max(forwards[1], 1))),
+            resident0,  resident1,
+        });
+        try testing.expectEqual(resident0, resident1);
+    }
+}
+
+// DSV41_BANK=<bank> DSV41_ENGRAM_TOKEN_MAP=<map> DSV41_ENGRAM_READ_RATE=1: records/s on the real
+// Engram file (inline and on the lane's pools) and a verify forward's reads cold and warm.
+test "dsv41 engram: record reads on the real bank, single and on the lane's pools" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    if (std.c.getenv("DSV41_ENGRAM_READ_RATE") == null) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("refused: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(gpa, testing.io, bank_dir, &diag);
+    var src = try RowSource.open(gpa, testing.io, bank_dir, map_path, &c, &diag);
+    defer src.deinit();
+    const resident0 = try engramResident(&src, bank_dir);
+    const rbytes: usize = src.bank.record_bytes;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const buf = try gpa.alloc(u8, 16_000 * rbytes);
+    defer gpa.free(buf);
+    const reqs = try gpa.alloc(row_cache.Request, 16_000);
+    defer gpa.free(reqs);
+    const lane = src.lane.?;
+    const Mode = struct { name: []const u8, pool: ?*row_cache.ReadPool, spread: row_cache.Spread, batch: usize, batches: usize };
+    const modes = [_]Mode{
+        .{ .name = "single thread (stock class route)", .pool = null, .spread = .{ .slices = 1 }, .batch = 2000, .batches = 1 },
+        .{ .name = "decode pool, 16 slices, 96-row batches (one group of a bank)", .pool = lane.decode_pool, .spread = .{ .slices = decode_read_workers }, .batch = 96, .batches = 40 },
+        .{ .name = "decode pool, 16 slices, 192-row batches (a bank's 8-row verify)", .pool = lane.decode_pool, .spread = .{ .slices = decode_read_workers }, .batch = 192, .batches = 40 },
+        .{ .name = "prefill pool, 64 in flight, 16,000-row batches (a chunk's misses)", .pool = lane.prefill_pool, .spread = .{ .cursor = prefill_read_depth }, .batch = 16_000, .batches = 3 },
+    };
+    var batch: row_cache.Batch = .{};
+    std.debug.print("\n", .{});
+    for (modes) |m| {
+        var total_ms: f64 = 0;
+        var max_ms: f64 = 0;
+        for (0..m.batches) |_| {
+            const rows = try gpa.alloc(u64, m.batch);
+            defer gpa.free(rows);
+            for (rows) |*r| r.* = rnd.uintLessThan(u64, src.bank.rows[0]);
+            std.mem.sort(u64, rows, {}, std.sort.asc(u64));
+            for (rows, 0..) |r, i| reqs[i] = .{ .off = r * rbytes, .dst = buf[i * rbytes ..].ptr, .len = rbytes };
+            const t0 = std.Io.Timestamp.now(testing.io, .boot);
+            if (m.pool) |p| {
+                p.submit(&batch, src.fds[0], reqs[0..m.batch], m.spread);
+                try p.wait(&batch);
+            } else for (reqs[0..m.batch]) |q| try preadExact(src.fds[0], q.dst[0..q.len], q.off);
+            const dt = msSince(t0);
+            total_ms += dt;
+            max_ms = @max(max_ms, dt);
+        }
+        const recs: f64 = @floatFromInt(m.batch * m.batches);
+        std.debug.print("DSV41_ENGRAM_READ_RATE {s}: {d:.0} records/s, {d:.2} us/record, {d:.3} ms per batch (max {d:.3})\n", .{ m.name, recs / (total_ms / 1e3), total_ms * 1e3 / recs, total_ms / @as(f64, @floatFromInt(m.batches)), max_ms });
+    }
+    // A verify forward's reads (8 rows, decode phase: the split and the lookahead), cold then warm.
+    try src.setPhase(.decode);
+    var st: HashState = .{};
+    defer st.deinit(gpa);
+    const n = max_verify_rows;
+    const cols = src.hashing.cols();
+    const nl = src.hashing.n_layers;
+    const hd: usize = src.bank.head_dim;
+    var out: [max_verify_rows * max_layers * max_cols]i64 = undefined;
+    var ids_buf: [max_verify_rows * max_cols]i64 = undefined;
+    const codes = try gpa.alloc(u8, n * cols * hd);
+    defer gpa.free(codes);
+    const scales = try gpa.alloc(u8, n * cols * (hd / 32));
+    defer gpa.free(scales);
+    var cold_ms: f64 = 0;
+    var warm_ms: f64 = 0;
+    var cold_max: f64 = 0;
+    const reps = 30;
+    var warm_misses: u64 = 0;
+    for (0..reps) |_| {
+        var ids: [max_verify_rows]u32 = undefined;
+        for (&ids) |*t| t.* = rnd.uintLessThan(u32, @intCast(src.map.ids.len));
+        for (0..2) |pass| {
+            const m0 = src.cacheStats(0).misses + src.cacheStats(1).misses;
+            const t0 = std.Io.Timestamp.now(testing.io, .boot);
+            try src.advance(gpa, &st, ids[0..n], out[0 .. n * nl * cols]);
+            for (0..nl) |li| try src.read(li, out[0 .. n * nl * cols], n, &ids_buf, codes, scales);
+            const dt = msSince(t0);
+            if (pass == 0) {
+                cold_ms += dt;
+                cold_max = @max(cold_max, dt);
+            } else {
+                warm_ms += dt;
+                warm_misses += src.cacheStats(0).misses + src.cacheStats(1).misses - m0;
+            }
+            st.trim(n);
+        }
+    }
+    const resident1 = try engramResident(&src, bank_dir);
+    std.debug.print("DSV41_ENGRAM_VERIFY_FORWARD 8 rows x 48 records, decode route (split 4+4, lookahead, 16 slices): cold {d:.3} ms mean (max {d:.3}); warm {d:.4} ms mean ({d} warm misses); bank 1 {any}; bank 14 {any}\n", .{ cold_ms / reps, cold_max, warm_ms / reps, warm_misses, src.cacheStats(0), src.cacheStats(1) });
+    try testing.expectEqual(@as(u64, 0), warm_misses);
+    std.debug.print("DSV41_ENGRAM_READ_RATE Engram page cache {d} -> {d} B\n", .{ resident0, resident1 });
+    try testing.expectEqual(resident0, resident1);
+}
+
+fn preadExact(fd: std.c.fd_t, buf: []u8, off: u64) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const r = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+        if (r <= 0) return error.ReadFailed;
+        done += @intCast(r);
+    }
+}
+
+test "dsv41 engram: the host charge covers the lane's caches, scratch, lookahead and pools" {
+    try testing.expectEqual(@as(u64, 2 * (254_200 * (264 + 20) + 524_288 * 13)), row_cache_host_bytes);
+    // The lane's 953-token prefill chunk: 22,872 lookups per gather.
+    const scratch = 2 * (22_872 * 324 + 32_768 * 13 + 8 * 24 * 264);
+    try testing.expectEqual(row_cache_host_bytes + scratch + 80 * (256 << 10), hostChargeBytes(953));
 }
