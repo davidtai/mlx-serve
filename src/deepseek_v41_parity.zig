@@ -7,6 +7,9 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
+/// Bank shards open past the page cache (F_NOCACHE): a test's reads leave no credited cache behind
+/// for the next window (SERVED3 found 4.2 GB).
+const bank_load: model.LoadOpts = .{ .nocache = true };
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -259,7 +262,7 @@ const EngramSide = struct {
             if (self.fds[i] < 0) return error.FileNotFound;
         }
         const res = try std.fmt.allocPrintSentinel(a, "{s}/engram/engram-residents.safetensors", .{bank_dir}, 0);
-        try model.loadSafetensorsFile(gpa, &self.weights, res.ptr, s, .{});
+        try model.loadSafetensorsFile(gpa, &self.weights, res.ptr, s, bank_load);
         return self;
     }
 
@@ -451,7 +454,7 @@ pub const Runner = struct {
             if (std.mem.indexOfScalar(u16, loaded.items, t.shard) != null) continue;
             try loaded.append(a, t.shard);
             const path = try ck.shardPath(a, t.shard);
-            try model.loadSafetensorsFile(gpa, &weights, path.ptr, cpu, .{});
+            try model.loadSafetensorsFile(gpa, &weights, path.ptr, cpu, bank_load);
         }
         const nl = layers.items.len;
         const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
@@ -641,7 +644,7 @@ pub const Runner = struct {
             const t = ck.tensors.get(try std.fmt.bufPrint(&nb, "layers.{d}.attn.wq_a.weight", .{l})) orelse return error.TensorMissing;
             if (std.mem.indexOfScalar(u16, loaded.items, t.shard) != null) continue;
             try loaded.append(a, t.shard);
-            try model.loadSafetensorsFile(gpa, &weights, (try ck.shardPath(a, t.shard)).ptr, cpu, .{});
+            try model.loadSafetensorsFile(gpa, &weights, (try ck.shardPath(a, t.shard)).ptr, cpu, bank_load);
         }
         const nl = layers.items.len;
         const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
@@ -705,7 +708,7 @@ pub const Runner = struct {
         if (eng_on) {
             src = try engram.RowSource.open(gpa, io, bank, map_path, &c, &diag);
             const res = try std.fmt.allocPrintSentinel(a, "{s}/engram/engram-residents.safetensors", .{bank}, 0);
-            try model.loadSafetensorsFile(gpa, &eweights, res.ptr, cpu, .{});
+            try model.loadSafetensorsFile(gpa, &eweights, res.ptr, cpu, bank_load);
         }
 
         const norm_t = ck.tensors.get("norm.weight") orelse return error.TensorMissing;
@@ -879,7 +882,7 @@ pub const Runner = struct {
             const t = ck.tensors.get(try std.fmt.bufPrint(&nb, "layers.{d}.attn.wq_a.weight", .{l})) orelse return error.TensorMissing;
             if (std.mem.indexOfScalar(u16, loaded.items, t.shard) != null) continue;
             try loaded.append(a, t.shard);
-            try model.loadSafetensorsFile(gpa, &weights, (try ck.shardPath(a, t.shard)).ptr, cpu, .{});
+            try model.loadSafetensorsFile(gpa, &weights, (try ck.shardPath(a, t.shard)).ptr, cpu, bank_load);
         }
         const nl = dg.layers.len;
         const lws = try a.alloc(graph.LayerW(mlx.mlx_array), nl);
@@ -1175,7 +1178,7 @@ test "dsv41 weights: every resident binds through model.loadWeights with its spe
     var diag: v41.Diag = .{};
     errdefer std.debug.print("refused: {s}\n", .{diag.message()});
     const c = try v41.Config.load(testing.allocator, testing.io, bank, &diag);
-    var w = try model.loadWeights(testing.io, testing.allocator, bank);
+    var w = try model.loadWeightsOpt(testing.io, testing.allocator, bank, bank_load);
     defer w.deinit();
     try v41.checkLoaded(&w, try v41.residentSpec(arena.allocator(), &c), &diag);
     for (0..c.n_layers) |l| _ = try bindLayer(&w, c.layers[l], @intCast(l));
