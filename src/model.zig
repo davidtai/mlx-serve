@@ -8,6 +8,7 @@ const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const deepseek_v41 = @import("deepseek_v41.zig");
+const deepseek_v41_arm = @import("deepseek_v41_arm.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -3132,7 +3133,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             log.err("deepseek_v41: {s}\n", .{diag.message()});
             return e;
         };
-        log.err("deepseek_v41: the native arch is not served yet; use the GGUF path (ds4)\n", .{});
+        // deepseek_v41_arm.zig builds the arch; the server generates with it
+        // once the arm's decode seam binds the DSpark loop (then wire it here).
+        comptime std.debug.assert(deepseek_v41_arm.serving_decode == .stand_in);
+        log.err("deepseek_v41: not served until the arm's decode seam binds the DSpark loop; dsv41-cell benchmarks the arm\n", .{});
         return error.UnsupportedDsv41NotServed;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block

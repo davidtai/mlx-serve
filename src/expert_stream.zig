@@ -355,6 +355,9 @@ pub const Stream = struct {
     /// The last event value handed out.
     gate_value: u64 = 0,
     forced_seen: i64 = 0,
+    /// The thread that built the stream (mlx-serve: the inference thread, the
+    /// only MLX caller); `grow` allocates slot memory and refuses any other.
+    owner: std.Thread.Id,
 
     const LayerSlots = struct {
         policy: LayerPolicy,
@@ -462,6 +465,7 @@ pub const Stream = struct {
             .preread = if (opt.lookahead) |la| la.preread else false,
             .event_word = word,
             .gated = opt.event != null,
+            .owner = std.Thread.getCurrentId(),
         };
         return self;
     }
@@ -812,6 +816,7 @@ pub const Stream = struct {
     /// `decode_rows` (the added rows empty, residents unmoved); routes are
     /// decode routes from here on. Needs every route released.
     pub fn grow(self: *Stream, decode_rows: []const u32) !void {
+        if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
         if (self.phase != .prefill) return error.AlreadyGrown;
         if (self.failed) return error.StreamFailed;
         if (decode_rows.len != self.layers.len) return error.InvalidRows;
@@ -1231,6 +1236,27 @@ test "dsv41 stream: growth is the one phase change" {
     try testing.expectEqual(@as(u32, 0), r.plan.n_evictions);
     try expectServed(s, &sb, r, &.{ 1, 2, 3, 4 });
     s.release(r);
+}
+
+test "dsv41 stream: growth from any thread but the one that built the stream is refused" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    const Helper = struct {
+        fn run(st: *Stream, out: *?anyerror) void {
+            st.grow(&.{ 4, 4 }) catch |e| {
+                out.* = e;
+                return;
+            };
+            out.* = null;
+        }
+    };
+    var got: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, Helper.run, .{ s, &got });
+    t.join();
+    try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), got);
+    try s.grow(&.{ 4, 4 });
 }
 
 test "dsv41 stream: a failed read fails the route and every later one" {
