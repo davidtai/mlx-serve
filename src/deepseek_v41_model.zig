@@ -616,6 +616,9 @@ pub fn Model(comptime G: type) type {
                         if (j > i and n_rows + r_ > cap) break;
                         n_rows += r_;
                     }
+                    // One sub-wave per routed group: its routed outputs, combines and HC posts are freed
+                    // once the group's new hidden states are evaluated and kept.
+                    const group_wave = g.mark();
                     const cat_xf = if (j - i == 1) xfs[i] else try g.concat(xfs[i..j], 0);
                     const idxs = try a.alloc(T, j - i);
                     for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
@@ -637,6 +640,8 @@ pub fn Model(comptime G: type) type {
                         pms[k] = g.keep(halves[k].ffn_pre);
                         releaseHalf(g, &halves[k]);
                     }
+                    try g.evalAll(hs[i..j]);
+                    g.resetTo(group_wave);
                     i = j;
                 }
                 try g.evalAll(hs);
