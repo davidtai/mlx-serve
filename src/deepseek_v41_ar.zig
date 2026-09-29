@@ -23,6 +23,7 @@ const xk = @import("exl3_kernels.zig");
 const kernel_set = @import("kernel_set.zig");
 const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
+const module = @import("deepseek_v41_module.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -117,6 +118,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const ref_path = std.mem.span(std.c.getenv("DSV41_AR_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    if (servedSchedule()) return error.SkipZigTest; // the served schedule's own test below
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -212,6 +214,166 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     });
     if (first) |i| std.debug.print("dsv41 ar: first differing step {d}: native {d}, reference {d} (reference top-2 {any}, margin {d})\n", .{ i, out[i], ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin });
     try testing.expectEqualSlices(u32, ref.generated_ids, out);
+}
+
+/// `DSV41_AR_SCHEDULE=served`: the "dsv41 ar:" harness runs the server's schedule instead of 8-row chunks.
+fn servedSchedule() bool {
+    const v = std.c.getenv("DSV41_AR_SCHEDULE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "served");
+}
+
+/// What the served-schedule run records (the ar-ref-v1 fields plus the schedule; chunk 0 = the model's own rule).
+const ServedRecord = struct {
+    format: []const u8 = reference_format,
+    schedule: []const u8 = "served",
+    trunk: []const u8 = "routes.served (deepseek_v41_module.Module, as the server constructs it)",
+    prompt_ids: []const u32,
+    chunk: u32 = 0,
+    new_tokens: u32,
+    generated_ids: []const u32,
+    generated_ids_sha256: []const u8,
+    steps: []const Step,
+    reference_ids_equal: bool,
+    first_difference: ?usize,
+    wall_ms: i64,
+};
+
+// Guarded window only (loads the bank): DSV41_AR_SCHEDULE=served DSV41_AR_REF=<ar-ref json: its prompt and
+// token count> DSV41_BANK=<bank> DSV41_AR_OUT=<new json> _GPU_WINDOW_LOCKED=1 [DSV41_AR_BASELINE_GB=<the
+// server's --memory-baseline-gb>] [DSV41_AR_ROWS=<the server's --expert-rows>]. The server's schedule through the
+// served module itself (mlx-serve Generator: generate.zig step 0 + deepseek_v41_module prefill / extend):
+// ONE forward of prompt[0 .. n-1] (Module.prefill, the model's own chunk rule, the wide routed lane), then the
+// last prompt token alone (Module.extend: the phase change first, once), then each generated id alone, greedy.
+// Records the ids and each step's logits sha256 / top-2 / margin in the ar-ref format; prints the comparison with
+// the reference's ids (the harness schedule) without judging it (the wide lane is rounding-class).
+test "dsv41 ar: the served schedule through the served module records its greedy ids" {
+    if (!servedSchedule()) return error.SkipZigTest;
+    const ref_path = std.mem.span(std.c.getenv("DSV41_AR_REF") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const out_path = std.mem.span(std.c.getenv("DSV41_AR_OUT") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, ref_path, a, .limited(16 << 20));
+    const ref = try std.json.parseFromSliceLeaky(Reference, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, ref.format, reference_format)) return error.ReferenceFormat;
+    if (ref.prompt_ids.len < 2 or ref.new_tokens == 0 or ref.generated_ids.len != ref.new_tokens) return error.ReferenceShape;
+
+    var config = try model.parseConfig(io, a, bank_dir);
+    if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    memProbe("dsv41 ar served", "start");
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const m = try module.Module.init(gpa, io, &config, &weights, s);
+    defer m.deinit();
+    memProbe("dsv41 ar served", "module constructed (kernels, arm, residents, warm-up)");
+
+    const n = ref.prompt_ids.len;
+    const out = try a.alloc(u32, ref.new_tokens);
+    const steps = try a.alloc(Step, ref.new_tokens);
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    // Step 0: every prompt token but the last in one forward (its logits are not sampled).
+    _ = mlx.mlx_array_free(try m.prefill(ref.prompt_ids[0 .. n - 1], 0));
+    memProbe("dsv41 ar served", "prompt[0 .. n-1] (one forward)");
+    var next: u32 = ref.prompt_ids[n - 1];
+    for (out, steps) |*o, *st| {
+        const logits = try m.extend(&.{next});
+        defer _ = mlx.mlx_array_free(logits);
+        st.* = try stepOf(a, logits, s);
+        next = st.top2[0];
+        o.* = next;
+    }
+    const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
+    memProbe("dsv41 ar served", "decode (the generated tokens)");
+
+    var d: [32]u8 = undefined;
+    const le = try a.alloc(u8, 4 * out.len);
+    for (out, 0..) |v, i| std.mem.writeInt(u32, le[4 * i ..][0..4], v, .little);
+    std.crypto.hash.sha2.Sha256.hash(le, &d, .{});
+    const ids_sha = std.fmt.bytesToHex(d, .lower);
+    var first: ?usize = null;
+    for (out, ref.generated_ids, 0..) |mine, theirs, i| if (mine != theirs) {
+        first = i;
+        break;
+    };
+    const rec: ServedRecord = .{
+        .prompt_ids = ref.prompt_ids,
+        .new_tokens = ref.new_tokens,
+        .generated_ids = out,
+        .generated_ids_sha256 = &ids_sha,
+        .steps = steps,
+        .reference_ids_equal = first == null,
+        .first_difference = first,
+        .wall_ms = wall_ms,
+    };
+    const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
+    std.debug.print("\ndsv41 ar served: {d} prompt tokens (one forward of {d}, then the last alone), {d} generated; ids sha256 {s}; vs the reference's ids (harness schedule): {s}; {d} ms; wrote {s}\n", .{
+        n, n - 1, out.len, &ids_sha, if (first == null) "IDENTICAL" else "DIFFER", wall_ms, out_path,
+    });
+    if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
+        i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
+    });
+}
+
+/// One step's record from the module's logits (any float dtype; hashed as the f32 row).
+fn stepOf(a: std.mem.Allocator, logits: mlx.mlx_array, s: mlx.mlx_stream) !Step {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, logits, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const n = mlx.mlx_array_size(f);
+    const row = (mlx.mlx_array_data_float32(f) orelse return error.MlxNoData)[0..n];
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(row), &d, .{});
+    const t = top2Of(row);
+    return .{ .logits_sha256 = try a.dupe(u8, &std.fmt.bytesToHex(d, .lower)), .top2 = t, .margin = @floatCast(row[t[0]] - row[t[1]]) };
+}
+
+/// The two highest entries, ties to the lower id (MLX argmax's pick for the first).
+fn top2Of(row: []const f32) [2]u32 {
+    var t: [2]u32 = if (row[1] > row[0]) .{ 1, 0 } else .{ 0, 1 };
+    for (row[2..], 2..) |v, i| {
+        if (v > row[t[0]]) {
+            t[1] = t[0]; // (not `t = .{ i, t[0] }`: the result location aliases t)
+            t[0] = @intCast(i);
+        } else if (v > row[t[1]]) t[1] = @intCast(i);
+    }
+    return t;
+}
+
+test "dsv41 ar: the served schedule's host preconditions: the top-2 rule and, on the bank, the shell config" {
+    try testing.expectEqual([2]u32{ 2, 0 }, top2Of(&.{ 1.0, 0.5, 3.0, 1.0 }));
+    try testing.expectEqual([2]u32{ 0, 1 }, top2Of(&.{ 2.0, 2.0, 1.0 }));
+    try testing.expectEqual([2]u32{ 1, 3 }, top2Of(&.{ 0.0, 5.0, 1.0, 5.0 }));
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // What Module.init reads from the shell's config: the bank dir and the Engram token map beside it.
+    const config = try model.parseConfig(testing.io, arena.allocator(), bank_dir);
+    try testing.expect(config.expert_bank_dir != null and config.engram_token_map_path != null);
+    if (std.c.getenv("DSV41_AR_REF")) |rp| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std.mem.span(rp), arena.allocator(), .limited(16 << 20));
+        const ref = try std.json.parseFromSliceLeaky(Reference, arena.allocator(), text, .{ .ignore_unknown_fields = true });
+        try testing.expectEqualStrings(reference_format, ref.format);
+        try testing.expect(ref.prompt_ids.len >= 2 and ref.generated_ids.len == ref.new_tokens);
+    }
 }
 
 pub const dspark_reference_format = "mlx-serve-dsv41-dspark-ref-v1";
