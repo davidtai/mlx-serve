@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf";
+pub const manifest_sha256 = "182e55b35a369575834ae23f29758e050056198462408138bdcac60173b74a28";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -68,6 +68,15 @@ pub const Kernel = enum {
     q3ht_combine_collapse_norm__f32_rbf16,
     q3drc_mxfp8_fma_f32x,
     q3rc_mxfp8_fma__draft,
+    // decode batch 2 (09-29): the texts the RC tiers of record still run beside the RC routes
+    dsv41_woa_decode_transpose_32,
+    mtplx_dsv41_index_topk_select,
+    q3_attnfuse_softmax,
+    q3_attnfuse_softmax__ls128,
+    dsv41_mxfp8_m1rows,
+    dsv41_head_m1rows,
+    dsv41_smallm_all,
+    dsv41_smallm_all__bf16,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -83,7 +92,7 @@ pub fn baseOf(k: Kernel) ?Kernel {
 }
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
-pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail };
+pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
@@ -146,8 +155,10 @@ fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) R
 
 // ── Signature and geometry ──
 
-/// Runtime sizes a launch depends on (the site shape supplies gn / k4 / k32 / gk).
-pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq };
+/// Runtime sizes a launch depends on (the site shape supplies gn / k4 / k32 / gk). keys: the
+/// attention's key count; ncomp / topk / width / allfin: the index top-k's compressed count, k,
+/// output width and its k >= n flag (0-d int32 scalars of the call).
+pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq, keys, ncomp, topk, width, allfin };
 pub const Vars = std.enums.EnumArray(Var, u64);
 
 /// One extent: m x value(v), or the constant m; at most `max` when set.
@@ -227,6 +238,8 @@ pub const Entry = struct {
     mlx_name: [:0]const u8,
     /// a variant's base kernel (null for a text of record)
     variant_of: ?Kernel = null,
+    /// a variant that is its base's instantiation at another launch rule (the fused softmax's ls 128)
+    launch_variant: bool = false,
     /// sha256 of the text (the variant key's first part)
     text_sha256: [32]u8,
     family: []const u8,
@@ -334,6 +347,11 @@ pub const Registry = struct {
     codebook: []const u8,
     multiplier: u64,
     ks: []const u32,
+    /// the manifest's own sha256 (hex) and the superseded manifests it lists as predecessors:
+    /// every kernel entry, text and header of a predecessor is byte-identical here (the exporter
+    /// checks it), so a fixture dumped against one still describes those kernels exactly.
+    manifest_hex: [64]u8,
+    predecessors: []const [64]u8,
 
     /// Parses the manifest, checks it against `pin` (hex sha256) and every text against it,
     /// once. Production passes `embedded` and `manifest_sha256`.
@@ -350,6 +368,8 @@ pub const Registry = struct {
             .codebook = "",
             .multiplier = 0,
             .ks = &.{},
+            .manifest_hex = got,
+            .predecessors = &.{},
         };
         errdefer reg.arena.deinit();
         const a = reg.arena.allocator();
@@ -366,7 +386,15 @@ pub const Registry = struct {
         try reg.adoptHeaders(texts, m.headers, diag);
         try reg.adoptKernels(a, texts, m.kernels, diag);
         reg.golden = try adoptGolden(m.golden, diag);
+        reg.predecessors = try adoptPredecessors(a, m.predecessors, diag);
         return reg;
+    }
+
+    /// A fixture's manifest is this one or a listed predecessor (whose kernels are unchanged here).
+    pub fn acceptsManifest(self: *const Registry, hex: []const u8) bool {
+        if (std.mem.eql(u8, hex, &self.manifest_hex)) return true;
+        for (self.predecessors) |p| if (std.mem.eql(u8, hex, &p)) return true;
+        return false;
     }
 
     pub fn deinit(self: *Registry) void {
@@ -532,7 +560,7 @@ const JText = struct { id: ?[]const u8 = null, file: []const u8, sha256: []const
 const JPin = struct { symbol: []const u8, hash_of: []const u8, sha256: []const u8, join: ?[]const u8 = null };
 const JSelfCheck = struct { checks: []const []const u8, rows_max: u32 = 0 };
 const JSite = struct { name: []const u8, N: u32, K: u32, G: u32, XS: u32, XG: u32, YS: u32, YG: u32 };
-const JVariant = struct { of: []const u8, mlx_name: []const u8 };
+const JVariant = struct { of: []const u8, mlx_name: []const u8, launch_only: bool = false };
 const JKernel = struct {
     name: []const u8,
     variant: ?JVariant = null,
@@ -562,7 +590,21 @@ const JGolden = struct {
     planes: struct { gate_up: JPlane, down: JPlane },
 };
 const JBank = struct { codebook: []const u8, multiplier: u64, K: []const u32 };
-const JManifest = struct { format: []const u8, bank: JBank, headers: []const JText, kernels: []const JKernel, golden: JGolden };
+const JPredecessor = struct { manifest_sha256: []const u8, kernels: []const []const u8, headers: []const []const u8 };
+const JManifest = struct { format: []const u8, bank: JBank, headers: []const JText, kernels: []const JKernel, golden: JGolden, predecessors: []const JPredecessor = &.{} };
+
+/// The predecessors' sha256s, each checked: 64 hex, and every kernel / header it lists is one this
+/// build embeds (a predecessor names a subset of this manifest).
+fn adoptPredecessors(a: Allocator, js: []const JPredecessor, diag: ?*Diag) (Refusal || Allocator.Error)![]const [64]u8 {
+    const out = try a.alloc([64]u8, js.len);
+    for (js, out) |j, *o| {
+        if (hexSha(j.manifest_sha256) == null) return refuse(diag, error.SchemaInvalid, "exl3 kernels: predecessor sha256 \"{s}\" is not 64 hex", .{j.manifest_sha256});
+        for (j.kernels) |name| if (std.meta.stringToEnum(Kernel, name) == null) return refuse(diag, error.SchemaInvalid, "exl3 kernels: predecessor {s} lists {s}, not a kernel of this build", .{ j.manifest_sha256[0..8], name });
+        for (j.headers) |name| if (std.meta.stringToEnum(Header, name) == null) return refuse(diag, error.SchemaInvalid, "exl3 kernels: predecessor {s} lists header {s}, not one of this build", .{ j.manifest_sha256[0..8], name });
+        @memcpy(o, j.manifest_sha256[0..64]);
+    }
+    return out;
+}
 
 fn hexSha(s: []const u8) ?[32]u8 {
     if (s.len != 64) return null;
@@ -675,6 +717,11 @@ fn sameTemplateValues(x: []const TemplateArg, y: []const TemplateArg) bool {
     return true;
 }
 
+/// x and y are a launch-only variant and its base (checked above to differ in the launch rule).
+fn launchPair(x: *const Entry, y: *const Entry) bool {
+    return (x.launch_variant and x.variant_of == y.kernel) or (y.launch_variant and y.variant_of == x.kernel);
+}
+
 fn sameInputDtypes(x: *const Entry, y: *const Entry) bool {
     if (x.inputs.len != y.inputs.len) return false;
     for (x.inputs, y.inputs) |p, q| if (p.dtype != q.dtype) return false;
@@ -684,7 +731,8 @@ fn sameInputDtypes(x: *const Entry, y: *const Entry) bool {
 /// Every variant: its base's text sha256 and header, the base's template names and kinds in
 /// order and its input names; and no two entries share (text sha256, header, template values,
 /// input dtypes): the instantiation MLX builds (the decmat mul1h / mul1 forms share a text and
-/// differ by header).
+/// differ by header). A launch-only variant is the one exception: its base's instantiation at
+/// another launch rule (the fused softmax's ls 128, a launch the kernel reads), and nothing else.
 fn checkVariants(entries: *const [n_kernels]Entry, diag: ?*Diag) Refusal!void {
     for (entries) |*e| {
         const b = &entries[@backingInt(e.variant_of orelse continue)];
@@ -699,11 +747,15 @@ fn checkVariants(entries: *const [n_kernels]Entry, diag: ?*Diag) Refusal!void {
         if (!shape_ok) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: template names / kinds are not those of {t}", .{ e.kernel, b.kernel });
         if (e.inputs.len != b.inputs.len) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
         for (e.inputs, b.inputs) |p, q| if (!std.mem.eql(u8, p.name, q.name)) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
+        if (e.launch_variant) {
+            const same_inst = e.launch == .rule and b.launch == .rule and sameTemplateValues(e.template, b.template) and sameInputDtypes(e, b);
+            if (!same_inst or std.meta.eql(e.launch.rule, b.launch.rule)) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: a launch-only variant is {t}'s instantiation at another launch rule", .{ e.kernel, b.kernel });
+        }
     }
     for (entries, 0..) |*x, i| for (entries[i + 1 ..]) |*y| {
         if (!std.mem.eql(u8, &x.text_sha256, &y.text_sha256) or x.header != y.header or !sameInputDtypes(x, y)) continue;
         const same = switch (x.launch) {
-            .rule => y.launch == .rule and sameTemplateShape(x.template, y.template) and sameTemplateValues(x.template, y.template),
+            .rule => y.launch == .rule and sameTemplateShape(x.template, y.template) and sameTemplateValues(x.template, y.template) and !launchPair(x, y),
             .plans => |xs| y.launch == .plans and for (xs) |px| {
                 const hit = for (y.launch.plans) |py| {
                     if (sameTemplateShape(px.template, py.template) and sameTemplateValues(px.template, py.template)) break true;
@@ -734,6 +786,7 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, headers
         .kernel = k,
         .mlx_name = @tagName(base orelse k),
         .variant_of = base,
+        .launch_variant = if (j.variant) |v| v.launch_only else false,
         .text_sha256 = hexSha(j.source.sha256).?,
         .family = j.family,
         .phase = j.phase,
@@ -956,13 +1009,48 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 41), n_kernels);
+    try testing.expectEqual(@as(usize, 49), n_kernels);
+    try testing.expectEqual(@as(usize, 10), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
     try testing.expect(reg.get(.q3rc_mxfp8_fma).checks.contains(.row_invariance));
     try testing.expect(reg.get(.q3_exl3_dig_decmat_5120x2304_mul1hk3).checks.contains(.golden_tiles));
     try testing.expectEqual(Header.rcproj, reg.get(.q3rc_mxfp8_fma).header.?);
+}
+
+test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the predecessor e03f9820" {
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    // the predecessor's 41 kernels are unchanged here (the exporter's check), so its fixtures stand
+    try testing.expectEqual(@as(usize, 1), reg.predecessors.len);
+    try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
+    try testing.expect(reg.acceptsManifest(manifest_sha256));
+    try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
+    // the member sites the RC tiers still run, a plan per M = 1..8 at each
+    const m1 = reg.get(.dsv41_mxfp8_m1rows);
+    try testing.expectEqual(@as(usize, 4), m1.sites.len);
+    try testing.expectEqual(@as(usize, 32), m1.launch.plans.len);
+    try testing.expect(m1.site("wq_a") == null and m1.site("engram_wkv") != null);
+    const sa = reg.get(.dsv41_smallm_all);
+    const sb = reg.get(.dsv41_smallm_all__bf16);
+    try testing.expectEqual(Kernel.dsv41_smallm_all, sb.variant_of.?);
+    try testing.expectEqual(@as(usize, 2), sa.sites.len);
+    try testing.expectEqual(@as(usize, 3), sb.sites.len);
+    try testing.expect(sa.site("moe_gate") == null);
+    try testing.expectEqual(@as(usize, 8), reg.get(.dsv41_head_m1rows).launch.plans.len);
+    // the attention softmax: one text, ls 32 up to 512 keys, ls 128 above
+    const s32 = reg.get(.q3_attnfuse_softmax);
+    const s128 = reg.get(.q3_attnfuse_softmax__ls128);
+    try testing.expectEqual([2]u64{ 65, 512 }, s32.bounds.get(.keys).?);
+    try testing.expectEqual([2]u64{ 513, 1024 }, s128.bounds.get(.keys).?);
+    try testing.expectEqual([3]u32{ 128, 1, 1 }, s128.launch.rule.threadgroup);
+    try testing.expectEqual(Header.attnfuse, s32.header.?);
+    // the index top-k's scalars read their own vars; the ring transpose has no rows
+    const it = reg.get(.mtplx_dsv41_index_topk_select);
+    try testing.expectEqual(Var.ncomp, it.inputs[2].domain.of.?);
+    try testing.expectEqual(mlx.mlx_dtype.bool_, it.outputs[1].dtype);
+    try testing.expect(reg.get(.dsv41_woa_decode_transpose_32).bounds.get(.rows) == null);
 }
 
 test "dsv41 kernels: a tampered source or header text is refused, by name" {
@@ -1125,6 +1213,8 @@ test "dsv41 kernels: a variant that is not its base's text at new template value
         .{ .anchor = "\"name\": \"q3rc_gate_part__n128\"", .needle = "\"mlx_name\": \"q3rc_gate_part\"", .replacement = "\"mlx_name\": \"q3rc_premix_part\"", .names = "q3rc_gate_part__n128" },
         // a template kind that is not the base's
         .{ .anchor = "\"name\": \"q3ht_combine__f32\"", .needle = "\"dtype\": \"float32\",\n     \"name\": \"OT\"", .replacement = "\"int\": 32,\n     \"name\": \"OT\"", .names = "q3ht_combine__f32" },
+        // a "launch-only" variant whose template values are not its base's (a new instantiation)
+        .{ .anchor = "\"name\": \"q3rc_gate_part__n128\"", .needle = "\"mlx_name\": \"q3rc_gate_part\"", .replacement = "\"launch_only\": true, \"mlx_name\": \"q3rc_gate_part\"", .names = "q3rc_gate_part__n128" },
     };
     for (cases) |c| {
         const m = try replaceAfter(a, embedded.manifest, c.anchor, c.needle, c.replacement);

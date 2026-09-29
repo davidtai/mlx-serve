@@ -33,6 +33,8 @@ pub const Refusal = error{
     RowsOutOfPlan,
     /// A routed row naming a slot outside its call's bank.
     SlotOutOfBank,
+    /// An attention key count outside the fused softmax's range (64 < k <= 1024): the stock chain's.
+    KeysOutOfPlan,
 };
 
 fn refuse(diag: ?*xk.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
@@ -203,10 +205,20 @@ fn RowPlans(comptime G: type, comptime n: usize) type {
 
         /// `site`: a plan kernel's site (rcproj sites; "" for sinkhorn), null for a rule kernel.
         fn init(g: *G, e: *const Entry, site: ?[]const u8, diag: ?*xk.Diag) !Self {
+            return initAt(g, e, site, &no_vars, diag);
+        }
+
+        /// As `init` at the fixed values `base` of the kernel's other vars (the attention's key
+        /// count): the table varies M only.
+        fn initAt(g: *G, e: *const Entry, site: ?[]const u8, base: *const Vars, diag: ?*xk.Diag) !Self {
             const b = e.bounds.get(.rows) orelse return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} has no row bound", .{e.kernel});
             if (b[0] != 1 or b[1] != n) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} takes rows {d}..{d}, the route's table 1..{d}", .{ e.kernel, b[0], b[1], n });
             var p: Self = .{ .e = e, .cfg = undefined, .prep = undefined };
-            for (&p.cfg, 1..) |*c, m| c.* = xk.launchFor(e, &rowsVars(m), site) catch return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} has no plan at site {?s} rows {d}", .{ e.kernel, site, m });
+            for (&p.cfg, 1..) |*c, m| {
+                var vars = base.*;
+                vars.set(.rows, m);
+                c.* = xk.launchFor(e, &vars, site) catch return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} has no plan at site {?s} rows {d}", .{ e.kernel, site, m });
+            }
             if (prepared) {
                 var built: usize = 0;
                 errdefer for (p.prep[0..built]) |*x| g.releasePrepared(x);
@@ -744,6 +756,290 @@ pub fn FusedProj(comptime G: type) type {
             const p = if (dir == .fwd) &self.fwd_p else &self.inv_p;
             try p.launch(g, rows, &.{ try g.reshape(x, &.{ @intCast(rows), 64, 512 }), cos, sin, self.ints[rows - 1], self.ints[seq - 1] }, &out);
             return g.reshape(out[0], sh.slice());
+        }
+    };
+}
+
+// ── Decode batch 2: the texts the RC tiers of record still run beside the RC routes ──
+
+/// The native pipeline's wo_a expansion (`fused_transpose.make_transpose`): one layer's packed
+/// mxfp8 wo_a -> bf16 [8, 4096, 1024], the layout the o-LoRA matmul reads. On the RC tiers
+/// (RCPROJ woarc) the decode ring is never filled: a prefill-sized M expands the layer's wo_a on
+/// demand and matmuls (`make_woarc_call`). One fixed launch, built once.
+pub fn WoaRingTranspose(comptime G: type) type {
+    const prepared = declaresFn(G, "prepareLaunch");
+    return struct {
+        const Self = @This();
+        e: *const Entry,
+        cfg: LaunchConfig,
+        prep: if (prepared) G.Prepared else void,
+
+        pub fn init(g: *G, reg: *const xk.Registry) !Self {
+            const e = reg.get(.dsv41_woa_decode_transpose_32);
+            var s: Self = .{ .e = e, .cfg = xk.launchFor(e, &no_vars, null) catch unreachable, .prep = undefined };
+            if (prepared) s.prep = try g.prepareLaunch(e.kernel, &s.cfg);
+            return s;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            if (prepared) g.releasePrepared(&self.prep);
+        }
+
+        /// A layer's pair, checked once when the layer binds it (not per call).
+        pub fn checkLayer(self: *const Self, g: *G, packed_w: G.T, scales: G.T, diag: ?*xk.Diag) Refusal!void {
+            try expectInput(G, g, self.e, "packed", packed_w, &no_vars, diag);
+            try expectInput(G, g, self.e, "scales", scales, &no_vars, diag);
+        }
+
+        /// packed u32 [8192, 1024] (e4m3 codes, 4 per word), scales u8 [8192, 128] (e8m0) ->
+        /// bf16 [8, 4096, 1024] = T(scale * e4m3(code)), transposed per o-LoRA group.
+        pub fn call(self: *const Self, g: *G, packed_w: G.T, scales: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            if (prepared) {
+                try g.launchPrepared(&self.prep, &.{ packed_w, scales }, &out);
+            } else {
+                try g.launch(self.e.kernel, &.{ packed_w, scales }, &self.cfg, &out);
+            }
+            return out[0];
+        }
+    };
+}
+
+/// DSV41_INDEX_TOPK=metal (`q3_indextopk_candidate.metal_select`): the DSA indexer's row
+/// selection in one dispatch (radix select + one ascending emit pass), decode / verify rows.
+/// k = min(512, N) and the output width = k on the tier (ATTN_CORE_COMPILE / K29 off); the flag
+/// is k >= N. N (the compressed count) grows during decode, so each call builds its launch
+/// config and its N / k scalars (the lane's own per-call ints); the 0 / 1 flags are built once.
+pub fn IndexTopk(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        pub const index_topk = 512;
+        e: *const Entry,
+        flag: [2]G.T,
+
+        pub fn init(g: *G, reg: *const xk.Registry) !Self {
+            var s: Self = .{ .e = reg.get(.mtplx_dsv41_index_topk_select), .flag = undefined };
+            var built: usize = 0;
+            errdefer for (s.flag[0..built]) |x| g.release(x);
+            for (&s.flag, 0..) |*f, i| {
+                const v: i32 = @intCast(i);
+                f.* = g.keep(try g.hostArray(std.mem.asBytes(&v), &.{}, .int32));
+                built += 1;
+            }
+            return s;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            for (self.flag) |x| g.release(x);
+        }
+
+        /// score f32 [M, N] (the indexer's final scores, -inf outside reach / candidates), clen
+        /// int32 [M] -> .{ sel int32 [M, k] (ascending selected indices, -1 padded), mask bool
+        /// [M, N] }, M = 1..8, N >= 1.
+        pub fn select(self: *const Self, g: *G, score: G.T, clen: G.T) ![2]G.T {
+            const sh = dims(G, g, score);
+            if (sh.n != 2) return error.RouteInput;
+            const rows: u64 = @intCast(sh.d[0]);
+            const n: u64 = @intCast(sh.d[1]);
+            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            if (n < 1) return error.RouteInput;
+            const k = @min(index_topk, n);
+            var vars: Vars = .initFill(0);
+            vars.set(.rows, rows);
+            vars.set(.ncomp, n);
+            vars.set(.topk, k);
+            vars.set(.width, k);
+            const cfg = xk.launchFor(self.e, &vars, null) catch unreachable;
+            const n32: i32 = @intCast(n);
+            const k32: i32 = @intCast(k);
+            const n_arr = try g.hostArray(std.mem.asBytes(&n32), &.{}, .int32);
+            const k_arr = try g.hostArray(std.mem.asBytes(&k32), &.{}, .int32);
+            var out: [2]G.T = undefined;
+            try g.launch(self.e.kernel, &.{ score, clen, n_arr, k_arr, k_arr, self.flag[@intFromBool(k >= n)] }, &cfg, &out);
+            return out;
+        }
+    };
+}
+
+/// DSV41_ATTN_FUSE=softmax (`q3_attnfuse_candidate.make_fused`): the verify attention's scale /
+/// mask / sink-softmax chain in one kernel, one threadgroup per (row, head); ls = MLX's
+/// row_reduce_simple threadgroup (32 for k <= 512, 128 for 512 < k <= 1024). The tier's two key
+/// counts (128 on the window-only layers, 640 elsewhere) launch from per-M tables built here;
+/// another k in (64, 1024] (warm-up, fewer compressed rows than index_topk) builds its launch per
+/// call. Rows > 8 or another k are the stock chain's (the lane's route).
+pub fn AttnSoftmax(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        pub const heads = 64;
+        ls32: *const Entry,
+        ls128: *const Entry,
+        statics: Statics(G),
+        k128: RowPlans(G, max_rows),
+        k640: RowPlans(G, max_rows),
+
+        pub fn init(g: *G, reg: *const xk.Registry, diag: ?*xk.Diag) !Self {
+            const ls32 = reg.get(.q3_attnfuse_softmax);
+            const ls128 = reg.get(.q3_attnfuse_softmax__ls128);
+            var v128: Vars = .initFill(0);
+            v128.set(.keys, 128);
+            var v640: Vars = .initFill(0);
+            v640.set(.keys, 640);
+            var k128: RowPlans(G, max_rows) = try .initAt(g, ls32, null, &v128, diag);
+            errdefer k128.deinit(g);
+            var k640: RowPlans(G, max_rows) = try .initAt(g, ls128, null, &v640, diag);
+            errdefer k640.deinit(g);
+            return .{ .ls32 = ls32, .ls128 = ls128, .statics = try Statics(G).init(g, ls32), .k128 = k128, .k640 = k640 };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.k128.deinit(g);
+            self.k640.deinit(g);
+            self.statics.deinit(g);
+        }
+
+        /// qk f32 [1, M, 64, k] (the UNSCALED QK), valid bool [1, M, k] (a strided view is
+        /// fine), sink f32 [1, 1, 64, 1] -> .{ ex f32 [1, M, 64, k], denom f32 [1, M, 64, 1] }.
+        pub fn call(self: *const Self, g: *G, qk: G.T, valid: G.T, sink: G.T) ![2]G.T {
+            const sh = dims(G, g, qk);
+            if (sh.n != 4) return error.RouteInput;
+            const rows: u64 = @intCast(sh.d[1]);
+            const k: u64 = @intCast(sh.d[3]);
+            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            const ins = [_]G.T{ qk, valid, sink, self.statics.arrays[3] };
+            var out: [2]G.T = undefined;
+            if (k == 128) {
+                try self.k128.launch(g, rows, &ins, &out);
+            } else if (k == 640) {
+                try self.k640.launch(g, rows, &ins, &out);
+            } else if (k > 64 and k <= 1024) {
+                const e = if (k <= 512) self.ls32 else self.ls128;
+                var vars: Vars = .initFill(0);
+                vars.set(.rows, rows);
+                vars.set(.keys, k);
+                const cfg = xk.launchFor(e, &vars, null) catch unreachable;
+                try g.launch(e.kernel, &ins, &cfg, &out);
+            } else return error.KeysOutOfPlan;
+            return out;
+        }
+    };
+}
+
+/// The minvariant mxfp8 member's sites the RC tiers still run (RCPROJ mxfp8 owns wq_a / wkv /
+/// wq_b / wo_b there): the indexer wq_b, the shared expert, the Engram wkv.
+pub const M1Site = enum { indexer_wq_b, shared_w1_w3, shared_w2, engram_wkv };
+
+/// DSV41_MXFP8_ROWS=m1order at one site (`M1Rows.run`): x [M, K] bf16 -> y [M, N] bf16, each
+/// row in MLX's M = 1 mxfp8_qmv_fast order, at the lane's pinned (R, V) per M (M = 1: R 4, V 1).
+pub fn Mxfp8Rows(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        site: M1Site,
+        plans: RowPlans(G, max_rows),
+        w: G.T,
+        scales: G.T,
+
+        /// `w` the packed mxfp8 weight (u32 [N, K / 4]), `scales` its e8m0 scales (u8 [N, K / 32]).
+        pub fn init(g: *G, reg: *const xk.Registry, site: M1Site, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
+            const e = reg.get(.dsv41_mxfp8_m1rows);
+            const s = e.site(@tagName(site)) orelse unreachable;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(s, &vars);
+            try expectInput(G, g, e, "w", w, &vars, diag);
+            try expectInput(G, g, e, "scales", scales, &vars, diag);
+            return .{ .e = e, .site = site, .plans = try .init(g, e, @tagName(site), diag), .w = g.keep(w), .scales = g.keep(scales) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.plans.deinit(g);
+            g.release(self.w);
+            g.release(self.scales);
+        }
+
+        /// x [M, K] bf16 (row-contiguous), M = 1..8 -> y [M, N] bf16.
+        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try self.plans.launch(g, rowsOf(G, g, x, 0), &.{ self.w, self.scales, x }, &out);
+            return out[0];
+        }
+    };
+}
+
+/// The minvariant woa_head member's head route (`Kernels.run_head`): the bf16 output head at
+/// M = 1..8 in MLX's M = 1 gemv order (the verify's M 2..8; the draft head's W103 call). RCTAIL
+/// headpad (M 5 / 7 -> the same call on M + 1 rows, a zero row appended, the first M kept) is
+/// the caller's.
+pub fn HeadRows(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        plans: RowPlans(G, max_rows),
+        w: G.T,
+
+        /// `w` the bf16 head weight [129280, 5120].
+        pub fn init(g: *G, reg: *const xk.Registry, w: G.T, diag: ?*xk.Diag) !Self {
+            const e = reg.get(.dsv41_head_m1rows);
+            try expectInput(G, g, e, "w", w, &no_vars, diag);
+            return .{ .e = e, .plans = try .init(g, e, "", diag), .w = g.keep(w) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.plans.deinit(g);
+            g.release(self.w);
+        }
+
+        /// x [M, 5120] bf16, M = 1..8 -> y [M, 129280] bf16.
+        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try self.plans.launch(g, rowsOf(G, g, x, 0), &.{ self.w, x }, &out);
+            return out[0];
+        }
+    };
+}
+
+/// The minvariant attention member's sites the RC tiers still run (RCTAIL owns the HC premix and
+/// the MoE gate there): the compressor wkv / wgate (f32 x on the ratio-2 layers, bf16 on ratio 1),
+/// the indexer wk (f32 / bf16 latent) and the indexer weights_proj (bf16).
+pub const SmallMSite = enum { cmp_f32, wk_f32, cmp_bf16, wk_bf16, wproj };
+
+/// DSV41_ATTN_KERNEL=smallm_all at one site (`SmallMAll.run`): a [M, K] -> out [M, N], each row
+/// in MLX's M = 1 gemv order; f32 x sites on dsv41_smallm_all (f32 out), bf16 x sites on its
+/// __bf16 variant (bf16 out); w [N, K] bf16.
+pub fn SmallM(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        site: SmallMSite,
+        plans: RowPlans(G, max_rows),
+        w: G.T,
+
+        pub fn init(g: *G, reg: *const xk.Registry, site: SmallMSite, w: G.T, diag: ?*xk.Diag) !Self {
+            const e = switch (site) {
+                .cmp_f32, .wk_f32 => reg.get(.dsv41_smallm_all),
+                .cmp_bf16, .wk_bf16, .wproj => reg.get(.dsv41_smallm_all__bf16),
+            };
+            const s = e.site(@tagName(site)) orelse unreachable;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(s, &vars);
+            try expectInput(G, g, e, "w", w, &vars, diag);
+            return .{ .e = e, .site = site, .plans = try .init(g, e, @tagName(site), diag), .w = g.keep(w) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.plans.deinit(g);
+            g.release(self.w);
+        }
+
+        /// a [M, K] (the site's x dtype), M = 1..8 -> out [M, N].
+        pub fn call(self: *const Self, g: *G, a: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try self.plans.launch(g, rowsOf(G, g, a, 0), &.{ a, self.w }, &out);
+            return out[0];
         }
     };
 }
@@ -1643,6 +1939,14 @@ const Trace = struct {
     }
 };
 
+/// The decode batch 2 families (their routes' own test covers them).
+fn isDecode2(e: *const Entry) bool {
+    inline for (.{ "woa_ring_transpose", "index_topk", "attn_fuse", "minv_mxfp8_rows", "minv_woa_head", "minv_smallm" }) |f| {
+        if (std.mem.eql(u8, e.family, f)) return true;
+    }
+    return false;
+}
+
 fn testRegistry() !xk.Registry {
     var diag: xk.Diag = .{};
     return xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
@@ -1913,9 +2217,9 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     for (t.launches.items) |l| hit.insert(l.k);
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
-    // only) and the DRAFTRC entries (the draft routes' own test covers those)
+    // only), the DRAFTRC entries and decode batch 2 (their routes' own tests cover those)
     for (reg.entries) |e| {
-        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_");
+        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e);
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
@@ -2650,14 +2954,16 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
                     launches += try expectRowPlans(32, &t, e, "");
                     continue;
                 }
+                if (e.sites.len == 0) launches += try expectRowPlans(8, &t, e, ""); // the bf16 head (M plans)
                 for (e.sites) |s| launches += try expectRowPlans(8, &t, e, s.name);
             },
         }
     }
-    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2, PREP 4
-    try testing.expectEqual(@as(usize, 24), rule);
-    // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, sinkhorn16 (32 n)
-    try testing.expectEqual(@as(usize, 6 * 48 + 18 * 8 + (6 + 3 + 8) * 8 + 32), launches);
+    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2, PREP 4; index top-k 1, softmax 2
+    try testing.expectEqual(@as(usize, 27), rule);
+    // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
+    // sinkhorn16 (32 n), the head (8 M)
+    try testing.expectEqual(@as(usize, 6 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
     // a route refuses M outside its table before any launch; its prepared configs are released
     const n_launch = t.launches.items.len;
@@ -2722,4 +3028,133 @@ test "dsv41 kernels ops: the routes launch the same through the profiling backen
     acc.deinit(&pt);
     try testing.expect(pt.inner.launcher == null);
     try testing.expectEqual(@as(isize, 0), pt.inner.prepared_live);
+}
+
+test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at the lanes' sizes, tabled where M is the one varying size" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    // the wo_a ring transpose: one fixed launch, prepared once; a layer's pair is checked once
+    {
+        const e = reg.get(.dsv41_woa_decode_transpose_32);
+        var r = try WoaRingTranspose(Trace).init(&t, &reg);
+        defer r.deinit(&t);
+        const pw = try t.arg(e, "packed", &no_vars);
+        const sc = try t.arg(e, "scales", &no_vars);
+        try r.checkLayer(&t, pw, sc, null);
+        _ = try r.call(&t, pw, sc);
+        try testing.expect(t.back(1).prepared);
+        try expectLaunch(t.back(1), e, &e.samples[0], &.{ pw, sc });
+        try testing.expectError(error.RouteInput, r.checkLayer(&t, try t.node(&.{ 8192, 512 }, .uint32, &.{}), sc, null));
+    }
+    // index top-k: N grows during decode, so a per-call launch; N / k scalars per call, the flag prebuilt
+    {
+        const e = reg.get(.mtplx_dsv41_index_topk_select);
+        var r = try IndexTopk(Trace).init(&t, &reg);
+        defer r.deinit(&t);
+        for (e.samples) |*s| {
+            const m: c_int = @intCast(s.vars.get(.rows));
+            const n: c_int = @intCast(s.vars.get(.ncomp));
+            const score = try t.node(&.{ m, n }, .float32, &.{});
+            const clen = try t.node(&.{m}, .int32, &.{});
+            _ = try r.select(&t, score, clen);
+            const l = t.back(1);
+            try testing.expect(!l.prepared);
+            try testing.expectEqual(r.flag[@intCast(s.vars.get(.allfin))], l.inputs[5]);
+            try testing.expectEqual(l.inputs[3], l.inputs[4]); // the width is k on the tier
+            try testing.expectEqual(@as(i32, n), std.mem.bytesToValue(i32, t.nodes.items[l.inputs[2]].bytes[0..4]));
+            try testing.expectEqual(@as(i32, @intCast(s.vars.get(.topk))), std.mem.bytesToValue(i32, t.nodes.items[l.inputs[3]].bytes[0..4]));
+            try expectLaunch(l, e, s, &.{ score, clen, l.inputs[2], l.inputs[3], l.inputs[4], l.inputs[5] });
+        }
+        try testing.expectError(error.RowsOutOfPlan, r.select(&t, try t.node(&.{ 9, 600 }, .float32, &.{}), try t.node(&.{9}, .int32, &.{})));
+    }
+    // the fused softmax: the tier's 128 / 640 keys from per-M tables, other keys per call, by ls
+    {
+        const e32 = reg.get(.q3_attnfuse_softmax);
+        const e128 = reg.get(.q3_attnfuse_softmax__ls128);
+        var r = try AttnSoftmax(Trace).init(&t, &reg, null);
+        defer r.deinit(&t);
+        const sink = try t.node(&.{ 1, 1, 64, 1 }, .float32, &.{});
+        for ([_]*const Entry{ e32, e128 }) |e| for (e.samples) |*s| {
+            const m: c_int = @intCast(s.vars.get(.rows));
+            const k: c_int = @intCast(s.vars.get(.keys));
+            const qk = try t.node(&.{ 1, m, 64, k }, .float32, &.{});
+            const valid = try t.node(&.{ 1, m, k }, .bool_, &.{});
+            _ = try r.call(&t, qk, valid, sink);
+            try testing.expect(t.back(1).prepared);
+            try expectLaunch(t.back(1), e, s, &.{ qk, valid, sink, r.statics.arrays[3] });
+        };
+        for ([_]c_int{ 65, 300, 512, 513, 1000, 1024 }) |k| {
+            _ = try r.call(&t, try t.node(&.{ 1, 3, 64, k }, .float32, &.{}), try t.node(&.{ 1, 3, k }, .bool_, &.{}), sink);
+            const l = t.back(1);
+            try testing.expect(!l.prepared);
+            try testing.expectEqual(if (k <= 512) Kernel.q3_attnfuse_softmax else Kernel.q3_attnfuse_softmax__ls128, l.k);
+            try testing.expectEqual([3]u32{ if (k <= 512) 32 else 128, 64, 3 }, l.cfg.grid);
+            try testing.expectEqual(@as(c_int, k), l.cfg.out_shapes[0][3]);
+        }
+        for ([_]c_int{ 64, 1025 }) |k| try testing.expectError(error.KeysOutOfPlan, r.call(&t, try t.node(&.{ 1, 2, 64, k }, .float32, &.{}), try t.node(&.{ 1, 2, k }, .bool_, &.{}), sink));
+        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 1, 9, 64, 128 }, .float32, &.{}), try t.node(&.{ 1, 9, 128 }, .bool_, &.{}), sink));
+    }
+    // the mxfp8 m1order sites the RC tiers still run: the lane's own launches, prepared per M
+    {
+        const e = reg.get(.dsv41_mxfp8_m1rows);
+        inline for (.{ M1Site.indexer_wq_b, M1Site.shared_w1_w3, M1Site.shared_w2, M1Site.engram_wkv }) |site| {
+            const st = e.site(@tagName(site)).?;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(st, &vars);
+            var r = try Mxfp8Rows(Trace).init(&t, &reg, site, try t.arg(e, "w", &vars), try t.arg(e, "scales", &vars), null);
+            defer r.deinit(&t);
+            for (e.samples) |*s| if (std.mem.eql(u8, s.site.?, @tagName(site))) {
+                const x = try t.node(&.{ @intCast(s.vars.get(.rows)), @intCast(st.K) }, .bfloat16, &.{});
+                _ = try r.call(&t, x);
+                try testing.expect(t.back(1).prepared);
+                try expectLaunch(t.back(1), e, s, &.{ r.w, r.scales, x });
+            };
+            try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, @intCast(st.K) }, .bfloat16, &.{})));
+        }
+        var vars: Vars = .initFill(0);
+        xk.siteVars(e.site("shared_w2").?, &vars);
+        try testing.expectError(error.RouteInput, Mxfp8Rows(Trace).init(&t, &reg, .indexer_wq_b, try t.arg(e, "w", &vars), try t.arg(e, "scales", &vars), null));
+    }
+    // the bf16 head: a plan per M
+    {
+        const e = reg.get(.dsv41_head_m1rows);
+        var r = try HeadRows(Trace).init(&t, &reg, try t.arg(e, "w", &no_vars), null);
+        defer r.deinit(&t);
+        for (e.samples) |*s| {
+            const x = try t.node(&.{ @intCast(s.vars.get(.rows)), 5120 }, .bfloat16, &.{});
+            _ = try r.call(&t, x);
+            try testing.expect(t.back(1).prepared);
+            try expectLaunch(t.back(1), e, s, &.{ r.w, x });
+        }
+        try testing.expectError(error.RouteInput, HeadRows(Trace).init(&t, &reg, try t.node(&.{ 129280, 5120 }, .float16, &.{}), null));
+    }
+    // smallm_all's live sites: f32 x on the text of record, bf16 x on its variant
+    {
+        inline for (.{ SmallMSite.cmp_f32, SmallMSite.wk_f32, SmallMSite.cmp_bf16, SmallMSite.wk_bf16, SmallMSite.wproj }) |site| {
+            const e = reg.get(if (site == .cmp_f32 or site == .wk_f32) .dsv41_smallm_all else .dsv41_smallm_all__bf16);
+            const st = e.site(@tagName(site)).?;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(st, &vars);
+            var r = try SmallM(Trace).init(&t, &reg, site, try t.arg(e, "w", &vars), null);
+            defer r.deinit(&t);
+            try testing.expectEqual(e, r.e);
+            for (e.samples) |*s| if (std.mem.eql(u8, s.site.?, @tagName(site))) {
+                const a = try t.node(&.{ @intCast(s.vars.get(.rows)), @intCast(st.K) }, e.inputs[0].dtype, &.{});
+                _ = try r.call(&t, a);
+                try testing.expect(t.back(1).prepared);
+                try expectLaunch(t.back(1), e, s, &.{ a, r.w });
+            };
+        }
+        const e = reg.get(.dsv41_smallm_all);
+        var vars: Vars = .initFill(0);
+        xk.siteVars(e.site("cmp_f32").?, &vars);
+        try testing.expectError(error.RouteInput, SmallM(Trace).init(&t, &reg, .cmp_f32, try t.node(&.{ 512, 5120 }, .float32, &.{}), null));
+    }
+    // every decode batch 2 entry was launched through its route
+    var hit: std.EnumSet(Kernel) = .empty;
+    for (t.launches.items) |l| hit.insert(l.k);
+    for (reg.entries) |e| if (isDecode2(&e)) try testing.expect(hit.contains(e.kernel));
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
 }

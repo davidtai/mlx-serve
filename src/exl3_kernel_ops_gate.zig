@@ -176,6 +176,7 @@ const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: [
 
 const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
 const draft_fixture_format = "mlx-serve-exl3-kernel-draft-fixture-v1";
+const decode2_fixture_format = "mlx-serve-exl3-kernel-decode2-fixture-v1";
 const golden: u64 = 0x9E3779B97F4A7C15;
 
 fn sm(seed: u64, i: u64) u64 {
@@ -188,7 +189,7 @@ fn sm(seed: u64, i: u64) u64 {
 fn dtypeOf(name: []const u8) Dtype {
     const map = [_]struct { []const u8, Dtype }{
         .{ "float32", .float32 }, .{ "float16", .float16 }, .{ "bfloat16", .bfloat16 }, .{ "int16", .int16 },
-        .{ "int32", .int32 },     .{ "uint32", .uint32 },   .{ "uint8", .uint8 },
+        .{ "int32", .int32 },     .{ "uint32", .uint32 },   .{ "uint8", .uint8 },       .{ "bool", .bool_ },
     };
     for (map) |m| if (std.mem.eql(u8, m[0], name)) return m[1];
     unreachable;
@@ -196,7 +197,7 @@ fn dtypeOf(name: []const u8) Dtype {
 
 fn size(dt: Dtype) usize {
     return switch (dt) {
-        .uint8 => 1,
+        .uint8, .bool_ => 1,
         .int16, .float16, .bfloat16 => 2,
         .int32, .uint32, .float32 => 4,
         else => unreachable,
@@ -205,7 +206,7 @@ fn size(dt: Dtype) usize {
 
 fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
     switch (dt) {
-        .uint8 => b[i] = @truncate(v),
+        .uint8, .bool_ => b[i] = @truncate(v),
         .int32, .uint32 => std.mem.writeInt(u32, b[i * 4 ..][0..4], @truncate(v), .little),
         else => unreachable,
     }
@@ -215,9 +216,9 @@ fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
 fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
     const b = try a.alloc(u8, n * size(dt));
     errdefer a.free(b);
-    const kind = std.meta.stringToEnum(enum { bits, uniform, index, range, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
+    const kind = std.meta.stringToEnum(enum { bits, bf16bits, uniform, index, range, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
     switch (kind) {
-        .bits => {
+        .bits, .bf16bits => {
             var w: usize = 0;
             while (w * 8 < b.len) : (w += 1) {
                 var le: [8]u8 = undefined;
@@ -225,6 +226,11 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
                 const end = @min(b.len, w * 8 + 8);
                 @memcpy(b[w * 8 .. end], le[0 .. end - w * 8]);
             }
+            // bf16bits: the stream's u16 words as bf16, exponent pinned to 0x78..0x7B
+            if (kind == .bf16bits) for (0..n) |i| {
+                const v = std.mem.readInt(u16, b[i * 2 ..][0..2], .little);
+                std.mem.writeInt(u16, b[i * 2 ..][0..2], (v & 0x807F) | ((0x78 + ((v >> 7) & 3)) << 7), .little);
+            };
         },
         .uniform => for (0..n) |i| {
             const t = @as(f64, @floatFromInt(sm(gen.seed, i) >> 11)) * 0x1p-53;
@@ -335,6 +341,49 @@ fn in(ins: *std.StringHashMapUnmanaged(mlx.mlx_array), name: []const u8) mlx.mlx
 fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.StringHashMapUnmanaged(mlx.mlx_array), outs: *[16]mlx.mlx_array) !usize {
     const f = c.family;
     const eq = std.mem.eql;
+    // decode batch 2 (dump_kernel_decode2_fixture.py): the members the RC tiers still run,
+    // ATTN_FUSE softmax, INDEX_TOPK and the wo_a ring transpose
+    if (eq(u8, f, "woa_transpose")) {
+        var r = try ops.WoaRingTranspose(MlxG).init(g, reg);
+        defer r.deinit(g);
+        try r.checkLayer(g, in(ins, "packed"), in(ins, "scales"), null);
+        outs[0] = try r.call(g, in(ins, "packed"), in(ins, "scales"));
+        return 1;
+    }
+    if (eq(u8, f, "index_topk")) {
+        var r = try ops.IndexTopk(MlxG).init(g, reg);
+        defer r.deinit(g);
+        outs[0..2].* = try r.select(g, in(ins, "score"), in(ins, "clen"));
+        return 2;
+    }
+    if (eq(u8, f, "attn_fuse")) {
+        var r = try ops.AttnSoftmax(MlxG).init(g, reg, null);
+        defer r.deinit(g);
+        outs[0..2].* = try r.call(g, in(ins, "qk"), in(ins, "valid"), in(ins, "sink"));
+        return 2;
+    }
+    // x1..x8: one call per M on the case's one weight
+    const x_names = [_][]const u8{ "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8" };
+    if (eq(u8, f, "mxfp8_rows")) {
+        const site = std.meta.stringToEnum(ops.M1Site, c.site.?) orelse return error.FixtureSite;
+        var r = try ops.Mxfp8Rows(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
+    if (eq(u8, f, "head_rows")) {
+        var r = try ops.HeadRows(MlxG).init(g, reg, in(ins, "w"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
+    if (eq(u8, f, "smallm")) {
+        const site = std.meta.stringToEnum(ops.SmallMSite, c.site.?) orelse return error.FixtureSite;
+        var r = try ops.SmallM(MlxG).init(g, reg, site, in(ins, "w"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
     // DRAFTRC (dump_draftrc_fixture.py): the draft routes, outputs in the dump's order
     if (eq(u8, f, "draft_proj")) {
         const site = std.meta.stringToEnum(ops.DraftSite, c.site.?) orelse return error.FixtureSite;
@@ -565,13 +614,15 @@ fn replayFixture(dir: []const u8, format: []const u8, filter: ?[]const u8, recei
     defer parsed.deinit();
     const spec = parsed.value;
     try testing.expectEqualStrings(format, spec.format);
-    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
     var diag: xk.Diag = .{};
     var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
         std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
         return e;
     };
     defer reg.deinit();
+    // this manifest or a predecessor whose kernels are unchanged here (the exporter's check)
+    if (!reg.acceptsManifest(spec.manifest_sha256)) std.debug.print("fixture manifest {s} is neither {s} nor a predecessor\n", .{ spec.manifest_sha256, xk.manifest_sha256 });
+    try testing.expect(reg.acceptsManifest(spec.manifest_sha256));
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var bound = try reg.bind(stream, &diag);
@@ -624,6 +675,14 @@ test "dsv41 kernels ops gpu: the DRAFTRC routes reproduce the lane's own draft k
     try replayFixture(dir, draft_fixture_format, null, std.c.getenv("DSV41_KERNEL_DRAFT_RECEIPT"), "kernel draft gate");
 }
 
+// The guarded window only (decode batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DECODE2_FIXTURE=<dir>
+// (the dump_kernel_decode2_fixture.py fixture); DSV41_KERNEL_DECODE2_RECEIPT=<path> keeps the lines.
+test "dsv41 kernels ops gpu: the decode batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_DECODE2_FIXTURE") orelse return error.SkipZigTest);
+    try replayFixture(dir, decode2_fixture_format, null, std.c.getenv("DSV41_KERNEL_DECODE2_RECEIPT"), "kernel decode2 gate");
+}
+
 // The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
 // DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
 test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
@@ -639,13 +698,13 @@ test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own di
     defer parsed.deinit();
     const spec = parsed.value;
     try testing.expectEqualStrings(prefill_format, spec.format);
-    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
     var diag: xk.Diag = .{};
     var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
         std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
         return e;
     };
     defer reg.deinit();
+    try testing.expect(reg.acceptsManifest(spec.manifest_sha256));
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var bound = try reg.bind(stream, &diag);
@@ -693,6 +752,9 @@ test "dsv41 kernels ops: the fixture generators are the dump's (sha256 of its --
         .{ .{ .kind = "wave_table", .slots = &.{ 3, 0, 2 }, .rows = &.{ 70, 37, 20 }, .tiles = 72 }, .int32, 80, "e7c9e15972414d0b85f223fc695913b94650858ba19f877f499ff124961b2968" },
         .{ .{ .kind = "slots16", .slots = &.{ 3, 1 } }, .int32, 16, "631b74d731b6e3635ad3bf3bb463aba6f2c678e26f9aa0fb5f5ca4b6d1d29f2f" },
         .{ .{ .kind = "values", .values = &.{ 0.3, 0.7, 1.1 } }, .float32, 3, "bcadc79e95123af764e6813ecf10b40cab57dafc8ef17f8f60118dfcf23ccbfd" },
+        // decode batch 2 (dump_kernel_decode2_fixture.py --golden): bool bytes and the bf16 head weight words
+        .{ .{ .kind = "range", .seed = 21, .lo = 0, .hi = 2 }, .bool_, 13, "61e3fd288705a89f08816c151a557cdd31d7a9ef95ba607c437d6bd4f66095e3" },
+        .{ .{ .kind = "bf16bits", .seed = 22 }, .bfloat16, 11, "7b6c6bc9a8d38b9b98954f6abd0aee09c1693bbbe62c9bac446bde806cf9d0f1" },
     };
     for (cases) |c| {
         const b = try generate(a, c[0], c[1], c[2]);

@@ -14,6 +14,7 @@ const Kernel = xk.Kernel;
 const Check = xk.Check;
 const Entry = xk.Entry;
 const Vars = xk.Vars;
+const Var = xk.Var;
 
 pub const Result = struct {
     kernel: Kernel,
@@ -201,6 +202,7 @@ fn putFloat(buf: []u8, i: usize, dt: mlx.mlx_dtype, v: f64) void {
 
 fn putInt(buf: []u8, i: usize, dt: mlx.mlx_dtype, v: i64) void {
     switch (dt) {
+        .bool_ => buf[i] = @intFromBool(v != 0),
         .int32 => std.mem.writeInt(i32, buf[i * 4 ..][0..4], @intCast(v), .little),
         .uint32 => std.mem.writeInt(u32, buf[i * 4 ..][0..4], @intCast(v), .little),
         .int16 => std.mem.writeInt(i16, buf[i * 2 ..][0..2], @intCast(v), .little),
@@ -277,6 +279,14 @@ fn defaultVars(e: *const Entry) Vars {
     v.set(.experts, 2);
     v.set(.a_rows, 16);
     v.set(.seq, v.get(.rows));
+    // decode batch 2: the attention's key count (the tier's 640, clamped into an entry's key
+    // range: 512 on the ls 32 text, 640 on ls 128) and the index top-k at a 2,048-entry history
+    // (k = width = 512, not all finite)
+    inline for (.{ .{ Var.keys, 640 }, .{ Var.ncomp, 2048 }, .{ Var.topk, 512 }, .{ Var.width, 512 } }) |d| {
+        const b = e.bounds.get(d[0]) orelse .{ 1, std.math.maxInt(u64) };
+        v.set(d[0], std.math.clamp(@as(u64, d[1]), b[0], b[1]));
+    }
+    v.set(.allfin, @intFromBool(v.get(.topk) >= v.get(.ncomp)));
     return v;
 }
 
@@ -542,7 +552,12 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
                 var ins2 = ins;
                 for (e.inputs, 0..) |*arg, i| switch (arg.role) {
                     .rows => ins2[i] = try sliceRows(h, &sc2, ins[i], arg, &vars, slot, m),
-                    .scalar => ins2[i] = try sc2.keep(mlx.mlx_array_new_int(@intCast(m))),
+                    // a row-count scalar (rows, or seq = rows here) follows the m-row call; any
+                    // other scalar (the index top-k's N / K / W / flag) keeps its value
+                    .scalar => ins2[i] = try sc2.keep(mlx.mlx_array_new_int(@intCast(switch (arg.domain.of.?) {
+                        .rows, .seq => m,
+                        else => vars.get(arg.domain.of.?),
+                    }))),
                     else => {},
                 };
                 var v2 = vars;
