@@ -159,11 +159,11 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// A dense `nn.Linear` without bias: `x @ W.T`.
-        fn linear(g: *G, x: T, w: T) !T {
+        pub fn linear(g: *G, x: T, w: T) !T {
             return g.matmul(x, try g.transpose(w));
         }
 
-        fn qlinear(g: *G, x: T, q: Q(T)) !T {
+        pub fn qlinear(g: *G, x: T, q: Q(T)) !T {
             return g.qmm(x, q.w, q.s, q.mode);
         }
 
@@ -495,7 +495,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `Attention._sparse_attend_oneshot` (f32 score path): one softmax over
         /// window + compressed rows with the per-head value-0 sink column.
-        fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
+        pub fn sparseAttend(g: *G, c: *const v41.Config, w: *const W, q: T, keys: T, attend: T) !T {
             const qs = g.shapeOf(q);
             const H: c_int = qs.d[2];
             const tk = g.shapeOf(keys).dim(1);
@@ -656,7 +656,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// The query-RoPE removal, grouped o-LoRA and `wo_b`. `flat` keeps the
         /// compiled tape's flatten / unflatten pair (the eager body reshapes once).
-        fn outProj(g: *G, c: *const v41.Config, o0: T, cs: CosSin, w_ol: T, wo_b: Q(T), flat: bool) !T {
+        pub fn outProj(g: *G, c: *const v41.Config, o0: T, cs: CosSin, w_ol: T, wo_b: Q(T), flat: bool) !T {
             const s0 = g.shapeOf(o0);
             const G_: c_int = @intCast(c.o_groups);
             var o1 = try ropeLast(g, o0, cs, true);
@@ -668,7 +668,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// The grouped `wo_a` as `[g, rank, in]`: bound once in f32 (W97), else
         /// dequantized per call (bf16) as `_o_lora_dense_weight`.
-        fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
+        pub fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
             if (w.wo_a_dense) |d| return d;
             return g.reshape(try g.dequantize(w.wo_a.w, w.wo_a.s, w.wo_a.mode), &.{ @intCast(c.o_groups), @intCast(c.o_lora_rank), -1 });
         }
@@ -847,7 +847,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
         /// attention RMSNorm. Out: attention input, pre, post, comb.
-        fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
+        pub fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
             const m = try hcMixes(g, c, h, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
             return .{ x, m.pre, m.post, m.comb };
@@ -855,7 +855,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_ffn_prep_impl`: the attention HC post, the ffn mixes, collapse and
         /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
-        fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+        pub fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
             const m = try hcMixes(g, c, h1, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
@@ -1636,4 +1636,80 @@ test "dsv41 graph: the W50 lean prefill score folds the sink instead of concaten
         try testing.expectEqual(!lean, std.mem.count(ops.Op, seq, &.{.softmax}) == 1);
         try testing.expectEqual(lean, std.mem.count(ops.Op, seq, &.{.exp}) == 2);
     }
+}
+
+/// Bytes the MLX backend holds for one traced node range: MlxOps tracks every
+/// op output until the per-layer `reset`, so an evaluated layer keeps all of
+/// them at once. Views (reshape / transpose / expand / broadcast / slice) and
+/// leaves share or own no new buffer and are left out.
+fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, max: u64, max_op: ops.Op } {
+    var sum: u64 = 0;
+    var mx: u64 = 0;
+    var mop: ops.Op = .input;
+    for (g.nodes.items[from..to]) |n| {
+        switch (n.op) {
+            .input, .host, .scalar, .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => continue,
+            else => {},
+        }
+        const b: u64 = @as(u64, @intCast(n.shape.numel())) * ops.dtypeSize(n.dtype);
+        sum += b;
+        if (b > mx) {
+            mx = b;
+            mop = n.op;
+        }
+    }
+    return .{ .sum = sum, .max = mx, .max_op = mop };
+}
+
+// The window-2 stage-3 bound (host only): the chained 40-layer stock trunk at a
+// 2,048-token pass, then three 1-token passes, as the parity runner drives it.
+test "dsv41 graph: the all-layer chain's per-layer held bytes at a 2,048-token pass" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const nl = c.n_layers;
+    const ws = try testing.allocator.alloc(LayerW(u32), nl);
+    defer testing.allocator.free(ws);
+    const caches = try testing.allocator.alloc(Tr.Cache, nl);
+    defer testing.allocator.free(caches);
+    for (ws, caches, 0..) |*w, *cc, l| {
+        w.* = try traceLayerW(&g, &c, c.layers[l]);
+        cc.* = Tr.Cache.init(c.layers[l], c.window, .{});
+    }
+    defer for (caches) |*cc| cc.deinit(&g);
+    const inv_s = try Tr.swaInvFreq(&g, &c);
+    const inv_y = try Tr.yarnInvFreq(&g, &c);
+    const stand: StandIn(TraceOps) = .{ .scale = try g.input(&.{ci(c.n_routed_experts)}, .float32) };
+    const passes = [_]c_int{ 2048, 1, 1, 1 };
+    var tok: c_int = 0;
+    var worst: u64 = 0;
+    var worst_l: usize = 0;
+    for (passes, 0..) |s, pi| {
+        var shared: Tr.Share = .{};
+        const pos = try g.arange(@floatFromInt(tok), @floatFromInt(tok + s), 1, .int32);
+        const e = try Tr.expandEmbedding(&g, &c, try g.input(&.{ 1, s, ci(c.hidden_size) }, .bfloat16));
+        var h = e.h;
+        var pm = e.pre_mix;
+        for (0..nl) |l| {
+            const li = c.layers[l];
+            const from = g.nodes.items.len;
+            p.names.clearRetainingCapacity();
+            p.nodes.clearRetainingCapacity();
+            const out = try Tr.layer(&g, &p, &c, &stock, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
+            h = out.h;
+            pm = out.pre_mix;
+            const hb = heldBytes(&g, from, g.nodes.items.len);
+            if (pi == 0) std.debug.print("dsv41 bound: L{d} ratio {d} held {d:.2} GiB, largest {d:.2} GiB ({s})\n", .{ l, li.ratio, @as(f64, @floatFromInt(hb.sum)) / (1 << 30), @as(f64, @floatFromInt(hb.max)) / (1 << 30), @tagName(hb.max_op) });
+            if (hb.sum > worst) {
+                worst = hb.sum;
+                worst_l = l;
+            }
+        }
+        for (caches) |*cc| cc.advance(@intCast(s));
+        tok += s;
+    }
+    std.debug.print("dsv41 bound: worst layer L{d} holds {d:.2} GiB at eval\n", .{ worst_l, @as(f64, @floatFromInt(worst)) / (1 << 30) });
+    try testing.expect(worst > 0);
 }

@@ -146,40 +146,45 @@ pub fn Model(comptime G: type) type {
 
         /// One trunk layer's residents by checkpoint name.
         pub fn bindLayer(lookup: anytype, li: v41.LayerInfo, l: u32) !graph.LayerW(T) {
+            return bindBlock(lookup, "layers", li, l);
+        }
+
+        /// A decoder block's residents under `pfx` (`layers`, or `mtp` for the DSpark stages).
+        pub fn bindBlock(lookup: anytype, comptime pfx: []const u8, li: v41.LayerInfo, l: u32) !graph.LayerW(T) {
             var b: [192]u8 = undefined;
             var lw: graph.LayerW(T) = .{
-                .attn_norm = try reqf(lookup, &b, "layers.{d}.attn_norm.weight", .{l}),
-                .ffn_norm = try reqf(lookup, &b, "layers.{d}.ffn_norm.weight", .{l}),
-                .hc_attn_fn = try reqf(lookup, &b, "layers.{d}.hc_attn_fn", .{l}),
-                .hc_attn_base = try reqf(lookup, &b, "layers.{d}.hc_attn_base", .{l}),
-                .hc_attn_scale = try reqf(lookup, &b, "layers.{d}.hc_attn_scale", .{l}),
-                .hc_ffn_fn = try reqf(lookup, &b, "layers.{d}.hc_ffn_fn", .{l}),
-                .hc_ffn_base = try reqf(lookup, &b, "layers.{d}.hc_ffn_base", .{l}),
-                .hc_ffn_scale = try reqf(lookup, &b, "layers.{d}.hc_ffn_scale", .{l}),
-                .attn_sink = try reqf(lookup, &b, "layers.{d}.attn.attn_sink", .{l}),
-                .q_norm = try reqf(lookup, &b, "layers.{d}.attn.q_norm.weight", .{l}),
-                .kv_norm = try reqf(lookup, &b, "layers.{d}.attn.kv_norm.weight", .{l}),
-                .wq_a = try reqQ(lookup, &b, "layers.{d}.attn.wq_a", .{l}),
-                .wq_b = try reqQ(lookup, &b, "layers.{d}.attn.wq_b", .{l}),
-                .wkv = try reqQ(lookup, &b, "layers.{d}.attn.wkv", .{l}),
-                .wo_a = try reqQ(lookup, &b, "layers.{d}.attn.wo_a", .{l}),
-                .wo_b = try reqQ(lookup, &b, "layers.{d}.attn.wo_b", .{l}),
-                .gate_w = try reqf(lookup, &b, "layers.{d}.ffn.gate.weight", .{l}),
-                .gate_bias = try reqf(lookup, &b, "layers.{d}.ffn.gate.bias", .{l}),
-                .sh_w1 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w1", .{l}),
-                .sh_w2 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w2", .{l}),
-                .sh_w3 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w3", .{l}),
+                .attn_norm = try reqf(lookup, &b, pfx ++ ".{d}.attn_norm.weight", .{l}),
+                .ffn_norm = try reqf(lookup, &b, pfx ++ ".{d}.ffn_norm.weight", .{l}),
+                .hc_attn_fn = try reqf(lookup, &b, pfx ++ ".{d}.hc_attn_fn", .{l}),
+                .hc_attn_base = try reqf(lookup, &b, pfx ++ ".{d}.hc_attn_base", .{l}),
+                .hc_attn_scale = try reqf(lookup, &b, pfx ++ ".{d}.hc_attn_scale", .{l}),
+                .hc_ffn_fn = try reqf(lookup, &b, pfx ++ ".{d}.hc_ffn_fn", .{l}),
+                .hc_ffn_base = try reqf(lookup, &b, pfx ++ ".{d}.hc_ffn_base", .{l}),
+                .hc_ffn_scale = try reqf(lookup, &b, pfx ++ ".{d}.hc_ffn_scale", .{l}),
+                .attn_sink = try reqf(lookup, &b, pfx ++ ".{d}.attn.attn_sink", .{l}),
+                .q_norm = try reqf(lookup, &b, pfx ++ ".{d}.attn.q_norm.weight", .{l}),
+                .kv_norm = try reqf(lookup, &b, pfx ++ ".{d}.attn.kv_norm.weight", .{l}),
+                .wq_a = try reqQ(lookup, &b, pfx ++ ".{d}.attn.wq_a", .{l}),
+                .wq_b = try reqQ(lookup, &b, pfx ++ ".{d}.attn.wq_b", .{l}),
+                .wkv = try reqQ(lookup, &b, pfx ++ ".{d}.attn.wkv", .{l}),
+                .wo_a = try reqQ(lookup, &b, pfx ++ ".{d}.attn.wo_a", .{l}),
+                .wo_b = try reqQ(lookup, &b, pfx ++ ".{d}.attn.wo_b", .{l}),
+                .gate_w = try reqf(lookup, &b, pfx ++ ".{d}.ffn.gate.weight", .{l}),
+                .gate_bias = try reqf(lookup, &b, pfx ++ ".{d}.ffn.gate.bias", .{l}),
+                .sh_w1 = try reqQ(lookup, &b, pfx ++ ".{d}.ffn.shared_experts.w1", .{l}),
+                .sh_w2 = try reqQ(lookup, &b, pfx ++ ".{d}.ffn.shared_experts.w2", .{l}),
+                .sh_w3 = try reqQ(lookup, &b, pfx ++ ".{d}.ffn.shared_experts.w3", .{l}),
             };
             if (li.kv_source) {
                 lw.comp = .{
-                    .wkv = try reqf(lookup, &b, "layers.{d}.attn.compressor.wkv.weight", .{l}),
-                    .wgate = if (li.ratio > 1) try reqf(lookup, &b, "layers.{d}.attn.compressor.wgate.weight", .{l}) else null,
-                    .norm = try reqf(lookup, &b, "layers.{d}.attn.compressor.norm.weight", .{l}),
+                    .wkv = try reqf(lookup, &b, pfx ++ ".{d}.attn.compressor.wkv.weight", .{l}),
+                    .wgate = if (li.ratio > 1) try reqf(lookup, &b, pfx ++ ".{d}.attn.compressor.wgate.weight", .{l}) else null,
+                    .norm = try reqf(lookup, &b, pfx ++ ".{d}.attn.compressor.norm.weight", .{l}),
                 };
-                lw.idx_k = .{ .wk = try reqf(lookup, &b, "layers.{d}.attn.indexer.wk.weight", .{l}), .k_norm = try reqf(lookup, &b, "layers.{d}.attn.indexer.k_norm.weight", .{l}) };
+                lw.idx_k = .{ .wk = try reqf(lookup, &b, pfx ++ ".{d}.attn.indexer.wk.weight", .{l}), .k_norm = try reqf(lookup, &b, pfx ++ ".{d}.attn.indexer.k_norm.weight", .{l}) };
             }
             if (li.index_source) {
-                lw.idx_q = .{ .wq_b = try reqQ(lookup, &b, "layers.{d}.attn.indexer.wq_b", .{l}), .weights_proj = try reqf(lookup, &b, "layers.{d}.attn.indexer.weights_proj.weight", .{l}) };
+                lw.idx_q = .{ .wq_b = try reqQ(lookup, &b, pfx ++ ".{d}.attn.indexer.wq_b", .{l}), .weights_proj = try reqf(lookup, &b, pfx ++ ".{d}.attn.indexer.weights_proj.weight", .{l}) };
             }
             return lw;
         }
@@ -506,8 +511,8 @@ const testing = std.testing;
 const TraceOps = ops.TraceOps;
 const TM = Model(TraceOps);
 
-/// Resident names -> trace inputs of the spec's dtype and shape.
-const SpecLookup = struct {
+/// Resident names -> trace inputs of the spec's dtype and shape (test helper).
+pub const SpecLookup = struct {
     g: *TraceOps,
     spec: []const v41.Param,
 
@@ -562,14 +567,15 @@ const TraceRouted = struct {
     }
 };
 
-const Mini = struct {
+/// The mini config with its Engram bank on disk and its resident spec (test helper).
+pub const Mini = struct {
     arena: std.heap.ArenaAllocator,
     tmp: std.testing.TmpDir,
     c: v41.Config,
     src: eng.RowSource,
     spec: []v41.Param,
 
-    fn init() !*Mini {
+    pub fn init() !*Mini {
         const m = try testing.allocator.create(Mini);
         errdefer testing.allocator.destroy(m);
         m.arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -588,7 +594,7 @@ const Mini = struct {
         return m;
     }
 
-    fn deinit(m: *Mini) void {
+    pub fn deinit(m: *Mini) void {
         m.src.deinit();
         m.tmp.cleanup();
         m.arena.deinit();
@@ -729,7 +735,7 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
         },
         .release => n_release += 1,
         .wait_gu, .wait_down => try testing.expectEqual((layer_next + nl - 1) % nl, e.layer),
-        .flush, .grow => {},
+        .flush, .grow, .gate => {},
     };
     try testing.expectEqual(n_route, n_release);
     try testing.expectEqual(@as(u32, 4), host.picks);

@@ -56,6 +56,13 @@ pub fn isFloat(d: Dtype) bool {
     return d == .float16 or d == .float32 or d == .float64 or d == .bfloat16;
 }
 
+pub fn isInteger(d: Dtype) bool {
+    return switch (d) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => true,
+        else => false,
+    };
+}
+
 pub fn dtypeSize(d: Dtype) usize {
     return switch (d) {
         .bool_, .uint8, .int8 => 1,
@@ -119,6 +126,16 @@ pub const MlxOps = struct {
     tapes: std.ArrayList(TapeEntry) = .empty,
     /// A region's tracing context: borrows the owner's stream and closures.
     is_child: bool = false,
+    /// The kernels lane's pinned registry bound on this stream (`launch`); set
+    /// once, before any kernel route is built.
+    launcher: ?Launcher = null,
+
+    /// `exl3_kernels.Bound.apply`, type-erased so this backend does not depend on
+    /// the registry module: `apply(ctx, kernel tag, inputs, *const LaunchConfig, outs)`.
+    pub const Launcher = struct {
+        ctx: *const anyopaque,
+        apply: *const fn (ctx: *const anyopaque, kernel: u32, inputs: []const mlx.mlx_array, cfg: *const anyopaque, outs: []mlx.mlx_array) anyerror!void,
+    };
 
     const TapeEntry = struct {
         key: usize,
@@ -154,7 +171,15 @@ pub const MlxOps = struct {
     }
 
     fn child(g: *const MlxOps) MlxOps {
-        return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .stream_box = g.stream_box, .is_child = true };
+        return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .stream_box = g.stream_box, .is_child = true, .launcher = g.launcher };
+    }
+
+    /// One pinned kernel launch (the kernels lane's routes call it with its
+    /// `Kernel` tag and `LaunchConfig`); the outputs join this scope.
+    pub fn launch(g: *MlxOps, k: anytype, inputs: []const T, cfg: anytype, out: []T) !void {
+        const l = g.launcher.?;
+        try l.apply(l.ctx, @intCast(@intFromEnum(k)), inputs, @ptrCast(cfg), out);
+        for (out) |*o| o.* = try g.track(o.*);
     }
 
     /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
@@ -744,6 +769,66 @@ pub const MlxOps = struct {
         return out;
     }
 
+    /// `mx.gather_qmm(x, w, scales, rhs_indices=idx, transpose=True, mode)` (the
+    /// resident `SwitchLinear`; unsorted, no biases).
+    pub fn gatherQmm(g: *MlxOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_gather_qmm(&r, x, w, sc, .{}, .{}, idx, true, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), false, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn argmax(g: *MlxOps, x: T, axis: c_int) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_argmax_axis(&r, x, axis, false, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn logsumexp(g: *MlxOps, x: T, axis: c_int, keepdims: bool) !T {
+        return g.reduce(mlx.mlx_logsumexp_axis, x, axis, keepdims);
+    }
+
+    /// Evaluates `x` and copies its values, row-major, into `out` (x's size).
+    pub fn hostU32(g: *MlxOps, x: T, out: []u32) ![]const u32 {
+        const flat = try g.reshape(x, &.{-1});
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const n = mlx.mlx_array_size(flat);
+        if (n != out.len) return error.HostReadSize;
+        switch (mlx.mlx_array_dtype(flat)) {
+            .uint32 => @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]),
+            .int32 => for (out, (mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData)[0..n]) |*o, v| {
+                o.* = @intCast(v);
+            },
+            else => return error.HostReadDtype,
+        }
+        return out;
+    }
+
+    pub fn hostF32(g: *MlxOps, x: T, out: []f32) ![]const f32 {
+        const flat = try g.reshape(x, &.{-1});
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const n = mlx.mlx_array_size(flat);
+        if (n != out.len) return error.HostReadSize;
+        if (mlx.mlx_array_dtype(flat) != .float32) return error.HostReadDtype;
+        @memcpy(out, (mlx.mlx_array_data_float32(flat) orelse return error.MlxNoData)[0..n]);
+        return out;
+    }
+
+    pub fn hostBool(g: *MlxOps, x: T, out: []bool) ![]const bool {
+        const flat = try g.reshape(x, &.{-1});
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const n = mlx.mlx_array_size(flat);
+        if (n != out.len) return error.HostReadSize;
+        if (mlx.mlx_array_dtype(flat) != .bool_) return error.HostReadDtype;
+        @memcpy(out, (mlx.mlx_array_data_bool(flat) orelse return error.MlxNoData)[0..n]);
+        return out;
+    }
+
     /// Greedy pick: `mx.argmax` over every logit of `x` (one row), evaluated and read.
     pub fn hostArgmax(g: *MlxOps, x: T) !u32 {
         const flat = try g.reshape(x, &.{-1});
@@ -886,6 +971,10 @@ pub const Op = enum {
     async_eval,
     host_read,
     kernel,
+    gather_qmm,
+    argmax,
+    logsumexp,
+    event_wait,
 };
 
 pub const TraceOps = struct {
@@ -897,11 +986,17 @@ pub const TraceOps = struct {
         ctx: *anyopaque,
         ids: *const fn (ctx: *anyopaque, out: []u16) anyerror!void,
         argmax: *const fn (ctx: *anyopaque) anyerror!u32,
+        u32s: ?*const fn (ctx: *anyopaque, out: []u32) anyerror!void = null,
+        f32s: ?*const fn (ctx: *anyopaque, out: []f32) anyerror!void = null,
+        bools: ?*const fn (ctx: *anyopaque, out: []bool) anyerror!void = null,
     };
 
     gpa: std.mem.Allocator,
     nodes: std.ArrayList(Node) = .empty,
     host_values: ?HostValues = null,
+    /// Each event wait's timeline value and dependency count, in build order.
+    waits: std.ArrayList(Wait) = .empty,
+    pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
         return .{ .gpa = gpa };
@@ -909,6 +1004,7 @@ pub const TraceOps = struct {
 
     pub fn deinit(g: *TraceOps) void {
         g.nodes.deinit(g.gpa);
+        g.waits.deinit(g.gpa);
     }
 
     pub fn reset(_: *TraceOps) void {}
@@ -1198,6 +1294,73 @@ pub const TraceOps = struct {
         return g.push(.kernel, dt, Shape.of(shape));
     }
 
+    /// A pinned kernel launch: one kernel node per output the launch declares.
+    pub fn launch(g: *TraceOps, _: anytype, _: []const T, cfg: anytype, out: []T) !void {
+        for (out, 0..) |*o, i| o.* = try g.kernel(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i]);
+    }
+
+    /// The resident switch: x [..., 1, K] x w [E, N, K*bits/32] at rhs indices [...]
+    /// -> [indices..., 1, N] at x's dtype.
+    pub fn gatherQmm(g: *TraceOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
+        const sx = g.shapeOf(x);
+        const sw = g.shapeOf(w);
+        const si = g.shapeOf(idx);
+        const in_dim = @divExact(sw.dim(-1) * 32, @as(c_int, @intCast(quantBits(mode))));
+        if (sw.n != 3 or sx.dim(-2) != 1 or sx.dim(-1) != in_dim or g.shapeOf(sc).dim(-1) * @as(c_int, @intCast(quantGroup(mode))) != in_dim) return error.GatherQmmShape;
+        if (!isInteger(g.dtypeOf(idx))) return error.GatherQmmIndices;
+        var out = si;
+        out.d[out.n] = 1;
+        out.d[out.n + 1] = sw.dim(1);
+        out.n += 2;
+        return g.push(.gather_qmm, g.dtypeOf(x), out);
+    }
+
+    /// An event wait's alias of `x` (the GPU reads it only after the event).
+    /// One array aliased behind an event wait at `value` after `n_deps` arrays.
+    pub fn eventAlias(g: *TraceOps, x: T, value: u64, n_deps: usize) !T {
+        try g.waits.append(g.gpa, .{ .value = value, .n_deps = @intCast(n_deps) });
+        return g.push(.event_wait, g.dtypeOf(x), g.shapeOf(x));
+    }
+
+    pub fn argmax(g: *TraceOps, x: T, axis: c_int) !T {
+        const s = g.shapeOf(x);
+        const a = normAxis(axis, s.n);
+        var out: Shape = .{};
+        for (0..s.n) |i| if (i != a) {
+            out.d[out.n] = s.d[i];
+            out.n += 1;
+        };
+        return g.push(.argmax, .uint32, out);
+    }
+
+    pub fn logsumexp(g: *TraceOps, x: T, axis: c_int, keepdims: bool) !T {
+        return g.reduce(.logsumexp, x, axis, keepdims, g.dtypeOf(x));
+    }
+
+    fn scripted(g: *TraceOps, x: T, n: usize) !TraceOps.HostValues {
+        _ = try g.push(.host_read, .bool_, .{});
+        if (g.shapeOf(x).numel() != @as(i64, @intCast(n))) return error.HostReadSize;
+        return g.host_values orelse error.NoHostValues;
+    }
+
+    pub fn hostU32(g: *TraceOps, x: T, out: []u32) ![]const u32 {
+        const hv = try g.scripted(x, out.len);
+        try (hv.u32s orelse return error.NoHostValues)(hv.ctx, out);
+        return out;
+    }
+
+    pub fn hostF32(g: *TraceOps, x: T, out: []f32) ![]const f32 {
+        const hv = try g.scripted(x, out.len);
+        try (hv.f32s orelse return error.NoHostValues)(hv.ctx, out);
+        return out;
+    }
+
+    pub fn hostBool(g: *TraceOps, x: T, out: []bool) ![]const bool {
+        const hv = try g.scripted(x, out.len);
+        try (hv.bools orelse return error.NoHostValues)(hv.ctx, out);
+        return out;
+    }
+
     pub fn clip(g: *TraceOps, x: T, lo: T, hi: T) !T {
         return g.push(.clip, promote(promote(g.dtypeOf(x), g.dtypeOf(lo)), g.dtypeOf(hi)), g.shapeOf(x));
     }
@@ -1471,4 +1634,22 @@ test "dsv41 ops: trace shapes for matmul, einsum, qmm, take, reductions" {
     try testing.expect(g.shapeOf(try g.sum(res, 2, false)).eql(Shape.of(&.{ 1, 3, 5120 })));
     // A same-dtype astype is the input itself, as in MLX.
     try testing.expectEqual(x, try g.astype(x, .float32));
+}
+
+test "dsv41 ops: a pinned kernel launch records one node per declared output; the MLX launch analyses" {
+    const Cfg = struct { n_out: usize, out_ranks: [4]usize, out_shapes: [4][4]c_int, out_dtypes: [4]Dtype };
+    const K = enum(u16) { gemv, other };
+    var g = TraceOps.init(std.testing.allocator);
+    defer g.deinit();
+    const cfg: Cfg = .{ .n_out = 2, .out_ranks = .{ 2, 1, 0, 0 }, .out_shapes = .{ .{ 3, 2304, 0, 0 }, .{ 7, 0, 0, 0 }, @splat(0), @splat(0) }, .out_dtypes = .{ .float32, .uint32, .float32, .float32 } };
+    var out: [2]u32 = undefined;
+    try g.launch(K.gemv, &.{}, &cfg, &out);
+    try std.testing.expect(g.shapeOf(out[0]).eql(Shape.of(&.{ 3, 2304 })));
+    try std.testing.expectEqual(Dtype.uint32, g.dtypeOf(out[1]));
+    const smoke = struct {
+        fn f(m: *MlxOps, c: *const Cfg, o: []mlx.mlx_array) !void {
+            try m.launch(K.other, &.{}, c, o);
+        }
+    }.f;
+    try std.testing.expect(@TypeOf(&smoke) != void);
 }

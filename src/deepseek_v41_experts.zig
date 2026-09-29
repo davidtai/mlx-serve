@@ -26,6 +26,8 @@ const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_policy = @import("expert_policy.zig");
 const expert_stream = @import("expert_stream.zig");
+const expert_lookahead = @import("expert_lookahead.zig");
+const expert_event = @import("expert_event.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
 pub const BankKind = expert_stream.BankKind;
@@ -210,6 +212,11 @@ pub const StreamSource = struct {
         return self.stream.stats();
     }
 
+    /// Event gates of the call's reads (a stream built with `event`).
+    pub fn gate(self: *StreamSource, call: *Call) Error!?expert_stream.Gates {
+        return self.stream.gate(call.route.?);
+    }
+
     pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {
         const ls = &self.stream.layers[layer];
         return switch (kind) {
@@ -260,6 +267,13 @@ pub const FakeSource = struct {
     counters: Stats = .{},
     /// When set, events are stamped with its node count (op order checks).
     trace: ?*const ops.TraceOps = null,
+    /// The lookahead's selection on the next layer's gate scores (the Stream's
+    /// `speculate`), logged per call that passes scores.
+    selector: ?expert_lookahead.Selector = null,
+    picks: std.ArrayList(Pick) = .empty,
+    gate_value: u64 = 0,
+
+    pub const Pick = struct { layer: u32, n: u8 = 0, experts: [expert_lookahead.max_budget]u16 = undefined };
 
     pub const Call = struct {
         state: enum { free, live, released } = .free,
@@ -271,7 +285,7 @@ pub const FakeSource = struct {
     };
 
     pub const Event = struct {
-        pub const Kind = enum { route, wait_gu, wait_down, release, flush, grow };
+        pub const Kind = enum { route, wait_gu, wait_down, release, flush, grow, gate };
         kind: Kind,
         layer: u32 = 0,
         part: u32 = 0,
@@ -317,6 +331,8 @@ pub const FakeSource = struct {
     }
 
     pub fn deinit(self: *FakeSource) void {
+        if (self.selector) |*sel| sel.deinit(self.a);
+        self.picks.deinit(self.a);
         for (self.policies) |*p| p.deinit(self.a);
         self.a.free(self.policies);
         self.a.free(self.base_rows);
@@ -344,7 +360,8 @@ pub const FakeSource = struct {
     }
 
     pub fn route(self: *FakeSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
-        std.debug.assert(ids.len > 0 and ids.len <= max_route_ids and scores.len == 0);
+        std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
+        std.debug.assert(scores.len == 0 or (self.selector != null and self.phase == .decode));
         try self.flush();
         const call = for (&self.calls) |*c| {
             if (c.state == .free) break c;
@@ -404,9 +421,25 @@ pub const FakeSource = struct {
         for (plan.loadsOf()) |l| {
             if (l.persistent) c.persistent_loads += 1 else c.transient_loads += 1;
         }
+        if (scores.len > 0 and layer + 1 < self.policies.len) {
+            const sel = &self.selector.?;
+            var pick: Pick = .{ .layer = layer + 1 };
+            pick.n = @intCast(sel.select(scores, &self.policies[layer + 1], pick.experts[0..sel.budget]).len);
+            self.picks.append(self.a, pick) catch @panic("fake source picks: out of memory");
+        }
         call.state = .live;
         self.note(.{ .kind = .route, .layer = layer });
         return call;
+    }
+
+    /// The Stream's gate values: the call's gate/up wave at `gu`, part p's down at `down_first + p`.
+    pub fn gate(self: *FakeSource, call: *Call) Error!?expert_stream.Gates {
+        std.debug.assert(call.state == .live);
+        if (call.n_parts == 0) return null;
+        const lo = self.gate_value;
+        self.gate_value = lo + 1 + call.n_parts;
+        self.note(.{ .kind = .gate, .layer = call.layer, .part = call.n_parts });
+        return .{ .gu = lo + 1, .down_first = lo + 2, .n_parts = call.n_parts };
     }
 
     pub fn served(_: *FakeSource, call: *const Call) Served {
@@ -596,32 +629,95 @@ pub const TraceMath = struct {
 
 // ── The executor: the model's routed hook over a source ──
 
+/// Construction-time routes of the executor.
+pub const Routes = struct {
+    /// Pass `route` the next routed layer's gate scores (the streamer's
+    /// lookahead predictor, evaluated with the routing barrier).
+    lookahead: bool = false,
+    /// Event gates instead of host waits: every wave is built at once over
+    /// event-wait aliases of the bank arrays (the typical tier's gate).
+    gated: bool = false,
+};
+
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
 /// bound once at `init` (base, transient) and at `grow` (the grown rows).
 /// `at(layer)` is the per-layer hook the trunk calls.
 pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
-    comptime assertSource(S);
+    return ExpertsWith(G, S, M, .{});
+}
+
+pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptime routes: Routes) type {
+    comptime {
+        assertSource(S);
+        if (routes.gated) expectMethod(S, "gate", &.{ *S, *S.Call }, ?expert_stream.Gates);
+    }
     return struct {
         const Self = @This();
         const T = G.T;
         pub const Arrays = BankArraysOf(T);
 
+        /// A routed layer's gate (the lookahead predictor reads the next layer's).
+        pub const Gate = struct { w: T, bias: T };
+
         a: std.mem.Allocator,
         source: *S,
         math: M,
         hidden: c_int,
+        n_experts: u32,
         /// Per layer, per bank kind: what the math binds (null: no rows).
         banks: [][n_banks]?Arrays,
+        /// Lookahead: every routed layer's gate, by layer.
+        gates: []const Gate = &.{},
+        /// Gated: the event the stream signals (an MLX backend's MTLSharedEvent).
+        event: expert_event.Event = .{ .id = 0, .object = 0 },
+
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null };
 
         pub fn init(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config) !Self {
+            return initWith(a, g, source, math, c, .{});
+        }
+
+        pub fn initWith(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config, opt: Options) !Self {
+            if (routes.lookahead and opt.gates.len != c.n_layers) return error.LookaheadNeedsGates;
+            if (routes.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
             const banks = try a.alloc([n_banks]?Arrays, c.n_layers);
             errdefer a.free(banks);
             for (banks, 0..) |*b, l| {
                 b.* = @splat(null);
                 for ([_]BankKind{ .base, .transient }) |kind| b[@intFromEnum(kind)] = try bind(g, source, @intCast(l), kind);
             }
-            return .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .banks = banks };
+            var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates };
+            if (opt.event) |e| self.event = e;
+            return self;
+        }
+
+        /// The router that scores layer `layer`'s read-ahead: the NEXT layer's
+        /// (none after the last layer).
+        pub fn predictorGate(self: *const Self, layer: u32) ?Gate {
+            return if (layer + 1 < self.gates.len) self.gates[layer + 1] else null;
+        }
+
+        /// `expert_lookahead.nextLayerScores`: sqrt(softplus(f32(x @ w^T))) + bias.
+        fn nextScores(g: *G, xf: T, gate: Gate) !T {
+            const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
+            return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
+        }
+
+        /// An event wait's aliases of `xs` (the GPU reads them after `value`).
+        fn eventWait(self: *Self, g: *G, xs: []const T, value: u64, deps: []const T, outs: []T) !void {
+            if (G == ops.MlxOps) {
+                try expert_event.wait(xs, self.event, value, deps, false, g.s, outs);
+                for (outs) |*o| o.* = try g.adopt(o.*);
+            } else {
+                for (xs, outs) |x, *o| o.* = try g.eventAlias(x, value, deps.len);
+            }
+        }
+
+        fn waitProj(self: *Self, g: *G, p: ProjOf(T), value: u64, deps: []const T) !ProjOf(T) {
+            var out: [3]T = undefined;
+            try self.eventWait(g, &.{ p.code, p.rout, p.rin }, value, deps, &out);
+            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
         }
 
         pub fn deinit(self: *Self) void {
@@ -679,7 +775,7 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
 
         /// The positions of wave `w`, grouped by bank in first-appearance order
         /// (`Exl3PackedOps.gate_up`'s groups), each group's gate/up + SwiGLU.
-        fn gateUpWave(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8) !Wave {
+        fn gateUpWave(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) !Wave {
             var wave: Wave = .{};
             for (sv.waves, sv.refs, 0..) |wv, ref, pos| {
                 if (wv != w) continue;
@@ -695,7 +791,7 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
                 gr.n += 1;
             }
             for (wave.groups[0..wave.n], 0..) |*gr, i| {
-                const arrays = self.banks[layer][@intFromEnum(gr.bank)].?;
+                const arrays = (if (over) |o| o[@intFromEnum(gr.bank)] else self.banks[layer][@intFromEnum(gr.bank)]).?;
                 var tok: [max_route_ids]i32 = undefined;
                 var rows: [max_route_ids]u32 = undefined;
                 for (gr.pos[0..gr.n], tok[0..gr.n], rows[0..gr.n]) |pos, *t, *r| {
@@ -711,10 +807,10 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
         }
 
         /// Each group's down; the outputs join the call's accumulator.
-        fn downWave(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc) ![]const T {
+        fn downWave(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) ![]const T {
             const first = acc.n_outs;
             for (wave.groups[0..wave.n], 0..) |*gr, i| {
-                const arrays = self.banks[layer][@intFromEnum(gr.bank)].?;
+                const arrays = (if (over) |o| o[@intFromEnum(gr.bank)] else self.banks[layer][@intFromEnum(gr.bank)]).?;
                 acc.outs[acc.n_outs] = try self.math.down(g, wave.h[i], wave.ids[i], arrays.down);
                 acc.n_outs += 1;
                 for (gr.pos[0..gr.n]) |pos| {
@@ -723,6 +819,41 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
                 }
             }
             return acc.outs[first..acc.n_outs];
+        }
+
+        /// The gated waves (the lookahead4 lane's event gate): every part's
+        /// gate/up over bank arrays waited at `gu`, then part p's down over
+        /// arrays waited at `down_first + p`, ordered after every gate/up and
+        /// the previous part's down. Nothing waits on the host.
+        fn gatedParts(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) !void {
+            var gu: [n_banks]?Arrays = @splat(null);
+            for (sv.waves, sv.refs) |w, ref| {
+                const b = @intFromEnum(ref.bank);
+                if (w == 0 or gu[b] != null) continue;
+                const arrays = self.banks[layer][b].?;
+                gu[b] = .{ .gate = try self.waitProj(g, arrays.gate, gates.gu, &.{}), .up = try self.waitProj(g, arrays.up, gates.gu, &.{}), .down = arrays.down };
+            }
+            var waves: [max_route_ids]Wave = undefined;
+            var hs: [max_route_ids]T = undefined;
+            var n_hs: usize = 0;
+            for (0..sv.n_parts) |p| {
+                waves[p] = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), &gu);
+                for (waves[p].h[0..waves[p].n]) |h| {
+                    hs[n_hs] = h;
+                    n_hs += 1;
+                }
+            }
+            var prev: []const T = &.{};
+            for (0..sv.n_parts) |p| {
+                var deps: [2 * max_route_ids]T = undefined;
+                @memcpy(deps[0..n_hs], hs[0..n_hs]);
+                @memcpy(deps[n_hs..][0..prev.len], prev);
+                var dn = gu;
+                for (&dn) |*d| if (d.*) |*arr| {
+                    arr.down = try self.waitProj(g, arr.down, gates.down_first + p, deps[0 .. n_hs + prev.len]);
+                };
+                prev = try self.downWave(g, layer, &waves[p], acc, &dn);
+            }
         }
 
         /// `PackedDecode.run` (gate/up publish before down): the routing
@@ -738,22 +869,32 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
             // are the prefill lane (seed waves + the DIG kernels), not ported.
             if (n_ids > max_route_ids) return error.PrefillLaneNotPorted;
             var id_buf: [max_route_ids]u16 = undefined;
+            var score_buf: [expert_lookahead.max_rows * 512]f32 = undefined;
+            var scores: []const f32 = &.{};
+            if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| {
+                // The predictor joins the routing barrier's eval (the last layer predicts nothing).
+                const sc = try nextScores(g, xf, gate);
+                try g.evalAll(&.{ indices, sc });
+                scores = try g.hostF32(sc, score_buf[0 .. n * self.n_experts]);
+            }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
-            const call = try self.source.route(layer, ids, &.{});
+            const call = try self.source.route(layer, ids, scores);
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
             var acc: Acc = .{};
             // Residents: gate/up and down at once.
-            const hits = try self.gateUpWave(g, layer, xf, k, sv, 0);
-            if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc));
-            for (0..sv.n_parts) |p| {
+            const hits = try self.gateUpWave(g, layer, xf, k, sv, 0, null);
+            if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc, null));
+            if (routes.gated) {
+                if (try self.source.gate(call)) |gates| try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
+            } else for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
                 try self.source.waitGu(call, part);
-                const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1));
+                const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
                 try g.asyncEval(wave.h[0..wave.n]);
                 try self.source.waitDown(call, part);
-                try g.asyncEval(try self.downWave(g, layer, &wave, &acc));
+                try g.asyncEval(try self.downWave(g, layer, &wave, &acc, null));
             }
             self.source.release(call);
             released = true;
@@ -809,6 +950,7 @@ fn kindsOf(log: []const FakeSource.Event, buf: []u8) []const u8 {
         .release => 'r',
         .flush => 'f',
         .grow => 'G',
+        .gate => 'E',
     };
     return buf[0..log.len];
 }
@@ -1121,4 +1263,197 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
     try ex.flush();
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
     std.debug.print("dsv41 experts: {d} recorded decode calls through the hook, {d} parts, {d} bank groups; plans, parts and waves equal the Python bank's\n", .{ f.routes.len, n_parts, n_groups });
+}
+
+test "dsv41 experts: the gated route builds every wave at once over event-wait aliases, no host waits" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    var ex = try ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true }).init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try ex.grow(&g, &.{ 8, 8 });
+    src.log.clearRetainingCapacity();
+    src.trace = &g;
+    var script: Script = .{ .calls = &.{&.{ 1, 2, 3, 4, 5, 6 }} };
+    g.host_values = script.values();
+    const first = g.nodes.items.len;
+    _ = try ex.at(0).routed(&g, try g.input(&.{ 2, 256 }, .bfloat16), try g.input(&.{ 2, 3 }, .int32));
+    var kb: [16]u8 = undefined;
+    try testing.expectEqualStrings("REr", kindsOf(src.log.items, &kb));
+    const sv = src.served(&src.calls[0]);
+    // Gate/up arrays waited once per miss bank (6 each); each part's down arrays (3 per bank) at its own value.
+    var kinds: [n_banks]bool = @splat(false);
+    for (sv.waves, sv.refs) |w, r| {
+        if (w > 0) kinds[@intFromEnum(r.bank)] = true;
+    }
+    var n_kinds: usize = 0;
+    for (kinds) |k| n_kinds += @intFromBool(k);
+    var n_alias: usize = 0;
+    var n_kernel: usize = 0;
+    for (g.nodes.items[first..]) |nd| {
+        n_alias += @intFromBool(nd.op == .event_wait);
+        n_kernel += @intFromBool(nd.op == .kernel);
+    }
+    try testing.expectEqual(6 * n_kinds + 3 * n_kinds * sv.n_parts, n_alias);
+    try testing.expectEqual(3 * (groupsOf(sv, 1) + groupsOf(sv, 2)), n_kernel);
+    // One gate per call: its gate/up value and one down value per part.
+    try testing.expectEqual(@as(u64, 1 + sv.n_parts), src.gate_value);
+    // In build order: every gate/up array at the gate/up value with no deps, then
+    // part p's down arrays at down_first + p after all gate/up outputs (+ part p-1's downs).
+    const gv: expert_stream.Gates = .{ .gu = 1, .down_first = 2, .n_parts = sv.n_parts }; // the FakeSource's first gate
+    const ws = g.waits.items;
+    try testing.expectEqual(n_alias, ws.len);
+    for (ws[0 .. 6 * n_kinds]) |w| try testing.expectEqual(TraceOps.Wait{ .value = gv.gu, .n_deps = 0 }, w);
+    var prev_deps: u32 = 0;
+    for (0..sv.n_parts) |p| {
+        const part = ws[6 * n_kinds + 3 * n_kinds * p ..][0 .. 3 * n_kinds];
+        for (part) |w| {
+            try testing.expectEqual(gv.down_first + p, w.value);
+            try testing.expectEqual(part[0].n_deps, w.n_deps);
+        }
+        if (p > 0) try testing.expect(part[0].n_deps > prev_deps);
+        prev_deps = part[0].n_deps;
+    }
+}
+
+test "dsv41 experts: the read-ahead of layer l is scored by layer l + 1's router, none after the last" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 3);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .lookahead = true });
+    var gates: [3]Ex.Gate = undefined;
+    for (&gates) |*gt| gt.* = .{ .w = try g.input(&.{ 16, 256 }, .bfloat16), .bias = try g.input(&.{16}, .float32) };
+    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .gates = &gates });
+    defer ex.deinit();
+    try testing.expectEqual(gates[1].w, ex.predictorGate(0).?.w);
+    try testing.expectEqual(gates[2].w, ex.predictorGate(1).?.w);
+    try testing.expect(ex.predictorGate(2) == null);
+}
+
+// DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py> (its scores file beside it)
+test "dsv41 experts: the scores the hook passes reproduce the streamer's read-ahead picks on the recorded trace" {
+    const path = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.testing.io;
+    const Call = struct { ids: []const u16, sel: []const []const u16 };
+    const Cfg = struct { k: u32, tau: ?f32, budget: u32 };
+    const TieCall = struct { call: u32, config: u32, sel: []const u16 };
+    const Fixture = struct {
+        layers: u32,
+        experts: u32,
+        transient: u32,
+        prefill_capacity: []const u32,
+        decode_capacity: []const u32,
+        resident0: []const []const u16,
+        rows: []const u32,
+        configs: []const Cfg,
+        scores_file: []const u8,
+        scores_rows: u64,
+        tie_calls: []const TieCall,
+        calls: []const Call,
+    };
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20));
+    defer a.free(text);
+    const parsed = try std.json.parseFromSlice(Fixture, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const f = parsed.value;
+    var dir_buf: [1024]u8 = undefined;
+    const scores_path = try std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ std.fs.path.dirname(path) orelse ".", f.scores_file });
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, scores_path, a, .limited(64 << 20));
+    defer a.free(raw);
+    const scores = try a.alloc(f32, raw.len / 4);
+    defer a.free(scores);
+    for (scores, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, raw[4 * i ..][0..4], .little));
+
+    var src = try FakeSource.init(a, .{ .hidden = 5120, .inter = 2304, .n_experts = f.experts, .rows = f.prefill_capacity, .transient_rows = f.transient });
+    defer src.deinit();
+    const cf = f.configs[0];
+    src.selector = try expert_lookahead.Selector.init(a, f.experts, cf.k, cf.tau orelse std.math.inf(f32), cf.budget);
+    // The prefill residency the fixture replays: the seed, admitted in waves of the transient width.
+    for (0..f.layers) |l| {
+        try src.seedPrefill(@intCast(l), f.resident0[l]);
+        const sorted = try a.dupe(u16, f.resident0[l]);
+        defer a.free(sorted);
+        std.sort.pdq(u16, sorted, {}, std.sort.asc(u16));
+        var i: usize = 0;
+        while (i < sorted.len) : (i += f.transient) {
+            const call = try src.route(@intCast(l), sorted[i..@min(i + f.transient, sorted.len)], &.{});
+            src.release(call);
+        }
+    }
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const c = testConfig(5120, 2304, @intCast(f.layers));
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .lookahead = true });
+    const gates = try a.alloc(Ex.Gate, f.layers);
+    defer a.free(gates);
+    for (gates) |*gt| gt.* = .{ .w = try g.input(&.{ @intCast(f.experts), 5120 }, .bfloat16), .bias = try g.input(&.{@intCast(f.experts)}, .float32) };
+    var cc = c;
+    cc.n_routed_experts = f.experts;
+    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &cc), &cc, .{ .gates = gates });
+    defer ex.deinit();
+    try ex.grow(&g, f.decode_capacity);
+    const Replay = struct {
+        calls: []const Call,
+        scores: []const f32,
+        experts: usize,
+        next: usize = 0,
+        at: usize = 0,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(out, self.calls[self.next].ids);
+            self.next += 1;
+        }
+        fn f32s(ctx: *anyopaque, out: []f32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(out, self.scores[self.at..][0..out.len]);
+            self.at += out.len;
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return error.NoPicks;
+        }
+    };
+    var replay: Replay = .{ .calls = f.calls, .scores = scores, .experts = f.experts };
+    g.host_values = .{ .ctx = &replay, .ids = Replay.ids, .argmax = Replay.argmax, .f32s = Replay.f32s };
+    var xs: [9]u32 = undefined;
+    var is: [9]u32 = undefined;
+    for (1..9) |rows| {
+        xs[rows] = try g.input(&.{ @intCast(rows), 5120 }, .bfloat16);
+        is[rows] = try g.input(&.{ @intCast(rows), 6 }, .int32);
+    }
+    var tie_i: usize = 0;
+    var n_picks: usize = 0;
+    for (f.calls, 0..) |call, ci| {
+        const l: u32 = @intCast(ci % f.layers);
+        const m = f.rows[ci / f.layers];
+        const before = src.picks.items.len;
+        _ = try ex.at(l).routed(&g, xs[m], is[m]);
+        if (l + 1 < f.layers) {
+            try testing.expectEqual(before + 1, src.picks.items.len);
+            const pick = src.picks.items[before];
+            try testing.expectEqual(l + 1, pick.layer);
+            var want = call.sel[0];
+            if (tie_i < f.tie_calls.len and f.tie_calls[tie_i].call == ci) {
+                if (f.tie_calls[tie_i].config == 0) want = f.tie_calls[tie_i].sel;
+                while (tie_i < f.tie_calls.len and f.tie_calls[tie_i].call == ci) tie_i += 1;
+            }
+            testing.expectEqualSlices(u16, want, pick.experts[0..pick.n]) catch |e| {
+                std.debug.print("call {d} (layer {d}): read-ahead picks differ\n", .{ ci, l });
+                return e;
+            };
+            n_picks += 1;
+        } else try testing.expectEqual(before, src.picks.items.len);
+    }
+    try testing.expectEqual(f.scores_rows * f.experts, replay.at);
+    try ex.flush();
+    std.debug.print("dsv41 experts: {d} layer calls through the hook with lookahead scores; {d} read-ahead picks equal the streamer's\n", .{ f.calls.len, n_picks });
 }
