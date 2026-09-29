@@ -83,6 +83,8 @@ pub const Module = struct {
     fenced: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
+    /// The inference thread that owns `g.s` (MLX streams are per thread).
+    owner: std.Thread.Id = 0,
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
@@ -93,6 +95,7 @@ pub const Module = struct {
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .kernels = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
         errdefer self.g.deinit();
+        self.owner = std.Thread.getCurrentId();
         var diag: arm_mod.Diag = .{};
         self.kernels = acceptKernels(gpa, &self.g, .{ .device = .{ .stream = s } }, &diag) catch |e| return refused(e, &diag);
         errdefer self.dropKernels();
@@ -180,7 +183,8 @@ pub const Module = struct {
 
     /// The kernels go after the last launch drained.
     fn dropKernels(self: *Module) void {
-        _ = mlx.mlx_synchronize(self.g.s);
+        // The process's teardown frees the registry off the inference thread, which has stopped launching.
+        if (std.Thread.getCurrentId() == self.owner) _ = mlx.mlx_synchronize(self.g.s);
         self.kernels.deinit(&self.g);
     }
 
