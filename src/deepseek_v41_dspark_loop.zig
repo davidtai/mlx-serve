@@ -204,6 +204,26 @@ pub fn Loop(comptime G: type) type {
         /// shape raised MLX's high-water mark by, measured once here (row counts
         /// 1 .. `max_rows`, then the draft block): the bill's per-shape terms.
         pub fn warm(self: *Self, a: std.mem.Allocator, ex: anytype, peaks: ?[]u64) !void {
+            return self.warmShapes(a, ex, peaks);
+        }
+
+        /// The install warm-up of a model and head a caller constructs (the
+        /// module's init, before any request): `warm` at the shapes a request
+        /// under `cfg` reaches (its depth and lookup set the widest verify:
+        /// `k_request` 0 is decode forwards only, no draft block), on a loop
+        /// that lives for the call.
+        pub fn warmFor(g: *G, a: std.mem.Allocator, model: *M, head: *const H, ex: anytype, cfg: Config, peaks: ?[]u64) !void {
+            var st = try model.newState();
+            defer st.deinit(g, a);
+            const caches = try a.alloc(H.Cache, head.nStages());
+            defer a.free(caches);
+            @memset(caches, .{});
+            var lp = init(g, model, head, &st, caches, cfg);
+            defer lp.deinit();
+            try lp.warmShapes(a, ex, peaks);
+        }
+
+        fn warmShapes(self: *Self, a: std.mem.Allocator, ex: anytype, peaks: ?[]u64) !void {
             const g = self.g;
             var st = try self.model.newState();
             defer st.deinit(g, a);

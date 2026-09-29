@@ -371,6 +371,65 @@ fn hostRowIds(a: std.mem.Allocator, g: *const TraceOps, from: usize, to: usize, 
     return out;
 }
 
+test "dsv41 dspark serve: the served tier binds the tier of record's routes; the warm-up traces them before any request" {
+    const a = testing.allocator;
+    const graph = @import("deepseek_v41_graph.zig");
+    // A wo_a dequantized in a forward (W97 off): `[g * rank, in]` bf16.
+    const woaDequants = struct {
+        fn count(g: *const TraceOps, c: *const v41.Config, from: usize) usize {
+            const shape = ops.Shape.of(&.{ @intCast(c.o_groups * c.o_lora_rank), @intCast(c.n_heads * c.head_dim / c.o_groups) });
+            var n: usize = 0;
+            for (g.nodes.items[from..]) |nd| n += @intFromBool(nd.op == .dequantize and nd.shape.eql(shape));
+            return n;
+        }
+    }.count;
+    const depth2: dsl.Config = .{ .k_request = 2, .max_tokens = std.math.maxInt(u32) };
+    {
+        const r = try Rig.createAt(routes.served);
+        defer r.destroy();
+        var s: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };
+        r.script(&s);
+        // A18 K30, A19 K22, A20 W97, A21 W50, A22 the bf16 head, the window ring; A25 K33 and A26 W103 on the draft head.
+        const rt = r.model.tier.routes;
+        try testing.expect(rt.selected_keys and rt.attn_rows == graph.attn_compile_max_rows and rt.wo_a_f32 and rt.lean_prefill_score);
+        try testing.expectEqual(graph.Routes.Head.bf16, rt.head);
+        try testing.expectEqualStrings("window_ring", @tagName(r.model.tier.kv.route));
+        try testing.expectEqual(graph.draft_compile_max_rows, r.head.rt.draft_rows);
+        try testing.expectEqual(graph.Routes.Head.bf16, r.head.rt.head);
+        // W97 on every trunk layer and every draft stage (DSparkAttention inherits the cache), billed.
+        for (r.model.layers) |lw| try testing.expect(lw.wo_a_dense != null);
+        for (r.head.stages) |st| try testing.expect(st.w.wo_a_dense != null);
+        const woa = graph.woaDenseBytes(&r.mini.c);
+        try testing.expectEqual(@as(u64, r.mini.c.n_layers) * woa, r.model.builtBytes());
+        try testing.expectEqual(@as(u64, r.head.nStages()) * woa, r.head.builtBytes());
+        // The warm-up of depth-2 requests (verify rows 1..3, then a draft block) through the served routes:
+        // the compiled regions trace here, and no forward dequantizes a wo_a (W97 on trunk and draft).
+        const n0 = r.g.nodes.items.len;
+        const c0 = r.g.compiles;
+        var peaks: [4]u64 = @splat(1);
+        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, depth2, &peaks);
+        try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, &peaks);
+        try testing.expect(r.g.compiles > c0);
+        try testing.expectEqual(@as(usize, 0), woaDequants(&r.g, &r.mini.c, n0));
+        // Depth-1 requests verify 1 or 2 rows: two row counts, then the draft block; depth 0 decodes only.
+        var p1: [3]u64 = @splat(1);
+        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 1, .max_tokens = std.math.maxInt(u32) }, &p1);
+        try testing.expectEqualSlices(u64, &.{ 0, 0, 0 }, &p1);
+        var p0: [1]u64 = @splat(1);
+        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, &p0);
+        try testing.expectEqualSlices(u64, &.{0}, &p0);
+    }
+    // The stock engine dequantizes every layer's and stage's wo_a per call and bills nothing.
+    const st = try Rig.create();
+    defer st.destroy();
+    var s2: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    st.script(&s2);
+    const m0 = st.g.nodes.items.len;
+    try Loop.warmFor(&st.g, a, st.model, st.head, &st.arm.hook, depth2, null);
+    try testing.expectEqual(3 * @as(usize, st.mini.c.n_layers) + st.head.nStages(), woaDequants(&st.g, &st.mini.c, m0));
+    try testing.expectEqual(@as(u64, 0), st.model.builtBytes() + st.head.builtBytes());
+}
+
 test "dsv41 dspark serve: the first prompt pass's fence moves every later lookup to the host rows, byte for byte the table's" {
     const rig = try Rig.create();
     defer rig.destroy();
