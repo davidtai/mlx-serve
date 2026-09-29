@@ -882,8 +882,7 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
     const xp = @import("deepseek_v41_experts.zig");
-    const xk = @import("exl3_kernels.zig");
-    const xko = @import("exl3_kernel_ops.zig");
+    const quant = @import("quant.zig");
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);
@@ -901,22 +900,17 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
     const Count = struct {
         calls: u32 = 0,
         rows: u32 = 0,
-        pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !@This() {
-            return .{};
-        }
-        pub fn deinit(_: *@This(), _: *TraceOps) void {}
-        pub fn call(self: *@This(), gg: *TraceOps, act: u32, r: xko.PrefillRows, _: xko.BankArrays(u32)) !u32 {
+        pub fn call(self: *@This(), gg: *TraceOps, act: u32, r: quant.PrefillRows, _: xp.BankArraysOf(u32)) !u32 {
             self.calls += 1;
             self.rows += @intCast(r.slot.len);
             return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
         }
         pub fn finish(_: *@This(), _: *TraceOps) !void {}
     };
-    var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
-    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = Count });
-    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    var counts: [8]Count = @splat(.{});
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, Count);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(testing.allocator, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = counts[0..nl] }, &m.c);
     defer ex.deinit();
     const Host = struct {
         n: u16,
@@ -941,7 +935,7 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
     try model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {});
     try testing.expectEqualSlices(u32, &.{ 7, 7, 7 }, &out);
     try testing.expectEqual(@as(u32, 27), st.offset);
-    for (ex.wide_routes) |r| {
+    for (counts[0..nl]) |r| {
         try testing.expectEqual(@as(u32, 1), r.calls);
         try testing.expectEqual(@as(u32, 25 * k), r.rows);
     }
@@ -989,8 +983,7 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
         const first: u32 = @intCast(g.nodes.items.len);
         const waves0 = g.freed.items.len;
         const r = try model_.forward(&g, &st, span, .{ .logits = .all, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
-        // The layer waves, in order; each layer's score chains (attention, and the indexer's on an
-        // index source) are sub-waves released inside it, before the layer's own reset.
+        // The layer waves, in order (a prefill-width layer's score chains would be sub-waves inside it).
         var layers: [16]TraceOps.Freed = undefined;
         var n_layers: usize = 0;
         var n_sub: usize = 0;
@@ -1017,7 +1010,8 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
             }
         }
         try testing.expectEqual(@as(usize, m.c.n_layers), n_layers);
-        try testing.expect(n_sub >= m.c.n_layers);
+        // Decode / verify widths keep their score chains in the layer wave (prefill widths release them).
+        try testing.expectEqual(@as(usize, 0), n_sub);
         prev = layers[n_layers - 1].to;
         // The final norm, the head and the taps' concat come after the last wave.
         try testing.expect(r.logits.? >= prev and r.main_hidden.? >= prev and r.hidden >= prev);

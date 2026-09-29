@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 as a module-owned arch of mlx-serve (the deepseek_v4 pattern): `Transformer.dsv41`
 //! holds a `Module` that `Transformer.init` builds from the loaded residents and `forwardWith` runs,
 //! its per-request state rebuilt at `cache.step == 0`. Construction refuses by name, in order:
-//!   1. the kernels (`exl3_kernel_ops.acceptAtStartup`: the registry against the pinned manifest,
+//!   1. the kernels (C2, kernels note sec. 19: the load context's `kernel_set.Set`, the registry against the pinned manifest,
 //!      every kernel built on the device, the device self-check judged);
 //!   2. the expert source (`deepseek_v41_arm.ArmWith`: bank, admission, the stream at the admitted
 //!      rows on MLX slot memory, the hook over the kernels' GEMV and the DIG-X prefill route), every
@@ -20,7 +20,10 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const xk = @import("exl3_kernels.zig");
-const xo = @import("exl3_kernel_ops.zig");
+const kernel_set = @import("kernel_set.zig");
+const xq = @import("exl3_quant.zig");
+const trunk_routes = @import("dsv41_kernel_routes.zig");
+const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -37,9 +40,13 @@ const log = std.log.scoped(.dsv41);
 const G = ops.MlxOps;
 /// The expert source: the exact tier's op chain around the kernels' EXL3 decode GEMV, the wide
 /// (prefill) routed calls on the kernels' DIG-X route.
-pub const A = arm_mod.ArmWith(G, xp.EagerChain(G, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(G) });
+pub const A = arm_mod.ArmWith(G, xp.QuantMath(G, xq.Accepted(G)), .{ .prefill = true });
 const M = mdl.Model(G);
 const H = dh.Head(G);
+
+/// The shell's generation headroom for a request that declared no budget
+/// (`transformer.KVCache.RESERVE_GEN_HEADROOM`).
+pub const generation_headroom: u64 = 8192;
 
 /// Beside the model's shards: the Engram token map the converter exports.
 pub const engram_token_map_file = "engram-token-map.u32";
@@ -50,7 +57,15 @@ const envelope = expert_admission.Envelope.dsv41_pass2;
 pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
-    kernels: *xo.Accepted(G),
+    /// The load context's kernel set, its launcher installed on `g`.
+    set: *kernel_set.Set,
+    /// The EXL3 quant accepted on the set: the served routed-expert math (C2).
+    exl3: *xq.Accepted(G),
+    /// The trunk routes' self-check results (their acceptance on the set).
+    trunk_report: selfcheck.Report = .{},
+    /// The install warm-up's per-shape MLX peaks (one per forward width, then the draft
+    /// block's): the bill's transient terms (C4, P4).
+    warm_peaks: []u64 = &.{},
     arm: *A,
     weights: *model_io.Weights,
     engram: eng.RowSource,
@@ -72,27 +87,31 @@ pub const Module = struct {
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .kernels = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
         errdefer self.g.deinit();
         var diag: arm_mod.Diag = .{};
-        self.kernels = acceptKernels(gpa, &self.g, .{ .device = .{ .stream = s } }, &diag) catch |e| return refused(e, &diag);
+        var vd0: v41.Diag = .{};
+        const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
+            log.err("config refused: {s}", .{vd0.message()});
+            return e;
+        };
+        try self.acceptKernels(gpa, &c0, s, &diag);
         errdefer self.dropKernels();
         _ = mlx.mlx_clear_cache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
         errdefer setCacheLimit(self.prev_cache_limit);
-        self.arm = A.init(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
+        self.arm = A.init(gpa, io, &self.g, self.exl3, .{
             .model_dir = dir,
             .envelope = envelope,
             .baseline_bytes = config.memory_baseline_bytes,
             .fixed_rows = config.expert_rows,
             .slot_memory = .{ .mlx = s },
-            .prefill = .{ .reg = &self.kernels.reg },
             .draft_pruned_bytes = 0,
         }, &diag) catch |e| return refused(e, &diag);
         errdefer self.arm.deinit();
-        checkArmBanks(self.arm, &self.g, &self.kernels.reg, &diag) catch |e| return refused(e, &diag);
-        self.arm.grown_check = .{ .ctx = &self.kernels.reg, .check = GrownBanks.check };
+        checkArmBanks(self.arm, &self.g, self.exl3, &diag) catch |e| return refused(e, &diag);
+        self.arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks.check };
         var vd: v41.Diag = .{};
         errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
         const c = self.arm.config;
@@ -105,12 +124,13 @@ pub const Module = struct {
         errdefer self.model.deinit(&self.g);
         self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
         errdefer self.head.deinit(&self.g);
-        // The install warm-up (P4.3): the served tier's compiled regions trace here, never in a request.
-        // Decode forwards only until the draft round (P5) serves its depth; each shape's MLX peak is the bill's.
-        var peak: [1]u64 = undefined;
-        try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &self.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, &peak);
+        // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
+        // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
+        // shape's MLX peak is kept for the bill (C4).
+        self.warm_peaks = try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &self.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows);
+        errdefer gpa.free(self.warm_peaks);
         _ = mlx.mlx_clear_cache();
-        log.info("warm-up: decode forward peak {d} B above the residents; built residents {d} B (W97)", .{ peak[0], self.model.builtBytes() + self.head.builtBytes() });
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B (W97)", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
         return self;
     }
 
@@ -122,25 +142,64 @@ pub const Module = struct {
         self.embed_rows.close();
         self.engram.deinit();
         self.arm.deinit();
+        self.gpa.free(self.warm_peaks);
         self.dropKernels();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
         gpa.destroy(self);
     }
 
+    /// The kernel set, its launcher, then the quant and the trunk routes' acceptance (C2).
+    fn acceptKernels(self: *Module, gpa: std.mem.Allocator, c: *const v41.Config, s: mlx.mlx_stream, diag: *arm_mod.Diag) !void {
+        var kd: xk.Diag = .{};
+        self.set = kernel_set.Set.init(gpa, .{ .device = .{ .stream = s } }, &kd) catch |e| return refuse(diag, e, "kernels: {s}", .{kd.message()});
+        errdefer self.set.deinit();
+        self.set.install(G, &self.g);
+        errdefer kernel_set.Set.uninstall(G, &self.g);
+        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set }, .{
+            .hidden = c.hidden_size,
+            .inter = c.moe_intermediate_size,
+            .top_k = c.n_experts_per_tok,
+            .n_layers = c.n_layers,
+            .act = .{ .swiglu_clamped = c.swiglu_limit },
+            .input = .bfloat16,
+        }, &kd) catch |e| return refuse(diag, e, "exl3 quant: {s}", .{kd.message()});
+        errdefer self.exl3.deinit(&self.g);
+        trunk_routes.accept(gpa, self.set, &self.trunk_report, &kd) catch |e| {
+            self.trunk_report.deinit(gpa);
+            return refuse(diag, e, "trunk routes: {s}", .{kd.message()});
+        };
+    }
+
     /// The kernels go after the last launch drained.
     fn dropKernels(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
-        self.kernels.deinit(&self.g);
+        self.trunk_report.deinit(self.gpa);
+        self.exl3.deinit(&self.g);
+        kernel_set.Set.uninstall(G, &self.g);
+        self.set.deinit();
     }
 
     /// A fresh request: the prompt from a new state (the model chunks it by its own rule);
     /// the last row's logits.
-    pub fn prefill(self: *Module, ids: []const u32) !mlx.mlx_array {
+    ///
+    /// The request's KV lanes are bounded to its positions (M5BOUND48, the served default): the
+    /// ring window, the compress / index / frontier lanes preallocated once and never grown.
+    /// `reserved_tokens` is the request's KV reservation (the shell's `KVCache.reserve`: prompt +
+    /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
+    /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
+    pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
-        self.state = try self.model.newState();
+        self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
         return self.forward(ids);
+    }
+
+    /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
+    /// generation headroom), plus one verify block.
+    pub fn maxPositions(prompt: usize, reserved_tokens: u64) u32 {
+        const budget: u64 = if (reserved_tokens > prompt) reserved_tokens else prompt + generation_headroom;
+        return @intCast(budget + mdl.Model(G).scratch_rows);
     }
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
@@ -195,26 +254,12 @@ fn refuse(diag: *arm_mod.Diag, err: anytype, comptime fmt: []const u8, args: any
     return err;
 }
 
-/// The kernels, accepted once before the expert source allocates; their message in `diag`.
-fn acceptKernels(a: std.mem.Allocator, g: *G, opts: xo.StartupOptions, diag: *arm_mod.Diag) !*xo.Accepted(G) {
-    var kd: xk.Diag = .{};
-    return xo.acceptAtStartup(G, a, g, opts, &kd) catch |e| return refuse(diag, e, "kernels: {s}", .{kd.message()});
-}
-
-/// A bank's gate / up / down arrays are what the kernels read.
-fn checkBank(g: *G, reg: *const xk.Registry, bank: xp.BankArraysOf(G.T), diag: *xk.Diag) xo.Refusal!void {
-    inline for (.{ .{ xo.Proj.gate, bank.gate }, .{ xo.Proj.up, bank.up }, .{ xo.Proj.down, bank.down } }) |pb| {
-        const p = pb[1];
-        try xo.checkBank(G, g, reg, pb[0], .{ .code = p.code, .rout = p.rout, .rin = p.rin }, diag);
-    }
-}
-
 /// Every bank the hook bound (base and transient; the grown ones after the phase change).
-fn checkArmBanks(arm: *A, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !void {
+fn checkArmBanks(arm: *A, g: *G, exl3: *const xq.Accepted(G), diag: *arm_mod.Diag) !void {
     var kd: xk.Diag = .{};
     for (arm.hook.banks, 0..) |banks, l| for (banks, 0..) |maybe, kind| {
         const bank = maybe orelse continue;
-        checkBank(g, reg, bank, &kd) catch |e|
+        exl3.checkBank(g, bank, &kd) catch |e|
             return refuse(diag, e, "kernels: layer {d} {t} bank: {s}", .{ l, @as(xp.BankKind, @fromBackingInt(@intCast(kind))), kd.message() });
     };
 }
@@ -222,14 +267,22 @@ fn checkArmBanks(arm: *A, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !
 /// The phase change's banks, once (`Arm.grown_check`); a refusal is logged by name.
 const GrownBanks = struct {
     fn check(ctx: *const anyopaque, arm: *A, g: *G) anyerror!void {
-        const reg: *const xk.Registry = @ptrCast(@alignCast(ctx));
+        const exl3: *const xq.Accepted(G) = @ptrCast(@alignCast(ctx));
         var diag: arm_mod.Diag = .{};
-        checkArmBanks(arm, g, reg, &diag) catch |e| {
+        checkArmBanks(arm, g, exl3, &diag) catch |e| {
             log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
             return e;
         };
     }
 };
+
+test "dsv41 module: a request's bounded lanes hold its reservation, else the prompt plus the shell's headroom, plus a verify block" {
+    try std.testing.expectEqual(@import("transformer.zig").KVCache.RESERVE_GEN_HEADROOM, generation_headroom);
+    // 16K prompt, no declared budget: 16384 + 8192 + 8.
+    try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), Module.maxPositions(16384, 0));
+    // A reservation (prompt + budget + chunk) is the bound.
+    try std.testing.expectEqual(@as(u32, 40000 + 8), Module.maxPositions(32768, 40000));
+}
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
     try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);

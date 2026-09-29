@@ -79,9 +79,6 @@ pub const Options = struct {
     lookahead: ?expert_stream.Lookahead = null,
     event: ?expert_stream.Event = null,
     pool: expert_io.Options = .{ .tickets = 1024 },
-    /// The wide lane's routes are built from this (an arm whose routes install
-    /// the lane: `ArmWith(.., .{ .prefill = ... })`); unused otherwise.
-    prefill: ?xp.PrefillInit = null,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -161,8 +158,7 @@ pub fn Arm(comptime G: type, comptime M: type) type {
 }
 
 /// The arm whose hook takes the executor's construction-time `routes` (the
-/// wide lane: `.prefill` = the kernels' DIG-X prefill route, built per layer
-/// from `Options.prefill`).
+/// wide lane: `.prefill` = the math's own prefill waves, the quant's).
 pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) type {
     return struct {
         const Self = @This();
@@ -231,7 +227,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
-            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .prefill = opt.prefill }) catch |e|
+            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{}) catch |e|
                 return refuse(diag, e, "routed-expert hook: {s}", .{@errorName(e)});
             return self;
         }
@@ -708,8 +704,8 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
     }
     for (0..5) |l| try testing.expectEqual(@as(u32, 4), arm.source.bankRows(@intCast(l), .base));
     for (arm.hook.banks) |b| {
-        try testing.expect(b[@intFromEnum(xp.BankKind.base)] != null);
-        try testing.expect(b[@intFromEnum(xp.BankKind.transient)] != null);
+        try testing.expect(b[@backingInt(xp.BankKind.base)] != null);
+        try testing.expect(b[@backingInt(xp.BankKind.transient)] != null);
     }
     const rec = arm.admissionRecord();
     try testing.expectEqual(arm.plan.admission.decode_rows, rec.decode_slots_per_layer);

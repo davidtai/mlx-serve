@@ -406,18 +406,22 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
         // the compiled regions trace here, and no forward dequantizes a wo_a (W97 on trunk and draft).
         const n0 = r.g.nodes.items.len;
         const c0 = r.g.compiles;
-        var peaks: [4]u64 = @splat(1);
-        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, depth2, &peaks);
-        try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, &peaks);
+        const peaks = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, depth2, 0);
+        defer a.free(peaks);
+        try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, peaks);
         try testing.expect(r.g.compiles > c0);
         try testing.expectEqual(@as(usize, 0), woaDequants(&r.g, &r.mini.c, n0));
-        // Depth-1 requests verify 1 or 2 rows: two row counts, then the draft block; depth 0 decodes only.
-        var p1: [3]u64 = @splat(1);
-        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 1, .max_tokens = std.math.maxInt(u32) }, &p1);
-        try testing.expectEqualSlices(u64, &.{ 0, 0, 0 }, &p1);
-        var p0: [1]u64 = @splat(1);
-        try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, &p0);
-        try testing.expectEqualSlices(u64, &.{0}, &p0);
+        // Depth-1 requests verify 1 or 2 rows (then the draft block); depth 0 decodes only; the
+        // module widens the warm-up to every width up to the compiled regions' bound.
+        const p1 = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 1, .max_tokens = std.math.maxInt(u32) }, 0);
+        defer a.free(p1);
+        try testing.expectEqual(@as(usize, 3), p1.len);
+        const p0 = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, 0);
+        defer a.free(p0);
+        try testing.expectEqual(@as(usize, 2), p0.len);
+        const pw = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, depth2, 12);
+        defer a.free(pw);
+        try testing.expectEqual(@as(usize, 13), pw.len);
     }
     // The stock engine dequantizes every layer's and stage's wo_a per call and bills nothing.
     const st = try Rig.create();
@@ -425,7 +429,7 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
     var s2: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };
     st.script(&s2);
     const m0 = st.g.nodes.items.len;
-    try Loop.warmFor(&st.g, a, st.model, st.head, &st.arm.hook, depth2, null);
+    a.free(try Loop.warmFor(&st.g, a, st.model, st.head, &st.arm.hook, depth2, 0));
     try testing.expectEqual(3 * @as(usize, st.mini.c.n_layers) + st.head.nStages(), woaDequants(&st.g, &st.mini.c, m0));
     try testing.expectEqual(@as(u64, 0), st.model.builtBytes() + st.head.builtBytes());
 }

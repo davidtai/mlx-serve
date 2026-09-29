@@ -42447,7 +42447,7 @@ fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     const ids = try self.allocator.alloc(u32, n);
     defer self.allocator.free(ids);
     for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
-    const logits = if (ctx.cache.step == 0) try mdl.prefill(ids) else try mdl.extend(ids);
+    const logits = if (ctx.cache.step == 0) try mdl.prefill(ids, ctx.cache.reserve_tokens) else try mdl.extend(ids);
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;
     var f32_logits = mlx.mlx_array_new();

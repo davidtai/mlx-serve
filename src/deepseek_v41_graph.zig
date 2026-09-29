@@ -111,6 +111,10 @@ pub fn woaDenseBytes(c: *const v41.Config) u64 {
 }
 
 pub const attn_compile_max_rows = 32;
+/// A forward wider than this releases its score chains inside the layer
+/// (`closeScores`): the prefill widths, where a chain's arrays are score-sized;
+/// a decode / verify forward keeps no per-layer host calls for it.
+pub const score_wave_min_rows = attn_compile_max_rows;
 pub const core_compile_max_rows = 8;
 pub const hc_compile_max_rows = 7;
 pub const small_stages_max_rows = 7;
@@ -202,6 +206,7 @@ pub fn Trunk(comptime G: type) type {
         /// to the layer's reset (a 953-row prefill chunk's attention and indexer
         /// arrays are 8 GB each at 16K).
         fn closeScores(g: *G, m: ops.Mark, outs: []const *T) !void {
+            std.debug.assert(outs.len <= 2);
             var kept: [2]T = undefined;
             for (outs, 0..) |o, i| kept[i] = g.keep(o.*);
             g.resetTo(m);
@@ -562,9 +567,11 @@ pub fn Trunk(comptime G: type) type {
             if (li.index_source) {
                 const lens = try g.floorDiv(try g.add(positions, try g.scalar(1, .int32)), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const cand = if (li.candidate_source) null else shared.candidates;
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (rowsOf(g, x, 1) > score_wave_min_rows) g.mark() else null;
                 var sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source);
-                if (sel.cand) |*cd| try closeScores(g, scores, &.{ &sel.mask, cd }) else try closeScores(g, scores, &.{&sel.mask});
+                if (scores) |m| {
+                    if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd }) else try closeScores(g, m, &.{&sel.mask});
+                }
                 shared.topk_mask = sel.mask;
                 if (li.candidate_source) shared.candidates = sel.cand;
                 mask = sel.mask;
@@ -811,9 +818,9 @@ pub fn Trunk(comptime G: type) type {
                     ckv = comp.kv;
                     cidx = shared.selected_idx;
                 };
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                 o0 = try sparseAttendSelected(g, c, rt, w, q, window, drop, ckv, cidx, positions);
-                try closeScores(g, scores, &.{&o0});
+                if (scores) |m| try closeScores(g, m, &.{&o0});
             } else {
                 var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), drop, b, s);
                 var keys = window;
@@ -823,9 +830,9 @@ pub fn Trunk(comptime G: type) type {
                         attend = try g.concat(&.{ attend, comp.mask }, -1);
                     }
                 }
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                 o0 = if (s > 1 and rt.lean_prefill_score) try sparseAttendLean(g, c, w, q, keys, attend) else try sparseAttend(g, c, w, q, keys, attend);
-                try closeScores(g, scores, &.{&o0});
+                if (scores) |m| try closeScores(g, m, &.{&o0});
             }
             try p.put("attn.o", o0);
             const w_ol = try woaDense(g, c, w);
