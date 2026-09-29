@@ -7,7 +7,9 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const xk = @import("exl3_kernels.zig");
-const ops = @import("exl3_kernel_ops.zig");
+const kr = @import("kernel_routes.zig");
+const tr = @import("dsv41_kernel_routes.zig");
+const xq = @import("exl3_quant.zig");
 
 const Allocator = std.mem.Allocator;
 const Dtype = mlx.mlx_dtype;
@@ -50,7 +52,7 @@ pub const MlxG = struct {
         return x;
     }
 
-    pub fn shapeOf(_: *MlxG, x: T) ops.Shape {
+    pub fn shapeOf(_: *MlxG, x: T) kr.Shape {
         return .of(mlx.getShape(x));
     }
 
@@ -258,13 +260,13 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
             };
         },
         .wave_table => {
-            var ex: [ops.wave_max]ops.WaveExpert = undefined;
+            var ex: [xq.wave_max]xq.WaveExpert = undefined;
             for (gen.slots, gen.rows, 0..) |s, r, j| ex[j] = .{ .slot = s, .rows = r };
-            const t = ops.digTable(ex[0..gen.slots.len], gen.tiles);
+            const t = xq.digTable(ex[0..gen.slots.len], gen.tiles);
             @memcpy(b, std.mem.sliceAsBytes(&t.table));
         },
         .slots16 => {
-            const t = ops.rebuildSlots(gen.slots);
+            const t = xq.rebuildSlots(gen.slots);
             @memcpy(b, std.mem.sliceAsBytes(&t));
         },
         .values => for (0..n) |i| std.mem.writeInt(u32, b[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(gen.values[i]))), .little),
@@ -347,20 +349,20 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     // decode batch 2 (dump_kernel_decode2_fixture.py): the members the RC tiers still run,
     // ATTN_FUSE softmax, INDEX_TOPK and the wo_a ring transpose
     if (eq(u8, f, "woa_transpose")) {
-        var r = try ops.WoaRingTranspose(MlxG).init(g, reg);
+        var r = try tr.WoaRingTranspose(MlxG).init(g, reg);
         defer r.deinit(g);
         try r.checkLayer(g, in(ins, "packed"), in(ins, "scales"), null);
         outs[0] = try r.call(g, in(ins, "packed"), in(ins, "scales"));
         return 1;
     }
     if (eq(u8, f, "index_topk")) {
-        var r = try ops.IndexTopk(MlxG).init(g, reg);
+        var r = try tr.IndexTopk(MlxG).init(g, reg);
         defer r.deinit(g);
         outs[0..2].* = try r.select(g, in(ins, "score"), in(ins, "clen"));
         return 2;
     }
     if (eq(u8, f, "attn_fuse")) {
-        var r = try ops.AttnSoftmax(MlxG).init(g, reg, null);
+        var r = try tr.AttnSoftmax(MlxG).init(g, reg, null);
         defer r.deinit(g);
         outs[0..2].* = try r.call(g, in(ins, "qk"), in(ins, "valid"), in(ins, "sink"));
         return 2;
@@ -368,21 +370,21 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     // x1..x8: one call per M on the case's one weight
     const x_names = [_][]const u8{ "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8" };
     if (eq(u8, f, "mxfp8_rows")) {
-        const site = std.meta.stringToEnum(ops.M1Site, c.site.?) orelse return error.FixtureSite;
-        var r = try ops.Mxfp8Rows(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        const site = std.meta.stringToEnum(tr.M1Site, c.site.?) orelse return error.FixtureSite;
+        var r = try tr.Mxfp8Rows(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
         defer r.deinit(g);
         for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
         return 8;
     }
     if (eq(u8, f, "head_rows")) {
-        var r = try ops.HeadRows(MlxG).init(g, reg, in(ins, "w"), null);
+        var r = try tr.HeadRows(MlxG).init(g, reg, in(ins, "w"), null);
         defer r.deinit(g);
         for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
         return 8;
     }
     if (eq(u8, f, "smallm")) {
-        const site = std.meta.stringToEnum(ops.SmallMSite, c.site.?) orelse return error.FixtureSite;
-        var r = try ops.SmallM(MlxG).init(g, reg, site, in(ins, "w"), null);
+        const site = std.meta.stringToEnum(tr.SmallMSite, c.site.?) orelse return error.FixtureSite;
+        var r = try tr.SmallM(MlxG).init(g, reg, site, in(ins, "w"), null);
         defer r.deinit(g);
         for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
         return 8;
@@ -390,14 +392,14 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     // prefill batch 2 (dump_kernel_prefill2_fixture.py): the P line's prefill-rows texts; the
     // prefill-rows index top-k replays through the index_topk branch above
     if (eq(u8, f, "idxscore")) {
-        const r = ops.IdxScore(MlxG).init(reg);
+        const r = tr.IdxScore(MlxG).init(reg);
         outs[0] = try r.call(g, in(ins, "q"), in(ins, "k"), in(ins, "w"), in(ins, "clen"));
         return 1;
     }
     if (eq(u8, f, "core_vec") or eq(u8, f, "core_rope")) {
-        const kind: ops.CoreKind = if (eq(u8, f, "core_vec")) .vec else .rope;
+        const kind: tr.CoreKind = if (eq(u8, f, "core_vec")) .vec else .rope;
         const ckv = ins.get("ckv");
-        var r = try ops.PrefillAttn(MlxG).init(g, reg, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
+        var r = try tr.PrefillAttn(MlxG).init(g, reg, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
         defer r.deinit(g);
         const cmp: ?[2]mlx.mlx_array = if (ckv) |store| .{ store, in(ins, "cidx") } else null;
         const rope: ?[2]mlx.mlx_array = if (kind == .rope) .{ in(ins, "qcos"), in(ins, "qsin") } else null;
@@ -406,22 +408,22 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     }
     if (eq(u8, f, "hcnorm")) {
         const x = in(ins, "x");
-        var r = try ops.HcNorm(MlxG).init(g, reg, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
+        var r = try tr.HcNorm(MlxG).init(g, reg, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
         defer r.deinit(g);
         outs[0] = try r.rsqrt(g, x);
         outs[1] = try r.preNorm(g, x, in(ins, "pre"), in(ins, "w"));
         return 2;
     }
     if (eq(u8, f, "smallk")) {
-        const r = ops.SmallKCombine(MlxG).init(reg);
+        const r = tr.SmallKCombine(MlxG).init(reg);
         outs[0] = try r.call(g, in(ins, "routed"), in(ins, "weights"), in(ins, "shared"));
         return 1;
     }
     // DRAFTRC (dump_draftrc_fixture.py): the draft routes, outputs in the dump's order
     if (eq(u8, f, "draft_proj")) {
-        const site = std.meta.stringToEnum(ops.DraftSite, c.site.?) orelse return error.FixtureSite;
+        const site = std.meta.stringToEnum(tr.DraftSite, c.site.?) orelse return error.FixtureSite;
         const x1 = in(ins, "x1");
-        var r = try ops.DraftProj(MlxG).init(g, reg, site, g.dtypeOf(x1), in(ins, "w"), in(ins, "scales"), null);
+        var r = try tr.DraftProj(MlxG).init(g, reg, site, g.dtypeOf(x1), in(ins, "w"), in(ins, "scales"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, x1);
         outs[1] = try r.call(g, in(ins, "x6"));
@@ -429,7 +431,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 3;
     }
     if (eq(u8, f, "draft_router")) {
-        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        var r = try tr.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
         defer r.deinit(g);
         outs[0..2].* = try r.call(g, in(ins, "x1"));
         outs[2..4].* = try r.call(g, in(ins, "x6"));
@@ -437,9 +439,9 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 6;
     }
     if (eq(u8, f, "draft_tape")) {
-        var r = try ops.HcTape(MlxG).init(g, reg, .float32, null);
+        var r = try tr.HcTape(MlxG).init(g, reg, .float32, null);
         defer r.deinit(g);
-        var mixed = try ops.HcTapeMixed(MlxG).init(g, reg, null);
+        var mixed = try tr.HcTapeMixed(MlxG).init(g, reg, null);
         defer mixed.deinit(g);
         const x, const rr, const rb, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "rb"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
@@ -449,32 +451,32 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 12;
     }
     if (eq(u8, f, "router")) {
-        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        var r = try tr.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
         defer r.deinit(g);
         outs[0..2].* = try r.call(g, in(ins, "x"));
         return 2;
     }
     if (eq(u8, f, "premix")) {
-        var r = try ops.Premix(MlxG).init(g, reg, in(ins, "w"), null);
+        var r = try tr.Premix(MlxG).init(g, reg, in(ins, "w"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "x"));
         return 1;
     }
     if (eq(u8, f, "sinkhorn")) {
-        var r = try ops.Sinkhorn(MlxG).init(g, reg);
+        var r = try tr.Sinkhorn(MlxG).init(g, reg);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "comb"));
         return 1;
     }
     if (eq(u8, f, "rcproj")) {
-        const site = std.meta.stringToEnum(ops.RcSite, c.site.?).?;
-        var r = try ops.RcProj(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        const site = std.meta.stringToEnum(tr.RcSite, c.site.?).?;
+        var r = try tr.RcProj(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "x"));
         return 1;
     }
     if (eq(u8, f, "hctape")) {
-        var r = try ops.HcTape(MlxG).init(g, reg, .bfloat16, null);
+        var r = try tr.HcTape(MlxG).init(g, reg, .bfloat16, null);
         defer r.deinit(g);
         const x, const rr, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
@@ -484,7 +486,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 11;
     }
     if (eq(u8, f, "fused_proj")) {
-        var r = try ops.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
+        var r = try tr.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
         defer r.deinit(g);
         const cos, const sin = .{ in(ins, "cos"), in(ins, "sin") };
         outs[0] = try r.qNorm(g, in(ins, "x_q"));
@@ -494,14 +496,14 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 4;
     }
     if (eq(u8, f, "gemv")) {
-        var r = try ops.Gemv(MlxG).init(g, reg);
+        var r = try xq.Gemv(MlxG).init(g, reg);
         defer r.deinit(g);
-        const proj: ops.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
+        const proj: xq.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
         outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"));
         return 1;
     }
     if (eq(u8, f, "prep")) {
-        var r = try ops.RinPrep(MlxG).init(g, reg);
+        var r = try xq.RinPrep(MlxG).init(g, reg);
         defer r.deinit(g);
         const ids = in(ins, "ids");
         outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
@@ -510,20 +512,20 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         outs[4] = try r.dpost(g, in(ins, "zd"), in(ins, "rout_d"), ids);
         return 5;
     }
-    const gate: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
-    const up: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
-    const down: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
+    const gate: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
+    const up: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
+    const down: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
     if (eq(u8, f, "rebuild")) {
-        const r = ops.Rebuild(MlxG).init(reg);
+        const r = xq.Rebuild(MlxG).init(reg);
         outs[0..3].* = try r.call(g, gate, up, down, in(ins, "slots"), @intCast(c.vars.experts));
         return 3;
     }
     if (eq(u8, f, "digx")) {
-        const r = ops.DigX(MlxG).init(reg);
+        const r = xq.DigX(MlxG).init(reg);
         const rhs = in(ins, "rhs");
         const tgs_gu = try tableTgs(g, in(ins, "tbl_gu"));
         const tgs_dn = try tableTgs(g, in(ins, "tbl_dn"));
-        const gu: ops.DigTableArray(MlxG) = .{ .tbl = in(ins, "tbl_gu"), .tgs = tgs_gu };
+        const gu: xq.DigTableArray(MlxG) = .{ .tbl = in(ins, "tbl_gu"), .tgs = tgs_gu };
         const x = try r.take2(g, in(ins, "act"), in(ins, "ridx"), rhs, gu.tbl, gate.rin, up.rin);
         const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
         const hd = try r.onePass(g, z[0], z[1], rhs, gu.tbl, gate.rout, up.rout, down.rin);
@@ -586,17 +588,17 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
         };
         try ins.put(a, i.name, x);
     }
-    const P = ops.ProjArrays(mlx.mlx_array);
-    const bank: ops.BankArrays(mlx.mlx_array) = .{
+    const P = xq.ProjArrays(mlx.mlx_array);
+    const bank: xq.BankArrays(mlx.mlx_array) = .{
         .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin") },
         .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin") },
         .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin") },
     };
-    try ops.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
-    try ops.checkBank(MlxG, g, reg, .up, bank.up, diag);
-    try ops.checkBank(MlxG, g, reg, .down, bank.down, diag);
-    const shape: ops.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
-    var r = try ops.DigXPrefill(MlxG).init(a, reg, shape, diag);
+    try xq.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
+    try xq.checkBank(MlxG, g, reg, .up, bank.up, diag);
+    try xq.checkBank(MlxG, g, reg, .down, bank.down, diag);
+    const shape: xq.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
+    var r = try xq.DigXPrefill(MlxG).init(a, reg, shape, diag);
     defer r.deinit(g);
     var results: std.ArrayList(mlx.mlx_array) = .empty;
     defer results.deinit(a);

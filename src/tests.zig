@@ -48,6 +48,13 @@ test {
     _ = @import("exl3_selfcheck.zig");
     _ = @import("exl3_kernel_ops.zig");
     _ = @import("exl3_kernel_ops_gate.zig");
+    _ = @import("kernel_routes.zig");
+    _ = @import("kernel_set.zig");
+    _ = @import("kernel_trace.zig");
+    _ = @import("quant.zig");
+    _ = @import("exl3_quant.zig");
+    _ = @import("dsv41_kernel_routes.zig");
+    _ = @import("dsv41_kernels_test.zig");
     _ = @import("dsv41_profile.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");

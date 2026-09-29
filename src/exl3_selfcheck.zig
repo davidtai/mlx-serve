@@ -78,11 +78,24 @@ fn isDigGemm(k: Kernel) bool {
 /// Runs every check of every kernel's plan; a failing check is recorded (with the latched MLX
 /// message) and the run continues, so one window reports the whole registry.
 pub fn runAll(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report) !void {
+    return runOver(a, reg, bound, .full, report);
+}
+
+/// As `runAll`, over the entries of `subset` (one consumer's kernels: `kernel_set.Set.selfCheck`),
+/// in registry order.
+pub fn runSubset(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, subset: []const Kernel, report: *Report) !void {
+    var want: std.EnumSet(Kernel) = .empty;
+    for (subset) |k| want.insert(k);
+    return runOver(a, reg, bound, want, report);
+}
+
+fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: std.EnumSet(Kernel), report: *Report) !void {
     const table = try a.create([65536]u16);
     defer a.destroy(table);
     xk.mul1Table(table);
     var h: H = .{ .a = a, .reg = reg, .bound = bound, .s = bound.stream, .rng = .init(20260928), .report = report, .table = table };
     for (&reg.entries) |*e| {
+        if (!want.contains(e.kernel)) continue;
         var it = e.checks.iterator();
         while (it.next()) |c| {
             const before = report.results.items.len;
