@@ -42,6 +42,10 @@ const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_event = @import("expert_event.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
+// The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
+comptime {
+    std.debug.assert(xp.decode_forward_rows == graph.rc_max_rows);
+}
 /// The expert source: the EXL3 quant's math (C2), the wide (prefill) routed calls on its DIG-X route, the
 /// next layer's reads started from the predictor. `A` waits on the host (LOOKAHEAD3, the exact tier);
 /// `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
