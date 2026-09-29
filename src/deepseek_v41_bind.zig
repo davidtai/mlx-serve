@@ -33,7 +33,7 @@
 //!      counts as grown (`Arm.grown_check`: the grown banks);
 //!   4. the decode's residents (a decode with `open`: the DSpark loop's trunk,
 //!      draft head and Engram rows; the Engram token map is the model
-//!      directory's `engram_token_map_file`);
+//!      directory's `engram_token_map_file`, `engram-token-map.u32`);
 //!   5. the session (`deepseek_v41_serve.Session`), released in reverse: the
 //!      decode's residents, the arm, the kernels (after their stream drained),
 //!      the backend.
@@ -176,8 +176,9 @@ pub fn GrownBanks(comptime A: type) type {
 
 /// The Engram token map's home in the model directory: the converter's output
 /// (`exl3/runtime/export_dsv41_engram_token_map.py --bank <dir> --out
-/// <dir>/engram/engram-token-map.u32`, its `.json` sidecar beside it).
-pub const engram_token_map_file = "engram/engram-token-map.u32";
+/// <dir>/engram-token-map.u32`, its `.json` sidecar beside it). A top-level
+/// file: a bank's `engram/` may be a link into another bank's directory.
+pub const engram_token_map_file = "engram-token-map.u32";
 
 /// Binding `b`'s construction over backend `G` (MLX serving; the trace
 /// backend in host tests, where no decode with residents binds).
@@ -526,12 +527,25 @@ test "dsv41 bind: a served request's receipt names the DSpark decode and the row
     try testing.expectEqual(@as(u32, 3), back.value.selection.policy.verify_rows);
 }
 
-// Guarded window only (the served construction on the bank: the kernels'
-// device self-check, the slot banks at the admitted rows, the trunk and the
-// draft head resident, one request): _GPU_WINDOW_LOCKED=1
-// DSV41_BIND_MODEL=<model dir, with engram/engram-token-map.u32 and its .json>
-// MTPLX_DSV41_BOX_BASELINE_GB=<the guard's baseline> DSV41_BIND_OUT=<receipt path; must not exist>
-// [DSV41_BIND_PROMPT_TOKENS=64] [DSV41_BIND_MAX_TOKENS=32]
+/// A window's prompt ids from a reference file: its `prompt` (a DSpark
+/// reference) or `prompt_ids` (an AR reference).
+fn promptFromFile(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u32 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    defer a.free(text);
+    const P = struct { prompt: ?[]const u32 = null, prompt_ids: ?[]const u32 = null };
+    const p = try std.json.parseFromSlice(P, a, text, .{ .ignore_unknown_fields = true });
+    defer p.deinit();
+    const ids = p.value.prompt orelse p.value.prompt_ids orelse return error.PromptFileHasNoIds;
+    if (ids.len == 0) return error.PromptFileHasNoIds;
+    return a.dupe(u32, ids);
+}
+
+// Guarded window only (G6: the served path on the bank, the DSpark binding without the flip): the kernels' device
+// self-check, the slot banks at the admitted rows, the trunk + draft head + Engram rows resident, one request.
+// _GPU_WINDOW_LOCKED=1 DSV41_BIND_MODEL=<model dir, with engram-token-map.u32 and its .json>
+// DSV41_BIND_OUT=<receipt path; must not exist> MTPLX_DSV41_BOX_BASELINE_GB=<the guard's baseline>
+// DSV41_BIND_PROMPT=<json: `prompt` (a DSpark reference) or `prompt_ids` (an AR reference); unset: seeded ids>
+// [DSV41_BIND_PROMPT_TOKENS=64 (seeded only)] [DSV41_BIND_MAX_TOKENS=100]
 test "dsv41 bind: the DSpark binding constructs on the bank and serves one request (the served path's GPU gate)" {
     const envOf = struct {
         fn f(name: [*:0]const u8) ?[]const u8 {
@@ -543,9 +557,41 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     if (envOf("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const a = testing.allocator;
     const io = testing.io;
+    const cell = @import("deepseek_v41_cell.zig");
     const baseline_gb = envOf("MTPLX_DSV41_BOX_BASELINE_GB");
-    const prompt_tokens = if (envOf("DSV41_BIND_PROMPT_TOKENS")) |v| try std.fmt.parseInt(u32, v, 10) else 64;
-    const max_tokens = if (envOf("DSV41_BIND_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, v, 10) else 32;
+    const max_tokens = if (envOf("DSV41_BIND_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, v, 10) else 100;
+    const prompt = if (envOf("DSV41_BIND_PROMPT")) |path| try promptFromFile(a, io, path) else blk: {
+        const n = if (envOf("DSV41_BIND_PROMPT_TOKENS")) |v| try std.fmt.parseInt(u32, v, 10) else 64;
+        const ids = try a.alloc(u32, n);
+        var rng = std.Random.DefaultPrng.init(0x5eed);
+        for (ids) |*t| t.* = rng.random().uintLessThan(u32, 100_000);
+        break :blk ids;
+    };
+    defer a.free(prompt);
+    const prompt_sha = try cell.idsSha256(a, prompt);
+    std.debug.print("DSV41_BIND_PROMPT {{\"tokens\": {d}, \"sha256\": \"{s}\", \"source\": \"{s}\"}}\n", .{ prompt.len, &prompt_sha, envOf("DSV41_BIND_PROMPT") orelse "seeded" });
+
+    var diag: arm_mod.Diag = .{};
+    const arm_opt: arm_mod.Options = .{
+        .model_dir = model_dir,
+        .baseline_bytes = if (baseline_gb) |v| @intFromFloat(@round(try std.fmt.parseFloat(f64, v) * 1e9)) else null,
+        .slot_memory = .host,
+    };
+    // The plan at the box now (CPU: config, bank, admission; no slot memory), for the window's child cap.
+    {
+        var planned = arm_mod.planRows(a, io, arm_opt, &diag) catch |err| {
+            std.debug.print("DSV41_BIND_REFUSED {s}: {s}\n", .{ @errorName(err), diag.message() });
+            return err;
+        };
+        defer planned.bank.deinit();
+        const adm = planned.plan.admission;
+        const process_bound = adm.physical_bound_bytes -| adm.baseline_bytes;
+        std.debug.print("DSV41_BIND_PLAN {{\"prefill_rows\": {d}, \"decode_rows\": {d}, \"slot_bank_bytes\": {d}, \"active_bound_bytes\": {d}, \"physical_bound_bytes\": {d}, \"baseline_bytes\": {d}, \"process_bound_bytes\": {d}, \"child_cap_bytes\": {d}, \"modeled_peak_physical_bytes\": {d}}}\n", .{
+            planned.prefill_rows,   planned.decode_rows,       adm.final_bank_bytes, adm.active_bound_bytes, adm.physical_bound_bytes,
+            adm.baseline_bytes,     process_bound,             process_bound + 3_000_000_000,
+            if (planned.plan.peak_fill) |pf| pf.modeled_peak_bytes else adm.physical_bound_bytes,
+        });
+    }
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -559,12 +605,6 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
-    var diag: arm_mod.Diag = .{};
-    const arm_opt: arm_mod.Options = .{
-        .model_dir = model_dir,
-        .baseline_bytes = if (baseline_gb) |v| @intFromFloat(@round(try std.fmt.parseFloat(f64, v) * 1e9)) else null,
-        .slot_memory = .host,
-    };
     const t0 = std.Io.Timestamp.now(io, .boot);
     const e = openMlx(dspark, a, io, model_dir, s, arm_opt, .{}, &diag) catch |err| {
         std.debug.print("DSV41_BIND_REFUSED {s}: {s}\n", .{ @errorName(err), diag.message() });
@@ -575,11 +615,7 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     const fp = arm_mod.footprint();
     std.debug.print("DSV41_BIND_BUILT {{\"construction_s\": {d:.1}, \"footprint_bytes\": {d}, \"footprint_peak_bytes\": {d}}}\n", .{ built_s, fp.now, fp.peak });
 
-    // A seeded prompt of ids below the vocabulary (the stand-in cell's).
-    const prompt = try a.alloc(u32, prompt_tokens);
-    defer a.free(prompt);
-    var rng = std.Random.DefaultPrng.init(0x5eed);
-    for (prompt) |*t| t.* = rng.random().uintLessThan(u32, 100_000);
+    // One request as the scheduler serves it: the serve defaults (typical 0.3, depth 5), no stop ids.
     const Count = struct {
         n: u32 = 0,
         fn push(ctx: *anyopaque, _: u32) void {
@@ -592,6 +628,10 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     while (try e.step(.{ .ctx = &sink, .push = Count.push }) == null) {}
     var run = try e.end();
     defer run.deinit(a);
+    var line_buf: [256]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    try serve.writeRequestLine(&run, &line);
+    std.debug.print("{s}", .{line.buffered()});
     var lines: std.Io.Writer.Allocating = .init(a);
     defer lines.deinit();
     try e.receipt(&run, out, &lines.writer);
@@ -599,4 +639,13 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     std.debug.print("DSV41_BIND_DONE {{\"generated\": {d}, \"cycles\": {d}, \"prompt_eval_time_s\": {d:.3}, \"decode_wall_s\": {d:.3}, \"process_footprint_peak_bytes\": {d}, \"mlx_peak_bytes\": {d}}}\n", .{
         run.generated.len, run.stats.cycles, run.prompt_eval_s, run.decode_wall_s, run.footprint.peak, run.mlx_peak_bytes orelse 0,
     });
+    // The receipt is a DSpark measurement: the math is real.
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, out, a, .limited(1 << 20));
+    defer a.free(text);
+    const Back = struct { decode_binding: []const u8, measurement_valid: bool };
+    const back = try std.json.parseFromSlice(Back, a, text, .{ .ignore_unknown_fields = true });
+    defer back.deinit();
+    try testing.expectEqualStrings("dspark", back.value.decode_binding);
+    try testing.expect(back.value.measurement_valid);
+    try testing.expectEqual(@as(usize, max_tokens), run.generated.len);
 }

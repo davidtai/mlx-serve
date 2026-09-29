@@ -5801,11 +5801,10 @@ fn dsv41EndRequest(sch: *Scheduler, engine: dsv41_serve.Engine) void {
     };
     defer run.deinit(sch.allocator);
     const n = run.generated.len;
-    log.info("[dsv41] request: {d} prompt, {d} generated in {d} cycles ({d:.2} tok/cycle), prefill {d:.3} s, decode {d:.2} tok/s\n", .{
-        run.prompt.len,                                                                                                                                           n, run.stats.cycles,
-        if (run.stats.cycles > 0) @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(run.stats.cycles)) else 0, run.prompt_eval_s,
-        if (run.decode_wall_s > 0) @as(f64, @floatFromInt(n -| 1)) / run.decode_wall_s else 0,
-    });
+    var line_buf: [256]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    dsv41_serve.writeRequestLine(&run, &line) catch {};
+    log.info("{s}", .{line.buffered()});
     const dir = std.mem.span(std.c.getenv("DSV41_RECEIPT_DIR") orelse return);
     var name_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&name_buf, "{s}/dsv41-serve-{d}-{d}.comparison.json", .{ dir, std.Io.Timestamp.now(sch.io, .real).nanoseconds, n }) catch return;

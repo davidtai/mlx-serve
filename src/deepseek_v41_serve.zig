@@ -267,6 +267,19 @@ pub fn Session(comptime A: type, comptime D: type) type {
     };
 }
 
+/// A finished request's one log line (the scheduler's, and the served path's gate's).
+pub fn writeRequestLine(run: *const cell.Run, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const n = run.generated.len;
+    try w.print("[dsv41] request: {d} prompt, {d} generated in {d} cycles ({d:.2} tok/cycle), prefill {d:.3} s, decode {d:.2} tok/s\n", .{
+        run.prompt.len,
+        n,
+        run.stats.cycles,
+        if (run.stats.cycles > 0) @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(run.stats.cycles)) else 0,
+        run.prompt_eval_s,
+        if (run.decode_wall_s > 0) @as(f64, @floatFromInt(n -| 1)) / run.decode_wall_s else 0,
+    });
+}
+
 fn seconds(d: std.Io.Duration) f64 {
     return @as(f64, @floatFromInt(d.nanoseconds)) / 1e9;
 }
