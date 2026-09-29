@@ -3,10 +3,12 @@
 //! `Engine.step` once per tick (the first step is the prefill and yields the
 //! primary token, every later one is a decode cycle) and pushes what it emits;
 //! stop ids end the request unemitted, `max_tokens` bounds it. One request at
-//! a time: the scheduler refuses a second concurrent one by name. Every call
-//! runs on the thread that built the arm's stream (the inference thread) or is
-//! refused. `end` returns the request's run in the bench cell's shape, so the
-//! cell's receipt writer serves per-request stats too.
+//! a time: the scheduler refuses a second concurrent one by name. The engine
+//! is bound to the thread that built the arm's stream (the inference thread):
+//! the scheduler builds it there and calls it from its inference loop only,
+//! so safe builds assert it and nothing checks it per step. `end` returns the
+//! request's run in the bench cell's shape, so the cell's receipt writer
+//! serves per-request stats too.
 //!
 //! The decode loop is the arm's seam: `begin(cfg) !void`, `prefill(arm, g,
 //! prompt) !u32`, `cycle(arm, g, a, out) !bool`, `stats()`. Which loop, math
@@ -47,6 +49,11 @@ pub fn optionsFrom(mode: ?mtp_acceptance.Mode, depth: u32) !Options {
 
 /// A cycle verifies depth + 1 rows; the decode lane takes at most 8.
 pub const max_depth: u32 = expert_lookahead.max_rows - 1;
+
+/// A step's token buffer: a cycle commits at most its verify rows (<= 8).
+const cycle_tokens_reserve = 16;
+/// `generated` is reserved up to `max_tokens`, at most this many ids (4 MiB).
+const max_reserved_tokens: u32 = 1 << 20;
 
 pub const Request = struct {
     prompt: []const u32,
@@ -118,6 +125,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
         max_tokens: u32 = 0,
         depth: u32 = 0,
         generated: std.ArrayList(u32) = .empty,
+        /// A step's tokens (the prefill's primary, a cycle's committed ones),
+        /// reserved at begin and cleared per step.
+        toks: std.ArrayList(u32) = .empty,
         t0: std.Io.Timestamp = undefined,
         t1: std.Io.Timestamp = undefined,
         prompt_eval_s: f64 = 0,
@@ -134,13 +144,14 @@ pub fn Session(comptime A: type, comptime D: type) type {
             return @ptrCast(@alignCast(p));
         }
 
-        fn onOwner(self: *const Self) !void {
-            if (std.Thread.getCurrentId() != self.arm.stream.owner) return error.NotInferenceThread;
+        /// Safe builds only: the caller is the thread the engine is bound to.
+        fn assertOwner(self: *const Self) void {
+            if (std.debug.runtime_safety) std.debug.assert(std.Thread.getCurrentId() == self.arm.stream.owner);
         }
 
         fn beginFn(p: *anyopaque, r: Request) anyerror!void {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (r.prompt.len == 0) return error.EmptyPrompt;
             if (r.max_tokens == 0) return error.ZeroMaxTokens;
             const depth = if (r.depth == 0) self.opts.depth else r.depth;
@@ -154,6 +165,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
             self.stop_ids = try self.a.dupe(u32, r.stop_ids);
             self.max_tokens = r.max_tokens;
             self.depth = depth;
+            // The request's buffers, reserved once here: no step allocates.
+            try self.generated.ensureTotalCapacity(self.a, @min(r.max_tokens, max_reserved_tokens));
+            try self.toks.ensureTotalCapacity(self.a, cycle_tokens_reserve);
             try self.decode.begin(.{
                 .depth = depth,
                 .typical_delta = if (acc == .typical) acc.typical else null,
@@ -167,10 +181,10 @@ pub fn Session(comptime A: type, comptime D: type) type {
 
         fn stepFn(p: *anyopaque, sink: Sink) anyerror!?Finish {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (!self.active or self.done) return error.NoActiveRequest;
-            var toks: std.ArrayList(u32) = .empty;
-            defer toks.deinit(self.a);
+            const toks = &self.toks;
+            toks.clearRetainingCapacity();
             var loop_done = false;
             if (!self.primed) {
                 try toks.append(self.a, try self.decode.prefill(self.arm, self.g, self.prompt));
@@ -180,7 +194,7 @@ pub fn Session(comptime A: type, comptime D: type) type {
                 if (!self.arm.grown) try self.arm.grow(self.g);
                 self.primed = true;
             } else {
-                loop_done = try self.decode.cycle(self.arm, self.g, self.a, &toks);
+                loop_done = try self.decode.cycle(self.arm, self.g, self.a, toks);
             }
             for (toks.items) |t| {
                 if (std.mem.indexOfScalar(u32, self.stop_ids, t) != null) {
@@ -203,7 +217,7 @@ pub fn Session(comptime A: type, comptime D: type) type {
 
         fn endFn(p: *anyopaque) anyerror!cell.Run {
             const self = of(p);
-            try self.onOwner();
+            self.assertOwner();
             if (!self.active) return error.NoActiveRequest;
             var mlx_peak: ?u64 = null;
             if (G == ops.MlxOps) {
@@ -251,6 +265,7 @@ pub fn Session(comptime A: type, comptime D: type) type {
             const self = of(p);
             self.clear();
             self.generated.deinit(self.a);
+            self.toks.deinit(self.a);
             if (self.release) |f| f(self) else self.a.destroy(self);
         }
 
@@ -409,24 +424,6 @@ test "dsv41 serve: request options are checked before anything runs, and a dropp
     defer run.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), run.generated.len);
     try testing.expectEqual(@as(u64, 2), h.session.requests);
-}
-
-test "dsv41 serve: every engine call from a thread other than the inference thread is refused" {
-    const h = try HostEngine.create();
-    defer h.destroy();
-    const e = h.session.engine();
-    const Helper = struct {
-        fn run(eng: Engine, out: *[3]?anyerror) void {
-            out[0] = if (eng.begin(.{ .prompt = &.{1}, .max_tokens = 1, .stop_ids = &.{} })) null else |err| err;
-            var c: Collect = .{};
-            out[1] = if (eng.step(c.sink())) |_| null else |err| err;
-            out[2] = if (eng.end()) |_| null else |err| err;
-        }
-    };
-    var got: [3]?anyerror = .{ null, null, null };
-    const t = try std.Thread.spawn(.{}, Helper.run, .{ e, &got });
-    t.join();
-    for (got) |g| try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), g);
 }
 
 test "dsv41 serve: a served request's run writes the cell's receipt" {
