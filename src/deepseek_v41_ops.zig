@@ -1064,6 +1064,8 @@ pub const TraceOps = struct {
     /// Launches of prepared configs, and the prepared configs not yet released.
     prepared_launches: usize = 0,
     prepared_live: usize = 0,
+    /// The kernel of each prepared launch, in order (which text a route reached).
+    launched: std.ArrayList(xk.Kernel) = .empty,
     /// The regions `prepareTape` compiled, by context.
     regions: [n_regions][contexts_per_region]?*const anyopaque = @splat(@splat(null)),
     /// When set, `hostArray` keeps a copy of its bytes (`hostBytesOf`), so a
@@ -1089,6 +1091,12 @@ pub const TraceOps = struct {
         while (it.next()) |v| g.gpa.free(v.*);
         g.host_data.deinit(g.gpa);
         g.tape_sigs.deinit(g.gpa);
+        g.launched.deinit(g.gpa);
+    }
+
+    /// Prepared launches of kernel `k` since the `from`-th.
+    pub fn launchesOf(g: *const TraceOps, from: usize, k: xk.Kernel) usize {
+        return std.mem.count(xk.Kernel, g.launched.items[from..], &.{k});
     }
 
     /// The bytes host array `x` was made from (`record_host` set before it was made).
@@ -1455,6 +1463,7 @@ pub const TraceOps = struct {
     /// Launches `p` (counted apart from per-call launches).
     pub fn launchPrepared(g: *TraceOps, p: *const Prepared, inputs: []const T, out: []T) !void {
         g.prepared_launches += 1;
+        try g.launched.append(g.gpa, p.k);
         return g.launch(p.k, inputs, &p.cfg, out);
     }
 

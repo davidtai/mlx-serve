@@ -122,7 +122,7 @@ pub const Module = struct {
         errdefer self.embed_rows.close();
         self.model = try M.initWith(gpa, &self.g, c, routes.served, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
+        self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null, .registry = &self.set.reg });
         errdefer self.head.deinit(&self.g);
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
         // never in a request (the draft block joins once the draft round, P5, serves its depth). Each

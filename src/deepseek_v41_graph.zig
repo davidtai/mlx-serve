@@ -106,6 +106,10 @@ pub const Routes = struct {
     /// order per row), M 5 / 7 padded to M + 1 (RCTAIL headpad: the kernel's odd-M cliff; every
     /// row is the kernel's M-invariant row); bound by the model over its head weight.
     rc_head: bool = false,
+    /// C16 DRAFTRC: the DSpark draft block's RC routes at rows <= 8 (proj at bf16 / f32 x, the HC
+    /// tapes at the draft's stream dtypes, the 128-expert router, the premix, the Sinkhorn), bound
+    /// by the draft head; the draft head's own head call stays MLX's (RCTAIL drafthead).
+    rc_draft: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -197,6 +201,30 @@ pub fn RcProjs(comptime G: type) type {
     };
 }
 
+/// C16: a shared expert's three projections on the draft FMA kernel (w1 / w3 at site shared_w13,
+/// w2 at shared_w2), at the call site's x dtype.
+pub fn SharedRc(comptime G: type) type {
+    return struct {
+        w1: kr.DraftProj(G),
+        w3: kr.DraftProj(G),
+        w2: kr.DraftProj(G),
+
+        pub fn init(g: *G, reg: *const xk.Registry, x_dtype: Dtype, w: *const LayerW(G.T)) !@This() {
+            var w1 = try kr.DraftProj(G).init(g, reg, .shared_w13, x_dtype, w.sh_w1.w, w.sh_w1.s, null);
+            errdefer w1.deinit(g);
+            var w3 = try kr.DraftProj(G).init(g, reg, .shared_w13, x_dtype, w.sh_w3.w, w.sh_w3.s, null);
+            errdefer w3.deinit(g);
+            return .{ .w1 = w1, .w3 = w3, .w2 = try kr.DraftProj(G).init(g, reg, .shared_w2, x_dtype, w.sh_w2.w, w.sh_w2.s, null) };
+        }
+
+        pub fn deinit(self: *@This(), g: *G) void {
+            self.w1.deinit(g);
+            self.w3.deinit(g);
+            self.w2.deinit(g);
+        }
+    };
+}
+
 /// The rounding-class tier's kernel routes one layer calls (null: the stock op chain):
 /// a view of the model's `Trunk(G).Kernels`, bound once at construction.
 pub fn LayerKernels(comptime G: type) type {
@@ -207,8 +235,15 @@ pub fn LayerKernels(comptime G: type) type {
         premix_attn: ?*const kr.Premix(G) = null,
         premix_ffn: ?*const kr.Premix(G) = null,
         proj: ?*const RcProjs(G) = null,
+        /// The HC tape (C15) of the ffn prep and the MoE-side combine, and of the attention prep
+        /// unless `tape_attn` names another (the draft's stage 0: a bf16 stream into its first prep).
         tape: ?*const kr.HcTape(G) = null,
+        tape_attn: ?*const kr.HcTape(G) = null,
+        /// The ffn prep's fused call on an f32 x over a bf16 residual (the draft's stage 0).
+        tape_mixed: ?*const kr.HcTapeMixed(G) = null,
         fused: ?*const kr.FusedProj(G) = null,
+        /// C16: the shared expert's projections (the draft's; the trunk's shared expert is stock).
+        shared: ?*const SharedRc(G) = null,
 
         pub fn attnMix(self: Self) MixKernels(G) {
             return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn };
@@ -326,6 +361,7 @@ pub fn Trunk(comptime G: type) type {
                     .premix_ffn = if (self.premix.items.len > 0) &self.premix.items[l][1] else null,
                     .proj = if (self.proj.items.len > 0) &self.proj.items[l] else null,
                     .tape = if (self.tape) |*x| x else null,
+                    .tape_attn = if (self.tape) |*x| x else null,
                     .fused = if (self.fused.items.len > 0) &self.fused.items[l] else null,
                 };
             }
@@ -1154,6 +1190,19 @@ pub fn Trunk(comptime G: type) type {
             return sharedExpertQ(g, c, x, w.sh_w1, w.sh_w3, w.sh_w2);
         }
 
+        /// C16: `sharedExpertQ`'s statements with the three projections on the draft FMA kernel.
+        fn sharedExpertRc(g: *G, c: *const v41.Config, s: *const SharedRc(G), x: T) !T {
+            const dt = g.dtypeOf(x);
+            var gate = try g.astype(try s.w1.linear(g, x), .float32);
+            var up = try g.astype(try s.w3.linear(g, x), .float32);
+            if (c.swiglu_limit > 0) {
+                up = try g.clip(up, try g.scalar(-c.swiglu_limit, .float32), try g.scalar(c.swiglu_limit, .float32));
+                gate = try g.minimum(gate, try g.scalar(c.swiglu_limit, .float32));
+            }
+            const h = try g.mul(try g.silu(gate), up);
+            return s.w2.linear(g, try g.astype(h, dt));
+        }
+
         fn sharedExpertQ(g: *G, c: *const v41.Config, x: T, w1: Q(T), w3: Q(T), w2: Q(T)) !T {
             const dt = g.dtypeOf(x);
             var gate = try g.astype(try qlinear(g, x, w1), .float32);
@@ -1190,7 +1239,8 @@ pub fn Trunk(comptime G: type) type {
             const r = try router(g, p, c, rt, lk, w, xf);
             const ro = try routed.routed(g, xf, r.indices);
             try p.put("moe.routed", ro);
-            const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
+            const rc_shared: ?*const SharedRc(G) = if (g.shapeOf(xf).dim(0) <= rc_max_rows) lk.shared else null;
+            const shared = try g.astype(if (rc_shared) |s| try sharedExpertRc(g, c, s, xf) else try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
             const y = if (g.shapeOf(xf).dim(0) <= rt.attn_rows) blk: {
                 var o: [1]T = undefined;
@@ -1203,7 +1253,7 @@ pub fn Trunk(comptime G: type) type {
         /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
         /// attention RMSNorm. Out: attention input, pre, post, comb.
         pub fn hcAttnPrep(g: *G, c: *const v41.Config, lk: LK, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
-            if (lk.tape) |t| if (tapeRows(g, h)) |d| {
+            if (lk.tape_attn) |t| if (tapeRows(g, h)) |d| {
                 // C15 seg1: collapse + RMSNorm + the premix sum of squares in one kernel.
                 const cn = try t.collapseNorm(g, try g.reshape(h, &.{ d.m, d.hc, d.dim }), try g.reshape(pre_mix, &.{ d.m, d.hc }), norm_w);
                 const mx = try tapeMixes(g, c, t, lk.attnMix(), d, cn[0], cn[1], fnw, base, scale);
@@ -1218,8 +1268,10 @@ pub fn Trunk(comptime G: type) type {
         /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
         pub fn hcFfnPrep(g: *G, c: *const v41.Config, lk: LK, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             if (lk.tape) |t| if (tapeRows(g, residual)) |d| {
-                // C15 seg2': the attention HC combine, collapse, RMSNorm and sum of squares fused.
-                const f = try t.combineCollapseNorm(g, try g.reshape(attn_out, &.{ d.m, d.dim }), try g.reshape(residual, &.{ d.m, d.hc, d.dim }), try g.reshape(attn_post, &.{ d.m, d.hc }), try g.reshape(attn_comb, &.{ d.m, d.hc * d.hc }), try g.reshape(attn_pre, &.{ d.m, d.hc }), norm_w);
+                // C15 seg2': the attention HC combine, collapse, RMSNorm and sum of squares fused
+                // (C16's stage 0: the f32 x over the bf16 residual on its own text).
+                const args = .{ try g.reshape(attn_out, &.{ d.m, d.dim }), try g.reshape(residual, &.{ d.m, d.hc, d.dim }), try g.reshape(attn_post, &.{ d.m, d.hc }), try g.reshape(attn_comb, &.{ d.m, d.hc * d.hc }), try g.reshape(attn_pre, &.{ d.m, d.hc }), norm_w };
+                const f = if (lk.tape_mixed) |tm| try tm.call(g, args[0], args[1], args[2], args[3], args[4], args[5]) else try t.combineCollapseNorm(g, args[0], args[1], args[2], args[3], args[4], args[5]);
                 const mx = try tapeMixes(g, c, t, lk.ffnMix(), d, f[1], f[2], fnw, base, scale);
                 return .{ try g.reshape(f[3], &.{ d.b, d.s, d.dim }), try g.reshape(f[0], &.{ d.b, d.s, d.hc, d.dim }), mx.post, mx.comb, mx.pre };
             };
@@ -1235,7 +1287,6 @@ pub fn Trunk(comptime G: type) type {
             const sh = g.shapeOf(h);
             const m = sh.d[0] * sh.d[1];
             if (m > rc_max_rows) return null;
-            if (std.debug.runtime_safety) std.debug.assert(g.dtypeOf(h) == .bfloat16);
             return .{ .b = sh.d[0], .s = sh.d[1], .m = m, .hc = sh.d[2], .dim = sh.d[3] };
         }
 
