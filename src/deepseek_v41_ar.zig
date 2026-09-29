@@ -479,6 +479,11 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
 
     const g = &md.g;
+    // The host-waits arm (the served default: no event gates configured).
+    const arm = switch (md.arm) {
+        .host_waits => |t| t.arm,
+        else => return error.CellArmVariant,
+    };
     const L = dsl.Loop(ops.MlxOps);
     // The request's bounded lanes: the prompt, the token cap, one verify block (Module.prefill's rule).
     var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(prompt.len, prompt.len + max_tokens)));
@@ -499,7 +504,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
 
     _ = mlx.mlx_reset_peak_memory();
     const t0 = std.Io.Timestamp.now(io, .boot);
-    const primary = try lp.prefill(gpa, &md.arm.hook, prompt);
+    const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
     memProbe("dsv41 served cell", "prompt (one pass)");
     const t1 = std.Io.Timestamp.now(io, .boot);
@@ -513,7 +518,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     var finish: dsl.Finish = .stop;
     if (std.mem.indexOfScalar(u32, stops[0..n_stop], primary) == null) while (true) {
         var lg: dsl.CycleLog = .{ .primary = 0 };
-        const f = try lp.cycle(&md.arm.hook, &out, gpa, &lg);
+        const f = try lp.cycle(&arm.hook, &out, gpa, &lg);
         try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
         if (f) |x| {
             finish = x;
@@ -540,8 +545,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
         .prompt_ids_sha256 = &prompt_sha,
         .max_tokens = max_tokens,
         .finish = @tagName(finish),
-        .prefill_rows_per_layer = md.arm.prefill_rows[0],
-        .decode_rows_per_layer = md.arm.decode_rows[0],
+        .prefill_rows_per_layer = arm.prefill_rows[0],
+        .decode_rows_per_layer = arm.decode_rows[0],
         .ttft_s = ttft_s,
         .prefill_tok_s = @as(f64, @floatFromInt(prompt.len)) / ttft_s,
         .phase_change_s = phase_s,

@@ -5706,6 +5706,8 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
+    // deepseek_v41 forwards the whole prompt in its own chunks, one wave per layer: its own bill.
+    if (config.dsv41_prefill) |bill| return bill.bytes(seq, max_tokens, .served);
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
@@ -21795,6 +21797,23 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),
     );
+}
+
+test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks and waves; it does not batch decode" {
+    const t = std.testing;
+    const v41 = @import("deepseek_v41.zig");
+    const json = try v41.testConfigJson(t.allocator, .real);
+    defer t.allocator.free(json);
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, json);
+    defer cfg.deinit(t.allocator);
+    const bill = cfg.dsv41_prefill.?;
+    // The whole prompt reaches the arch (chunk = seq); the bill is the arch's, at the model's own chunk.
+    try t.expectEqual(bill.bytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    try t.expectEqual(@as(u64, 953), bill.chunkRows(16384));
+    try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
+    // The served gate's 64-token prompt: a small bill.
+    try t.expect(bill.bytes(64, 32, .served) < 5_000_000_000);
+    try t.expect(!scheduler_mod.configBatchesDecode(&cfg));
 }
 
 test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, not the generic MoE chunk" {

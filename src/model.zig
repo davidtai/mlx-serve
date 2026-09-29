@@ -410,9 +410,19 @@ pub const ModelConfig = struct {
     memory_baseline_bytes: ?u64 = null,
     /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
     expert_rows: ?u32 = null,
+    /// The memory a streamed-expert model's admission fits under (`--memory-ceiling-gb`); null = the GPU's
+    /// working set (the wired limit).
+    memory_ceiling_bytes: ?u64 = null,
+    /// deepseek_v41's prompt-pass bill for the prefill admission (its own estimator, as deepseek_v4 has one).
+    dsv41_prefill: ?deepseek_v41.PrefillBill = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
+    /// A streamed-expert model's routed waves wait on the reads' events instead of the host (the
+    /// `expert_event_gates` model setting; null = the arch's default).
+    expert_event_gates: ?bool = null,
+    /// A module-owned arch's numerics, chosen at construction (the `numeric_tier` model setting; null = served).
+    numeric_tier: ?@import("model_settings.zig").NumericTier = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1842,6 +1852,8 @@ var config_overrides: ?[]const u8 = null;
 /// `--memory-baseline-gb`, in bytes, and `--expert-rows`: stamped on every parsed config.
 pub var memory_baseline_override: ?u64 = null;
 pub var expert_rows_override: ?u32 = null;
+/// `--memory-ceiling-gb`, in bytes.
+pub var memory_ceiling_override: ?u64 = null;
 
 pub fn setConfigOverrides(raw: ?[]const u8) void {
     config_overrides = raw;
@@ -1907,6 +1919,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     var config = ModelConfig{};
     config.memory_baseline_bytes = memory_baseline_override;
     config.expert_rows = expert_rows_override;
+    config.memory_ceiling_bytes = memory_ceiling_override;
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
@@ -3165,11 +3178,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Native DeepSeek-V4.1: the arch's own parse refuses by name; the module
         // (deepseek_v41_module.zig) owns everything past the shell's generic fields.
         var diag: deepseek_v41.Diag = .{};
-        _ = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
+        const v41c = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
             log.err("deepseek_v41: {s}\n", .{diag.message()});
             return e;
         };
         config.model_type = "deepseek_v41";
+        // Routed experts, as deepseek_v4's arm states them: not a batched-decode model.
+        config.num_experts = v41c.n_routed_experts;
+        config.num_hidden_layers = v41c.n_layers;
+        config.dsv41_prefill = .of(&v41c);
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
         config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
@@ -7603,6 +7620,8 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     try testing.expectEqualStrings("deepseek_v41", c.model_type);
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
     try testing.expect(!c.perRequestPrefillChunk());
+    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.dsv41_prefill != null);
+    try testing.expectEqual(@as(u32, 40), c.num_hidden_layers);
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
