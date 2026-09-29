@@ -989,13 +989,36 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
         const first: u32 = @intCast(g.nodes.items.len);
         const waves0 = g.freed.items.len;
         const r = try model_.forward(&g, &st, span, .{ .logits = .all, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
-        const waves = g.freed.items[waves0..];
-        try testing.expectEqual(@as(usize, m.c.n_layers), waves.len);
+        // The layer waves, in order; each layer's score chains (attention, and the indexer's on an
+        // index source) are sub-waves released inside it, before the layer's own reset.
+        var layers: [16]TraceOps.Freed = undefined;
+        var n_layers: usize = 0;
+        var n_sub: usize = 0;
         var prev = first;
-        for (waves) |w| {
-            try testing.expect(w.from >= prev and w.to > w.from);
+        for (g.freed.items[waves0..]) |w| {
+            try testing.expect(w.from >= first and w.to > w.from);
+            if (w.from < prev) {
+                // A later wave that contains the earlier ones: the layer closing over its sub-waves.
+                while (n_layers > 0 and layers[n_layers - 1].from >= w.from) n_layers -= 1;
+                layers[n_layers] = w;
+                n_layers += 1;
+            } else {
+                layers[n_layers] = w;
+                n_layers += 1;
+            }
             prev = w.to;
         }
+        for (g.freed.items[waves0..]) |w| {
+            for (layers[0..n_layers]) |l| {
+                if (w.from >= l.from and w.to <= l.to and (w.from != l.from or w.to != l.to)) {
+                    n_sub += 1;
+                    break;
+                }
+            }
+        }
+        try testing.expectEqual(@as(usize, m.c.n_layers), n_layers);
+        try testing.expect(n_sub >= m.c.n_layers);
+        prev = layers[n_layers - 1].to;
         // The final norm, the head and the taps' concat come after the last wave.
         try testing.expect(r.logits.? >= prev and r.main_hidden.? >= prev and r.hidden >= prev);
     }

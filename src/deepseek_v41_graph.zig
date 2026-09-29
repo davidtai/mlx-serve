@@ -195,6 +195,19 @@ pub fn Trunk(comptime G: type) type {
             }
         };
 
+        /// A score sub-wave (inside a layer's wave): `outs`, built since `m`, survive
+        /// as fresh handles; everything else the chain built is released before the
+        /// eval, so MLX frees each score-sized array at its last use, as the Python
+        /// lane does (at most two score blocks live) instead of holding all of them
+        /// to the layer's reset (a 953-row prefill chunk's attention and indexer
+        /// arrays are 8 GB each at 16K).
+        fn closeScores(g: *G, m: ops.Mark, outs: []const *T) !void {
+            var kept: [2]T = undefined;
+            for (outs, 0..) |o, i| kept[i] = g.keep(o.*);
+            g.resetTo(m);
+            for (outs, 0..) |o, i| o.* = try g.adopt(kept[i]);
+        }
+
         /// A weak Python float against `like` (MLX `to_array(v, like.dtype)`).
         fn sf(g: *G, v: f64, like: T) !T {
             const d = g.dtypeOf(like);
@@ -549,7 +562,9 @@ pub fn Trunk(comptime G: type) type {
             if (li.index_source) {
                 const lens = try g.floorDiv(try g.add(positions, try g.scalar(1, .int32)), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const cand = if (li.candidate_source) null else shared.candidates;
-                const sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source);
+                const scores = g.mark();
+                var sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source);
+                if (sel.cand) |*cd| try closeScores(g, scores, &.{ &sel.mask, cd }) else try closeScores(g, scores, &.{&sel.mask});
                 shared.topk_mask = sel.mask;
                 if (li.candidate_source) shared.candidates = sel.cand;
                 mask = sel.mask;
@@ -796,7 +811,9 @@ pub fn Trunk(comptime G: type) type {
                     ckv = comp.kv;
                     cidx = shared.selected_idx;
                 };
+                const scores = g.mark();
                 o0 = try sparseAttendSelected(g, c, rt, w, q, window, drop, ckv, cidx, positions);
+                try closeScores(g, scores, &.{&o0});
             } else {
                 var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), drop, b, s);
                 var keys = window;
@@ -806,7 +823,9 @@ pub fn Trunk(comptime G: type) type {
                         attend = try g.concat(&.{ attend, comp.mask }, -1);
                     }
                 }
+                const scores = g.mark();
                 o0 = if (s > 1 and rt.lean_prefill_score) try sparseAttendLean(g, c, w, q, keys, attend) else try sparseAttend(g, c, w, q, keys, attend);
+                try closeScores(g, scores, &.{&o0});
             }
             try p.put("attn.o", o0);
             const w_ol = try woaDense(g, c, w);

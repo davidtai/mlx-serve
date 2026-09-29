@@ -656,33 +656,79 @@ test "dsv41 dspark loop: each draft stage is one wave, freed at the stage's end"
     try testing.expect(d.ids >= prev and d.logits >= prev and d.conf >= prev);
 }
 
-/// The bytes MlxOps holds over one traced call `[from, to)` whose waves are
-/// `waves`: `reset` = every allocating node until the call's reset (one reset
-/// per forward, the 8b72bd27 harness), `outside` + `widest` = the call's nodes
-/// outside its waves plus its widest wave (one wave per layer).
+/// The bytes MlxOps holds over one traced call `[from, to)` whose released
+/// ranges are `ranges` (layer waves, and the score sub-waves nested in them):
+/// `reset` = every allocating node until the call's reset (one reset per
+/// forward, the 8b72bd27 harness); `layer` = the widest layer wave holding all
+/// its nodes to the layer's reset (69fe3eb); `wave` = the widest layer wave with
+/// its score chains released at last use (their outputs kept, at most their
+/// two largest arrays live at once, as MLX frees a chain); `outside` = the
+/// call's nodes outside every wave.
 const Held = struct {
     reset: u64,
     outside: u64,
-    widest: u64,
+    layer: u64,
+    wave: u64,
     widest_at: usize,
 
-    fn of(g: *const TraceOps, from: usize, to: usize, waves: []const TraceOps.Freed) Held {
-        var h: Held = .{ .reset = graph.heldBytes(g, from, to).sum, .outside = 0, .widest = 0, .widest_at = 0 };
+    fn allocating(n: TraceOps.Node) u64 {
+        switch (n.op) {
+            .input, .host, .scalar, .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => return 0,
+            else => return @as(u64, @intCast(n.shape.numel())) * ops.dtypeSize(n.dtype),
+        }
+    }
+
+    /// A released chain's live bound: its two largest arrays, and its output (the last array) kept.
+    fn chain(g: *const TraceOps, r: TraceOps.Freed) struct { live: u64, out: u64 } {
+        var a: u64 = 0;
+        var b: u64 = 0;
+        var out: u64 = 0;
+        for (g.nodes.items[r.from..r.to]) |n| {
+            const x = allocating(n);
+            if (x == 0) continue;
+            out = x;
+            if (x > a) {
+                b = a;
+                a = x;
+            } else if (x > b) b = x;
+        }
+        return .{ .live = a + b, .out = out };
+    }
+
+    fn of(g: *const TraceOps, from: usize, to: usize, ranges: []const TraceOps.Freed) Held {
+        var h: Held = .{ .reset = graph.heldBytes(g, from, to).sum, .outside = 0, .layer = 0, .wave = 0, .widest_at = 0 };
         var in_waves: u64 = 0;
-        for (waves, 0..) |w, i| {
-            const b = graph.heldBytes(g, w.from, w.to).sum;
-            in_waves += b;
-            if (b > h.widest) {
-                h.widest = b;
-                h.widest_at = i;
+        var k: usize = 0;
+        for (ranges, 0..) |w, i| {
+            const top = for (ranges) |o| {
+                if (o.from <= w.from and w.to <= o.to and (o.from != w.from or o.to != w.to)) break false;
+            } else true;
+            if (!top) continue;
+            const all = graph.heldBytes(g, w.from, w.to).sum;
+            in_waves += all;
+            var kept = all;
+            var live: u64 = 0;
+            for (ranges) |r| {
+                if (r.from >= w.from and r.to <= w.to and (r.from != w.from or r.to != w.to)) {
+                    const ch = chain(g, r);
+                    kept = kept - graph.heldBytes(g, r.from, r.to).sum + ch.out;
+                    live = @max(live, ch.live);
+                }
             }
+            if (all > h.layer) h.layer = all;
+            if (kept + live > h.wave) {
+                h.wave = kept + live;
+                h.widest_at = k;
+            }
+            _ = i;
+            k += 1;
         }
         h.outside = h.reset - in_waves;
         return h;
     }
 
     fn print(h: Held, what: []const u8) void {
-        std.debug.print("dsv41 held: {s}: one reset per forward {d} B; one wave per layer {d} B ({d} B outside the waves + the widest wave, #{d}, {d} B)\n", .{ what, h.reset, h.outside + h.widest, h.outside, h.widest_at, h.widest });
+        std.debug.print("dsv41 held: {s}: one reset per forward {d} B; layer waves {d} B; score chains released {d} B ({d} B outside the waves + the widest wave, #{d}, {d} B)\n", .{ what, h.reset, h.outside + h.layer, h.outside + h.wave, h.outside, h.widest_at, h.wave });
     }
 };
 
@@ -787,9 +833,66 @@ test "dsv41 dspark loop: the bank's forwards hold one layer's arrays per wave, n
     const woa_layer: u64 = @as(u64, c.o_groups) * c.o_lora_rank * (@as(u64, c.n_heads) * c.head_dim / c.o_groups) * (2 + 4);
     for ([_]Held{ m3_prompt, m3_decode, m5_verify }) |h| {
         try testing.expect(h.reset >= nl * woa_layer);
-        try testing.expect(h.widest >= woa_layer and h.outside + h.widest < 2 * woa_layer + (256 << 20));
+        try testing.expect(h.wave >= woa_layer and h.outside + h.wave < 2 * woa_layer + (256 << 20));
     }
-    try testing.expect(m5_draft.reset >= n_st * woa_layer and m5_draft.widest < 2 * woa_layer);
+    try testing.expect(m5_draft.reset >= n_st * woa_layer and m5_draft.layer < 2 * woa_layer);
+}
+
+// Bank mode (host only, the trace backend; DSV41_BANK): the 16K cell's prompt as the model chunks it (the Python
+// rule: 17 x 953 + 183), each chunk one forward over the state the earlier chunks built, the routed calls a
+// stand-in (the prefill's routed transients are the wide lane's own). Per chunk: the widest layer wave with
+// every array held to the layer's reset (69fe3eb) against the score chains released at last use; the stock
+// tier (masked-full attention, the parity harnesses') and the served tier (K30 selected keys).
+test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blocks per chain, not the layer's" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 held: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(a, io, bank, &diag);
+    const eng = @import("deepseek_v41_engram.zig");
+    const kvc = @import("deepseek_v41_cache.zig");
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    const prompt = try aa.alloc(u32, 16384);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    const spans = try kvc.prefillSpans(aa, 16384, kvc.resolvePrefillChunk(&c, 16384, null, kvc.default_chunk_target_bytes));
+    try testing.expectEqual(@as(usize, 18), spans.len);
+    for ([_]struct { name: []const u8, tier: routes.Tier }{ .{ .name = "stock", .tier = routes.stock }, .{ .name = "served", .tier = routes.served } }) |t| {
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+        const model_ = try Loop(TraceOps).M.init(a, &g, c, t.tier, &lookup, &src);
+        defer model_.deinit(&g);
+        var st = try model_.newState();
+        defer st.deinit(&g, a);
+        const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
+        var worst: Held = undefined;
+        var worst_i: usize = 0;
+        for (spans, 0..) |sp, i| {
+            const f0 = g.nodes.items.len;
+            const w0 = g.freed.items.len;
+            _ = try model_.forward(&g, &st, prompt[sp[0]..sp[1]], .{ .logits = if (i + 1 == spans.len) .last else .none }, stand, graph.NoProbe{});
+            const h = Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+            if (i == 0 or h.outside + h.layer > worst.outside + worst.layer) {
+                worst = h;
+                worst_i = i;
+            }
+            if (i + 2 >= spans.len) {
+                var nb: [96]u8 = undefined;
+                h.print(try std.fmt.bufPrint(&nb, "{s} tier, 16K chunk {d} ({d} rows)", .{ t.name, i, sp[1] - sp[0] }));
+            }
+        }
+        var nb: [96]u8 = undefined;
+        worst.print(try std.fmt.bufPrint(&nb, "{s} tier, 16K widest chunk {d}", .{ t.name, worst_i }));
+        // Released score chains: the stock tier's masked-full chunk keeps two 8 GB score blocks of its
+        // five (plus the indexer's), under half its layer wave; K30's gathered chain under 3 / 5 of it.
+        if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else try testing.expect(5 * worst.wave < 3 * worst.layer);
+    }
 }
 
 test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every routed id through its lut and otherwise drafts as the full head" {

@@ -218,7 +218,7 @@ pub const MlxOps = struct {
     /// Compiles region `Body` for context `ctx` (at construction; idempotent).
     /// `ctx` carries the region's structural constants and must outlive the backend.
     pub fn prepareTape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx) !void {
-        const slots = &g.regions[@intFromEnum(Body.region)];
+        const slots = &g.regions[@backingInt(Body.region)];
         for (slots) |sl| if (sl.ctx == @as(*const anyopaque, ctx)) return;
         const free = for (slots) |*sl| {
             if (sl.ctx == null) break sl;
@@ -231,7 +231,7 @@ pub const MlxOps = struct {
     pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
         // Construction prepared every region a call can reach (the trace twin refuses the rest by name,
         // which the host tests prove); here the lookup only picks the context's closure (<= 2 slots).
-        const compiled = for (g.regions[@intFromEnum(Body.region)]) |sl| {
+        const compiled = for (g.regions[@backingInt(Body.region)]) |sl| {
             if (sl.ctx == @as(*const anyopaque, ctx)) break sl.compiled;
         } else unreachable;
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
@@ -1126,6 +1126,9 @@ pub const TraceOps = struct {
         return x;
     }
     pub fn release(_: *TraceOps, _: T) void {}
+    pub fn adopt(_: *TraceOps, x: T) !T {
+        return x;
+    }
 
     fn push(g: *TraceOps, op: Op, dtype: Dtype, shape: Shape) !T {
         try g.nodes.append(g.gpa, .{ .op = op, .dtype = dtype, .shape = shape });
@@ -1265,7 +1268,7 @@ pub const TraceOps = struct {
     /// The region runs inline between two markers (a test pins its boundary).
     /// Records that region `Body` is compiled for `ctx` (the MLX backend's construction step).
     pub fn prepareTape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx) !void {
-        const slots = &g.regions[@intFromEnum(Body.region)];
+        const slots = &g.regions[@backingInt(Body.region)];
         for (slots) |sl| if (sl == @as(?*const anyopaque, ctx)) return;
         for (slots) |*sl| if (sl.* == null) {
             sl.* = ctx;
@@ -1275,10 +1278,10 @@ pub const TraceOps = struct {
     }
 
     pub fn tape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
-        for (g.regions[@intFromEnum(Body.region)]) |sl| {
+        for (g.regions[@backingInt(Body.region)]) |sl| {
             if (sl == @as(?*const anyopaque, ctx)) break;
         } else return error.RegionNotPrepared;
-        var h = std.hash.Wyhash.init(@intFromEnum(Body.region));
+        var h = std.hash.Wyhash.init(@backingInt(Body.region));
         h.update(std.mem.asBytes(&@intFromPtr(ctx)));
         for (inputs) |x| {
             const nd = g.nodes.items[x];
