@@ -175,9 +175,14 @@ pub const Lookup = struct {
 
     /// Any prompt length (`LookupExtension`): positions are indexed from
     /// `key_len` on, as the history grows past it.
-    pub fn init(a: std.mem.Allocator, prompt: []const u32, minimum_context: u32, extra_tokens: u32) !Lookup {
+    /// `reserve`: the positions the request can reach (prompt + tokens), the
+    /// history and the key map sized to them once; 0 lets them grow.
+    pub fn init(a: std.mem.Allocator, prompt: []const u32, minimum_context: u32, extra_tokens: u32, reserve: usize) !Lookup {
         var l: Lookup = .{ .a = a, .arena = .init(a), .minimum_context = minimum_context, .extra_tokens = extra_tokens };
-        try l.history.appendSlice(a, prompt);
+        errdefer l.deinit();
+        try l.history.ensureTotalCapacity(a, @max(reserve, prompt.len));
+        try l.ends.ensureTotalCapacity(l.arena.allocator(), @intCast(@max(reserve, prompt.len)));
+        l.history.appendSliceAssumeCapacity(prompt);
         return l;
     }
 
@@ -299,7 +304,7 @@ test "dsv41 dspark: typical flags decide acceptance, the argmax stays the correc
 test "dsv41 dspark: the lookup extends a full proposal from its earliest longest-context occurrence" {
     const a = testing.allocator;
     // history: 7 8 | 1 2 3 4 5 6 9 | 8 | 1 2 3 4 5 70 71 | 9 7 8   (then the primary 8 is committed)
-    var lk = try Lookup.init(a, &.{ 7, 8, 1, 2, 3, 4, 5, 6, 9, 8, 1, 2, 3, 4, 5, 70, 71, 9, 7 }, 2, 2);
+    var lk = try Lookup.init(a, &.{ 7, 8, 1, 2, 3, 4, 5, 6, 9, 8, 1, 2, 3, 4, 5, 70, 71, 9, 7 }, 2, 2, 0);
     defer lk.deinit();
     try lk.appendCommitted(&.{8});
     var buf: [8]u32 = undefined;
@@ -311,7 +316,7 @@ test "dsv41 dspark: the lookup extends a full proposal from its earliest longest
     // Below minimum_context: "3 4 5 70 71" occurs once, and the token before it (2) is not the tail's (8).
     try testing.expectEqualSlices(u32, &.{ 3, 4, 5, 70, 71 }, lk.extend(&.{ 3, 4, 5, 70, 71 }, &buf));
     // A prompt shorter than the key (Python indexes from end 5 on as the history grows).
-    var short = try Lookup.init(a, &.{ 1, 2, 3 }, 2, 2);
+    var short = try Lookup.init(a, &.{ 1, 2, 3 }, 2, 2, 0);
     defer short.deinit();
     try short.appendCommitted(&.{ 4, 5, 6, 1, 2, 3, 4, 5 });
     try testing.expectEqual(@as(usize, 6), short.ends.count()); // ends 5..10
@@ -335,7 +340,7 @@ test "dsv41 dspark: the lookup replays the lane's LookupExtension call for call"
     var calls: usize = 0;
     var extended: usize = 0;
     for (f.scenarios) |sc| {
-        var lk = try Lookup.init(a, sc.prompt, f.minimum_context, f.extra_tokens);
+        var lk = try Lookup.init(a, sc.prompt, f.minimum_context, f.extra_tokens, 0);
         defer lk.deinit();
         var buf: [16]u32 = undefined;
         for (sc.ops, 0..) |op, i| {

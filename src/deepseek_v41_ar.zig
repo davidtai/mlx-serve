@@ -21,6 +21,22 @@ const ds = @import("deepseek_v41_dspark.zig");
 const dss = @import("deepseek_v41_dspark_serve.zig");
 const xk = @import("exl3_kernels.zig");
 const xko = @import("exl3_kernel_ops.zig");
+const status = @import("status.zig");
+
+/// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
+/// high-water mark since the previous probe (then reset), and the process footprint now
+/// (`status.getAppMemFootprintMb`). The gap between the footprint and MLX is the host side.
+fn memProbe(harness: []const u8, phase: []const u8) void {
+    var active: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    const fp_mib: u64 = status.getAppMemFootprintMb();
+    std.debug.print("\n{s}: memory {s}: MLX active {d:.2} GB, MLX peak since the last probe {d:.2} GB, footprint {d:.2} GB\n", .{
+        harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp_mib << 20)) / 1e9,
+    });
+    _ = mlx.mlx_reset_peak_memory();
+}
 
 /// The kernels lane's startup acceptance on the harness's GPU stream (registry,
 /// kernels built, the device self-check plan judged, the backend's launcher set),
@@ -64,6 +80,7 @@ const StepHashes = struct {
     n: usize = 0,
 
     pub fn step(self: *StepHashes, _: *ops.MlxOps, logits: mlx.mlx_array) !void {
+        if (self.n == 0) memProbe("dsv41 ar", "prompt (residents bound on first use, the prompt's forwards)");
         const n = mlx.mlx_array_size(logits);
         const p = mlx.mlx_array_data_float32(logits) orelse return error.MlxNoData;
         var d: [32]u8 = undefined;
@@ -114,8 +131,10 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     var prev_cache: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
+    memProbe("dsv41 ar", "start");
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
+    memProbe("dsv41 ar", "kernels accepted (the startup self-check)");
 
     var weights = try dss.loadResidents(io, gpa, bank_dir, &c);
     defer weights.deinit();
@@ -147,6 +166,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     defer ex.deinit();
     try ex.grow(&g, grown);
     try checkBanks(&g, &kernels.reg, &ex);
+    memProbe("dsv41 ar", "slots grown (the residents are loaded lazily, at first use)");
 
     const out = try a.alloc(u32, ref.new_tokens);
     var hashes: StepHashes = .{ .out = try a.alloc([64]u8, ref.new_tokens) };
@@ -160,15 +180,16 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
         if (mine != theirs and first == null) first = i;
         if (i < ref.steps.len and std.mem.eql(u8, &hashes.out[i], ref.steps[i].logits_sha256)) logits_equal += 1;
     }
+    memProbe("dsv41 ar", "decode (the generated tokens)");
     const sst = ex.source.stats();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    std.debug.print("dsv41 ar: {d} prompt tokens in forwards of {d}, {d} generated; ids {s}; logits rows equal {d}/{d}; {d} rows/layer; routes {d}, hits {d}, misses {d}, {d} B read in {d} preadv; {d} ms; MLX peak {d} B\n", .{
-        ref.prompt_ids.len,       ref.chunk,               out.len,
-        if (first == null) "IDENTICAL" else "DIFFER", logits_equal, out.len, rows,
-        sst.route_calls,          sst.expert_cache_hits,   sst.expert_cache_misses,
-        sst.expert_bytes_read,    sst.preadv_calls,        wall_ms,
-        peak,
+    std.debug.print("\ndsv41 ar: {d} prompt tokens in forwards of {d}, {d} generated; ids {s}; logits rows equal {d}/{d}; {d} rows/layer; routes {d}, hits {d}, misses {d}, {d} B read in {d} preadv; {d} ms; MLX peak {d} B\n", .{
+        ref.prompt_ids.len,                           ref.chunk,             out.len,
+        if (first == null) "IDENTICAL" else "DIFFER", logits_equal,          out.len,
+        rows,                                         sst.route_calls,       sst.expert_cache_hits,
+        sst.expert_cache_misses,                      sst.expert_bytes_read, sst.preadv_calls,
+        wall_ms,                                      peak,
     });
     if (first) |i| std.debug.print("dsv41 ar: first differing step {d}: native {d}, reference {d} (reference top-2 {any}, margin {d})\n", .{ i, out[i], ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin });
     try testing.expectEqualSlices(u32, ref.generated_ids, out);
@@ -235,8 +256,10 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     var prev_cache: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
+    memProbe("dsv41 dspark", "start");
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
+    memProbe("dsv41 dspark", "kernels accepted (the startup self-check)");
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
     const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, null, &diag);
@@ -268,14 +291,17 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer ex.deinit();
     try ex.grow(&g, grown);
     try checkBanks(&g, &kernels.reg, &ex);
+    memProbe("dsv41 dspark", "residents and the draft head built, slots grown");
 
     const acceptance: ds.Acceptance = if (std.mem.eql(u8, ref.arm, "typical")) .{ .typical = .{ .delta = @floatCast(ref.delta.?) } } else .greedy;
     var lp = L.init(&g, m, head, &st, caches[0..head.nStages()], .{ .acceptance = acceptance, .max_tokens = 1 << 20 });
     defer lp.deinit();
     const primary = try lp.prefill(gpa, &ex, ref.prompt);
     try testing.expectEqual(ref.tokens[0], primary);
+    memProbe("dsv41 dspark", "prompt");
     // The served adapter's fence: the embedding table retires to its host rows before the cycles.
     try res.retireEmbedding(&g);
+    memProbe("dsv41 dspark", "the prompt fence (the embedding table freed)");
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     // The gate: the generated ids and each cycle's acceptance (drafts proposed,
@@ -304,7 +330,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
                 const margin = (lg.top_logits[t][0] - lg.top_logits[t][1]) / lg.rms[t];
                 const flip = lg.top_ids[t][1] == v and margin <= 1.0 / 32.0;
                 std.debug.print("dsv41 dspark: first divergence cycle {d} verify row {d}: ours {d} (logit {d:.6}), second {d} (logit {d:.6}), reference {d}; margin / rms {d:.6}: {s}\n", .{
-                    i, t, lg.top_ids[t][0], lg.top_logits[t][0], lg.top_ids[t][1], lg.top_logits[t][1], v, margin,
+                    i,                                                                                                                                                                                    t, lg.top_ids[t][0], lg.top_logits[t][0], lg.top_ids[t][1], lg.top_logits[t][1], v, margin,
                     if (flip) "TIE FLIP (within 2^-5 of the row rms)" else if (lg.top_ids[t][1] == v) "NOT a tie flip (margin above 2^-5)" else "NOT a tie flip (the reference token is not our second)",
                 });
             }
@@ -325,19 +351,20 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
         }
     }
     const wall_ms = @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms);
+    memProbe("dsv41 dspark", "cycles");
     const n = @min(out.items.len, ref.tokens.len - 1);
     const ids_same = std.mem.eql(u32, out.items[0..n], ref.tokens[1..][0..n]);
     const sst = ex.source.stats();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    std.debug.print("dsv41 dspark: {s} arm, kv {s} {d}, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
-        ref.arm,                                                   if (kv_bound != null) "bounded" else "tier",
-        kv_bound orelse 0,                                         ref.cycles.len,
-        if (ids_same) "IDENTICAL" else "DIFFER",                   n + 1,
-        if (first_accept == null) "IDENTICAL" else "DIFFER",       if (first_decision == null) "IDENTICAL" else "DIFFER",
-        lp.stats.accepted_drafts,                                  lp.stats.drafted_tokens,
-        rows,                                                      sst.route_calls,
-        sst.expert_bytes_read,                                     wall_ms,
+    std.debug.print("\ndsv41 dspark: {s} arm, kv {s} {d}, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
+        ref.arm,                                             if (kv_bound != null) "bounded" else "tier",
+        kv_bound orelse 0,                                   ref.cycles.len,
+        if (ids_same) "IDENTICAL" else "DIFFER",             n + 1,
+        if (first_accept == null) "IDENTICAL" else "DIFFER", if (first_decision == null) "IDENTICAL" else "DIFFER",
+        lp.stats.accepted_drafts,                            lp.stats.drafted_tokens,
+        rows,                                                sst.route_calls,
+        sst.expert_bytes_read,                               wall_ms,
         peak,
     });
     try testing.expect(first_accept == null);

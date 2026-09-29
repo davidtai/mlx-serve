@@ -152,7 +152,8 @@ pub fn Loop(comptime G: type) type {
             try g.evalAll(&.{self.main_h.?});
             g.reset();
             if (self.cfg.lookup) |l| {
-                self.lookup = try ds.Lookup.init(a, prompt, l.minimum_context, l.extra_tokens);
+                // Reserved to the state's admitted length when bounded (the request's positions).
+                self.lookup = try ds.Lookup.init(a, prompt, l.minimum_context, l.extra_tokens, self.st.max_len orelse 0);
                 try self.lookup.?.appendCommitted(&.{self.primary});
             }
             return self.primary;
@@ -191,6 +192,54 @@ pub fn Loop(comptime G: type) type {
             try g.evalAll(&.{ tt, typical });
             _ = try g.hostU32(tt, target[0..width]);
             return try g.hostBool(typical, flags[0..drafted]);
+        }
+
+        /// The install warm-up (the lane's pipelines warmed at install): every
+        /// compiled region traced once at the shapes the cycles serve, before the
+        /// first request. On a scratch state and scratch draft windows: a verify
+        /// forward of each row count 1 .. `max_rows` (logits every row, main
+        /// hidden kept), the windows seeded from each, then one draft block.
+        /// Nothing it builds outlives it; the routed calls go through `ex`.
+        /// `peaks` (optional, `max_rows + 1` entries): the transient bytes each
+        /// shape raised MLX's high-water mark by, measured once here (row counts
+        /// 1 .. `max_rows`, then the draft block): the bill's per-shape terms.
+        pub fn warm(self: *Self, a: std.mem.Allocator, ex: anytype, peaks: ?[]u64) !void {
+            const g = self.g;
+            var st = try self.model.newState();
+            defer st.deinit(g, a);
+            var caches: [8]H.Cache = @splat(.{});
+            const n_st = self.head.nStages();
+            defer for (caches[0..n_st]) |*x| x.deinit(g);
+            var ids: [ds.max_block + 1]u32 = @splat(1);
+            var main: ?T = null;
+            defer if (main) |x| g.release(x);
+            for (1..self.max_rows + 1) |m| {
+                const base = g.peakFrom();
+                const r = try self.model.forward(g, &st, ids[0..m], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
+                try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
+                try self.head.seedMain(g, r.main_hidden.?, caches[0..n_st]);
+                var ws: [8]T = undefined;
+                var nw: usize = 0;
+                for (caches[0..n_st]) |c| if (c.window) |w| {
+                    ws[nw] = w;
+                    nw += 1;
+                };
+                try g.evalAll(ws[0..nw]);
+                if (main == null) {
+                    main = g.keep(try sliceRows(g, r.main_hidden.?, 0, 1));
+                    try g.evalAll(&.{main.?});
+                }
+                if (peaks) |p| p[m - 1] = g.peakAbove(base);
+                try ex.flush();
+                g.reset();
+            }
+            if (self.k_cap > 0) {
+                const base = g.peakFrom();
+                const d = try self.head.draftBlock(g, main.?, 1, caches[0..n_st], self.model.embed, self.model.head);
+                try g.evalAll(&.{ d.ids, d.logits, d.conf });
+                if (peaks) |p| p[self.max_rows] = g.peakAbove(base);
+                g.reset();
+            }
         }
 
         /// A logged verify chunk's rows, for the tie-flip rule: the top two ids
@@ -526,7 +575,8 @@ test "dsv41 dspark loop: the K33 draft block replays the eager one from regions 
     try testing.expectEqual(@as(usize, 0), count(&rig.g, e0, e1, .tape_begin));
     try testing.expectEqual(8 * n_st + rig.head.blockSize() + 1, count(&rig.g, e1, e2, .tape_begin));
     // The regions hold the eager body's heavy ops.
-    inline for (.{ ops.Op.qmm, ops.Op.gather_qmm, ops.Op.softmax, ops.Op.argmax, ops.Op.matmul }) |op| {
+    // (take: the markov embeds are gathered once per step on both paths.)
+    inline for (.{ ops.Op.qmm, ops.Op.gather_qmm, ops.Op.softmax, ops.Op.argmax, ops.Op.matmul, ops.Op.take }) |op| {
         try testing.expectEqual(count(&rig.g, e0, e1, op), count(&rig.g, e1, e2, op));
     }
 }
@@ -608,7 +658,7 @@ test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every
             var buf2: [96]u8 = undefined;
             const want = try std.fmt.bufPrint(&buf2, "mtp.{d}.ffn.experts.", .{st});
             if (!std.mem.startsWith(u8, name, want) or !std.mem.endsWith(u8, name, ".w1.weight")) continue;
-            const e = try std.fmt.parseInt(u16, name[want.len .. std.mem.indexOfScalarPos(u8, name, want.len, '.').?], 10);
+            const e = try std.fmt.parseInt(u16, name[want.len..std.mem.indexOfScalarPos(u8, name, want.len, '.').?], 10);
             try testing.expectEqual(kept[slot], e);
             slot += 1;
         }
@@ -705,6 +755,90 @@ test "dsv41 dspark loop: a logged cycle that wants the tie-flip rule reads each 
     try testing.expect(n_argmax >= 3 and n_where >= 1);
 }
 
+test "dsv41 dspark loop: the install warm-up traces every region at the served shapes; cycles at every row count then trace none" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // Every decode region route on: ATTN / HC / SMALL_STAGES compile and the K33 draft regions.
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_ATTN_COMPILE", "1" }, .{ "MTPLX_DSV41_HC_COMPILE", "1" }, .{ "MTPLX_DSV41_SMALL_STAGES_FUSED", "1" }, .{ "MTPLX_DSV41_DRAFT_COMPILE", "1" } }, null);
+    const model = try Loop(TraceOps).M.init(a, &rig.g, rig.m.c, tier, &rig.lookup, &rig.m.src);
+    defer model.deinit(&rig.g);
+    const head = try Loop(TraceOps).H.init(a, &rig.g, rig.m.c, tier.routes, &rig.lookup);
+    defer head.deinit(&rig.g);
+    var st = try model.newState();
+    defer st.deinit(&rig.g, a);
+    var caches: [4]Loop(TraceOps).H.Cache = @splat(.{});
+    defer for (caches[0..head.nStages()]) |*x| x.deinit(&rig.g);
+    // Three cycles verifying 2, 2 and 3 rows (block 2, confidence 0.5, greedy, no lookup; the confidence stop
+    // keeps at least one draft, so 2 .. max_rows are the served row counts).
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 7 }, &.{ 8, 9 }, &.{ 8, 10 }, &.{ 11, 12 }, &.{ 11, 12, 13 } },
+        .f32s = &.{ &.{ 0.2, 0.2 }, &.{ 0.9, 0.2 }, &.{ 0.9, 0.9 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, model, head, &st, caches[0..head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 64 });
+    defer lp.deinit();
+    try testing.expectEqual(@as(u32, 3), lp.max_rows);
+    const before = rig.g.compiles;
+    var peaks: [4]u64 = @splat(1);
+    try lp.warm(a, &rig.ex, &peaks);
+    try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, &peaks); // the trace backend holds no device memory
+    try testing.expect(rig.g.compiles > before);
+    try testing.expectEqual(@as(u32, 0), st.offset);
+    // The prompt pass traces its own shapes (8-row forwards here); the cycles then replay warmed traces only.
+    var prompt: [40]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(1 + i % 30);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    const warmed = rig.g.compiles;
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var verified: [3]u32 = undefined;
+    for (&verified) |*v| {
+        var lg: CycleLog = .{ .primary = 0 };
+        _ = try lp.cycle(&rig.ex, &out, a, &lg);
+        v.* = lg.verified;
+    }
+    try testing.expectEqualSlices(u32, &.{ 2, 2, 3 }, &verified);
+    try testing.expectEqual(warmed, rig.g.compiles);
+}
+
+test "dsv41 dspark loop: on a bounded state the lookup's history and key map are reserved to the request's positions" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var st = try rig.model.newStateWith(rig.model.boundedKv(64));
+    defer st.deinit(&rig.g, a);
+    var caches: [4]Loop(TraceOps).H.Cache = @splat(.{});
+    defer for (caches[0..rig.head.nStages()]) |*x| x.deinit(&rig.g);
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &st, caches[0..rig.head.nStages()], .{ .max_tokens = 8 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    const lk = &lp.lookup.?;
+    try testing.expect(lk.history.capacity >= st.max_len.?);
+    try testing.expect(lk.ends.capacity() >= st.max_len.?);
+}
+
+/// The loop on MLX with the served expert source, analysed on the host (never run): the
+/// MLX backend's warm-up measurement, the logged verify reads and the cycle compile.
+fn mlxSmoke(lp: *Loop(ops.MlxOps), a: std.mem.Allocator, ex: *xp.Experts(ops.MlxOps, xp.StreamSource, xp.EagerChain(ops.MlxOps, xp.MlxGemv)), out: *std.ArrayList(u32)) !void {
+    var peaks: [ds.max_block + 2]u64 = undefined;
+    try lp.warm(a, ex, &peaks);
+    var lg: CycleLog = .{ .primary = 0, .want_top = true };
+    _ = try lp.cycle(ex, out, a, &lg);
+}
+
+test "dsv41 dspark loop: the MLX instantiation of the loop analyses (host, nothing runs)" {
+    try testing.expect(@TypeOf(&mlxSmoke) != void);
+}
+
 /// A wide route that records each call: its layer (routes are built in layer
 /// order), rows, act rows and slots, in the order the forward makes them.
 const WideLog = struct {
@@ -779,6 +913,8 @@ test "dsv41 dspark loop: the served prompt pass is one forward the model chunks;
     defer st.deinit(&g, a);
     const max_len = st.max_len orelse return error.TestUnexpectedResult;
     try testing.expect(max_len >= n_prompt + 4 + 8);
+    // The bounded state's n-gram history is reserved to its admitted length at state build.
+    try testing.expect(st.hash.?.hist.capacity >= max_len);
     var caches: [4]Loop(TraceOps).H.Cache = @splat(.{});
     defer for (caches[0..head.nStages()]) |*x| x.deinit(&g);
     var lp = Loop(TraceOps).init(&g, model, head, &st, caches[0..head.nStages()], .{ .lookup = null, .max_tokens = 4, .prompt_chunk = whole_prompt });

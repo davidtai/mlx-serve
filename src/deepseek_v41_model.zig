@@ -103,6 +103,9 @@ pub fn Model(comptime G: type) type {
         /// Rows a forward may run on the state's scratch (the decode lane's
         /// widest call: a verify block of 8 rows).
         pub const scratch_rows = 8;
+        comptime {
+            std.debug.assert(scratch_rows <= routes.min_prefill_chunk);
+        }
 
         pub const Mark = struct { offset: u32, layers: []Cache.Mark };
 
@@ -242,7 +245,14 @@ pub fn Model(comptime G: type) type {
                 lc.* = Cache.init(self.c.layers[l], self.c.window, kv);
                 if (lc.admitLimit()) |m| max_len = if (max_len) |x| @min(x, m) else m;
             }
-            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null, .max_len = max_len, .scratch = try self.gpa.alloc(u8, self.scratchBytes(scratch_rows)) };
+            // The n-gram history of a bounded state is reserved to its admitted length: a step never grows it.
+            var hash: ?eng.HashState = null;
+            if (self.engram != null) {
+                hash = .{};
+                if (max_len) |m| try hash.?.hist.ensureTotalCapacity(self.gpa, m);
+            }
+            errdefer if (hash) |*h| h.deinit(self.gpa);
+            return .{ .layers = cs, .hash = hash, .max_len = max_len, .scratch = try self.gpa.alloc(u8, self.scratchBytes(scratch_rows)) };
         }
 
         /// The bounded route (W107 lanes) for a request of at most `max_positions`

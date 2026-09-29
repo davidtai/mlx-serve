@@ -546,10 +546,11 @@ pub fn StandIn(comptime A: type) type {
             var outs: [v41.max_layers]G.T = undefined;
             for (0..c.n_layers) |l| {
                 self.fillIds(l, n, c.n_routed_experts, k);
-                var ids32: [xp.max_route_ids]u32 = undefined;
+                // int32, as the router's indices: the routed hook reads one dtype.
+                var ids32: [xp.max_route_ids]i32 = undefined;
                 for (ids32[0 .. n * k], self.ids[0 .. n * k]) |*o, e| o.* = e;
                 const xf = try g.zeros(&.{ @intCast(n), @intCast(c.hidden_size) }, .bfloat16);
-                const indices = try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ @intCast(n), @intCast(k) }, .uint32);
+                const indices = try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ @intCast(n), @intCast(k) }, .int32);
                 outs[l] = try arm.hook.at(@intCast(l)).routed(g, xf, indices);
             }
             try g.evalAll(outs[0..c.n_layers]);

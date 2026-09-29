@@ -229,9 +229,11 @@ pub const MlxOps = struct {
     /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`, prepared
     /// at construction: traced once per input signature, replayed after.
     pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
+        // Construction prepared every region a call can reach (the trace twin refuses the rest by name,
+        // which the host tests prove); here the lookup only picks the context's closure (<= 2 slots).
         const compiled = for (g.regions[@intFromEnum(Body.region)]) |sl| {
             if (sl.ctx == @as(*const anyopaque, ctx)) break sl.compiled;
-        } else return error.RegionNotPrepared;
+        } else unreachable;
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
@@ -288,6 +290,22 @@ pub const MlxOps = struct {
     }
 
     /// `mx.eval(arrays)`: one fence for a span's outputs and cache lanes.
+    /// MLX's high-water mark from here (`mlx_reset_peak_memory`) and the active
+    /// bytes now: a construction-time measurement's two ends (the warm-up).
+    pub fn peakFrom(_: *MlxOps) u64 {
+        _ = mlx.mlx_reset_peak_memory();
+        var n: usize = 0;
+        _ = mlx.mlx_get_active_memory(&n);
+        return n;
+    }
+
+    /// Bytes MLX's high-water mark rose above `base` (a `peakFrom` value).
+    pub fn peakAbove(_: *MlxOps, base: u64) u64 {
+        var n: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&n);
+        return n -| base;
+    }
+
     pub fn evalAll(_: *MlxOps, xs: []const T) !void {
         const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -811,18 +829,10 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostIdsSize;
-        // Two producers: the router (int32) and the arm's stand-in decode (uint32).
-        switch (mlx.mlx_array_dtype(flat)) {
-            .int32 => {
-                const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
-                for (out, p[0..n]) |*o, v| o.* = @intCast(v);
-            },
-            .uint32 => {
-                const p = mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData;
-                for (out, p[0..n]) |*o, v| o.* = @intCast(v);
-            },
-            else => return error.HostIdsDtype,
-        }
+        // One producer dtype: the router's int32 indices (the arm's stand-in emits the same).
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .int32);
+        const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
+        for (out, p[0..n]) |*o, v| o.* = @intCast(v);
         return out;
     }
 
@@ -1060,6 +1070,10 @@ pub const TraceOps = struct {
     /// test can compare what a graph was fed.
     record_host: bool = false,
     host_data: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    /// Region traces: a region called with inputs of a signature (shapes and
+    /// dtypes) it has not seen is what `mx.compile` traces anew.
+    compiles: usize = 0,
+    tape_sigs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1074,6 +1088,7 @@ pub const TraceOps = struct {
         var it = g.host_data.valueIterator();
         while (it.next()) |v| g.gpa.free(v.*);
         g.host_data.deinit(g.gpa);
+        g.tape_sigs.deinit(g.gpa);
     }
 
     /// The bytes host array `x` was made from (`record_host` set before it was made).
@@ -1095,6 +1110,15 @@ pub const TraceOps = struct {
         std.debug.assert(m.n <= g.nodes.items.len);
         g.freed.append(g.gpa, .{ .from = @intCast(m.n), .to = @intCast(g.nodes.items.len) }) catch @panic("trace: out of memory");
     }
+    /// No device memory on the trace backend.
+    pub fn peakFrom(_: *TraceOps) u64 {
+        return 0;
+    }
+
+    pub fn peakAbove(_: *TraceOps, _: u64) u64 {
+        return 0;
+    }
+
     pub fn evalAll(g: *TraceOps, _: []const T) !void {
         try g.evals.append(g.gpa, g.nodes.items.len);
     }
@@ -1254,6 +1278,14 @@ pub const TraceOps = struct {
         for (g.regions[@intFromEnum(Body.region)]) |sl| {
             if (sl == @as(?*const anyopaque, ctx)) break;
         } else return error.RegionNotPrepared;
+        var h = std.hash.Wyhash.init(@intFromEnum(Body.region));
+        h.update(std.mem.asBytes(&@intFromPtr(ctx)));
+        for (inputs) |x| {
+            const nd = g.nodes.items[x];
+            h.update(std.mem.asBytes(&nd.dtype));
+            h.update(std.mem.sliceAsBytes(nd.shape.d[0..nd.shape.n]));
+        }
+        if (!(try g.tape_sigs.getOrPut(g.gpa, h.final())).found_existing) g.compiles += 1;
         _ = try g.push(.tape_begin, .bool_, .{});
         try Body.run(g, ctx, inputs, out);
         _ = try g.push(.tape_end, .bool_, .{});
@@ -1385,6 +1417,7 @@ pub const TraceOps = struct {
     /// The routing barrier: a marker, then the script's next ids.
     pub fn hostIds(g: *TraceOps, x: T, out: []u16) ![]const u16 {
         _ = try g.push(.host_read, .bool_, .{});
+        if (g.dtypeOf(x) != .int32) return error.HostIdsDtype;
         if (g.shapeOf(x).numel() != @as(i64, @intCast(out.len))) return error.HostIdsSize;
         const hv = g.host_values orelse return error.NoHostValues;
         try hv.ids(hv.ctx, out);
@@ -1814,6 +1847,13 @@ test "dsv41 ops: both backends carry the kernels contract's launch, wave and sco
         comptime std.debug.assert(hasMethod(G, "launchPrepared", false, &.{ *const G.Prepared, []const T, []T }, void, true));
         comptime std.debug.assert(hasMethod(G, "releasePrepared", false, &.{*G.Prepared}, void, false));
     }
+}
+
+test "dsv41 ops: a host read of routed ids takes the router's int32 only" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var out: [6]u16 = undefined;
+    try testing.expectError(error.HostIdsDtype, g.hostIds(try g.input(&.{ 2, 3 }, .uint32), &out));
 }
 
 test "dsv41 ops: resetTo frees exactly what was tracked after its mark" {

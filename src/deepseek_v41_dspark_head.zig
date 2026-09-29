@@ -431,16 +431,15 @@ pub fn Head(comptime G: type) type {
             var outs: [64]T = undefined;
             var logit_cols: [64]T = undefined;
             var embeds: [64]T = undefined;
-            var inputs: [64]T = undefined;
             const n: usize = ds.block_size;
             const compiled = bs <= @as(c_int, @intCast(self.rt.draft_rows));
             for (0..n) |i| {
                 const row = try g.reshape(try g.slice(base, &.{ 0, @intCast(i), 0 }, &.{ 1, @intCast(i + 1), vocab }, &.{ 1, 1, 1 }), &.{ 1, vocab });
-                inputs[i] = prev;
                 if (compiled) {
                     var o3: [3]T = undefined;
                     try g.tape(MarkovStep, &self.mc, &.{ prev, row, self.markov_embed, self.markov_head }, &o3);
                     logit_cols[i] = o3[0];
+                    embeds[i] = o3[1];
                     prev = o3[2];
                 } else {
                     const me = try Tr.embed(g, self.markov_embed, prev);
@@ -452,10 +451,9 @@ pub fn Head(comptime G: type) type {
                 outs[i] = prev;
             }
             const conf = if (compiled) blk: {
-                // One gather over the block's markov inputs (the eager path's per-step embeds).
-                const me = try Tr.embed(g, self.markov_embed, try g.stack(inputs[0..n], 1));
+                // The markov steps' own embeds (each step's gather, not a second one).
                 var o: [1]T = undefined;
-                try g.tape(Confidence, &self.mc, &.{ x, me, self.conf_proj }, &o);
+                try g.tape(Confidence, &self.mc, &.{ x, try g.stack(embeds[0..n], 1), self.conf_proj }, &o);
                 break :blk o[0];
             } else blk: {
                 const markov = try g.stack(embeds[0..n], 1);

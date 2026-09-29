@@ -12,10 +12,15 @@ const kvc = @import("deepseek_v41_cache.zig");
 
 pub const Refusal = error{ UnknownLever, LeverValue, LeverNeedsKernel };
 
+/// The narrowest explicit prefill chunk: a decode / verify forward (at most this
+/// many rows, the model's host scratch) must never be chunked.
+pub const min_prefill_chunk = 8;
+
 pub const Tier = struct {
     routes: graph.Routes = .{},
     kv: kvc.Geometry = .{},
-    /// `MTPLX_DSV41_PREFILL_CHUNK`: explicit query chunk (<= 0 one shot); null = derived.
+    /// `MTPLX_DSV41_PREFILL_CHUNK`: explicit query chunk (<= 0 one shot, else at least
+    /// `min_prefill_chunk`); null = derived.
     prefill_chunk: ?i64 = null,
     chunk_target_bytes: f64 = kvc.default_chunk_target_bytes,
     /// K16: every layer over all chunks before the next (one routed-bank read).
@@ -232,7 +237,10 @@ pub fn parse(pairs: []const [2][]const u8, diag: ?*v41.Diag) Refusal!Tier {
                 if (std.mem.eql(u8, name, "PREFILL_CHUNK")) {
                     const v = std.mem.trim(u8, val, " ");
                     if (v.len > 0 and !std.ascii.eqlIgnoreCase(v, "auto")) {
-                        t.prefill_chunk = std.fmt.parseInt(i64, v, 10) catch return refuse(diag, error.LeverValue, "{s}={s}: not an integer or auto", .{ kv[0], val });
+                        const n = std.fmt.parseInt(i64, v, 10) catch return refuse(diag, error.LeverValue, "{s}={s}: not an integer or auto", .{ kv[0], val });
+                        // A decode / verify forward (<= min_prefill_chunk rows) stays one span: its host scratch is sized for that.
+                        if (n > 0 and n < min_prefill_chunk) return refuse(diag, error.LeverValue, "{s}={s}: below {d} rows would chunk a verify forward", .{ kv[0], val, min_prefill_chunk });
+                        t.prefill_chunk = n;
                     }
                 } else if (std.mem.eql(u8, name, "PREFILL_CHUNK_TARGET_GB")) {
                     t.chunk_target_bytes = try gb(name, val, diag);
@@ -307,6 +315,14 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     // K33 draft compile is a route now (the draft head applies it); the other draft levers stay deferred.
     try testing.expectEqual(graph.draft_compile_max_rows, r.draft_rows);
     try testing.expectEqual(@as(usize, 8), t.deferredLevers().len);
+}
+
+test "dsv41 routes: an explicit prefill chunk narrower than a verify forward is refused by name" {
+    var diag: v41.Diag = .{};
+    try testing.expectError(error.LeverValue, parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "4" }}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "verify forward") != null);
+    try testing.expectEqual(@as(?i64, 8), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "8" }}, null)).prefill_chunk);
+    try testing.expectEqual(@as(?i64, 0), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "0" }}, null)).prefill_chunk);
 }
 
 test "dsv41 routes: every lever the build cannot run the same way refuses, by name" {
