@@ -1029,7 +1029,8 @@ fn cellConfig(config: *model.ModelConfig) !void {
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1")) return true;
     if (std.mem.eql(u8, v, "0")) return false;
-    std.debug.print("dsv41 served cell: {s}={s} (0 or 1)\n", .{ name, v });
+    _ = name;
+    _ = v;
     return error.CellBoolValue;
 }
 
