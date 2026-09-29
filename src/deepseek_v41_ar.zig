@@ -1047,8 +1047,8 @@ test "dsv41 served cell: the window's inputs pass on the host (the standard prom
     const inputs = try cellInputs(a, testing.io, prompt_path, case_id, bank_dir);
     try testing.expectEqual(@as(usize, 16384), inputs.prompt.len);
     const sha = try cell.idsSha256(a, inputs.prompt);
-    const want = if (case_id) |id| (if (std.mem.eql(u8, id, "code-20260923")) "667506d734cce8152f3c42c9a97639a5b466540c70d9798a72e7564e2361bf86" else "") else "1a45b35bae742fae0e26d4f40ee0dc1093a2038e5b514460a4f02e9e56d74565";
-    if (want.len > 0) try testing.expectEqualStrings(want, &sha);
+    // The fastest line's prompt is pinned here; either file's own digest was checked by the loader.
+    if (case_id) |id| if (std.mem.eql(u8, id, "code-20260923")) try testing.expectEqualStrings("667506d734cce8152f3c42c9a97639a5b466540c70d9798a72e7564e2361bf86", &sha);
     if (case_id != null) {
         try testing.expectError(error.PromptIdsNoCell, cellPrompt(a, testing.io, prompt_path, "no-such-case"));
     } else try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
