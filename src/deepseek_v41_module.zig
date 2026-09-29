@@ -201,3 +201,35 @@ const GrownBanks = struct {
         };
     }
 };
+
+// DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]: the
+// module's expert-source plan on the real bank at a box baseline (CPU: config, bank, admission; no slot
+// memory), the numbers the served gate's line carries.
+test "dsv41 module: the served plan on the real bank at a box baseline" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const gb = struct {
+        fn of(name: [*:0]const u8, default: f64) !u64 {
+            const v = if (std.c.getenv(name)) |x| try std.fmt.parseFloat(f64, std.mem.span(x)) else default;
+            return @intFromFloat(@round(v * 1e9));
+        }
+    }.of;
+    const a = std.testing.allocator;
+    var diag: arm_mod.Diag = .{};
+    var p = arm_mod.planRows(a, std.testing.io, .{
+        .model_dir = bank,
+        .baseline_bytes = try gb("DSV41_MODULE_BASELINE_GB", 7.755397656),
+        .wired_bytes = try gb("DSV41_MODULE_WIRED_GB", 3.377741824),
+        .slot_memory = .host,
+        .draft_pruned_bytes = 0,
+    }, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    const ad = p.plan.admission;
+    const rec: u64 = 13_315_584;
+    std.debug.print("\nDSV41_MODULE_PLAN {{\"prefill_rows\": {d}, \"decode_rows\": {d}, \"slot_bank_prefill_bytes\": {d}, \"slot_bank_decode_bytes\": {d}, \"active_bound_bytes\": {d}, \"physical_bound_bytes\": {d}, \"host_reserve_bytes\": {d}, \"baseline_bytes\": {d}}}\n", .{
+        p.prefill_rows, p.decode_rows, (40 * @as(u64, p.prefill_rows) + 48) * rec, (40 * @as(u64, p.decode_rows) + 48) * rec, ad.active_bound_bytes, ad.physical_bound_bytes, ad.host_reserve_bytes, p.inputs.baseline_bytes,
+    });
+    try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= 110_000_000_000);
+}
