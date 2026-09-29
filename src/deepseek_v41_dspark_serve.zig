@@ -25,11 +25,33 @@ const eng = @import("deepseek_v41_engram.zig");
 const model_io = @import("model.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
+const mlx = @import("mlx.zig");
 
-/// The residents' loader, for the served arm and both window harnesses: the
-/// shards read past the page cache (`nocache_reader`), so a load keeps no file
-/// pages next to the array buffers (the guard counts cached pages as used).
-pub const loadResidents = model_io.loadWeightsNoCache;
+/// How the residents load: past the page cache (`nocache_reader`), so a load
+/// keeps no file pages next to the array buffers (the guard counts cached
+/// pages as used).
+pub const resident_load_opts: model_io.LoadOpts = .{ .nocache = true };
+
+/// The Engram residents' sidecar (`wkv`, `q_weight`, `k_weight` of every
+/// Engram layer), beside the model's shards; the index names none of them.
+pub const engram_residents_file = "engram/engram-residents.safetensors";
+
+/// Every resident the model and the draft head bind, for the served arm and
+/// both window harnesses: the shards the index names (`loadWeightsNoCache`)
+/// and, when the config has Engram layers, the Engram sidecar, all past the
+/// page cache.
+pub fn loadResidents(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, c: *const v41.Config) !model_io.Weights {
+    var w = try model_io.loadWeightsNoCache(io, a, model_dir);
+    errdefer w.deinit();
+    if (c.engram.n_layers > 0) {
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/" ++ engram_residents_file, .{model_dir}, 0);
+        defer a.free(path);
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try model_io.loadSafetensorsFile(a, &w, path.ptr, s, resident_load_opts);
+    }
+    return w;
+}
 
 /// The loop's model and draft head over a bank's residents, owned: bound once
 /// (every refusal named, before any request), released by `deinit` after the
@@ -50,7 +72,7 @@ pub fn Resources(comptime G: type) type {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.a = a;
-            self.weights = try loadResidents(io, a, model_dir);
+            self.weights = try loadResidents(io, a, model_dir, &c);
             errdefer self.weights.deinit();
             self.engram = try eng.RowSource.open(a, io, model_dir, token_map, &c, diag);
             errdefer self.engram.deinit();
@@ -197,9 +219,55 @@ const D = Dspark(TraceArm);
 const TraceSession = serve.Session(TraceArm, D);
 
 test "dsv41 dspark serve: the residents load past the page cache, for the served arm and both harnesses" {
-    // Resources.open (the served arm and the DSpark harness) and the AR harness load through `loadResidents`.
-    try testing.expect(&loadResidents == &model_io.loadWeightsNoCache);
-    try testing.expect(&loadResidents != &model_io.loadWeights);
+    // Resources.open (the served arm and the DSpark harness) and the AR harness load through
+    // `loadResidents`: the shards through `loadWeightsNoCache`, the Engram sidecar with these options.
+    try testing.expect(resident_load_opts.nocache);
+    try testing.expect(!resident_load_opts.vision and !resident_load_opts.keep_f16);
+}
+
+// DSV41_BANK=<the 3.0 bank>: the files `loadResidents` reads (the index's shards, as `loadWeights` selects them,
+// and the Engram sidecar) declare every resident the model and the draft head bind; the shards alone do not
+// declare the Engram residents (the M3AR2 model-init refusal: MissingWeight at the first Engram lookup).
+test "dsv41 dspark serve: the residents' files declare every name the model and the draft head bind" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var diag: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank, &diag);
+    var shards = try v41.Checkpoint.openIndexed(a, testing.io, bank, &diag);
+    defer shards.deinit();
+    const side_path = try std.fmt.allocPrint(arena.allocator(), "{s}/" ++ engram_residents_file, .{bank});
+    var side = try v41.Checkpoint.openFile(a, side_path, &diag);
+    defer side.deinit();
+    const text = try v41.residentSpec(arena.allocator(), &c);
+    const eng_spec = try v41.engramSpec(arena.allocator(), &c);
+    var nb: [160]u8 = undefined;
+    var in_shards: usize = 0;
+    var in_side: usize = 0;
+    for ([_][]const v41.Param{ text, eng_spec }, 0..) |list, which| for (list) |p| {
+        var names: [2][]const u8 = undefined;
+        var n_names: usize = 1;
+        switch (p.kind) {
+            .dense => names[0] = p.name,
+            .quant => {
+                names[0] = try std.fmt.bufPrint(nb[0..80], "{s}.weight", .{p.name});
+                names[1] = try std.fmt.bufPrint(nb[80..], "{s}.scales", .{p.name});
+                n_names = 2;
+            },
+        }
+        for (names[0..n_names]) |name| {
+            const sh = shards.tensors.get(name) != null;
+            const sd = side.tensors.get(name) != null;
+            try testing.expect(sh or sd);
+            // The Engram residents are the sidecar's alone; everything else the shards'.
+            try testing.expectEqual(which == 1, sd and !sh);
+            in_shards += @intFromBool(sh);
+            in_side += @intFromBool(sd);
+        }
+    };
+    try testing.expectEqual(@as(usize, 8), in_side);
+    std.debug.print("dsv41 dspark serve: {d} residents in the index's shards, {d} in the Engram sidecar ({s})\n", .{ in_shards, in_side, engram_residents_file });
 }
 
 /// The host reads of a scripted run, in the loop's read order: each routing
