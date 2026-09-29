@@ -225,11 +225,69 @@ fn servedSchedule() bool {
     return std.mem.eql(u8, std.mem.span(v), "served");
 }
 
+/// When the served schedule's phase change (the embedding fence, the grown slot banks) runs: `late` at
+/// the first 1-row extend, as served; `early_fence` the fence before the prompt; `early_grow` the grow
+/// (and the decode cache charge) before the prompt, whose forwards then take the decode lane (<= 8 rows).
+pub const ArPhase = enum { late, early_grow, early_fence };
+pub const ArTier = enum { served, stock };
+
+/// The served schedule's variant (pass3ab): the prompt's first forward of `split` rows, then ONE extend of
+/// the rest; the phase change; the numeric tier.
+pub const ServedRun = struct { split: u32, phase: ArPhase, tier: ArTier };
+
+/// DSV41_AR_SPLIT / DSV41_AR_PHASE / DSV41_AR_TIER for an `n`-token prompt (null = unset), refused by name.
+pub fn parseServedRun(n: u32, split_s: ?[]const u8, phase_s: ?[]const u8, tier_s: ?[]const u8) !ServedRun {
+    const split: u32 = if (split_s) |v| std.fmt.parseInt(u32, v, 10) catch return error.ArSplitNotANumber else n - 1;
+    if (split < 1 or split > n - 1) return error.ArSplitRange;
+    const phase = if (phase_s) |v| std.meta.stringToEnum(ArPhase, v) orelse return error.ArPhaseUnknown else .late;
+    const tier = if (tier_s) |v| std.meta.stringToEnum(ArTier, v) orelse return error.ArTierUnknown else .served;
+    // The grown stream refuses wide-lane calls: the early grow feeds the prompt in <= 8-row forwards, 63 + 1 only.
+    if (phase == .early_grow and split != n - 1) return error.ArEarlyGrowSplit;
+    // The stock tier's prompt runs in 8-row forwards anyway: only the last token's forward is positioned.
+    if (tier == .stock and split != n - 1) return error.ArStockSplit;
+    return .{ .split = split, .phase = phase, .tier = tier };
+}
+
+/// One Module call over prompt rows [lo, hi): the first is `prefill` (a fresh request), the rest `extend`.
+pub const PromptCall = struct { lo: u32, hi: u32 };
+
+/// The prompt's Module calls, in order: [0, split) then [split, n); under `early_grow` [0, n - 1) in
+/// forwards of <= 8 rows (the decode width), then the last token alone.
+pub fn promptCalls(a: std.mem.Allocator, n: u32, run: ServedRun) ![]PromptCall {
+    var calls: std.ArrayList(PromptCall) = .empty;
+    if (run.phase == .early_grow) {
+        var lo: u32 = 0;
+        const w: u32 = mdl.Model(ops.MlxOps).scratch_rows; // the decode lane's widest forward
+        while (lo < n - 1) : (lo += w) try calls.append(a, .{ .lo = lo, .hi = @min(lo + w, n - 1) });
+        try calls.append(a, .{ .lo = n - 1, .hi = n });
+    } else {
+        try calls.append(a, .{ .lo = 0, .hi = run.split });
+        try calls.append(a, .{ .lo = run.split, .hi = n });
+    }
+    return calls.items;
+}
+
+/// Every Module call's rows, prompt then generated (the last prompt call yields generated id 0; each later
+/// id is fed alone: `new_tokens - 1` 1-row calls).
+pub fn forwardRows(a: std.mem.Allocator, calls: []const PromptCall, new_tokens: u32) ![]u32 {
+    const rows = try a.alloc(u32, calls.len + new_tokens - 1);
+    for (calls, 0..) |c, i| rows[i] = c.hi - c.lo;
+    @memset(rows[calls.len..], 1);
+    return rows;
+}
+
 /// What the served-schedule run records (the ar-ref-v1 fields plus the schedule; chunk 0 = the model's own rule).
 const ServedRecord = struct {
     format: []const u8 = reference_format,
     schedule: []const u8 = "served",
-    trunk: []const u8 = "routes.served (deepseek_v41_module.Module, as the server constructs it)",
+    trunk: []const u8 = "deepseek_v41_module.Module, as the server constructs it, at `tier`",
+    split: u32,
+    phase: []const u8,
+    tier: []const u8,
+    /// The model's own chunk rule for a multi-row call (null: derived; the stock tier's 8).
+    model_prefill_chunk: ?i64,
+    /// The rows of every Module call, prompt then generated.
+    forwards: []const u32,
     prompt_ids: []const u32,
     chunk: u32 = 0,
     new_tokens: u32,
@@ -265,9 +323,17 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     if (!std.mem.eql(u8, ref.format, reference_format)) return error.ReferenceFormat;
     if (ref.prompt_ids.len < 2 or ref.new_tokens == 0 or ref.generated_ids.len != ref.new_tokens) return error.ReferenceShape;
 
+    const n: u32 = @intCast(ref.prompt_ids.len);
+    const run = try parseServedRun(n, envStr("DSV41_AR_SPLIT"), envStr("DSV41_AR_PHASE"), envStr("DSV41_AR_TIER"));
+    const calls = try promptCalls(a, n, run);
+    const forwards = try forwardRows(a, calls, ref.new_tokens);
     var config = try model.parseConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    config.numeric_tier = switch (run.tier) {
+        .served => .served,
+        .stock => .stock,
+    };
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -287,21 +353,41 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     defer m.deinit();
     memProbe("dsv41 ar served", "module constructed (kernels, arm, residents, warm-up)");
 
-    const n = ref.prompt_ids.len;
     const out = try a.alloc(u32, ref.new_tokens);
     const steps = try a.alloc(Step, ref.new_tokens);
     const t0 = std.Io.Timestamp.now(io, .boot);
-    // Step 0: every prompt token but the last in one forward (its logits are not sampled).
-    _ = mlx.mlx_array_free(try m.prefill(ref.prompt_ids[0 .. n - 1], 0));
-    memProbe("dsv41 ar served", "prompt[0 .. n-1] (one forward)");
-    var next: u32 = ref.prompt_ids[n - 1];
-    for (out, steps) |*o, *st| {
-        const logits = try m.extend(&.{next});
-        defer _ = mlx.mlx_array_free(logits);
-        st.* = try stepOf(a, logits, s);
-        next = st.top2[0];
-        o.* = next;
+    // The phase change moved before the prompt (the module's own pieces; `late` leaves it to extend).
+    switch (run.phase) {
+        .late => {},
+        .early_fence => {
+            try dss.embeddingFence(ops.MlxOps, &m.g, m.model, &m.embed_rows, m.weights);
+            m.fenced = true;
+        },
+        .early_grow => {
+            _ = mlx.mlx_clear_cache();
+            var prev_limit: usize = 0;
+            _ = mlx.mlx_set_cache_limit(&prev_limit, @import("expert_admission.zig").Envelope.dsv41_pass2.decode_cache_bytes);
+            switch (m.arm) {
+                inline else => |t| try t.arm.grow(&m.g),
+            }
+        },
     }
+    // The prompt's calls; the last one's logits are generated id 0.
+    var logits = try m.prefill(ref.prompt_ids[calls[0].lo..calls[0].hi], 0);
+    for (calls[1..]) |c| {
+        _ = mlx.mlx_array_free(logits);
+        logits = try m.extend(ref.prompt_ids[c.lo..c.hi]);
+    }
+    memProbe("dsv41 ar served", "the prompt's calls");
+    for (out, steps, 0..) |*o, *st, i| {
+        if (i > 0) {
+            _ = mlx.mlx_array_free(logits);
+            logits = try m.extend(&.{out[i - 1]});
+        }
+        st.* = try stepOf(a, logits, s);
+        o.* = st.top2[0];
+    }
+    _ = mlx.mlx_array_free(logits);
     const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
@@ -316,6 +402,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
         break;
     };
     const rec: ServedRecord = .{
+        .split = run.split,
+        .phase = @tagName(run.phase),
+        .tier = @tagName(run.tier),
+        .model_prefill_chunk = module.numericTier(config.numeric_tier.?).prefill_chunk,
+        .forwards = forwards,
         .prompt_ids = ref.prompt_ids,
         .new_tokens = ref.new_tokens,
         .generated_ids = out,
@@ -327,12 +418,57 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     };
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
-    std.debug.print("\ndsv41 ar served: {d} prompt tokens (one forward of {d}, then the last alone), {d} generated; ids sha256 {s}; vs the reference's ids (harness schedule): {s}; {d} ms; wrote {s}\n", .{
-        n, n - 1, out.len, &ids_sha, if (first == null) "IDENTICAL" else "DIFFER", wall_ms, out_path,
+    std.debug.print("\ndsv41 ar served: split {d}+{d}, phase {t}, tier {t}; {d} prompt tokens in {d} calls, {d} generated; ids sha256 {s}; step 0 top-2 {any} margin {d}, step 1 top-2 {any} margin {d}; vs the reference's ids (harness schedule): {s}, first difference {?d}; {d} ms; wrote {s}\n", .{
+        run.split,     n - run.split,  run.phase,     run.tier,       n,         calls.len, out.len, &ids_sha,
+        steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (first == null) "IDENTICAL" else "DIFFER", first, wall_ms, out_path,
     });
     if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
         i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
     });
+}
+
+fn envStr(name: [*:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+}
+
+test "dsv41 ar: the served schedule's variants parse by name and plan their Module calls (pass3ab)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Defaults: 63 + 1, late, served.
+    const d = try parseServedRun(64, null, null, null);
+    try testing.expectEqual(ServedRun{ .split = 63, .phase = .late, .tier = .served }, d);
+    // Refusals by name.
+    try testing.expectError(error.ArSplitNotANumber, parseServedRun(64, "x", null, null));
+    try testing.expectError(error.ArSplitRange, parseServedRun(64, "64", null, null));
+    try testing.expectError(error.ArSplitRange, parseServedRun(64, "0", null, null));
+    try testing.expectError(error.ArPhaseUnknown, parseServedRun(64, null, "early", null));
+    try testing.expectError(error.ArTierUnknown, parseServedRun(64, null, null, "exact"));
+    try testing.expectError(error.ArEarlyGrowSplit, parseServedRun(64, "56", "early_grow", null));
+    try testing.expectError(error.ArStockSplit, parseServedRun(64, "60", null, "stock"));
+    // The six runs' calls and every forward's rows (32 generated ids).
+    const R = struct { split: ?[]const u8, phase: ?[]const u8, tier: ?[]const u8, want: []const u32 };
+    const ones: [31]u32 = @splat(1);
+    const runs = [_]R{
+        .{ .split = null, .phase = null, .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R1 served late 63
+        .{ .split = "56", .phase = null, .tier = null, .want = &([_]u32{ 56, 8 } ++ ones) }, // R2
+        .{ .split = "60", .phase = null, .tier = null, .want = &([_]u32{ 60, 4 } ++ ones) }, // R3
+        .{ .split = null, .phase = null, .tier = "stock", .want = &([_]u32{ 63, 1 } ++ ones) }, // R4 (the model chunks 63 by 8)
+        .{ .split = null, .phase = "early_fence", .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R5
+        .{ .split = null, .phase = "early_grow", .tier = null, .want = &([_]u32{ 8, 8, 8, 8, 8, 8, 8, 7, 1 } ++ ones) }, // R6
+    };
+    for (runs) |r| {
+        const run = try parseServedRun(64, r.split, r.phase, r.tier);
+        const calls = try promptCalls(a, 64, run);
+        try testing.expectEqual(@as(u32, 0), calls[0].lo);
+        try testing.expectEqual(@as(u32, 64), calls[calls.len - 1].hi);
+        for (calls[1..], calls[0 .. calls.len - 1]) |c, p| try testing.expectEqual(p.hi, c.lo);
+        try testing.expectEqualSlices(u32, r.want, try forwardRows(a, calls, 32));
+    }
+    // An 8-row extend is not a decode-width phase trigger: the phase change runs at the first 1-row call.
+    try testing.expect(!module.phaseChangeDue(8, false) and module.phaseChangeDue(1, false) and !module.phaseChangeDue(1, true));
+    // The stock tier's model chunks a multi-row call by 8; the served tier derives its chunk.
+    try testing.expectEqual(@as(?i64, 8), module.numericTier(.stock).prefill_chunk);
 }
 
 /// One step's record from the module's logits (any float dtype; hashed as the f32 row).
