@@ -9,7 +9,7 @@ const mlx = @import("mlx.zig");
 const expert_io = @import("expert_io.zig");
 const expert_bank = @import("expert_bank.zig");
 
-const c = struct {
+const c = if (@import("build_options").macos_engines) struct {
     extern fn dsv41ev_abi() i32;
     extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
     extern fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
@@ -19,7 +19,7 @@ const c = struct {
     extern fn dsv41ev_value(event: i32) u64;
     extern fn dsv41ev_stats(out: *[8]i64) void;
     extern fn dsv41ev_last_error() [*:0]const u8;
-};
+} else @import("expert_io_stub.zig").ev;
 
 pub const abi_version = 2026092801;
 

@@ -9,6 +9,7 @@
 //! `noCache`): streamed weights, expert banks, on-disk row tables.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Seconds since the Unix epoch (wall-clock).
 pub fn nowSecs(io: std.Io) i64 {
@@ -60,14 +61,16 @@ pub const NoCacheOptions = struct {
 };
 
 /// Reads of `fd` bypass the page cache (F_NOCACHE); read-ahead off unless asked.
-pub fn noCache(fd: std.c.fd_t, opts: NoCacheOptions) error{NoCacheFcntl}!void {
+/// Darwin only: elsewhere it refuses, so no caller silently reads through the cache.
+pub fn noCache(fd: std.c.fd_t, opts: NoCacheOptions) error{ NoCacheFcntl, NoCacheUnsupported }!void {
+    if (comptime !builtin.os.tag.isDarwin()) return error.NoCacheUnsupported;
     if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0) return error.NoCacheFcntl;
     if (!opts.read_ahead and std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0) return error.NoCacheFcntl;
 }
 
 /// `path` read-only and close-on-exec, then `noCache`. `error.OpenFailed` leaves
 /// errno as `open` set it.
-pub fn openNoCache(path: [*:0]const u8, opts: NoCacheOptions) error{ FileNotFound, OpenFailed, NoCacheFcntl }!std.c.fd_t {
+pub fn openNoCache(path: [*:0]const u8, opts: NoCacheOptions) error{ FileNotFound, OpenFailed, NoCacheFcntl, NoCacheUnsupported }!std.c.fd_t {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = !opts.follow_symlinks, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c._errno().* == @intFromEnum(std.posix.E.NOENT)) error.FileNotFound else error.OpenFailed;
     errdefer _ = std.c.close(fd);
