@@ -15,6 +15,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const xk = @import("exl3_kernels.zig");
+const selfcheck = @import("exl3_selfcheck.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -194,10 +195,16 @@ pub fn Router(comptime G: type) type {
         w: G.T,
         bias: G.T,
 
-        /// `w` the gate weight (bf16 [384, 5120]), `bias` the selection bias (f32 [384]).
+        /// `w` the gate weight (bf16 [N, 5120]), `bias` the selection bias (f32 [N]): N 384 = the
+        /// verify router (top-6), N 128 = the DSpark draft router (DRAFTRC member router: the
+        /// __n128 / __n128_top3 variants, top-3). Another N is refused (RouteInput).
         pub fn init(g: *G, reg: *const xk.Registry, w: G.T, bias: G.T, diag: ?*xk.Diag) Refusal!Self {
-            const part = reg.get(.q3rc_gate_part);
-            const tail = reg.get(.q3rc_router_tail);
+            const n = rowsOf(G, g, w, 0);
+            const part, const tail = switch (n) {
+                384 => .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) },
+                128 => .{ reg.get(.q3rc_gate_part__n128), reg.get(.q3rc_router_tail__n128_top3) },
+                else => return refuse(diag, error.RouteInput, "exl3 kernel ops: a router of {d} experts (the registry carries 384 and the draft's 128)", .{n}),
+            };
             try expectInput(G, g, part, "w", w, &no_vars, diag);
             try expectInput(G, g, tail, "bias", bias, &no_vars, diag);
             return .{ .part = part, .tail = tail, .w = g.keep(w), .bias = g.keep(bias) };
@@ -213,7 +220,7 @@ pub fn Router(comptime G: type) type {
             return self.call(g, try g.astype(xf, .float32));
         }
 
-        /// x [M, 5120] f32 -> (weights [M, 6] f32, indices [M, 6] i32).
+        /// x [M, 5120] f32 -> (weights [M, top-k] f32, indices [M, top-k] i32): top-6 / top-3.
         pub fn call(self: *const Self, g: *G, x: G.T) ![2]G.T {
             const vars = rowsVars(rowsOf(G, g, x, 0));
             var part: [1]G.T = undefined;
@@ -386,30 +393,115 @@ pub fn RcProj(comptime G: type) type {
     };
 }
 
+// ── DRAFTRC proj (DSV41_DECODE_DRAFTRC member proj): the DSpark draft block's rcproj sites ──
+
+/// The draft's rcproj sites (`q3_decode_draftrc_candidate.DRAFT_SHAPES`): the verify sites the
+/// draft stages share, and the draft-only main_proj / shared expert.
+pub const DraftSite = enum { wq_a, wkv, wq_b, wo_b, woa, main_proj, shared_w13, shared_w2 };
+
+/// One draft site at one x dtype (`DraftProjKernels.run`): bf16 x -> the registered FMA text
+/// (q3rc_mxfp8_fma at the verify sites, its plan variant q3rc_mxfp8_fma__draft at the
+/// draft-only sites), f32 x -> q3drc_mxfp8_fma_f32x; the output has x's dtype; a plan per M =
+/// 1..8 at the site's pinned geometry. The dtype is the call site's (fixed at construction).
+pub fn DraftProj(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        site: DraftSite,
+        plans: [max_rows]LaunchConfig,
+        w: G.T,
+        scales: G.T,
+
+        /// `x_dtype` bf16 or f32 (the call site's activations), `w` the packed mxfp8 weight (u32
+        /// [G N, K / 4]), `scales` its e8m0 scales (u8 [G N, K / 32]).
+        pub fn init(g: *G, reg: *const xk.Registry, site: DraftSite, x_dtype: Dtype, w: G.T, scales: G.T, diag: ?*xk.Diag) Refusal!Self {
+            const draft_only = switch (site) {
+                .main_proj, .shared_w13, .shared_w2 => true,
+                else => false,
+            };
+            const e = switch (x_dtype) {
+                .bfloat16 => reg.get(if (draft_only) .q3rc_mxfp8_fma__draft else .q3rc_mxfp8_fma),
+                .float32 => reg.get(.q3drc_mxfp8_fma_f32x),
+                else => return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: draft {t} at x {t}: the registry carries bf16 and f32 x", .{ site, x_dtype }),
+            };
+            const s = e.site(@tagName(site)) orelse unreachable;
+            var vars: Vars = .initFill(0);
+            xk.siteVars(s, &vars);
+            try expectInput(G, g, e, "w", w, &vars, diag);
+            try expectInput(G, g, e, "scales", scales, &vars, diag);
+            var r: Self = .{ .e = e, .site = site, .plans = undefined, .w = undefined, .scales = undefined };
+            for (0..max_rows) |i| {
+                vars.set(.rows, i + 1);
+                r.plans[i] = xk.launchFor(e, &vars, @tagName(site)) catch unreachable;
+            }
+            r.w = g.keep(w);
+            r.scales = g.keep(scales);
+            return r;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            g.release(self.w);
+            g.release(self.scales);
+        }
+
+        /// The draft's `QuantizedLinear.__call__` seam (`Tr.qlinear`): x [..., G K] with 1..8 rows ->
+        /// y [..., G N] at x's dtype.
+        pub fn linear(self: *const Self, g: *G, x: G.T) !G.T {
+            const sh = dims(G, g, x);
+            const lead = sh.slice()[0 .. sh.n - 1];
+            var m: c_int = 1;
+            for (lead) |d| m *= d;
+            const y = try self.call(g, try g.reshape(x, &.{ m, sh.slice()[sh.n - 1] }));
+            var shape: Shape = .of(lead);
+            shape.d[shape.n] = @intCast(self.plans[0].out_shapes[0][1]);
+            shape.n += 1;
+            return g.reshape(y, shape.slice());
+        }
+
+        /// x [M, G K] (row-contiguous, the construction dtype), M = 1..8 -> y [M, G N].
+        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
+            const m = rowsOf(G, g, x, 0);
+            if (m < 1 or m > max_rows) return error.RowsOutOfPlan;
+            var out: [1]G.T = undefined;
+            try g.launch(self.e.kernel, &.{ self.w, self.scales, x }, &self.plans[m - 1], &out);
+            return out[0];
+        }
+    };
+}
+
 // ── HCTAPE (DSV41_DECODE_HCTAPE = all) ──
 
-/// The verify barrier's HC tail kernels: `HcTapeKernels` (combine, collapse_norm,
-/// combine_collapse_norm, mixfin). The stream dtype is a template (OT); the registry carries
-/// the tier's bf16 stream only.
+/// The HC tail kernels: `HcTapeKernels` (combine, collapse_norm, combine_collapse_norm,
+/// mixfin). The stream dtype is a template (OT): bf16 = the verify barrier's texts, f32 = the
+/// DSpark draft stages' variants (DRAFTRC member tape; the norm weight stays bf16).
 pub fn HcTape(comptime G: type) type {
     return struct {
         const Self = @This();
         combine_e: *const Entry,
         collapse_e: *const Entry,
         fused_e: *const Entry,
+        /// the f32 stream's fused call with a bf16 residual (the draft's stage-0 first ffn prep)
+        fused_rbf16_e: ?*const Entry,
         mixfin_e: *const Entry,
 
         pub fn init(reg: *const xk.Registry, stream: Dtype, diag: ?*xk.Diag) Refusal!Self {
-            const combine_e = reg.get(.q3ht_combine);
-            const ot = for (combine_e.template) |t| {
-                if (std.mem.eql(u8, t.name, "OT")) break t.value.dtype;
-            } else unreachable;
-            if (stream != ot) return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries OT {t} only", .{ stream, ot });
-            return .{
-                .combine_e = combine_e,
-                .collapse_e = reg.get(.q3ht_collapse_norm),
-                .fused_e = reg.get(.q3ht_combine_collapse_norm),
-                .mixfin_e = reg.get(.q3ht_mixfin),
+            return switch (stream) {
+                .bfloat16 => .{
+                    .combine_e = reg.get(.q3ht_combine),
+                    .collapse_e = reg.get(.q3ht_collapse_norm),
+                    .fused_e = reg.get(.q3ht_combine_collapse_norm),
+                    .fused_rbf16_e = null,
+                    .mixfin_e = reg.get(.q3ht_mixfin),
+                },
+                .float32 => .{
+                    .combine_e = reg.get(.q3ht_combine__f32),
+                    .collapse_e = reg.get(.q3ht_collapse_norm__f32),
+                    .fused_e = reg.get(.q3ht_combine_collapse_norm__f32),
+                    .fused_rbf16_e = reg.get(.q3ht_combine_collapse_norm__f32_rbf16),
+                    .mixfin_e = reg.get(.q3ht_mixfin),
+                },
+                else => refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries bf16 and f32", .{stream}),
             };
         }
 
@@ -434,6 +526,16 @@ pub fn HcTape(comptime G: type) type {
             const vars = rowsVars(rowsOf(G, g, x, 0));
             var out: [4]G.T = undefined;
             try launchRule(G, g, self.fused_e, &vars, &.{ x, r, post, comb, pre, w }, &out);
+            return out;
+        }
+
+        /// The f32 stream's fused call on a bf16 residual r [M, 4, D] (x f32): the draft's stage-0
+        /// first ffn prep. A bf16-stream route has no such call (TemplateNotRegistered).
+        pub fn combineCollapseNormResidualBf16(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T, pre: G.T, w: G.T) ![4]G.T {
+            const e = self.fused_rbf16_e orelse return error.TemplateNotRegistered;
+            const vars = rowsVars(rowsOf(G, g, x, 0));
+            var out: [4]G.T = undefined;
+            try launchRule(G, g, e, &vars, &.{ x, r, post, comb, pre, w }, &out);
             return out;
         }
 
@@ -1102,6 +1204,129 @@ pub fn DigXPrefill(comptime G: type) type {
     };
 }
 
+// ── Startup acceptance: the arm's one entry (registry, device self-check, typed handles) ──
+
+/// What the startup acceptance runs on.
+pub const Device = union(enum) {
+    /// the arm's GPU stream: every kernel is built on it and the self-check plan runs there
+    stream: mlx.mlx_stream,
+    /// host tests: no kernel object and no MLX array; the plan's results are scripted
+    stub: StubDevice,
+};
+
+/// A scripted device: every (kernel, check) of the plan passes, except `fail` when set.
+pub const StubDevice = struct {
+    fail: ?struct { kernel: Kernel, check: xk.Check } = null,
+};
+
+pub const StartupOptions = struct {
+    device: Device,
+    /// the texts the registry checks against the pin (production: the embedded ones)
+    texts: *const xk.Texts = &xk.embedded,
+    pin: []const u8 = xk.manifest_sha256,
+};
+
+/// The backend methods every route uses (the phase-3 contract); the prefill route adds its
+/// own (evalAll, asyncEval, concat, take, mark, resetTo) and checks them itself.
+const backend_methods = [_][]const u8{ "launch", "shapeOf", "dtypeOf", "hostArray", "keep", "release", "reshape", "astype" };
+
+/// The first route method `G` lacks, or null.
+pub fn missingBackendMethod(comptime G: type) ?[]const u8 {
+    inline for (backend_methods) |m| if (!@hasDecl(G, m)) return m;
+    return null;
+}
+
+/// The accepted registry on one device: the typed handles the arm keeps (heap-allocated: the
+/// backend's launcher and the routes point into it). `deinit` after the last launch drained.
+pub fn Accepted(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        a: Allocator,
+        reg: xk.Registry,
+        bound: xk.Bound,
+        /// the self-check plan's results (its receipt: `report.writeJsonLines(a)`)
+        report: selfcheck.Report,
+        gemv: Gemv(G),
+
+        /// The EXL3 decode GEMV as the caller's `GemvT` = { ctx, project_fn(ctx, g: *G, k, out_dim, xh,
+        /// ids, code) anyerror!G.T } (EagerChain's MlxGemv): xh f32 [rows, in] rotated, ids u32 [rows]
+        /// (each row's slot), code the projection's bank code; out_dim 2304 (gate / up) or 5120
+        /// (down); k 3 (the bank). The output is a launch output the backend owns.
+        pub fn gemvRoute(self: *const Self, comptime GemvT: type) GemvT {
+            return .{ .ctx = &self.gemv, .project_fn = GemvFn(G).project };
+        }
+
+        /// Releases the route statics, the kernels, the plan's results and the registry.
+        pub fn deinit(self: *Self, g: *G) void {
+            self.gemv.deinit(g);
+            self.bound.deinit();
+            self.report.deinit(self.a);
+            self.reg.deinit();
+            self.a.destroy(self);
+        }
+    };
+}
+
+fn GemvFn(comptime G: type) type {
+    return struct {
+        fn project(ctx: *const anyopaque, g: *G, k: u32, out_dim: u32, xh: G.T, ids: G.T, code: G.T) anyerror!G.T {
+            const r: *const Gemv(G) = @ptrCast(@alignCast(ctx));
+            if (k != xk.bank_ks[0]) return error.GemvKNotRegistered;
+            const proj: Proj = switch (out_dim) {
+                2304 => .gate,
+                5120 => .down,
+                else => return error.GemvOutDim,
+            };
+            return r.project(g, proj, xh, ids, code);
+        }
+    };
+}
+
+/// The stub device's plan: one scripted result per (kernel, check) of the registry's plan.
+fn stubPlan(a: Allocator, reg: *const xk.Registry, stub: StubDevice, report: *selfcheck.Report) !void {
+    for (&reg.entries) |*e| {
+        var it = e.checks.iterator();
+        while (it.next()) |c| {
+            const fails = if (stub.fail) |f| f.kernel == e.kernel and f.check == c else false;
+            try report.results.append(a, .{ .kernel = e.kernel, .check = c, .words = 1, .ok = !fails, .err = if (fails) "stub device: scripted failure" else "" });
+        }
+    }
+}
+
+/// The arm's one startup entry: builds the registry (every text against the pinned manifest),
+/// builds every kernel on the device, runs the device self-check plan (the KSELF plan of this
+/// registry, ~30 s and ~1.6 GB on the GPU: before the model loads) and judges it, points the
+/// backend's `launcher: ?*const xk.Bound` at the accepted kernels (when the backend has that
+/// field: `deepseek_v41_ops.MlxOps` at m1 c8411cf+), and builds the GEMV route's statics.
+/// Refused by name: a registry refusal (xk.Refusal: TextSha256Mismatch, ManifestNotPinned,
+/// LanePinMismatch, ...; `diag` names the text), NotGpuStream / KernelCreateFailed at bind,
+/// SelfCheckFailed (`diag` names the first failing kernel / check / site); a backend without a
+/// route method does not compile (the method is named).
+pub fn acceptAtStartup(comptime G: type, a: Allocator, g: *G, opts: StartupOptions, diag: *xk.Diag) !*Accepted(G) {
+    comptime {
+        if (missingBackendMethod(G)) |m| @compileError("exl3 kernel ops: the backend " ++ @typeName(G) ++ " lacks " ++ m ++ " (acceptAtStartup)");
+    }
+    const acc = try a.create(Accepted(G));
+    errdefer a.destroy(acc);
+    acc.* = .{ .a = a, .reg = undefined, .bound = undefined, .report = .{}, .gemv = undefined };
+    acc.reg = try xk.Registry.init(a, opts.texts, opts.pin, diag);
+    errdefer acc.reg.deinit();
+    acc.bound = switch (opts.device) {
+        .stream => |s| try acc.reg.bind(s, diag),
+        .stub => .{ .reg = &acc.reg, .stream = .{}, .kernels = @splat(.{}) },
+    };
+    errdefer acc.bound.deinit();
+    errdefer acc.report.deinit(a);
+    switch (opts.device) {
+        .stream => try selfcheck.runAll(a, &acc.reg, &acc.bound, &acc.report),
+        .stub => |st| try stubPlan(a, &acc.reg, st, &acc.report),
+    }
+    try selfcheck.judge(&acc.report, diag);
+    acc.gemv = try Gemv(G).init(g, &acc.reg);
+    if (@hasField(G, "launcher")) g.launcher = &acc.bound;
+    return acc;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1130,6 +1355,8 @@ const Trace = struct {
     held: std.ArrayList(T) = .empty,
     /// every keep, in order, with the number of resets before it (append-only)
     kept: std.ArrayList(struct { node: T, resets: u32 }) = .empty,
+    /// the model backend's kernel launcher (`MlxOps.launcher: ?*const xk.Bound`), set by acceptAtStartup
+    launcher: ?*const xk.Bound = null,
 
     fn deinit(t: *Trace) void {
         for (t.nodes.items) |n| t.a.free(n.bytes);
@@ -1526,7 +1753,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     for (t.launches.items) |l| hit.insert(l.k);
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
-    // only) and the DRAFTRC entries (their routes land with the model lane's draft block, M4)
+    // only) and the DRAFTRC entries (the draft routes' own test covers those)
     for (reg.entries) |e| {
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_");
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
@@ -1550,7 +1777,7 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
     const sc = try t.node(&.{ 1280, 40 }, .uint8, &.{});
     try testing.expectError(error.RouteInput, RcProj(Trace).init(&t, &reg, .wq_a, w, sc, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_mxfp8_fma input scales") != null);
-    try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&reg, .float32, &diag));
+    try testing.expectError(error.TemplateNotRegistered, HcTape(Trace).init(&reg, .float16, &diag));
     const qn32 = try t.node(&.{1280}, .float32, &.{});
     try testing.expectError(error.RouteInput, FusedProj(Trace).init(&t, &reg, qn32, try t.node(&.{512}, .bfloat16, &.{}), &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280 input weight") != null);
@@ -2005,4 +2232,180 @@ test "dsv41 kernels ops: prefill rows read by act_row take the same act words (t
         var k: usize = 0;
         while (k < ba.len) : (k += 4) try testing.expectEqual(@divTrunc(std.mem.readInt(i32, ba[k..][0..4], .little), 6), std.mem.readInt(i32, bb[k..][0..4], .little));
     }
+}
+
+// ── Startup acceptance (stub device) ──
+
+/// `deepseek_v41_experts.MlxGemv`'s shape on the trace backend.
+const TestGemv = struct {
+    ctx: *const anyopaque,
+    project_fn: *const fn (ctx: *const anyopaque, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) anyerror!Trace.T,
+
+    fn project(self: TestGemv, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) !Trace.T {
+        return self.project_fn(self.ctx, g, k, out_dim, xh, ids, code);
+    }
+};
+
+test "dsv41 kernels ops: acceptAtStartup (stub device) judges the plan, installs the launcher, hands out the GEMV route" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    const acc = try acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} } }, &diag);
+    // the plan: one result per (kernel, check) of the registry, all passed
+    var n: usize = 0;
+    for (&acc.reg.entries) |*e| n += e.checks.count();
+    try testing.expect(n >= 100);
+    try testing.expectEqual(n, acc.report.results.items.len);
+    try testing.expectEqual(@as(usize, 0), acc.report.failures());
+    const receipt = try acc.report.writeJsonLines(a);
+    defer a.free(receipt);
+    try testing.expectEqual(n, std.mem.count(u8, receipt, "\n"));
+    // the backend's launcher: the accepted kernels
+    try testing.expectEqual(@as(*const xk.Bound, &acc.bound), t.launcher.?);
+    try testing.expectEqual(&acc.reg, acc.bound.reg);
+    // the GEMV route through the caller's type: EagerChain's (k, out_dim, xh, ids, code) -> the lane's launch
+    const gemv = acc.gemvRoute(TestGemv);
+    try testing.expectEqual(@as(*const anyopaque, &acc.gemv), gemv.ctx);
+    for ([_]struct { e: *const Entry, out: u32, st: *const Statics(Trace) }{
+        .{ .e = acc.gemv.gu, .out = 2304, .st = &acc.gemv.gu_statics },
+        .{ .e = acc.gemv.dn, .out = 5120, .st = &acc.gemv.dn_statics },
+    }) |c| for (c.e.samples) |*s| {
+        const xh, const ids, const code = .{ try t.arg(c.e, "xh", &s.vars), try t.arg(c.e, "ids", &s.vars), try t.arg(c.e, "code", &s.vars) };
+        const z = try gemv.project(&t, 3, c.out, xh, ids, code);
+        var want: [9]Trace.T = undefined;
+        want[0..3].* = .{ xh, ids, code };
+        @memcpy(want[3..], c.st.arrays[3..9]);
+        try expectLaunch(t.back(1), c.e, s, &want);
+        try testing.expectEqual(t.back(1).outs[0], z);
+    };
+    const e = acc.gemv.gu;
+    const s = &e.samples[0];
+    const xh, const ids, const code = .{ try t.arg(e, "xh", &s.vars), try t.arg(e, "ids", &s.vars), try t.arg(e, "code", &s.vars) };
+    const launches = t.launches.items.len;
+    try testing.expectError(error.GemvKNotRegistered, gemv.project(&t, 2, 2304, xh, ids, code));
+    try testing.expectError(error.GemvOutDim, gemv.project(&t, 3, 1280, xh, ids, code));
+    try testing.expectEqual(launches, t.launches.items.len);
+    try testing.expect(t.keeps > 0);
+    acc.deinit(&t);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+}
+
+test "dsv41 kernels ops: acceptAtStartup refuses by name (text, pin, self-check) and a backend without a route method" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    // a self-check failure names its kernel and check; nothing is handed out
+    try testing.expectError(error.SelfCheckFailed, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{ .fail = .{ .kernel = .q3rc_router_tail__n128_top3, .check = .f64 } } } }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_router_tail__n128_top3 f64") != null);
+    try testing.expect(t.launcher == null);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+    // a text that is not the pinned manifest's
+    var texts = xk.embedded;
+    const k = Kernel.q3drc_mxfp8_fma_f32x;
+    const bad = try a.dupeSentinel(u8, xk.embedded.sources[@backingInt(k)], 0);
+    defer a.free(bad);
+    bad[bad.len / 3] ^= 0x04;
+    texts.sources[@backingInt(k)] = bad;
+    try testing.expectError(error.TextSha256Mismatch, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .texts = &texts }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), @tagName(k)) != null);
+    // another pin
+    try testing.expectError(error.ManifestNotPinned, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .pin = "0000000000000000000000000000000000000000000000000000000000000000" }, &diag));
+    try testing.expect(t.launcher == null);
+    // the route methods: the first one a backend lacks (acceptAtStartup names it at compile time)
+    try testing.expect(missingBackendMethod(Trace) == null);
+    try testing.expectEqualStrings("launch", missingBackendMethod(struct {}).?);
+    const NoRelease = struct {
+        pub const T = u32;
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn reshape() void {}
+        pub fn astype() void {}
+    };
+    try testing.expectEqualStrings("release", missingBackendMethod(NoRelease).?);
+}
+
+test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the lane's own sizes, by site and dtype" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    // proj: every draft site at both x dtypes (the entry the dtype and site select)
+    for (std.enums.values(DraftSite)) |site| for ([_]Dtype{ .bfloat16, .float32 }) |dt| {
+        const draft_only = site == .main_proj or site == .shared_w13 or site == .shared_w2;
+        const want_k: Kernel = if (dt == .float32) .q3drc_mxfp8_fma_f32x else if (draft_only) .q3rc_mxfp8_fma__draft else .q3rc_mxfp8_fma;
+        const e = reg.get(want_k);
+        const s0 = sampleAt(e, @tagName(site), 1);
+        const w, const sc = .{ try t.arg(e, "w", &s0.vars), try t.arg(e, "scales", &s0.vars) };
+        var r = try DraftProj(Trace).init(&t, &reg, site, dt, w, sc, &diag);
+        defer r.deinit(&t);
+        try testing.expectEqual(want_k, r.e.kernel);
+        var n: usize = 0;
+        for (e.samples) |*s| {
+            if (!std.mem.eql(u8, s.site.?, @tagName(site))) continue;
+            const x = try t.arg(e, "x", &s.vars);
+            try testing.expectEqual(dt, t.dtypeOf(x));
+            _ = try r.call(&t, x);
+            try expectLaunch(t.back(1), e, s, &.{ w, sc, x });
+            n += 1;
+        }
+        try testing.expect(n >= 3);
+        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, dt, &.{})));
+    };
+    // router: the draft gate weight (N 128) selects the N 128 / top-3 variants
+    {
+        const pe, const te = .{ reg.get(.q3rc_gate_part__n128), reg.get(.q3rc_router_tail__n128_top3) };
+        const w, const bias = .{ try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars) };
+        var r = try Router(Trace).init(&t, &reg, w, bias, &diag);
+        defer r.deinit(&t);
+        for (pe.samples) |*s| {
+            const x = try t.arg(pe, "x", &s.vars);
+            const out = try r.call(&t, x);
+            try expectLaunch(t.back(2), pe, s, &.{ x, w });
+            try expectLaunch(t.back(1), te, sampleAt(te, null, s.vars.get(.rows)), &.{ t.back(2).outs[0], bias });
+            try testing.expectEqual(@as(c_int, 3), t.shapeOf(out[0]).d[1]);
+        }
+        const w200 = try t.node(&.{ 200, 5120 }, .bfloat16, &.{});
+        try testing.expectError(error.RouteInput, Router(Trace).init(&t, &reg, w200, bias, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "a router of 200 experts") != null);
+    }
+    // tape: the f32 stream's variants, and the f32-x / bf16-residual fused call
+    {
+        const ce, const le, const fe, const fr = .{ reg.get(.q3ht_combine__f32), reg.get(.q3ht_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32_rbf16) };
+        const r = try HcTape(Trace).init(&reg, .float32, &diag);
+        for (ce.samples) |*s| {
+            const v = &s.vars;
+            const x, const rr, const post, const comb = .{ try t.arg(ce, "x", v), try t.arg(ce, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v) };
+            const pre, const w = .{ try t.arg(fe, "pre", v), try t.arg(fe, "w", v) };
+            const rb = try t.arg(fr, "r", v);
+            _ = try r.combine(&t, x, rr, post, comb);
+            try expectLaunch(t.back(1), ce, s, &.{ x, rr, post, comb });
+            _ = try r.collapseNorm(&t, rr, pre, w);
+            try expectLaunch(t.back(1), le, sampleAt(le, null, v.get(.rows)), &.{ rr, pre, w });
+            _ = try r.combineCollapseNorm(&t, x, rr, post, comb, pre, w);
+            try expectLaunch(t.back(1), fe, sampleAt(fe, null, v.get(.rows)), &.{ x, rr, post, comb, pre, w });
+            _ = try r.combineCollapseNormResidualBf16(&t, x, rb, post, comb, pre, w);
+            try expectLaunch(t.back(1), fr, sampleAt(fr, null, v.get(.rows)), &.{ x, rb, post, comb, pre, w });
+        }
+        const b = try HcTape(Trace).init(&reg, .bfloat16, &diag);
+        const v = &ce.samples[0].vars;
+        try testing.expectError(error.TemplateNotRegistered, b.combineCollapseNormResidualBf16(&t, try t.arg(ce, "x", v), try t.arg(fr, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v), try t.arg(fe, "pre", v), try t.arg(fe, "w", v)));
+    }
+    // every DRAFTRC entry is some route's
+    var hit: std.EnumSet(Kernel) = .empty;
+    for (t.launches.items) |l| hit.insert(l.k);
+    for (&reg.entries) |*e| if (std.mem.startsWith(u8, e.family, "draftrc_")) try testing.expect(hit.contains(e.kernel));
+    // refusals: another x dtype, a weight of another site
+    const fe = reg.get(.q3drc_mxfp8_fma_f32x);
+    const s0 = sampleAt(fe, "wq_a", 1);
+    const w, const sc = .{ try t.arg(fe, "w", &s0.vars), try t.arg(fe, "scales", &s0.vars) };
+    try testing.expectError(error.TemplateNotRegistered, DraftProj(Trace).init(&t, &reg, .wq_a, .float16, w, sc, &diag));
+    try testing.expectError(error.RouteInput, DraftProj(Trace).init(&t, &reg, .main_proj, .float32, w, sc, &diag));
+    try testing.expectEqual(@as(isize, 0), t.keeps);
 }
