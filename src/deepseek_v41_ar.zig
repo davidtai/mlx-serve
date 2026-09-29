@@ -815,6 +815,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
     if (max_tokens < 2) return error.CellMaxTokens;
+    try cellFill(a, io, &config, prompt.len, max_tokens);
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -1005,7 +1006,14 @@ fn cellConfig(config: *model.ModelConfig) !void {
             return @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
         }
     }.of;
-    config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
+    // The box baseline the guard's stop compares against: its non-file start (the guard exports it as
+    // _GPU_WINDOW_USED_START_NONFILE_BYTES in nonfile mode; its accounting is non-file start + the
+    // step's footprint), else the runner's DSV41_CELL_BASELINE_GB. In-run file-cache growth has no
+    // bill term: every resident and record read bypasses the page cache.
+    config.memory_baseline_bytes = if (std.c.getenv("_GPU_WINDOW_USED_START_NONFILE_BYTES")) |v|
+        std.fmt.parseInt(u64, std.mem.span(v), 10) catch return error.CellBaselineValue
+    else
+        (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
     config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
     if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     // The prefill ladder's routes (all off by default; the Module refuses what it cannot build):
@@ -1024,6 +1032,32 @@ fn cellConfig(config: *model.ModelConfig) !void {
         if (r > 8) return error.CellWideColdRows;
         config.expert_wide_cold_rows = r;
     }
+    // A combination the bills do not cover is refused here, by name, before any window work
+    // (the Module's own construction check: K16 only on the served tier, with its request bill).
+    _ = try module.layerMajor(config);
+}
+
+/// The native admission's fill (unless DSV41_CELL_ROWS forces the decode rows): the cell's own bill
+/// at the envelope's rows gives each phase's rows-free total, and `module.fillRows` takes rows up to
+/// the stop's target; the config then carries both row counts (the stream's, the bill's).
+fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !void {
+    if (config.expert_rows != null) return;
+    const b0 = try cellBill(a, io, config, prompt_tokens, max_tokens);
+    const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
+    const per_row = @as(u64, b0.layers) * rec;
+    const nr = module.fillRows(.{
+        .prefill_fixed = b0.prefillTotal() - b0.prefill_rows * per_row,
+        .decode_fixed = b0.decodeTotal() - b0.decode_rows * per_row,
+        .per_row = per_row,
+    }, config.memory_ceiling_bytes.?, b0.n_experts) catch |e| {
+        std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
+        return e;
+    };
+    std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"envelope_rows\": [{d}, {d}], \"filled_rows\": [{d}, {d}]}}\n", .{
+        @as(f64, @floatFromInt(b0.baseline)) / 1e9, @as(f64, @floatFromInt(config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes)) / 1e9, b0.prefill_rows, b0.decode_rows, nr.prefill, nr.decode,
+    });
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
 }
 
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
@@ -1039,6 +1073,11 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
 /// decode phase over the box baseline. `processBound` is what the child may hold above the baseline.
 pub const CellBill = struct {
     baseline: u64,
+    /// The slot banks' geometry: routed layers, the transient rows (max_route_ids x wide depth), the
+    /// layer's experts (the rows' cap).
+    layers: u32 = 0,
+    transient_rows: u64 = 0,
+    n_experts: u32 = 0,
     prefill_rows: u32,
     decode_rows: u32,
     /// (layers x rows + the transient bank's max_route_ids rows) x the bank's record.
@@ -1120,6 +1159,9 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
     const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
     return .{
         .baseline = config.memory_baseline_bytes.?,
+        .layers = c.n_layers,
+        .transient_rows = transient,
+        .n_experts = c.n_routed_experts,
         .prefill_rows = p.prefill_rows,
         .decode_rows = p.decode_rows,
         .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
@@ -1177,6 +1219,7 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     var config = try model.parseConfig(testing.io, a, bank_dir);
     try cellConfig(&config);
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
+    try cellFill(a, testing.io, &config, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, 16384, max_tokens);
     printBill(b);
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
@@ -1255,6 +1298,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     try cellConfig(&config);
+    try cellFill(a, io, &config, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
     defer {
