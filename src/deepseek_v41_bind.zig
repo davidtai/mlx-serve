@@ -24,9 +24,12 @@
 //!      plan, installs the accepted kernels in the backend's launcher and
 //!      builds the GEMV route; the MLX cache is cleared after it, so the
 //!      admission below reads the box without the self-check's buffers;
-//!   2. the arm (`deepseek_v41_arm.Arm`): config, bank, admission, the stream
-//!      at the admitted rows on MLX slot memory, the hook over the binding's
-//!      math (the kernels' GEMV bound once: `Accepted.gemvRoute`);
+//!   2. the arm (`deepseek_v41_arm.ArmWith`): config, bank, admission, the
+//!      stream at the admitted rows on MLX slot memory, the hook over the
+//!      binding's math (the kernels' GEMV bound once: `Accepted.gemvRoute`)
+//!      and routes (the wide lane: the DIG-X prefill route per layer at
+//!      `PrefillShape.tier` from the accepted registry; its MoE input is
+//!      rounded to bf16 once at the route, as the lane of record's);
 //!   3. the banks (math `.kernels`): every bank the hook bound (base and
 //!      transient, per layer) holds what the kernels read; the arm runs the
 //!      same check over every bank once more at the phase change, before it
@@ -120,6 +123,18 @@ pub fn MathOf(comptime b: Binding, comptime G: type) type {
     };
 }
 
+/// The executor's routes under binding `b`: with the kernels, the wide lane (a
+/// routed call of more rows than a route takes: a prefill chunk) is the DIG-X
+/// prefill route, one per layer at `PrefillShape.tier` from the accepted
+/// registry; the stand-in has none, so a wide call refuses by name
+/// (`PrefillLaneNotPorted`), never a fallback.
+pub fn RoutesOf(comptime b: Binding, comptime G: type) xp.Routes {
+    return switch (b.math) {
+        .stand_in => .{},
+        .kernels => .{ .prefill = xo.DigXPrefill(G) },
+    };
+}
+
 /// Compile time: backend `G` carries every method the binding's routes call,
 /// with the contract's types (the missing one is named).
 pub fn requireBackend(comptime G: type) void {
@@ -187,7 +202,7 @@ pub fn Construction(comptime b: Binding, comptime G: type) type {
     return struct {
         const Self = @This();
         pub const M = MathOf(b, G);
-        pub const A = arm_mod.Arm(G, M);
+        pub const A = arm_mod.ArmWith(G, M, RoutesOf(b, G));
         pub const D = b.decode(A);
         pub const S = serve.Session(A, D);
         const Kernels = if (b.math == .kernels) *xo.Accepted(G) else void;
@@ -212,7 +227,9 @@ pub fn Construction(comptime b: Binding, comptime G: type) type {
                 if (G == ops.MlxOps) _ = mlx.mlx_clear_cache();
             } else self.kernels = {};
             errdefer if (b.math == .kernels) self.dropKernels();
-            const arm = try A.init(a, io, &self.g, self.mathArg(), arm_opt, diag);
+            var o = arm_opt;
+            if (b.math == .kernels) o.prefill = .{ .reg = &self.kernels.reg };
+            const arm = try A.init(a, io, &self.g, self.mathArg(), o, diag);
             errdefer arm.deinit();
             if (b.math == .kernels) {
                 try checkArmBanks(A, arm, &self.g, &self.kernels.reg, diag);
@@ -293,7 +310,11 @@ test "dsv41 bind: the server binds the stand-in until the flip; the DSpark bindi
     comptime {
         std.debug.assert(serving.tag == arm_mod.serving_decode);
         std.debug.assert(MlxDspark.M == xp.EagerChain(ops.MlxOps, xp.MlxGemv));
-        std.debug.assert(MlxDspark.D == dsp.Dspark(arm_mod.Arm(ops.MlxOps, xp.EagerChain(ops.MlxOps, xp.MlxGemv))));
+        // The wide lane: the kernels' DIG-X prefill route per layer; the stand-in has none.
+        std.debug.assert(MlxDspark.A.Hook == xp.ExpertsWith(ops.MlxOps, xp.StreamSource, xp.EagerChain(ops.MlxOps, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(ops.MlxOps) }));
+        std.debug.assert(Construction(stand_in, ops.MlxOps).A.Hook == xp.Experts(ops.MlxOps, xp.StreamSource, arm_mod.StandInMath(ops.MlxOps)));
+        std.debug.assert(MlxDspark.A == arm_mod.ArmWith(ops.MlxOps, xp.EagerChain(ops.MlxOps, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(ops.MlxOps) }));
+        std.debug.assert(MlxDspark.D == dsp.Dspark(MlxDspark.A));
         std.debug.assert(Construction(stand_in, ops.MlxOps).M == arm_mod.StandInMath(ops.MlxOps));
         std.debug.assert(Construction(stand_in, ops.MlxOps).D == arm_mod.StandIn(arm_mod.Arm(ops.MlxOps, arm_mod.StandInMath(ops.MlxOps))));
     }
@@ -405,6 +426,112 @@ test "dsv41 bind: the construction refuses an arm whose banks the kernels cannot
     // A failing self-check refuses before the arm opens anything.
     try testing.expectError(error.SelfCheckFailed, Construction(kernels_stand_in, TraceOps).create(testing.allocator, testing.io, TraceOps.init(testing.allocator), .{ .device = .{ .stub = .{ .fail = .{ .kernel = .q3rc_router_tail, .check = .f64 } } } }, tm.options(), .{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_router_tail f64") != null);
+}
+
+test "dsv41 bind: the arm's wide lane takes a 25-row prompt forward of the mini model through the stream; the stand-in refuses it" {
+    const a = testing.allocator;
+    const mdl = @import("deepseek_v41_model.zig");
+    const routes = @import("deepseek_v41_routes.zig");
+    const TM = mdl.Model(TraceOps);
+    // The mini geometry's wide route (the DIG-X kernels decode hidden 5120 only): it records each call and
+    // returns the route's output shape, [rows, hidden] f32.
+    const Wide = struct {
+        calls: u32 = 0,
+        rows: u32 = 0,
+        finishes: u32 = 0,
+        act_bf16: bool = true,
+        slots_in_bank: bool = true,
+        pub fn init(_: std.mem.Allocator, _: *const xk.Registry, shape: xo.PrefillShape, _: ?*xk.Diag) !@This() {
+            if (shape.wave != xo.PrefillShape.tier.wave or shape.row_budget != xo.PrefillShape.tier.row_budget) return error.NotTheTierShape;
+            return .{};
+        }
+        pub fn deinit(_: *@This(), _: *TraceOps) void {}
+        pub fn call(self: *@This(), g: *TraceOps, act: u32, r: xo.PrefillRows, bank: xo.BankArrays(u32)) !u32 {
+            self.calls += 1;
+            self.rows += @intCast(r.slot.len);
+            self.act_bf16 = self.act_bf16 and g.dtypeOf(act) == .bfloat16;
+            const cap: u32 = @intCast(g.shapeOf(bank.gate.code).d[0]);
+            for (r.slot) |slot| self.slots_in_bank = self.slots_in_bank and slot < cap;
+            return g.input(&.{ @intCast(r.slot.len), g.shapeOf(act).d[1] }, .float32);
+        }
+        pub fn finish(self: *@This(), _: *TraceOps) !void {
+            self.finishes += 1;
+        }
+    };
+    const Host = struct {
+        n: u16,
+        k: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i / h.k + i % h.k) % h.n);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 3;
+        }
+    };
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, null);
+    defer reg.deinit();
+    const tm = try arm_mod.TestModel.create(true);
+    defer tm.destroy();
+    const mini = try mdl.Mini.init();
+    defer mini.deinit();
+    const k = mini.c.n_experts_per_tok;
+    const nl = mini.c.n_layers;
+    const prompt: [25]u32 = @splat(1);
+    try testing.expect(prompt.len * k > xp.max_route_ids);
+    {
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var host: Host = .{ .n = @intCast(mini.c.n_routed_experts), .k = @intCast(k) };
+        g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+        var diag: arm_mod.Diag = .{};
+        var opt = tm.options();
+        opt.prefill = .{ .reg = &reg };
+        const A = arm_mod.ArmWith(TraceOps, arm_mod.StandInMath(TraceOps), .{ .prefill = Wide });
+        const arm = try A.init(a, testing.io, &g, {}, opt, &diag);
+        defer arm.deinit();
+        var lookup: mdl.SpecLookup = .{ .g = &g, .spec = mini.spec };
+        const model = try TM.init(a, &g, mini.c, try routes.parse(&.{}, null), &lookup, &mini.src);
+        defer model.deinit(&g);
+        var st = try model.newState();
+        defer st.deinit(&g, a);
+        var out: [3]u32 = undefined;
+        // One 25-row prompt forward (every layer's call is wide), then two one-row forwards.
+        try model.greedy(&g, &st, &prompt, prompt.len, &arm.hook, &out, {});
+        try testing.expectEqualSlices(u32, &.{ 3, 3, 3 }, &out);
+        try testing.expectEqual(@as(u32, prompt.len + 2), st.offset);
+        try testing.expectEqual(@as(usize, nl), arm.hook.wide_routes.len);
+        for (arm.hook.wide_routes) |r| {
+            // 4 experts: one group; the prefill phase serves them from the base bank: one call per layer.
+            try testing.expectEqual(@as(u32, 1), r.calls);
+            try testing.expectEqual(@as(u32, @intCast(prompt.len * k)), r.rows);
+            try testing.expectEqual(@as(u32, 1), r.finishes);
+            try testing.expect(r.act_bf16 and r.slots_in_bank);
+        }
+        // Through the streamer: one route per layer for the wide forward, one per layer per decode forward;
+        // the prompt's experts were read into their slots.
+        const st_io = arm.stream.stats();
+        try testing.expectEqual(@as(u64, 3 * nl), st_io.route_calls);
+        try testing.expect(st_io.expert_bytes_read > 0);
+    }
+    {
+        // The stand-in binding's arm has no wide lane: the same forward refuses by name.
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var host: Host = .{ .n = @intCast(mini.c.n_routed_experts), .k = @intCast(k) };
+        g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+        var diag: arm_mod.Diag = .{};
+        const A = Construction(stand_in, TraceOps).A;
+        const arm = try A.init(a, testing.io, &g, {}, tm.options(), &diag);
+        defer arm.deinit();
+        var lookup: mdl.SpecLookup = .{ .g = &g, .spec = mini.spec };
+        const model = try TM.init(a, &g, mini.c, try routes.parse(&.{}, null), &lookup, &mini.src);
+        defer model.deinit(&g);
+        var st = try model.newState();
+        defer st.deinit(&g, a);
+        var out: [3]u32 = undefined;
+        try testing.expectError(error.PrefillLaneNotPorted, model.greedy(&g, &st, &prompt, prompt.len, &arm.hook, &out, {}));
+    }
 }
 
 test "dsv41 bind: the arm checks its banks at the phase change; a refusal leaves it ungrown and refuses every later growth" {
