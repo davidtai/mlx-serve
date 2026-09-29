@@ -21,6 +21,7 @@ const xp = @import("deepseek_v41_experts.zig");
 const xk = @import("exl3_kernels.zig");
 const xo = @import("exl3_kernel_ops.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
+const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const routes = @import("deepseek_v41_routes.zig");
 const eng = @import("deepseek_v41_engram.zig");
@@ -41,6 +42,9 @@ const H = dh.Head(G);
 /// Beside the model's shards: the Engram token map the converter exports.
 pub const engram_token_map_file = "engram-token-map.u32";
 
+/// The admission's calibration; its MLX allocator cache charges are the limits the module sets per phase.
+const envelope = expert_admission.Envelope.dsv41_pass2;
+
 pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
@@ -56,6 +60,8 @@ pub const Module = struct {
     state: ?M.State = null,
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
     fenced: bool = false,
+    /// MLX's allocator cache limit before the module set its own (restored at deinit).
+    prev_cache_limit: usize = 0,
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
@@ -70,8 +76,12 @@ pub const Module = struct {
         self.kernels = acceptKernels(gpa, &self.g, .{ .device = .{ .stream = s } }, &diag) catch |e| return refused(e, &diag);
         errdefer self.dropKernels();
         _ = mlx.mlx_clear_cache();
+        // The allocator cache holds no more than the admission charges for the phase (prefill here).
+        _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
+        errdefer setCacheLimit(self.prev_cache_limit);
         self.arm = A.init(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
             .model_dir = dir,
+            .envelope = envelope,
             .baseline_bytes = config.memory_baseline_bytes,
             .fixed_rows = config.expert_rows,
             .slot_memory = .{ .mlx = s },
@@ -105,6 +115,7 @@ pub const Module = struct {
         self.arm.deinit();
         self.dropKernels();
         self.g.deinit();
+        setCacheLimit(self.prev_cache_limit);
         gpa.destroy(self);
     }
 
@@ -130,6 +141,9 @@ pub const Module = struct {
                 try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
                 self.fenced = true;
             }
+            // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
+            _ = mlx.mlx_clear_cache();
+            setCacheLimit(envelope.decode_cache_bytes);
             try self.arm.grow(&self.g);
         }
         return self.forward(ids);
@@ -146,6 +160,11 @@ pub const Module = struct {
         return out;
     }
 };
+
+fn setCacheLimit(limit: usize) void {
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, limit);
+}
 
 /// The Engram residents' sidecar joins the loaded shards (the index names none of them).
 fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8) !void {
