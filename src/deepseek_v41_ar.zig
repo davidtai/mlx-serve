@@ -273,8 +273,45 @@ pub fn forwardRows(a: std.mem.Allocator, calls: []const PromptCall, new_tokens: 
     return rows;
 }
 
+/// One kv-source layer's lanes at a point of the run (the short-prompt readout): the entry offset, the
+/// window rows visible (offset - drop) and the drop, the compressed rows, the compressor frontier's fed
+/// rows; for an index source, n_comp and the selection's valid keys for the last row (min(index_topk,
+/// offset / ratio): the selection keeps the top index_topk of the groups the row reaches).
+const LayerStateLine = struct {
+    point: []const u8,
+    layer: u32,
+    ratio: u32,
+    index_source: bool,
+    positions: [2]u32,
+    offset: u32,
+    window_rows: u32,
+    window_drop: u32,
+    compressed_rows: u32,
+    frontier_rows: u32,
+    n_comp: ?u32,
+    valid_selected_keys: ?u32,
+    index_topk: u32,
+};
+
+/// DSV41_AR_PROMPT_IDS=<json with "prompt_ids"> + DSV41_AR_PROMPT_TOKENS=<L>: the first L ids as the prompt
+/// (both or neither; refused by name otherwise).
+pub fn promptOverride(a: std.mem.Allocator, io: std.Io, path: ?[]const u8, tokens: ?[]const u8) !?[]const u32 {
+    if (path == null and tokens == null) return null;
+    const p = path orelse return error.ArPromptOverrideHalf;
+    const t = tokens orelse return error.ArPromptOverrideHalf;
+    const l = std.fmt.parseInt(usize, t, 10) catch return error.ArPromptTokensNotANumber;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, p, a, .limited(64 << 20));
+    const f = try std.json.parseFromSliceLeaky(struct { prompt_ids: []const u32 }, a, text, .{ .ignore_unknown_fields = true });
+    if (l < 2 or l > f.prompt_ids.len) return error.ArPromptTokensRange;
+    return f.prompt_ids[0..l];
+}
+
 /// What the served-schedule run records (the ar-ref-v1 fields plus the schedule; chunk 0 = the model's own rule).
 const ServedRecord = struct {
+    /// "ref" (the reference's prompt) or "p16" (the override's first `prompt_tokens` ids).
+    prompt: []const u8,
+    prompt_tokens: u32,
+    state: []const LayerStateLine,
     format: []const u8 = reference_format,
     schedule: []const u8 = "served",
     trunk: []const u8 = "deepseek_v41_module.Module, as the server constructs it, at `tier`",
@@ -320,7 +357,9 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     if (!std.mem.eql(u8, ref.format, reference_format)) return error.ReferenceFormat;
     if (ref.prompt_ids.len < 2 or ref.new_tokens == 0 or ref.generated_ids.len != ref.new_tokens) return error.ReferenceShape;
 
-    const n: u32 = @intCast(ref.prompt_ids.len);
+    const override = try promptOverride(a, io, envStr("DSV41_AR_PROMPT_IDS"), envStr("DSV41_AR_PROMPT_TOKENS"));
+    const prompt: []const u32 = override orelse ref.prompt_ids;
+    const n: u32 = @intCast(prompt.len);
     const run = try parseServedRun(n, envStr("DSV41_AR_SPLIT"), envStr("DSV41_AR_PHASE"), envStr("DSV41_AR_TIER"));
     const calls = try promptCalls(a, n, run);
     const forwards = try forwardRows(a, calls, ref.new_tokens);
@@ -370,16 +409,21 @@ test "dsv41 ar: the served schedule through the served module records its greedy
         },
     }
     // The prompt's calls; the last one's logits are generated id 0.
-    var logits = try m.prefill(ref.prompt_ids[calls[0].lo..calls[0].hi], 0);
+    var state: std.ArrayList(LayerStateLine) = .empty;
+    const probe = stateProbe(&m.model.c);
+    var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     for (calls[1..]) |c| {
         _ = mlx.mlx_array_free(logits);
-        logits = try m.extend(ref.prompt_ids[c.lo..c.hi]);
+        logits = try m.extend(prompt[c.lo..c.hi]);
     }
+    try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     memProbe("dsv41 ar served", "the prompt's calls");
     for (out, steps, 0..) |*o, *st, i| {
         if (i > 0) {
             _ = mlx.mlx_array_free(logits);
+            const before = m.state.?.offset;
             logits = try m.extend(&.{out[i - 1]});
+            if (i <= 2) try readState(a, &state, m, probe, if (i == 1) "after_step1" else "after_step2", before);
         }
         st.* = try stepOf(a, logits, s);
         o.* = st.top2[0];
@@ -394,22 +438,25 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     std.crypto.hash.sha2.Sha256.hash(le, &d, .{});
     const ids_sha = std.fmt.bytesToHex(d, .lower);
     var first: ?usize = null;
-    for (out, ref.generated_ids, 0..) |mine, theirs, i| if (mine != theirs) {
+    if (override == null) for (out, ref.generated_ids, 0..) |mine, theirs, i| if (mine != theirs) {
         first = i;
         break;
     };
     const rec: ServedRecord = .{
+        .prompt = if (override != null) "p16" else "ref",
+        .prompt_tokens = n,
+        .state = state.items,
         .split = run.split,
         .phase = @tagName(run.phase),
         .tier = @tagName(run.tier),
         .model_prefill_chunk = module.numericTier(config.numeric_tier.?).prefill_chunk,
         .forwards = forwards,
-        .prompt_ids = ref.prompt_ids,
+        .prompt_ids = prompt,
         .new_tokens = ref.new_tokens,
         .generated_ids = out,
         .generated_ids_sha256 = &ids_sha,
         .steps = steps,
-        .reference_ids_equal = first == null,
+        .reference_ids_equal = override == null and first == null,
         .first_difference = first,
         .wall_ms = wall_ms,
     };
@@ -417,11 +464,61 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
     std.debug.print("\ndsv41 ar served: split {d}+{d}, phase {t}, tier {t}; {d} prompt tokens in {d} calls, {d} generated; ids sha256 {s}; step 0 top-2 {any} margin {d}, step 1 top-2 {any} margin {d}; vs the reference's ids (harness schedule): {s}, first difference {?d}; {d} ms; wrote {s}\n", .{
         run.split,     n - run.split,  run.phase,     run.tier,       n,         calls.len, out.len, &ids_sha,
-        steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (first == null) "IDENTICAL" else "DIFFER", first, wall_ms, out_path,
+        steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (override != null) "ref: prompt differs" else if (first == null) "IDENTICAL" else "DIFFER", first, wall_ms, out_path,
     });
     if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
         i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
     });
+}
+
+/// The readout's layers: the first kv source of each of the first two compression ratios (V4.1's
+/// config: ratio 2 on layers 2-19, ratio 1 on 20-39; not V4's 4 / 128).
+fn stateProbe(c: *const v41.Config) [2]?u32 {
+    var out: [2]?u32 = .{ null, null };
+    var ratios: [2]u8 = .{ 0, 0 };
+    for (c.layers[0..c.n_layers], 0..) |li, l| {
+        if (!li.kv_source or li.ratio == 0) continue;
+        for (&out, &ratios) |*o, *r| {
+            if (o.* != null and r.* == li.ratio) break;
+            if (o.* == null) {
+                o.* = @intCast(l);
+                r.* = li.ratio;
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+fn readState(a: std.mem.Allocator, lines: *std.ArrayList(LayerStateLine), m: *module.Module, probe: [2]?u32, point: []const u8, lo: u32) !void {
+    const st = &m.state.?;
+    const c = &m.model.c;
+    for (probe) |pl| {
+        const l = pl orelse continue;
+        const ls = &st.layers[l];
+        const li = c.layers[l];
+        const drop = ls.window.dropOffset();
+        const n_comp = ls.compress.rows();
+        const line: LayerStateLine = .{
+            .point = point,
+            .layer = l,
+            .ratio = li.ratio,
+            .index_source = li.index_source,
+            .positions = .{ lo, ls.offset },
+            .offset = ls.offset,
+            .window_rows = ls.offset - drop,
+            .window_drop = drop,
+            .compressed_rows = n_comp,
+            .frontier_rows = ls.nFed(),
+            .n_comp = if (li.index_source) n_comp else null,
+            .valid_selected_keys = if (li.index_source) @min(c.index_topk, ls.offset / li.ratio) else null,
+            .index_topk = c.index_topk,
+        };
+        try lines.append(a, line);
+        std.debug.print("dsv41 ar state: {s} layer {d} ratio {d}{s}: positions [{d}, {d}), offset {d}, window rows {d} (drop {d}), compressed rows {d}, frontier rows {d}, n_comp {?d}, valid selected keys {?d} of index_topk {d}\n", .{
+            point, l, li.ratio, if (li.index_source) " (index source)" else "", lo, ls.offset, ls.offset, line.window_rows, drop, n_comp, line.frontier_rows, line.n_comp, line.valid_selected_keys, c.index_topk,
+        });
+    }
 }
 
 fn envStr(name: [*:0]const u8) ?[]const u8 {
@@ -464,6 +561,33 @@ test "dsv41 ar: the served schedule's variants parse by name and plan their Modu
     }
     // An 8-row extend is not a decode-width phase trigger: the phase change runs at the first 1-row call.
     try testing.expect(!module.phaseChangeDue(8, false) and module.phaseChangeDue(1, false) and !module.phaseChangeDue(1, true));
+    // The prompt override: both variables or neither, a number, within the file.
+    try testing.expectEqual(@as(?[]const u32, null), try promptOverride(a, testing.io, null, null));
+    try testing.expectError(error.ArPromptOverrideHalf, promptOverride(a, testing.io, "x.json", null));
+    try testing.expectError(error.ArPromptOverrideHalf, promptOverride(a, testing.io, null, "64"));
+    try testing.expectError(error.ArPromptTokensNotANumber, promptOverride(a, testing.io, "x.json", "sixty"));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "p.json", .data = "{\"prompt_ids\": [5, 6, 7, 8, 9], \"note\": 1}" });
+    var root: [512]u8 = undefined;
+    const rp = root[0..try tmp.dir.realPath(testing.io, &root)];
+    const path = try std.fmt.allocPrint(a, "{s}/p.json", .{rp});
+    try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, (try promptOverride(a, testing.io, path, "3")).?);
+    try testing.expectError(error.ArPromptTokensRange, promptOverride(a, testing.io, path, "6"));
+    // L1-L6: the long prompts' plans (late, split L-1).
+    for ([_]u32{ 64, 128, 256, 1024 }) |l| {
+        const run = try parseServedRun(l, null, null, null);
+        const calls = try promptCalls(a, l, run);
+        try testing.expectEqual(@as(usize, 2), calls.len);
+        try testing.expectEqual(l - 1, calls[0].hi - calls[0].lo);
+    }
+    // The readout's layers on the real geometry: a ratio-4 and a ratio-128 kv source.
+    const json = try v41.testConfigJson(a, .real);
+    const rc = try v41.Config.parse(a, json, null);
+    const pr = stateProbe(&rc);
+    try testing.expect(pr[0] != null and pr[1] != null);
+    try testing.expectEqual(@as(u8, 2), rc.layers[pr[0].?].ratio);
+    try testing.expectEqual(@as(u8, 1), rc.layers[pr[1].?].ratio);
     // The stock tier's model chunks a multi-row call by 8; the served tier derives its chunk.
     try testing.expectEqual(@as(?i64, 8), module.numericTier(.stock).prefill_chunk);
 }
