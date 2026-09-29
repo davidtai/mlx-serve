@@ -189,6 +189,8 @@ pub fn Head(comptime G: type) type {
             if (ds.n_routed_experts > 512) return error.TooManyExperts;
             for (self.stages, 0..) |*st, s| {
                 st.* = .{ .w = try M.bindBlock(lookup, "mtp", c.layers[c.n_layers + s], @intCast(s)), .experts = undefined };
+                // W97 on the draft's attention too (DSparkAttention inherits `_o_lora_dense_weight`).
+                if (rt.wo_a_f32) st.w.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, &self.c, st.w.wo_a));
                 const first_owned = self.owned.items.len;
                 var all: [512]u16 = undefined;
                 for (all[0..ds.n_routed_experts], 0..) |*e, i| e.* = @intCast(i);
@@ -270,6 +272,13 @@ pub fn Head(comptime G: type) type {
 
         pub fn nStages(self: *const Self) usize {
             return self.stages.len;
+        }
+
+        /// Device bytes the head builds beyond the checkpoint's residents (the
+        /// bill's resident term): W97's dense f32 wo_a per stage. Its expert
+        /// stacks replace the per-expert arrays they drop (no net bytes).
+        pub fn builtBytes(self: *const Self) u64 {
+            return if (self.rt.wo_a_f32) @as(u64, self.stages.len) * graph.woaDenseBytes(&self.c) else 0;
         }
 
         pub fn blockSize(self: *const Self) u32 {

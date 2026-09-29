@@ -328,7 +328,8 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     memProbe("dsv41 dspark", "kernels accepted (the startup self-check)");
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
-    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, null, &diag);
+    // The Python reference ran the stock path (every lever unset).
+    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, routes.stock, map_path, null, &diag);
     defer res.deinit(&g);
     const m = res.model;
     const head = res.head;

@@ -60,10 +60,11 @@ pub fn Resources(comptime G: type) type {
         model: *L.M,
         head: *L.H,
 
-        /// The text trunk at the stock tier, the draft head's stages (every
-        /// expert, or only a pinned subset's) and the Engram row source over
-        /// `token_map` (the tokenizer's exported map).
-        pub fn open(a: std.mem.Allocator, io: std.Io, g: *G, model_dir: []const u8, c: v41.Config, token_map: []const u8, subset: ?*const dh.Subset, diag: *v41.Diag) !*Self {
+        /// The text trunk at `tier` (the served tier, or the stock path for a
+        /// parity harness), the draft head's stages at its routes (every expert,
+        /// or only a pinned subset's) and the Engram row source over `token_map`
+        /// (the tokenizer's exported map).
+        pub fn open(a: std.mem.Allocator, io: std.Io, g: *G, model_dir: []const u8, c: v41.Config, tier: routes.Tier, token_map: []const u8, subset: ?*const dh.Subset, diag: *v41.Diag) !*Self {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.a = a;
@@ -73,9 +74,9 @@ pub fn Resources(comptime G: type) type {
             errdefer self.engram.deinit();
             self.embed_rows = try openEmbeddingRows(a, io, model_dir, &c, diag);
             errdefer self.embed_rows.close();
-            self.model = try L.M.init(a, g, c, try routes.parse(&.{}, diag), &self.weights, &self.engram);
+            self.model = try L.M.init(a, g, c, tier, &self.weights, &self.engram);
             errdefer self.model.deinit(g);
-            self.head = try L.H.initWith(a, g, c, .{}, &self.weights, .{ .subset = subset });
+            self.head = try L.H.initWith(a, g, c, tier.draftRoutes(), &self.weights, .{ .subset = subset });
             return self;
         }
 
@@ -257,6 +258,11 @@ const Rig = struct {
     head: *Loop.H,
 
     fn create() !*Rig {
+        return createAt(routes.stock);
+    }
+
+    /// The engine with its model and draft head at `tier` (the head at the tier's draft routes).
+    fn createAt(tier: routes.Tier) !*Rig {
         const a = testing.allocator;
         const r = try a.create(Rig);
         errdefer a.destroy(r);
@@ -273,9 +279,9 @@ const Rig = struct {
         };
         errdefer r.arm.deinit();
         r.lookup = .{ .g = &r.g, .spec = r.mini.spec };
-        r.model = try Loop.M.init(a, &r.g, r.mini.c, try routes.parse(&.{}, null), &r.lookup, &r.mini.src);
+        r.model = try Loop.M.init(a, &r.g, r.mini.c, tier, &r.lookup, &r.mini.src);
         errdefer r.model.deinit(&r.g);
-        r.head = try Loop.H.init(a, &r.g, r.mini.c, .{}, &r.lookup);
+        r.head = try Loop.H.init(a, &r.g, r.mini.c, tier.draftRoutes(), &r.lookup);
         return r;
     }
 
