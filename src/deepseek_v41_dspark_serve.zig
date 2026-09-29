@@ -26,6 +26,11 @@ const model_io = @import("model.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
+/// The residents' loader, for the served arm and both window harnesses: the
+/// shards read past the page cache (`nocache_reader`), so a load keeps no file
+/// pages next to the array buffers (the guard counts cached pages as used).
+pub const loadResidents = model_io.loadWeightsNoCache;
+
 /// The loop's model and draft head over a bank's residents, owned: bound once
 /// (every refusal named, before any request), released by `deinit` after the
 /// last forward.
@@ -45,7 +50,7 @@ pub fn Resources(comptime G: type) type {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.a = a;
-            self.weights = try model_io.loadWeights(io, a, model_dir);
+            self.weights = try loadResidents(io, a, model_dir);
             errdefer self.weights.deinit();
             self.engram = try eng.RowSource.open(a, io, model_dir, token_map, &c, diag);
             errdefer self.engram.deinit();
@@ -190,6 +195,12 @@ const TraceOps = ops.TraceOps;
 const TraceArm = arm_mod.Arm(TraceOps, arm_mod.StandInMath(TraceOps));
 const D = Dspark(TraceArm);
 const TraceSession = serve.Session(TraceArm, D);
+
+test "dsv41 dspark serve: the residents load past the page cache, for the served arm and both harnesses" {
+    // Resources.open (the served arm and the DSpark harness) and the AR harness load through `loadResidents`.
+    try testing.expect(&loadResidents == &model_io.loadWeightsNoCache);
+    try testing.expect(&loadResidents != &model_io.loadWeights);
+}
 
 /// The host reads of a scripted run, in the loop's read order: each routing
 /// barrier's ids (k distinct experts per row), the prompt's pick, per cycle

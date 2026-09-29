@@ -117,7 +117,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
 
-    var weights = try model.loadWeights(io, gpa, bank_dir);
+    var weights = try dss.loadResidents(io, gpa, bank_dir);
     defer weights.deinit();
     var src = try engram.RowSource.open(gpa, io, bank_dir, map_path, &c, &diag);
     defer src.deinit();
