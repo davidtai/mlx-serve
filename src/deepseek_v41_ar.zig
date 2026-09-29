@@ -1030,7 +1030,6 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1")) return true;
     if (std.mem.eql(u8, v, "0")) return false;
     _ = name;
-    _ = v;
     return error.CellBoolValue;
 }
 
