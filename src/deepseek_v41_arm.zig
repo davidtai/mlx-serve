@@ -82,6 +82,56 @@ pub const Options = struct {
     pool: expert_io.Options = .{ .tickets = 1024 },
 };
 
+/// The arm's construction up to the admitted rows: config, bank, plan. No
+/// slot memory yet (the caller owns `bank`).
+pub const Planned = struct {
+    config: v41.Config,
+    bank: expert_bank.Bank,
+    inputs: expert_admission.Inputs,
+    plan: expert_admission.Plan,
+    /// Per layer, before and after the phase change.
+    prefill_rows: u32,
+    decode_rows: u32,
+};
+
+pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Planned {
+    var cdiag: v41.Diag = .{};
+    const c = v41.Config.load(a, io, opt.model_dir, &cdiag) catch |e| return refuse(diag, e, "config: {s}", .{cdiag.message()});
+    const im = opt.implemented;
+    if (c.hidden_size != im.hidden or c.moe_intermediate_size != im.inter or c.n_routed_experts != im.n_experts or c.n_layers != im.n_layers)
+        return refuse(diag, error.ConfigBankMismatch, "config: hidden {d}, inter {d}, {d} experts, {d} layers; the bank lane decodes {d}, {d}, {d}, {d}", .{
+            c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, im.hidden, im.inter, im.n_experts, im.n_layers,
+        });
+    const baseline = opt.baseline_bytes orelse return refuse(diag, error.BaselineMissing, "admission: no measured box baseline", .{});
+    var bdiag: expert_bank.Diag = .{};
+    var bank = expert_bank.Bank.open(a, io, opt.model_dir, im, &bdiag) catch |e| return refuse(diag, e, "bank: {s}", .{bdiag.message()});
+    errdefer bank.deinit();
+    var record: u64 = 0;
+    for (bank.layers) |l| record = @max(record, l.logical_bytes);
+    const inputs: expert_admission.Inputs = .{
+        .baseline_bytes = baseline,
+        .wired_bytes = opt.wired_bytes orelse wiredBytes(),
+        .record_bytes = record,
+        .fixed_rows = opt.fixed_rows,
+        .allocation = opt.allocation,
+        .phase_reserve_bytes = opt.phase_reserve_bytes,
+        .lookahead_staging_bytes = if (opt.lookahead) |la| expert_admission.lookaheadCharge(record, 2 * la.budget, std.heap.pageSize()) else 0,
+        .host_reserve_bytes = opt.host_reserve_bytes,
+        .prefill_charge_bytes = opt.prefill_charge_bytes,
+        .peak_fill = opt.peak_fill,
+        .rowsx = opt.rowsx,
+    };
+    const plan_ = expert_admission.Admission.plan(opt.envelope, inputs) catch |e| return refuse(diag, e, "admission: {s}", .{@errorName(e)});
+    // The stream holds what the admitted prefill bank bound holds (the
+    // Python engine resolves its own plan within it); a layer never
+    // holds more rows than it has experts.
+    const n_experts = bank.n_experts;
+    const prefill = @min(plan_.admission.prefill_capacity, n_experts);
+    const decode = @min(plan_.admission.decode_rows, n_experts);
+    if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
+    return .{ .config = c, .bank = bank, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
+}
+
 /// The arm over graph backend `G` (`MlxOps` serving, `TraceOps` host tests)
 /// with routed-expert math `M` (`M.init(math_arg, *const Config)`).
 pub fn Arm(comptime G: type, comptime M: type) type {
@@ -106,52 +156,21 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         pub fn init(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, diag: *Diag) !*Self {
             const self = try a.create(Self);
             errdefer a.destroy(self);
-            var cdiag: v41.Diag = .{};
-            const c = v41.Config.load(a, io, opt.model_dir, &cdiag) catch |e| return refuse(diag, e, "config: {s}", .{cdiag.message()});
-            const im = opt.implemented;
-            if (c.hidden_size != im.hidden or c.moe_intermediate_size != im.inter or c.n_routed_experts != im.n_experts or c.n_layers != im.n_layers)
-                return refuse(diag, error.ConfigBankMismatch, "config: hidden {d}, inter {d}, {d} experts, {d} layers; the bank lane decodes {d}, {d}, {d}, {d}", .{
-                    c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, im.hidden, im.inter, im.n_experts, im.n_layers,
-                });
-            const baseline = opt.baseline_bytes orelse return refuse(diag, error.BaselineMissing, "admission: no measured box baseline", .{});
-            var bdiag: expert_bank.Diag = .{};
-            var bank = expert_bank.Bank.open(a, io, opt.model_dir, im, &bdiag) catch |e| return refuse(diag, e, "bank: {s}", .{bdiag.message()});
-            errdefer bank.deinit();
-            var record: u64 = 0;
-            for (bank.layers) |l| record = @max(record, l.logical_bytes);
-            const inputs: expert_admission.Inputs = .{
-                .baseline_bytes = baseline,
-                .wired_bytes = opt.wired_bytes orelse wiredBytes(),
-                .record_bytes = record,
-                .fixed_rows = opt.fixed_rows,
-                .allocation = opt.allocation,
-                .phase_reserve_bytes = opt.phase_reserve_bytes,
-                .lookahead_staging_bytes = if (opt.lookahead) |la| expert_admission.lookaheadCharge(record, 2 * la.budget, std.heap.pageSize()) else 0,
-                .host_reserve_bytes = opt.host_reserve_bytes,
-                .prefill_charge_bytes = opt.prefill_charge_bytes,
-                .peak_fill = opt.peak_fill,
-                .rowsx = opt.rowsx,
-            };
-            const plan = expert_admission.Admission.plan(opt.envelope, inputs) catch |e| return refuse(diag, e, "admission: {s}", .{@errorName(e)});
-            // The stream holds what the admitted prefill bank bound holds (the
-            // Python engine resolves its own plan within it); a layer never
-            // holds more rows than it has experts.
-            const n_experts = bank.n_experts;
-            const prefill = @min(plan.admission.prefill_capacity, n_experts);
-            const decode = @min(plan.admission.decode_rows, n_experts);
-            if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
+            var p = try planRows(a, io, opt, diag);
+            errdefer p.bank.deinit();
+            const c = p.config;
             const prefill_rows = try a.alloc(u32, c.n_layers);
             errdefer a.free(prefill_rows);
-            @memset(prefill_rows, prefill);
+            @memset(prefill_rows, p.prefill_rows);
             const decode_rows = try a.alloc(u32, c.n_layers);
             errdefer a.free(decode_rows);
-            @memset(decode_rows, decode);
+            @memset(decode_rows, p.decode_rows);
             self.* = .{
                 .a = a,
                 .config = c,
-                .bank = bank,
-                .inputs = inputs,
-                .plan = plan,
+                .bank = p.bank,
+                .inputs = p.inputs,
+                .plan = p.plan,
                 .prefill_rows = prefill_rows,
                 .decode_rows = decode_rows,
                 .stream = undefined,
@@ -634,6 +653,38 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
     try testing.expect(rec.tcq3_peak_fill != null and rec.q3_rowsx == null);
     try arm.grow(&g);
     try testing.expect(arm.grown);
+}
+
+// DSV41_BANK=<the 3.0 bank dir>: the planning half on the real bank (CPU; no slot memory).
+test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var diag: Diag = .{};
+    // pass2-host-fast-exact-exl3: its baseline, wired, forced rows and the lookahead lane.
+    var p = planRows(testing.allocator, std.testing.io, .{
+        .model_dir = dir,
+        .baseline_bytes = 7_755_397_656,
+        .wired_bytes = 3_377_741_824,
+        .fixed_rows = 147,
+        .lookahead = .{},
+        .slot_memory = .host,
+    }, &diag) catch |e| {
+        std.debug.print("dsv41 arm: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    try testing.expectEqual(@as(u64, 13_315_584), p.inputs.record_bytes);
+    try testing.expectEqual(@as(u64, 54_460_416), p.inputs.lookahead_staging_bytes);
+    const adm = p.plan.admission;
+    try testing.expectEqual(@as(u32, 147), adm.decode_rows);
+    try testing.expectEqual(@as(u32, 80), adm.prefill_rows);
+    try testing.expectEqual(@as(u32, 113), p.prefill_rows);
+    try testing.expectEqual(@as(u32, 147), p.decode_rows);
+    try testing.expectEqual(@as(u64, 75_741_338_100), adm.transition_start_bytes);
+    try testing.expectEqual(@as(u64, 108_921_111_644), adm.physical_bound_bytes);
+    try testing.expectEqual(@as(u64, 78_934_781_952), adm.final_bank_bytes);
+    std.debug.print("dsv41 arm on the real bank: {d} prefill / {d} decode rows per layer, slot banks {d} B, modeled peak {d} B\n", .{
+        p.prefill_rows, p.decode_rows, adm.final_bank_bytes, p.plan.peak_fill.?.modeled_peak_bytes,
+    });
 }
 
 test "dsv41 arm: every construction refusal is named" {
