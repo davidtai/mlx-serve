@@ -26,6 +26,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const routes = @import("deepseek_v41_routes.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const mdl = @import("deepseek_v41_model.zig");
+const kvc = @import("deepseek_v41_cache.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
 const qwen4 = @import("qwen4_exp.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
@@ -253,4 +254,111 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         p.prefill_rows, p.decode_rows, (40 * @as(u64, p.prefill_rows) + 48) * rec, (40 * @as(u64, p.decode_rows) + 48) * rec, ad.active_bound_bytes, ad.physical_bound_bytes, ad.host_reserve_bytes, p.inputs.baseline_bytes,
     });
     try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= 110_000_000_000);
+}
+
+/// The bytes one traced forward `[from, to)` holds under its waves: every node outside the outermost waves plus the
+/// widest outermost wave (its inner waves counted as live at once: an upper bound).
+const WaveBound = struct {
+    reset: u64,
+    outside: u64,
+    widest: u64,
+
+    fn of(g: *const ops.TraceOps, from: usize, to: usize, freed: []const ops.TraceOps.Freed) WaveBound {
+        const total = graph.heldBytes(g, from, to).sum;
+        var in_waves: u64 = 0;
+        var widest: u64 = 0;
+        for (freed, 0..) |w, i| {
+            if (w.to <= w.from) continue;
+            const inner = for (freed, 0..) |v, j| {
+                if (j != i and v.from <= w.from and w.to <= v.to and (v.from != w.from or v.to != w.to)) break true;
+            } else false;
+            if (inner) continue;
+            const b = graph.heldBytes(g, w.from, w.to).sum;
+            in_waves += b;
+            widest = @max(widest, b);
+        }
+        return .{ .reset = total, .outside = total -| in_waves, .widest = widest };
+    }
+};
+
+const RandomIds = struct {
+    rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(20260929),
+    n_experts: u16,
+
+    fn values(self: *RandomIds) ops.TraceOps.HostValues {
+        return .{ .ctx = self, .ids = ids, .argmax = argmax };
+    }
+    fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+        const s: *RandomIds = @ptrCast(@alignCast(ctx));
+        for (out) |*o| o.* = s.rng.random().uintLessThan(u16, s.n_experts);
+    }
+    fn argmax(_: *anyopaque) anyerror!u32 {
+        return 0;
+    }
+};
+
+// DSV41_BANK=<bank> (host, the trace backend): the served prompt forwards on the bank's own config, residents and
+// Engram rows, the routed calls through the stock chain and the DIG-X wide lane. Each forward's bytes per wave (the
+// widest outermost wave plus what lies outside the waves) fit the prefill bill's wave at its rows and positions.
+test "dsv41 module: the prefill bill covers the served prompt forwards' waves on the bank (trace backend)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var vd: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 module held: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, io, bank, &vd);
+    const bill = v41.PrefillBill.of(&c);
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/" ++ engram_token_map_file, .{bank}), &c, &vd);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    var g = ops.TraceOps.init(a);
+    defer g.deinit();
+    const TM = mdl.Model(ops.TraceOps);
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+    const model_ = try TM.init(a, &g, c, try routes.parse(&.{}, null), &lookup, &src);
+    defer model_.deinit(&g);
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const rows = try aa.alloc(u32, c.n_layers);
+    @memset(rows, 8);
+    var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = rows });
+    defer fsrc.deinit();
+    const Chain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
+    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, Chain, .{ .prefill = xo.DigXPrefill(ops.TraceOps) });
+    var ex = try Ex.initWith(a, &g, &fsrc, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    var rid: RandomIds = .{ .n_experts = @intCast(c.n_routed_experts) };
+    g.host_values = rid.values();
+    const prompt = try aa.alloc(u32, 2048);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    // (positions already in the state, rows of the measured forward): the decode lane, the gate's prompt, wide chunks.
+    for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 256 }, .{ 0, 953 }, .{ 0, 2048 }, .{ 1024, 256 }, .{ 1024, 953 } }) |pn| {
+        var st = try model_.newState();
+        defer st.deinit(&g, a);
+        if (pn[0] > 0) {
+            const r0 = try model_.forward(&g, &st, prompt[0..pn[0]], .{ .logits = .none }, &ex, graph.NoProbe{});
+            try TM.fence(&g, &st, &.{r0.hidden});
+            try ex.flush();
+            g.reset();
+        }
+        const n = pn[1];
+        const f0 = g.nodes.items.len;
+        const w0 = g.freed.items.len;
+        const r = try model_.forward(&g, &st, prompt[pn[0]..][0..n], .{ .logits = .last }, &ex, graph.NoProbe{});
+        const h = WaveBound.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+        try TM.fence(&g, &st, &.{r.logits.?});
+        try ex.flush();
+        g.reset();
+        const billed = bill.waveBytes(n, pn[0] + n);
+        std.debug.print("\nDSV41_HELD {{\"positions\": {d}, \"rows\": {d}, \"one_reset\": {d}, \"waves\": {d}, \"billed\": {d}}}", .{ pn[0], n, h.reset, h.outside + h.widest, billed });
+        try std.testing.expect(h.outside + h.widest <= billed);
+    }
+    // The bill's chunk is the model's.
+    for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
+        try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));
+    std.debug.print("\nDSV41_PREFILL_BILL {{\"kv_pos_bytes\": {d}, \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}\n", .{ bill.kv_pos_bytes, bill.bytes(64, 32), bill.bytes(16384, 1024), bill.waveBytes(bill.chunkRows(16384), 16384) });
 }

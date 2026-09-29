@@ -9,9 +9,80 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
+const expert_admission = @import("expert_admission.zig");
 
 pub const max_layers = 64;
 pub const max_rank = 6;
+
+/// The prompt pass's bill for mlx-serve's prefill admission (the arch's own estimator, as deepseek_v4 has one): what
+/// one request allocates beyond the loaded model and its slot banks while the model forwards its prompt in its own
+/// chunks, one wave per layer. The wave's terms are pinned by the bank trace test of the served prompt forwards.
+pub const PrefillBill = struct {
+    n_heads: u64,
+    index_heads: u64,
+    /// The chunk rule's smallest positive compression ratio (`prefillScoreBytesPerRow`).
+    min_ratio: u64,
+    /// f32 bytes one position adds to the stock tier's lanes (every layer's window history, the sources' lanes).
+    kv_pos_bytes: u64,
+    /// The head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
+    head_promotion_bytes: u64,
+    /// The allocator cache the module holds MLX to during the prefill.
+    cache_bytes: u64,
+
+    /// Score-sized f32 arrays one attention wave holds (scores, scale, mask, sink column, softmax) and the indexer's.
+    pub const score_copies = 5;
+    pub const index_copies = 3;
+    /// A wave's bytes independent of its rows (the grouped wo_a dequantized and cast) and per chunk row.
+    pub const wave_fixed_bytes: u64 = 256 << 20;
+    pub const wave_row_bytes: u64 = 4 << 20;
+    /// `default_chunk_target_bytes` of the chunk rule the model forwards its prompt by.
+    pub const chunk_target_bytes: f64 = 8e9;
+
+    pub fn of(c: *const Config) PrefillBill {
+        var min_ratio: u64 = 0;
+        var kv: u64 = 0;
+        for (c.layers[0 .. c.n_layers + c.dspark.n_stages], 0..) |li, l| {
+            if (li.ratio > 0 and (min_ratio == 0 or li.ratio < min_ratio)) min_ratio = li.ratio;
+            if (l >= c.n_layers) continue;
+            kv += @as(u64, c.head_dim) * 4;
+            if (li.ratio == 0) continue;
+            if (li.kv_source) kv += @as(u64, c.head_dim) * 4 / li.ratio;
+            if (li.index_source) kv += @as(u64, c.index_head_dim) * 4 / li.ratio;
+        }
+        return .{
+            .n_heads = c.n_heads,
+            .index_heads = c.index_n_heads,
+            .min_ratio = min_ratio,
+            .kv_pos_bytes = kv,
+            .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
+            .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
+        };
+    }
+
+    /// The model's chunk for a prompt of `seq` tokens (`resolvePrefillChunk` at its default target).
+    pub fn chunkRows(b: PrefillBill, seq: u64) u64 {
+        const n_comp = if (b.min_ratio > 0) seq / b.min_ratio else 0;
+        const per_row = b.n_heads * (seq + n_comp) * 4;
+        if (per_row == 0) return seq;
+        const chunk: u64 = @intFromFloat(@floor(chunk_target_bytes / @as(f64, @floatFromInt(per_row))));
+        return @max(1, @min(chunk, seq));
+    }
+
+    /// The widest wave of a chunk of `rows` whose attention reads `positions` positions.
+    pub fn waveBytes(b: PrefillBill, rows: u64, positions: u64) u64 {
+        const t = positions + (if (b.min_ratio > 0) positions / b.min_ratio else 0);
+        return wave_fixed_bytes + rows * wave_row_bytes + score_copies * rows * b.n_heads * (t + 1) * 4 +
+            index_copies * rows * b.index_heads * positions * 4;
+    }
+
+    /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
+    /// a full chunk reading every prompt position), the head's promotion at the logits, the allocator cache.
+    pub fn bytes(b: PrefillBill, seq: u64, max_tokens: u64) u64 {
+        const wave = b.waveBytes(b.chunkRows(seq), seq);
+        const kv = (seq + max_tokens + 8) * b.kv_pos_bytes;
+        return wave / 4 * 5 + kv + b.head_promotion_bytes + b.cache_bytes;
+    }
+};
 
 /// Per-layer attention mode (Python `_derive_layer_modes`): ratio 0 is a pure
 /// sliding window; a kv source owns its group's compressed KV and index keys, a

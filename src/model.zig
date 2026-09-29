@@ -410,6 +410,8 @@ pub const ModelConfig = struct {
     memory_baseline_bytes: ?u64 = null,
     /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
     expert_rows: ?u32 = null,
+    /// deepseek_v41's prompt-pass bill for the prefill admission (its own estimator, as deepseek_v4 has one).
+    dsv41_prefill: ?deepseek_v41.PrefillBill = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
@@ -3172,6 +3174,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.model_type = "deepseek_v41";
         // Routed experts, as deepseek_v4's arm states them: not a batched-decode model.
         config.num_experts = v41c.n_routed_experts;
+        config.dsv41_prefill = .of(&v41c);
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
         config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
@@ -7605,7 +7608,7 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     try testing.expectEqualStrings("deepseek_v41", c.model_type);
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
     try testing.expect(!c.perRequestPrefillChunk());
-    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode());
+    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.dsv41_prefill != null);
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
