@@ -190,8 +190,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
                 try toks.append(self.a, try self.decode.prefill(self.arm, self.g, self.prompt));
                 self.prompt_eval_s = seconds(self.t0.untilNow(self.io, .boot));
                 self.io_after_prefill = self.arm.stream.stats();
-                self.t1 = std.Io.Timestamp.now(self.io, .boot);
                 if (!self.arm.grown) try self.arm.grow(self.g);
+                // The phase change is in neither prompt_eval nor decode_wall: the Python harness grows in its prefill callback.
+                self.t1 = std.Io.Timestamp.now(self.io, .boot);
                 self.primed = true;
             } else {
                 loop_done = try self.decode.cycle(self.arm, self.g, self.a, toks);

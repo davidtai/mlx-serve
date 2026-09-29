@@ -728,6 +728,8 @@ test "dsv41 bind: the DSpark binding constructs on the bank and serves one reque
     const model_dir = envOf("DSV41_BIND_MODEL") orelse return error.SkipZigTest;
     const out = envOf("DSV41_BIND_OUT") orelse return error.SkipZigTest;
     if (envOf("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    // The key lines start at column 0 (the test runner's name line has no newline).
+    std.debug.print("\n", .{});
     const a = testing.allocator;
     const io = testing.io;
     const cell = @import("deepseek_v41_cell.zig");
