@@ -95,6 +95,7 @@ pub fn Head(comptime G: type) type {
             var b: [160]u8 = undefined;
             for (self.stages, 0..) |*st, s| {
                 st.w = try M.bindBlock(lookup, "mtp", c.layers[c.n_layers + s], @intCast(s));
+                const first_owned = self.owned.items.len;
                 inline for (.{ "w1", "w3", "w2" }) |name| {
                     var ws: [512]T = undefined;
                     var ss: [512]T = undefined;
@@ -105,7 +106,14 @@ pub fn Head(comptime G: type) type {
                     }
                     const n = ds.n_routed_experts;
                     @field(st.experts, name) = .{ .w = try self.own(g, try g.stack(ws[0..n], 0)), .s = try self.own(g, try g.stack(ss[0..n], 0)), .mode = .mxfp4 };
+                    // The stacks hold the per-expert arrays until they evaluate; a lookup that
+                    // can forget them frees each stage's inputs once its stacks are built.
+                    if (comptime canDrop(@TypeOf(lookup))) for (0..n) |e| {
+                        lookup.drop(try std.fmt.bufPrint(&b, "mtp.{d}.ffn.experts.{d}." ++ name ++ ".weight", .{ s, e }));
+                        lookup.drop(try std.fmt.bufPrint(&b, "mtp.{d}.ffn.experts.{d}." ++ name ++ ".scales", .{ s, e }));
+                    };
                 }
+                try g.evalAll(self.owned.items[first_owned..]);
             }
             const last = ds.n_stages - 1;
             self.main_proj = .{ .w = try need(lookup, "mtp.0.main_proj.weight"), .s = try need(lookup, "mtp.0.main_proj.scales"), .mode = .mxfp8 };
@@ -117,6 +125,13 @@ pub fn Head(comptime G: type) type {
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, &self.c));
             try g.evalAll(self.owned.items);
             return self;
+        }
+
+        fn canDrop(comptime L: type) bool {
+            return switch (@typeInfo(L)) {
+                .pointer => |p| @hasDecl(p.child, "drop"),
+                else => false,
+            };
         }
 
         fn need(lookup: anytype, name: []const u8) !T {

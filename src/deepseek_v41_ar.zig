@@ -110,6 +110,10 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(gpa, s);
     defer g.deinit();
+    // The bound: MLX keeps no freed buffer (the kernels' startup check and each forward's transients go back).
+    var prev_cache: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
 
@@ -226,6 +230,10 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(gpa, s);
     defer g.deinit();
+    // The bound: MLX keeps no freed buffer (the kernels' startup check and each forward's transients go back).
+    var prev_cache: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
     // The served decode seam's own binding of the residents (`Dspark(A).open`).

@@ -97,6 +97,21 @@ pub const MlxG = struct {
         for (out) |o| _ = try g.track(o);
     }
 
+    pub const Prepared = xk.Prepared;
+
+    pub fn prepareLaunch(g: *MlxG, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        return g.bound.prepare(k, cfg);
+    }
+
+    pub fn launchPrepared(g: *MlxG, p: *const Prepared, inputs: []const T, out: []T) !void {
+        try g.bound.applyPrepared(p, inputs, out);
+        for (out) |o| _ = try g.track(o);
+    }
+
+    pub fn releasePrepared(_: *MlxG, p: *Prepared) void {
+        p.deinit();
+    }
+
     pub fn evalAll(_: *MlxG, xs: []const T) !void {
         const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(v);
@@ -160,6 +175,7 @@ const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, 
 const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const JCase };
 
 const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
+const draft_fixture_format = "mlx-serve-exl3-kernel-draft-fixture-v1";
 const golden: u64 = 0x9E3779B97F4A7C15;
 
 fn sm(seed: u64, i: u64) u64 {
@@ -284,7 +300,7 @@ fn replayCase(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u8, 
         }
         try ins.put(a, i.name, try g.hostArray(bytes, shape[0..i.shape.len], dt));
     }
-    var outs: [11]mlx.mlx_array = undefined;
+    var outs: [16]mlx.mlx_array = undefined;
     const n_out = try runFamily(g, reg, c, &ins, &outs);
     if (n_out != c.outputs.len) return error.FixtureOutputs;
     const v = mlx.mlx_vector_array_new_data(&outs, n_out);
@@ -316,9 +332,40 @@ fn in(ins: *std.StringHashMapUnmanaged(mlx.mlx_array), name: []const u8) mlx.mlx
 }
 
 /// The ported calls of one family, outputs in the dump's order.
-fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.StringHashMapUnmanaged(mlx.mlx_array), outs: *[11]mlx.mlx_array) !usize {
+fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.StringHashMapUnmanaged(mlx.mlx_array), outs: *[16]mlx.mlx_array) !usize {
     const f = c.family;
     const eq = std.mem.eql;
+    // DRAFTRC (dump_draftrc_fixture.py): the draft routes, outputs in the dump's order
+    if (eq(u8, f, "draft_proj")) {
+        const site = std.meta.stringToEnum(ops.DraftSite, c.site.?) orelse return error.FixtureSite;
+        const x1 = in(ins, "x1");
+        var r = try ops.DraftProj(MlxG).init(g, reg, site, g.dtypeOf(x1), in(ins, "w"), in(ins, "scales"), null);
+        defer r.deinit(g);
+        outs[0] = try r.call(g, x1);
+        outs[1] = try r.call(g, in(ins, "x6"));
+        outs[2] = try r.call(g, in(ins, "x8"));
+        return 3;
+    }
+    if (eq(u8, f, "draft_router")) {
+        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        defer r.deinit(g);
+        outs[0..2].* = try r.call(g, in(ins, "x1"));
+        outs[2..4].* = try r.call(g, in(ins, "x6"));
+        outs[4..6].* = try r.call(g, in(ins, "x8"));
+        return 6;
+    }
+    if (eq(u8, f, "draft_tape")) {
+        var r = try ops.HcTape(MlxG).init(g, reg, .float32, null);
+        defer r.deinit(g);
+        var mixed = try ops.HcTapeMixed(MlxG).init(g, reg, null);
+        defer mixed.deinit(g);
+        const x, const rr, const rb, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "rb"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
+        outs[0] = try r.combine(g, x, rr, post, comb);
+        outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
+        outs[4..8].* = try r.combineCollapseNorm(g, x, rr, post, comb, pre, w);
+        outs[8..12].* = try mixed.call(g, x, rb, post, comb, pre, w);
+        return 12;
+    }
     if (eq(u8, f, "router")) {
         var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
         defer r.deinit(g);
@@ -345,7 +392,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "hctape")) {
-        const r = try ops.HcTape(MlxG).init(reg, .bfloat16, null);
+        var r = try ops.HcTape(MlxG).init(g, reg, .bfloat16, null);
+        defer r.deinit(g);
         const x, const rr, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
         outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
@@ -371,7 +419,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "prep")) {
-        const r = ops.RinPrep(MlxG).init(reg);
+        var r = try ops.RinPrep(MlxG).init(g, reg);
+        defer r.deinit(g);
         const ids = in(ins, "ids");
         outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
         outs[2] = try r.guEpi(g, in(ins, "zg"), in(ins, "zu"), in(ins, "rout_g"), in(ins, "rout_u"), ids);
@@ -502,13 +551,10 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
 
 const testing = std.testing;
 
-// The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1,
-// DSV41_KERNEL_OPS_FIXTURE=<fixture dir>; DSV41_KERNEL_OPS_FAMILIES=<a,b|all> narrows it,
-// DSV41_KERNEL_OPS_RECEIPT=<path> keeps the per-output JSON lines.
-test "dsv41 kernels ops gpu: every route reproduces its lane's own device output (fixture), bitwise" {
-    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
-    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_OPS_FIXTURE") orelse return error.SkipZigTest);
-    const filter: ?[]const u8 = if (std.c.getenv("DSV41_KERNEL_OPS_FAMILIES")) |f| std.mem.span(f) else null;
+/// One fixture replayed through the routes (the ops gate and the draft gate): the spec's format and
+/// manifest pin checked, every case's inputs regenerated and checked, every output word compared;
+/// one JSON line per output (the receipt), then `[<label>] <cases> cases, <outputs> outputs, <failed> failed`.
+fn replayFixture(dir: []const u8, format: []const u8, filter: ?[]const u8, receipt: ?[*:0]const u8, comptime label: []const u8) !void {
     const a = testing.allocator;
     mlx.installErrorHandler();
     const spec_path = try std.fs.path.join(a, &.{ dir, "spec.json" });
@@ -518,7 +564,7 @@ test "dsv41 kernels ops gpu: every route reproduces its lane's own device output
     const parsed = try std.json.parseFromSlice(JSpec, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const spec = parsed.value;
-    try testing.expectEqualStrings(fixture_format, spec.format);
+    try testing.expectEqualStrings(format, spec.format);
     try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
     var diag: xk.Diag = .{};
     var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
@@ -541,7 +587,7 @@ test "dsv41 kernels ops gpu: every route reproduces its lane's own device output
         replayCase(a, &g, &reg, dir, c, &lines) catch |e| {
             var buf: [256]u8 = undefined;
             const msg = mlx.takeError(&buf) orelse "";
-            std.debug.print("[kernel ops gate] {s} {s}: {t} {s}\n", .{ c.family, c.case, e, msg });
+            std.debug.print("[" ++ label ++ "] {s} {s}: {t} {s}\n", .{ c.family, c.case, e, msg });
             try lines.append(a, .{ .family = c.family, .case = c.case, .output = "", .err = @errorName(e) });
         };
         g.reset();
@@ -554,10 +600,28 @@ test "dsv41 kernels ops gpu: every route reproduces its lane's own device output
         try j.print(a, "{{\"family\":\"{s}\",\"case\":\"{s}\",\"output\":\"{s}\",\"words\":{d},\"bad\":{d},\"ok\":{},\"err\":\"{s}\"}}\n", .{ l.family, l.case, l.output, l.words, l.bad, l.ok, l.err });
     }
     std.debug.print("{s}", .{j.items});
-    if (std.c.getenv("DSV41_KERNEL_OPS_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
-    std.debug.print("[kernel ops gate] {d} cases, {d} outputs, {d} failed\n", .{ cases, lines.items.len, failed });
+    if (receipt) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
+    std.debug.print("[" ++ label ++ "] {d} cases, {d} outputs, {d} failed\n", .{ cases, lines.items.len, failed });
     try testing.expect(cases > 0);
     try testing.expectEqual(@as(usize, 0), failed);
+}
+
+// The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1,
+// DSV41_KERNEL_OPS_FIXTURE=<fixture dir>; DSV41_KERNEL_OPS_FAMILIES=<a,b|all> narrows it,
+// DSV41_KERNEL_OPS_RECEIPT=<path> keeps the per-output JSON lines.
+test "dsv41 kernels ops gpu: every route reproduces its lane's own device output (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_OPS_FIXTURE") orelse return error.SkipZigTest);
+    const filter: ?[]const u8 = if (std.c.getenv("DSV41_KERNEL_OPS_FAMILIES")) |f| std.mem.span(f) else null;
+    try replayFixture(dir, fixture_format, filter, std.c.getenv("DSV41_KERNEL_OPS_RECEIPT"), "kernel ops gate");
+}
+
+// The guarded window only (block (t)): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DRAFT_FIXTURE=<dir> (the
+// dump_draftrc_fixture.py fixture); DSV41_KERNEL_DRAFT_RECEIPT=<path> keeps the per-output JSON lines.
+test "dsv41 kernels ops gpu: the DRAFTRC routes reproduce the lane's own draft kernels (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_DRAFT_FIXTURE") orelse return error.SkipZigTest);
+    try replayFixture(dir, draft_fixture_format, null, std.c.getenv("DSV41_KERNEL_DRAFT_RECEIPT"), "kernel draft gate");
 }
 
 // The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;

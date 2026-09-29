@@ -11,6 +11,8 @@
 //! route's flush, after the eval that consumed them). The outputs come back
 //! in the router's order as `[n, k, hidden]` f32; the trunk combines them.
 //! `grow` is the one phase change; `flush` follows the forward's last eval.
+//! A call of more rows than a route takes (a prefill chunk) is the wide lane:
+//! the kernels' DIG-X prefill route over the slots its experts are served in.
 //!
 //! Sources: `StreamSource` (the streamer's `Stream`) and `FakeSource` (the
 //! streamer's residency policy with no reads, for host tests). The math of a
@@ -28,6 +30,8 @@ const expert_policy = @import("expert_policy.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
+const xk = @import("exl3_kernels.zig");
+const xko = @import("exl3_kernel_ops.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
 pub const BankKind = expert_stream.BankKind;
@@ -629,6 +633,12 @@ pub const TraceMath = struct {
 
 // ── The executor: the model's routed hook over a source ──
 
+/// `argsort(positions)` of unique positions: `inv[pos[j]] = j` (the row of
+/// the joined outputs that holds routed position `pos[j]`).
+fn invertPositions(pos: []const u32, inv: []u32) void {
+    for (pos, 0..) |p, j| inv[p] = @intCast(j);
+}
+
 /// Construction-time routes of the executor.
 pub const Routes = struct {
     /// Pass `route` the next routed layer's gate scores (the streamer's
@@ -637,6 +647,17 @@ pub const Routes = struct {
     /// Event gates instead of host waits: every wave is built at once over
     /// event-wait aliases of the bank arrays (the typical tier's gate).
     gated: bool = false,
+    /// The wide lane (calls of more than `max_route_ids` routed rows): one
+    /// route of this type per layer (`exl3_kernel_ops.DigXPrefill(G)`); null
+    /// refuses a wide call (`PrefillLaneNotPorted`).
+    prefill: ?type = null,
+};
+
+/// What the wide lane's routes are built from (`initWith`, once per layer).
+pub const PrefillInit = struct {
+    reg: *const xk.Registry,
+    shape: xko.PrefillShape = .tier,
+    diag: ?*xk.Diag = null,
 };
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
@@ -671,8 +692,33 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         gates: []const Gate = &.{},
         /// Gated: the event the stream signals (an MLX backend's MTLSharedEvent).
         event: expert_event.Event = .{ .id = 0, .object = 0 },
+        /// The backend the banks and the wide routes were bound on.
+        g: *G,
+        /// The wide lane: one route per layer (empty when not installed).
+        wide_routes: []Wide = &.{},
+        wide: WideScratch = .{},
 
-        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null };
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, prefill: ?PrefillInit = null };
+
+        /// The wide lane's route (void when not installed).
+        pub const Wide = routes.prefill orelse void;
+
+        /// The wide lane's host scratch, reused across calls.
+        const WideScratch = struct {
+            ids: std.ArrayList(u16) = .empty,
+            /// Per expert: its index in `distinct`, or -1.
+            first: std.ArrayList(i32) = .empty,
+            distinct: std.ArrayList(u16) = .empty,
+            slot: std.ArrayList(u32) = .empty,
+            act_row: std.ArrayList(u32) = .empty,
+            pos: std.ArrayList(u32) = .empty,
+            inv: std.ArrayList(u32) = .empty,
+            kept: std.ArrayList(T) = .empty,
+
+            fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+            }
+        };
 
         pub fn init(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config) !Self {
             return initWith(a, g, source, math, c, .{});
@@ -687,8 +733,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 b.* = @splat(null);
                 for ([_]BankKind{ .base, .transient }) |kind| b[@intFromEnum(kind)] = try bind(g, source, @intCast(l), kind);
             }
-            var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates };
+            var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g };
             if (opt.event) |e| self.event = e;
+            if (routes.prefill) |P| {
+                const pi = opt.prefill orelse return error.PrefillNeedsRegistry;
+                const rs = try a.alloc(P, c.n_layers);
+                errdefer a.free(rs);
+                var built: usize = 0;
+                errdefer for (rs[0..built]) |*r| r.deinit(g);
+                for (rs) |*r| {
+                    r.* = try P.init(a, pi.reg, pi.shape, pi.diag);
+                    built += 1;
+                }
+                self.wide_routes = rs;
+            }
             return self;
         }
 
@@ -721,6 +779,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn deinit(self: *Self) void {
+            if (routes.prefill != null) {
+                for (self.wide_routes) |*r| r.deinit(self.g);
+                self.a.free(self.wide_routes);
+            }
+            self.wide.deinit(self.a);
             self.a.free(self.banks);
             self.* = undefined;
         }
@@ -866,8 +929,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = n * k;
             // A route decision on M: calls of at most `max_route_ids` ids (decode
             // and verify, <= 8 rows of top-6) are the decode lane; wider calls
-            // are the prefill lane (seed waves + the DIG kernels), not ported.
-            if (n_ids > max_route_ids) return error.PrefillLaneNotPorted;
+            // are the wide lane (the DIG kernels), when it is installed.
+            if (n_ids > max_route_ids) {
+                if (comptime routes.prefill == null) {
+                    return error.PrefillLaneNotPorted;
+                } else {
+                    return self.runWide(g, layer, xf, indices, n, k);
+                }
+            }
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [expert_lookahead.max_rows * 512]f32 = undefined;
             var scores: []const f32 = &.{};
@@ -904,6 +973,85 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var order: [max_route_ids]u32 = undefined;
             for (acc.pos[0..acc.n_pos], 0..) |pos, j| order[pos] = @intCast(j);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..acc.n_pos]), &.{@intCast(acc.n_pos)}, .uint32);
+            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// The wide lane: the routing barrier; the call's distinct experts (first
+        /// appearance) routed in groups of at most `max_route_ids`; per group,
+        /// every part waited, then per bank the group's rows through the layer's
+        /// DIG-X route (slot = the row the source serves the expert in, act row =
+        /// its token), drained and evaluated before the group is released (the
+        /// next route may refill those slots); the outputs joined in the
+        /// router's order, `[n, k, hidden]` f32. The DIG kernels read bf16
+        /// activations (the lane of record's MoE input): another dtype is
+        /// rounded to bf16 once, here.
+        fn runWide(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
+            const a = self.a;
+            const w = &self.wide;
+            const n_ids = n * k;
+            try w.ids.resize(a, n_ids);
+            _ = try g.hostIds(indices, w.ids.items);
+            try w.first.resize(a, self.n_experts);
+            @memset(w.first.items, -1);
+            w.distinct.clearRetainingCapacity();
+            for (w.ids.items) |e| if (w.first.items[e] < 0) {
+                w.first.items[e] = @intCast(w.distinct.items.len);
+                try w.distinct.append(a, e);
+            };
+            const act = if (g.dtypeOf(xf) == .bfloat16) xf else try g.astype(xf, .bfloat16);
+            const route = &self.wide_routes[layer];
+            w.pos.clearRetainingCapacity();
+            w.kept.clearRetainingCapacity();
+            errdefer {
+                for (w.kept.items) |x| g.release(x);
+                w.kept.clearRetainingCapacity();
+            }
+            var start: usize = 0;
+            while (start < w.distinct.items.len) {
+                const group = w.distinct.items[start..@min(start + max_route_ids, w.distinct.items.len)];
+                const call = try self.source.route(layer, group, &.{});
+                var released = false;
+                errdefer if (!released) self.source.release(call);
+                const sv = self.source.served(call);
+                for (0..sv.n_parts) |p| {
+                    try self.source.waitGu(call, @intCast(p));
+                    try self.source.waitDown(call, @intCast(p));
+                }
+                for ([_]BankKind{ .base, .ext, .transient }) |kind| {
+                    w.slot.clearRetainingCapacity();
+                    w.act_row.clearRetainingCapacity();
+                    for (w.ids.items, 0..) |e, row| {
+                        const gi: usize = @intCast(w.first.items[e]);
+                        if (gi < start or gi >= start + group.len) continue;
+                        const ref = sv.refs[gi - start];
+                        if (ref.bank != kind) continue;
+                        try w.slot.append(a, ref.row);
+                        try w.act_row.append(a, @intCast(row / @as(usize, k)));
+                        try w.pos.append(a, @intCast(row));
+                    }
+                    if (w.slot.items.len == 0) continue;
+                    const b = self.banks[layer][@intFromEnum(kind)].?;
+                    try w.kept.ensureUnusedCapacity(a, 1);
+                    const y = try route.call(g, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, .{
+                        .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin },
+                        .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin },
+                        .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
+                    });
+                    w.kept.appendAssumeCapacity(y);
+                    try route.finish(g);
+                    try g.evalAll(&.{y});
+                }
+                self.source.release(call);
+                released = true;
+                start += group.len;
+            }
+            // `take(concatenate(outputs), argsort(positions))`, the permutation made on the host.
+            const joined = try g.concat(w.kept.items, 0);
+            for (w.kept.items) |x| g.release(x);
+            w.kept.clearRetainingCapacity();
+            try w.inv.resize(a, n_ids);
+            invertPositions(w.pos.items, w.inv.items);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
     };
@@ -1082,6 +1230,242 @@ test "dsv41 experts: a wider call is the prefill lane's (not ported), refused be
     const idx = try g.input(&.{ 9, 6 }, .int32);
     try testing.expectError(error.PrefillLaneNotPorted, ex.at(0).routed(&g, xf, idx));
     try testing.expectEqual(@as(usize, 0), src.log.items.len);
+}
+
+/// The wide lane's host tests: a registry from the embedded manifest (no MLX).
+fn hostRegistry() !xk.Registry {
+    var diag: xk.Diag = .{};
+    return xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
+        std.debug.print("dsv41 experts: {s}\n", .{diag.message()});
+        return e;
+    };
+}
+
+/// A wide-lane route that records every call: its rows, the bank it was
+/// handed and, from the fake source's live route, the served slots of the
+/// group (so the test can derive what each call should have been).
+const RecRoute = struct {
+    a: std.mem.Allocator,
+    calls: std.ArrayList(Rec) = .empty,
+    finishes: u32 = 0,
+
+    /// The source whose live route each call snapshots.
+    var source: ?*FakeSource = null;
+
+    const Rec = struct { slot: []u32, act_row: []u32, bank_code: u32, route: u64, refs: []SlotRef, at: usize, node: usize, act_dtype: ops.Dtype };
+
+    pub fn init(a: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !RecRoute {
+        return .{ .a = a };
+    }
+
+    pub fn deinit(self: *RecRoute, _: *TraceOps) void {
+        for (self.calls.items) |r| {
+            self.a.free(r.slot);
+            self.a.free(r.act_row);
+            self.a.free(r.refs);
+        }
+        self.calls.deinit(self.a);
+    }
+
+    pub fn call(self: *RecRoute, g: *TraceOps, act: u32, rows: xko.PrefillRows, bank: xko.BankArrays(u32)) !u32 {
+        const src = source.?;
+        const live = for (&src.calls) |*c| {
+            if (c.state == .live) break c;
+        } else return error.NoLiveRoute;
+        try self.calls.append(self.a, .{
+            .slot = try self.a.dupe(u32, rows.slot),
+            .act_row = try self.a.dupe(u32, rows.act_row.?),
+            .bank_code = bank.gate.code,
+            .route = src.counters.route_calls,
+            .refs = try self.a.dupe(SlotRef, live.refs[0..live.plan.n_ids]),
+            .at = src.log.items.len,
+            .node = g.nodes.items.len,
+            .act_dtype = g.dtypeOf(act),
+        });
+        return g.input(&.{ @intCast(rows.slot.len), g.shapeOf(act).d[1] }, .float32);
+    }
+
+    pub fn finish(self: *RecRoute, _: *TraceOps) !void {
+        self.finishes += 1;
+    }
+};
+
+test "dsv41 experts: a wide call routes its experts in groups and runs each bank's rows through the wide route" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 64;
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    src.trace = &g;
+    RecRoute.source = &src;
+    defer RecRoute.source = null;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .prefill = RecRoute });
+    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    // 20 tokens x top-6 over 64 experts: 120 rows, every expert id distinct within a token.
+    const n = 20;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 64);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    // An f32 stream reaches the wide route rounded to bf16 (the DIG kernels' activations).
+    const out = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
+    try testing.expect(g.shapeOf(out).eql(ops.Shape.of(&.{ n, k, 256 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(out));
+
+    // The call's distinct experts, in first appearance, routed in groups of max_route_ids.
+    var first: [64]i32 = @splat(-1);
+    var distinct: std.ArrayList(u16) = .empty;
+    defer distinct.deinit(a);
+    for (ids) |e| if (first[e] < 0) {
+        first[e] = @intCast(distinct.items.len);
+        try distinct.append(a, e);
+    };
+    const n_groups = (distinct.items.len + max_route_ids - 1) / max_route_ids;
+    try testing.expectEqual(@as(u64, n_groups), src.counters.route_calls);
+    // The source protocol: per group route, every part's waits, release (the next route flushes it).
+    var kb: [64]u8 = undefined;
+    const kinds = kindsOf(src.log.items, &kb);
+    try testing.expectEqual(@as(usize, n_groups), std.mem.count(u8, kinds, "R"));
+    try testing.expectEqual(@as(usize, n_groups), std.mem.count(u8, kinds, "r"));
+    try testing.expectEqual(std.mem.count(u8, kinds, "g"), std.mem.count(u8, kinds, "d"));
+
+    // Each recorded call is exactly its group's rows in one bank, in routed order, read
+    // from the slot the source serves the expert in, after the group's waits and before
+    // its release; together they cover every row once.
+    const rr = &ex.wide_routes[0];
+    try testing.expect(rr.calls.items.len >= n_groups);
+    try testing.expectEqual(@as(u32, @intCast(rr.calls.items.len)), rr.finishes);
+    var rows_seen: usize = 0;
+    for (rr.calls.items) |rec| {
+        try testing.expectEqual(ops.Dtype.bfloat16, rec.act_dtype);
+        const gidx: usize = @intCast(rec.route - 1);
+        const kind: BankKind = for ([_]BankKind{ .base, .ext, .transient }) |kd| {
+            if (ex.banks[0][@intFromEnum(kd)]) |b| if (b.gate.code == rec.bank_code) break kd;
+        } else return error.UnknownBank;
+        var want_slot: std.ArrayList(u32) = .empty;
+        defer want_slot.deinit(a);
+        var want_act: std.ArrayList(u32) = .empty;
+        defer want_act.deinit(a);
+        for (ids, 0..) |e, row| {
+            const gi: usize = @intCast(first[e]);
+            if (gi / max_route_ids != gidx) continue;
+            const ref = rec.refs[gi - gidx * max_route_ids];
+            if (ref.bank != kind) continue;
+            try want_slot.append(a, ref.row);
+            try want_act.append(a, @intCast(row / k));
+        }
+        try testing.expectEqualSlices(u32, want_slot.items, rec.slot);
+        try testing.expectEqualSlices(u32, want_act.items, rec.act_row);
+        // after the group's route and waits, before its release
+        try testing.expect(kinds[rec.at - 1] == 'd' or kinds[rec.at - 1] == 'R');
+        try testing.expect(rec.at < kinds.len);
+        // evaluated before the group is released (the next route may refill its slots)
+        const release_at = for (src.log.items[rec.at..]) |e| {
+            if (e.kind == .release) break e.at;
+        } else return error.NoRelease;
+        var evaluated = false;
+        for (g.evals.items) |ev| evaluated = evaluated or (ev >= rec.node and ev <= release_at);
+        try testing.expect(evaluated);
+        rows_seen += rec.slot.len;
+    }
+    try testing.expectEqual(@as(usize, n * k), rows_seen);
+}
+
+/// dump_prefill_waves.route_rows: slot j repeated counts[j] times, then
+/// Fisher-Yates from the end with j = splitmix64(seed) output % (i + 1).
+fn sampleRows(a: std.mem.Allocator, seed: u64, slots: []const u32, counts: []const u32) ![]u16 {
+    var n: usize = 0;
+    for (counts) |c| n += c;
+    const rows = try a.alloc(u16, n);
+    var i: usize = 0;
+    for (slots, counts) |s, c| for (0..c) |_| {
+        rows[i] = @intCast(s);
+        i += 1;
+    };
+    var st = seed;
+    var j = n;
+    while (j > 1) {
+        j -= 1;
+        const r: usize = @intCast(xk.splitmix64(&st) % (j + 1));
+        std.mem.swap(u16, &rows[j], &rows[r]);
+    }
+    return rows;
+}
+
+test "dsv41 experts: the joined outputs are put back in routed order" {
+    // Outputs joined as positions 3, 0, 4, 1, 2: routed position p reads joined row inv[p].
+    var inv: [5]u32 = undefined;
+    invertPositions(&.{ 3, 0, 4, 1, 2 }, &inv);
+    try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
+}
+
+test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samples' wave structure" {
+    const a = testing.allocator;
+    const Sample = struct {
+        cases: []const struct {
+            case: []const u8,
+            calls: []const struct { name: []const u8, a_rows: u32, route: struct { seed: u64, slots: []const u32, counts: []const u32 }, events: []const []const u8 },
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const tier = for (parsed.value.cases) |cs| {
+        if (std.mem.eql(u8, cs.case, "tier")) break cs;
+    } else return error.NoTierCase;
+    var c = testConfig(5120, 2304, 1);
+    c.n_routed_experts = 64;
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var src = try FakeSource.init(a, .{ .hidden = 5120, .inter = 2304, .n_experts = 64, .rows = &.{64} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .prefill = xko.DigXPrefill(TraceOps) });
+    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    // The sample calls one route serves whole (at most max_route_ids distinct experts),
+    // their rows as tokens x k: the lane's slots are this call's experts.
+    const Pick = struct { name: []const u8, k: u32 };
+    const picks = [_]Pick{ .{ .name = "chunk183", .k = 6 }, .{ .name = "drained", .k = 6 }, .{ .name = "solo_carried", .k = 4 }, .{ .name = "budget_gt", .k = 3 } };
+    var checked: usize = 0;
+    for (picks) |pk| {
+        const cl = for (tier.calls) |x| {
+            if (std.mem.eql(u8, x.name, pk.name)) break x;
+        } else return error.NoSampleCall;
+        try testing.expect(cl.route.slots.len <= max_route_ids);
+        const rows = try sampleRows(a, cl.route.seed, cl.route.slots, cl.route.counts);
+        defer a.free(rows);
+        const n: u32 = @intCast(rows.len / pk.k);
+        try testing.expectEqual(rows.len, n * pk.k);
+        var script: Script = .{ .calls = &.{rows} };
+        g.host_values = script.values();
+        const first_node = g.nodes.items.len;
+        const resets_before = g.freed.items.len;
+        const calls_before = src.counters.route_calls;
+        const out = try ex.at(0).routed(&g, try g.input(&.{ @intCast(n), 5120 }, .bfloat16), try g.input(&.{ @intCast(n), @intCast(pk.k) }, .int32));
+        try testing.expect(g.shapeOf(out).eql(ops.Shape.of(&.{ @intCast(n), @intCast(pk.k), 5120 })));
+        try testing.expectEqual(calls_before + 1, src.counters.route_calls);
+        // The lane's waves: 5 launches each (7 outputs: take2 2, gate|up GEMM 2, onepass,
+        // down GEMM, widen1), a reset per wave plus the join's.
+        var launches: usize = 0;
+        for (cl.events) |e| launches += @intFromBool(std.mem.startsWith(u8, e, "launch "));
+        const waves = launches / 5;
+        var kernels: usize = 0;
+        for (g.nodes.items[first_node..]) |nd| kernels += @intFromBool(nd.op == .kernel);
+        try testing.expectEqual(7 * waves, kernels);
+        try testing.expectEqual(waves + 1, g.freed.items.len - resets_before);
+        checked += 1;
+        src.flush() catch {};
+    }
+    try testing.expectEqual(picks.len, checked);
 }
 
 const SynthBank = struct {

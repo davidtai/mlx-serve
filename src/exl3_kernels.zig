@@ -433,6 +433,21 @@ pub const Registry = struct {
     }
 };
 
+/// One launch's mlx config (output shapes and dtypes, grid, threadgroup, template arguments),
+/// built once (`Bound.prepare`) and handed to every launch at that geometry (`applyPrepared`).
+/// mlx copies what a launch needs when it is applied, so `deinit` is safe once the last
+/// `applyPrepared` using it has returned (its outputs need not be evaluated yet).
+pub const Prepared = struct {
+    kernel: Kernel,
+    config: mlx.mlx_fast_metal_kernel_config,
+    n_out: usize,
+
+    pub fn deinit(self: *Prepared) void {
+        _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
+        self.* = undefined;
+    }
+};
+
 /// The kernels built on one GPU stream; freed after that stream has drained.
 pub const Bound = struct {
     reg: *const Registry,
@@ -446,10 +461,12 @@ pub const Bound = struct {
         self.* = undefined;
     }
 
-    /// One launch of `k` with `cfg`; `outs` receives `cfg.n_out` new arrays (caller frees).
-    pub fn apply(self: *const Bound, k: Kernel, inputs: []const mlx.mlx_array, cfg: *const LaunchConfig, outs: []mlx.mlx_array) !void {
+    /// A launch's mlx config built once (a route's construction): `applyPrepared` hands it to the
+    /// kernel with no per-launch config work. The caller owns it (`Prepared.deinit`).
+    pub fn prepare(self: *const Bound, k: Kernel, cfg: *const LaunchConfig) error{MlxError}!Prepared {
+        _ = self;
         const c = mlx.mlx_fast_metal_kernel_config_new();
-        defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         for (0..cfg.n_out) |i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &cfg.out_shapes[i], cfg.out_ranks[i], cfg.out_dtypes[i]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @intCast(cfg.grid[0]), @intCast(cfg.grid[1]), @intCast(cfg.grid[2])));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, @intCast(cfg.threadgroup[0]), @intCast(cfg.threadgroup[1]), @intCast(cfg.threadgroup[2])));
@@ -457,15 +474,29 @@ pub const Bound = struct {
             .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name.ptr, v)),
             .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
         };
+        return .{ .kernel = k, .config = c, .n_out = cfg.n_out };
+    }
+
+    /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
+    pub fn applyPrepared(self: *const Bound, p: *const Prepared, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
         const vin = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(vin);
         var vout = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vout);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(k)], vin, c, self.stream));
-        for (outs[0..cfg.n_out], 0..) |*o, i| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
+        for (outs[0..p.n_out], 0..) |*o, i| {
             o.* = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
         }
+    }
+
+    /// One launch of `k` with `cfg`, its config built for this launch only; `outs` receives
+    /// `cfg.n_out` new arrays (caller frees). The per-call path: the prefill routes whose geometry
+    /// varies per call; decode routes launch prepared configs (`prepare` / `applyPrepared`).
+    pub fn apply(self: *const Bound, k: Kernel, inputs: []const mlx.mlx_array, cfg: *const LaunchConfig, outs: []mlx.mlx_array) error{MlxError}!void {
+        var p = try self.prepare(k, cfg);
+        defer p.deinit();
+        try self.applyPrepared(&p, inputs, outs);
     }
 };
 
