@@ -400,7 +400,14 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
     }.count;
     const depth2: dsl.Config = .{ .k_request = 2, .max_tokens = std.math.maxInt(u32) };
     {
-        const r = try Rig.createAt(routes.served);
+        // The router / premix kernels bake the real geometry (384 x 5120, 24 x 20480): the mini
+        // model refuses them by name at construction; they bind on the real shapes (the graph
+        // test, the 16K accounting on the bank). Here the served tier without those two members.
+        try testing.expectError(error.RouterGeometry, Rig.createAt(routes.served));
+        var mini_served = routes.served;
+        mini_served.routes.rc_router = false;
+        mini_served.routes.rc_premix = false;
+        const r = try Rig.createAt(mini_served);
         defer r.destroy();
         var s: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };
         r.script(&s);

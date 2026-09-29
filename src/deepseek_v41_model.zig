@@ -167,7 +167,7 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
-            if (opts.registry) |reg| self.kx = try Tr.Kernels.init(g, reg, &self.c, &self.tier.routes);
+            if (opts.registry) |reg| self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
@@ -569,7 +569,7 @@ pub fn Model(comptime G: type) type {
                 // Per chunk: the resident gate (M == the chunk, as chunk-major).
                 for (halves, xfs, routes_) |hf, *xf, *r| {
                     xf.* = try g.reshape(hf.moe_in, &.{ -1, dim });
-                    r.* = try Tr.router(g, probe, c, rt, lw, xf.*);
+                    r.* = try Tr.router(g, probe, c, rt, self.kx.at(l), lw, xf.*);
                 }
                 // The routed call over consecutive chunks up to the row cap.
                 var i: usize = 0;
