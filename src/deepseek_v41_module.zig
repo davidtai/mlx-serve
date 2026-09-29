@@ -138,12 +138,14 @@ pub const Module = struct {
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
-        self.model = try M.initWith(gpa, &self.g, c, routes.served, weights, &self.engram, .{ .registry = &self.set.reg });
+        const tier = numericTier(config.numeric_tier orelse .served);
+        log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
+        self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = subset });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset });
         errdefer self.head.deinit(&self.g);
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
         // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
@@ -259,7 +261,7 @@ pub const Module = struct {
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
         switch (self.arm) {
-            inline else => |t| if (ids.len == 1 and !t.arm.grown) {
+            inline else => |t| if (phaseChangeDue(ids.len, t.arm.grown)) {
                 if (!self.fenced) {
                     try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
                     self.fenced = true;
@@ -277,17 +279,39 @@ pub const Module = struct {
         const g = &self.g;
         const st = &(self.state orelse return error.Dsv41NoRequest);
         switch (self.arm) {
-            inline else => |t| {
-                const r = try self.model.forward(g, st, ids, .{ .logits = .last }, &t.arm.hook, graph.NoProbe{});
-                try M.fence(g, st, &.{r.logits.?});
-                try t.arm.hook.flush();
-                const out = g.keep(r.logits.?);
-                g.reset();
-                return out;
-            },
+            inline else => |t| return requestForward(G, g, self.model, st, ids, &t.arm.hook),
         }
     }
 };
+
+/// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
+/// decode-width (8 rows: no rounding-class wide lane); `served` is the tier of record (its DIG-X prefill).
+pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
+    return switch (t) {
+        .stock => blk: {
+            var s = routes.stock;
+            s.prefill_chunk = routes.min_prefill_chunk;
+            break :blk s;
+        },
+        .served => routes.served,
+    };
+}
+
+/// The phase change runs before the first decode-width forward of a prompt, once.
+pub fn phaseChangeDue(rows: usize, grown: bool) bool {
+    return rows == 1 and !grown;
+}
+
+/// One forward of a served request: the model's own chunking, the last row's logits (kept), the
+/// hook's settle, one reset.
+pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Model(B).State, ids: []const u32, hook: anytype) !B.T {
+    const r = try model.forward(g, st, ids, .{ .logits = .last }, hook, graph.NoProbe{});
+    try mdl.Model(B).fence(g, st, &.{r.logits.?});
+    try hook.flush();
+    const out = g.keep(r.logits.?);
+    g.reset();
+    return out;
+}
 
 fn setCacheLimit(limit: usize) void {
     var prev: usize = 0;
@@ -538,4 +562,170 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
         try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));
     inline for (.{ .stock, .served }) |t| std.debug.print("\nDSV41_PREFILL_BILL {{\"tier\": \"{t}\", \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}", .{ @as(v41.PrefillBill.Tier, t), bill.bytes(64, 32, t), bill.bytes(16384, 1024, t), bill.waveBytes(bill.chunkRows(16384), 16384, t) });
+}
+
+/// The routed hook with a record of each forward's rows (layer 0's routed call), the order the model feeds it.
+fn Recorder(comptime Ex: type) type {
+    return struct {
+        const Self = @This();
+        ex: *Ex,
+        rows: std.ArrayList(u32) = .empty,
+        /// Index into `rows` of the first forward after each grow.
+        grown_at: std.ArrayList(usize) = .empty,
+        gpa: std.mem.Allocator,
+
+        const Hook = struct {
+            r: *Self,
+            layer: u32,
+            pub fn routed(h: Hook, g: *ops.TraceOps, xf: u32, indices: u32) !u32 {
+                if (h.layer == 0) try h.r.rows.append(h.r.gpa, @intCast(g.shapeOf(xf).dim(0)));
+                return h.r.ex.at(h.layer).routed(g, xf, indices);
+            }
+        };
+        pub fn at(self: *Self, layer: u32) Hook {
+            return .{ .r = self, .layer = layer };
+        }
+        pub fn flush(self: *Self) !void {
+            try self.ex.flush();
+        }
+        fn grow(self: *Self, g: *ops.TraceOps, rows: []const u32) !void {
+            try self.ex.grow(g, rows);
+            try self.grown_at.append(self.gpa, self.rows.items.len);
+        }
+        fn deinit(self: *Self) void {
+            self.rows.deinit(self.gpa);
+            self.grown_at.deinit(self.gpa);
+        }
+    };
+}
+
+const ScriptedPicks = struct {
+    rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(20260929),
+    n_experts: u16,
+    picks: []const u32,
+    next: usize = 0,
+
+    fn values(self: *ScriptedPicks) ops.TraceOps.HostValues {
+        return .{ .ctx = self, .ids = ids, .argmax = argmax };
+    }
+    fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+        const s: *ScriptedPicks = @ptrCast(@alignCast(ctx));
+        for (out) |*o| o.* = s.rng.random().uintLessThan(u16, s.n_experts);
+    }
+    fn argmax(ctx: *anyopaque) anyerror!u32 {
+        const s: *ScriptedPicks = @ptrCast(@alignCast(ctx));
+        defer s.next += 1;
+        return s.picks[s.next % s.picks.len];
+    }
+};
+
+// DSV41_BANK=<bank> [DSV41_SCHEDULE_REF=<ar-ref json>] (host, the trace backend): the served request's schedule
+// (mlx-serve's Generator for a whole-prompt arch, generate.zig: the prompt but its last token in one forward, then
+// one token per forward; the module's phase change before the first decode-width forward) against the AR harness's
+// (`Model.greedy`, prompt forwards of 8 rows). Both feed the same ids and leave the same Engram history; their
+// forward shapes differ, which is why the harness's reference is not the served path's.
+test "dsv41 module: the served request's forward schedule against the AR harness's (bank, trace backend)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var vd: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 module schedule: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, io, bank, &vd);
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/" ++ engram_token_map_file, .{bank}), &c, &vd);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    // The parity prompt and its reference ids (the M3 reference), else a stand-in prompt.
+    var prompt: []const u32 = undefined;
+    var picks: []const u32 = undefined;
+    if (std.c.getenv("DSV41_SCHEDULE_REF")) |p| {
+        const Ref = struct { prompt_ids: []const u32, generated_ids: []const u32 };
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(p), aa, .limited(16 << 20));
+        const ref = try std.json.parseFromSliceLeaky(Ref, aa, text, .{ .ignore_unknown_fields = true });
+        prompt = ref.prompt_ids;
+        picks = ref.generated_ids;
+    } else {
+        const pr = try aa.alloc(u32, 64);
+        for (pr, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+        prompt = pr;
+        picks = &.{ 1, 1, 1528, 9998, 7, 42 };
+    }
+    const n_new: usize = 6;
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const TChain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
+    const Wide = xq.DigXPrefill(ops.TraceOps);
+    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, xp.WithPrefillRoutes(ops.TraceOps, TChain, Wide), .{ .prefill = true });
+    const TM = mdl.Model(ops.TraceOps);
+    const Route = enum { harness, served };
+    var fed: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&fed) |*f| f.deinit(a);
+    var hist: [2][]i64 = undefined;
+    var rows: [2][]u32 = undefined;
+    var grown: [2][]usize = undefined;
+    for ([_]Route{ .harness, .served }, 0..) |route, ri| {
+        var g = ops.TraceOps.init(a);
+        defer g.deinit();
+        var sp: ScriptedPicks = .{ .n_experts = @intCast(c.n_routed_experts), .picks = picks };
+        g.host_values = sp.values();
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+        const model_ = try TM.initWith(a, &g, c, routes.served, &lookup, &src, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        const prows = try aa.alloc(u32, c.n_layers);
+        @memset(prows, 8);
+        const drows = try aa.alloc(u32, c.n_layers);
+        @memset(drows, 16);
+        var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = prows });
+        defer fsrc.deinit();
+        const digx = try aa.alloc(Wide, c.n_layers);
+        for (digx) |*d| d.* = try Wide.init(a, &reg, .tier, null);
+        defer for (digx) |*d| d.deinit(&g);
+        var ex = try Ex.init(a, &g, &fsrc, .{ .d = TChain.init(.{}, &c), .routes = digx }, &c);
+        defer ex.deinit();
+        var rec: Recorder(Ex) = .{ .ex = &ex, .gpa = a };
+        defer rec.deinit();
+        var st = try model_.newState();
+        defer st.deinit(&g, a);
+        switch (route) {
+            .harness => {
+                // The AR harness (deepseek_v41_ar.zig): its stream grown before the prompt, then Model.greedy.
+                try rec.grow(&g, drows);
+                const out = try aa.alloc(u32, n_new);
+                var i: usize = 0;
+                while (i < prompt.len) : (i += 8) try fed[ri].appendSlice(a, prompt[i..@min(i + 8, prompt.len)]);
+                try model_.greedy(&g, &st, prompt, 8, &rec, out, {});
+                try fed[ri].appendSlice(a, out[0 .. n_new - 1]);
+            },
+            .served => {
+                // The Generator: the prompt but its last token (step 0), then one id per forward; the module's
+                // phase change before the first decode-width forward.
+                var ids: []const u32 = prompt[0 .. prompt.len - 1];
+                var step: usize = 0;
+                var next: u32 = prompt[prompt.len - 1];
+                while (step <= n_new) : (step += 1) {
+                    if (step > 0) {
+                        if (phaseChangeDue(ids.len, rec.grown_at.items.len > 0)) try rec.grow(&g, drows);
+                    }
+                    try fed[ri].appendSlice(a, ids);
+                    const lg = try requestForward(ops.TraceOps, &g, model_, &st, ids, &rec);
+                    if (step > 0) next = try g.hostArgmax(lg);
+                    ids = (&next)[0..1];
+                    if (fed[ri].items.len >= prompt.len + n_new - 1) break;
+                }
+            },
+        }
+        hist[ri] = try aa.dupe(i64, st.hash.?.hist.items);
+        rows[ri] = try aa.dupe(u32, rec.rows.items);
+        grown[ri] = try aa.dupe(usize, rec.grown_at.items);
+    }
+    std.debug.print("\nDSV41_SCHEDULE harness rows {any} grown before forward {any}\nDSV41_SCHEDULE served rows {any} grown before forward {any}\n", .{ rows[0], grown[0], rows[1], grown[1] });
+    // Same ids fed, same Engram history: the plumbing feeds the model what the harness does.
+    try std.testing.expectEqualSlices(u32, fed[0].items, fed[1].items);
+    try std.testing.expectEqualSlices(i64, hist[0], hist[1]);
+    // The documented difference: the shapes (8-row prompt forwards vs one prompt forward, the last token at M = 1
+    // after the phase change).
+    try std.testing.expect(!std.mem.eql(u32, rows[0], rows[1]));
 }

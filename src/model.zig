@@ -418,6 +418,8 @@ pub const ModelConfig = struct {
     /// A streamed-expert model's routed waves wait on the reads' events instead of the host (the
     /// `expert_event_gates` model setting; null = the arch's default).
     expert_event_gates: ?bool = null,
+    /// A module-owned arch's numerics, chosen at construction (the `numeric_tier` model setting; null = served).
+    numeric_tier: ?@import("model_settings.zig").NumericTier = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

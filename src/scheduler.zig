@@ -2707,6 +2707,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     if (o.nocache_weights) |n| config.nocache_weights = n;
     if (o.expert_event_gates) |n| config.expert_event_gates = n;
+    if (o.numeric_tier) |n| config.numeric_tier = n;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;

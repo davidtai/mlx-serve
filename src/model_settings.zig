@@ -8,6 +8,9 @@ const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
+/// A module-owned arch's construction-time numerics (`numeric_tier`).
+pub const NumericTier = enum { stock, served };
+
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,
@@ -18,6 +21,9 @@ pub const Override = struct {
     nocache_weights: ?bool = null,
     /// A streamed-expert model's routed waves wait on the reads' events, not the host (null: the arch's default).
     expert_event_gates: ?bool = null,
+    /// A module-owned arch's numerics, chosen at construction: "stock" (the exact reference math, the prompt in
+    /// decode-width forwards) or "served" (the tier of record, its rounding-class prefill). Null: served.
+    numeric_tier: ?NumericTier = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -31,7 +37,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and
+            o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and o.numeric_tier == null and
             o.chat_template_kwargs == null and o.drafter == null;
     }
 
@@ -108,6 +114,9 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     if (obj.get("expert_event_gates")) |n| switch (n) {
         .bool => |b| o.expert_event_gates = b,
         else => {},
+    };
+    if (obj.get("numeric_tier")) |n| if (n == .string) {
+        o.numeric_tier = std.meta.stringToEnum(NumericTier, n.string);
     };
     if (obj.get("drafter")) |d| if (d == .string) {
         const name = d.string;
@@ -248,6 +257,17 @@ test "model_settings: nocache_weights is a bool, anything else is unset" {
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").nocache_weights);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").nocache_weights);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: numeric_tier names stock or served, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"numeric_tier": "stock"}, "/m/b": {"numeric_tier": "served"}, "/m/c": {"numeric_tier": "fast"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?NumericTier, .stock), s.lookup(t, "/m/a").numeric_tier);
+    try std.testing.expectEqual(@as(?NumericTier, .served), s.lookup(t, "/m/b").numeric_tier);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }
 
