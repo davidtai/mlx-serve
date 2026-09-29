@@ -24,6 +24,12 @@ pub const Override = struct {
     /// A module-owned arch's numerics, chosen at construction: "stock" (the exact reference math, the prompt in
     /// decode-width forwards) or "served" (the tier of record, its rounding-class prefill). Null: served.
     numeric_tier: ?NumericTier = null,
+    /// A module-owned arch's prompt pass layer by layer over every chunk (null: chunk by chunk).
+    layer_major_prefill: ?bool = null,
+    /// A streamed-expert model's wide prefill calls: seeded, hottest groups first, one drain per group.
+    expert_wide_feed: ?bool = null,
+    /// A streamed-expert model's wide prefill calls: groups in flight (1 or 2; null: 1).
+    expert_wide_depth: ?u8 = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -38,6 +44,7 @@ pub const Override = struct {
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
             o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and o.numeric_tier == null and
+            o.layer_major_prefill == null and o.expert_wide_feed == null and o.expert_wide_depth == null and
             o.chat_template_kwargs == null and o.drafter == null;
     }
 
@@ -117,6 +124,20 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("numeric_tier")) |n| if (n == .string) {
         o.numeric_tier = std.meta.stringToEnum(NumericTier, n.string);
+    };
+    if (obj.get("layer_major_prefill")) |n| switch (n) {
+        .bool => |b| o.layer_major_prefill = b,
+        else => {},
+    };
+    if (obj.get("expert_wide_feed")) |n| switch (n) {
+        .bool => |b| o.expert_wide_feed = b,
+        else => {},
+    };
+    if (obj.get("expert_wide_depth")) |n| switch (n) {
+        .integer => |i| if (i >= 1 and i <= 2) {
+            o.expert_wide_depth = @intCast(i);
+        },
+        else => {},
     };
     if (obj.get("drafter")) |d| if (d == .string) {
         const name = d.string;
@@ -308,4 +329,17 @@ test "model_settings: drafter is off, auto or an absolute path; anything else is
     }
     try std.testing.expect(s.lookup(t, "/m/d").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/e").isEmpty());
+}
+
+test "model_settings: the prefill routes are a bool, a bool and a depth of 1 or 2; anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"layer_major_prefill": true, "expert_wide_feed": false, "expert_wide_depth": 2}, "/m/c": {"layer_major_prefill": 1, "expert_wide_depth": 3}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").layer_major_prefill);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/a").expert_wide_feed);
+    try std.testing.expectEqual(@as(?u8, 2), s.lookup(t, "/m/a").expert_wide_depth);
+    try std.testing.expectEqual(@as(?bool, null), s.lookup(t, "/m/c").layer_major_prefill);
+    try std.testing.expectEqual(@as(?u8, null), s.lookup(t, "/m/c").expert_wide_depth);
 }

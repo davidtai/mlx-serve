@@ -195,6 +195,11 @@ pub const Options = struct {
     event: ?Event = null,
     /// Host pages, or MLX arrays on the given stream (the serving form).
     slot_memory: SlotMemory = .host,
+    /// Prefill routes live at once in one layer (the wide lane's read-ahead:
+    /// 2 = the next group's reads issued before this group's waves). Each
+    /// live route owns a window of `max_route_ids` transient rows, so the
+    /// transient rows must hold `wide_depth` windows.
+    wide_depth: u8 = 1,
 };
 
 /// DSV41_LOOKAHEAD4=<k>:<tau>:<budget>:<chunks> at horizon 1.
@@ -306,6 +311,8 @@ pub const Route = struct {
     n_parts: u32 = 0,
     parts: [max_route_ids]Part = undefined,
     state: enum { free, live, released } = .free,
+    /// Its transient window (prefill routes beside a live one: `Options.wide_depth`).
+    window: u8 = 0,
     /// Decode layer calls with the lookahead class: this call's settle value.
     tag: i64 = 0,
     gates: ?Gates = null,
@@ -325,6 +332,8 @@ pub const Route = struct {
 
 /// The route being served plus released ones awaiting the next flush.
 const route_capacity = 4;
+/// Prefill routes one layer may hold live at once (`Options.wide_depth`).
+pub const max_wide_depth = 2;
 const wait_timeout_ns: i64 = 60 * std.time.ns_per_s;
 
 /// Expert residency for one model: per-layer persistent slot pools at the
@@ -340,6 +349,7 @@ pub const Stream = struct {
     memory: SlotMemory = .host,
     max_route_ids: u32,
     records_per_part: u32,
+    wide_depth: u8 = 1,
     phase: Phase = .prefill,
     failed: bool = false,
     routes: [route_capacity]Route = @splat(.{}),
@@ -389,6 +399,7 @@ pub const Stream = struct {
         const n_layers = bank.layers.len;
         if (opt.rows.len != n_layers) return error.InvalidRows;
         for (opt.rows) |r| if (r > bank.n_experts) return error.InvalidRows;
+        if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
         if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or
             opt.records_per_part == 0 or opt.records_per_part > expert_io.max_items) return error.InvalidOptions;
         // One transient row must hold any layer's record.
@@ -475,6 +486,7 @@ pub const Stream = struct {
             .memory = opt.slot_memory,
             .max_route_ids = opt.max_route_ids,
             .records_per_part = opt.records_per_part,
+            .wide_depth = opt.wide_depth,
             .selector = selector,
             .preread = if (opt.lookahead) |la| la.preread else false,
             .event_word = word,
@@ -579,9 +591,29 @@ pub const Stream = struct {
         if (self.n_free == 0) return self.fail(error.RoutesExhausted);
         self.n_free -= 1;
         const r = &self.routes[self.free[self.n_free]];
-        r.* = .{ .layer = layer };
+        // A prefill route beside live ones of its layer: their slots are held,
+        // its transient loads take the first window no route holds.
+        var held_buf: [route_capacity * 2 * max_route_ids]u32 = undefined;
+        var n_held: usize = 0;
+        var used_windows: u8 = 0;
+        if (self.wide_depth > 1) for (&self.routes) |*o| {
+            if (o.state == .free) continue;
+            used_windows |= @as(u8, 1) << @intCast(o.window);
+            if (o.layer != layer) continue;
+            for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
+                held_buf[n_held] = hs;
+                n_held += 1;
+            };
+            for (o.plan.loadsOf()) |l| if (l.persistent) {
+                held_buf[n_held] = l.slot;
+                n_held += 1;
+            };
+        };
+        const window: u8 = @intCast(@ctz(~used_windows));
+        if (window >= self.wide_depth) return self.fail(error.RoutesExhausted);
+        r.* = .{ .layer = layer, .window = window };
         const ls = &self.layers[layer];
-        ls.policy.plan(ids, self.phase, &r.plan);
+        ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_buf[0..n_held] });
         const plan = &r.plan;
         for (plan.hitsOf(), r.hit_slots[0..plan.n_hits]) |e, *s| {
             s.* = ls.policy.slotOf(e).?;
@@ -1805,4 +1837,58 @@ test "dsv41 stream: a two-layer recorded trace with lookahead and gates on the r
     try testing.expectEqual(@as(u64, 0), st.gates_forced);
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped) * geom.logical_bytes, st.expert_bytes_read);
     try testing.expect(st.spec_issued > 0 and st.pre_issued > 0 and st.gates > 0);
+}
+
+test "dsv41 stream: wide depth 2 holds two prefill routes of a layer in disjoint slots and transient windows" {
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    // The transient rows must hold both windows.
+    try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = test_pool, .wide_depth = 2 }));
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = test_pool, .wide_depth = 2, .transient_rows = 2 * max_route_ids });
+    defer s.deinit();
+    var a_ids: [max_route_ids]u16 = undefined;
+    var b_ids: [max_route_ids]u16 = undefined;
+    for (&a_ids, &b_ids, 0..) |*x, *y, i| {
+        x.* = @intCast(i);
+        y.* = @intCast(max_route_ids + i);
+    }
+    // Group A fills the 16 persistent rows and 32 transient rows of window 0.
+    const ra = try serve(s, 0, &a_ids);
+    try testing.expectEqual(@as(u8, 0), ra.window);
+    // Group B while A is live: no victim among A's slots (they are held), window 1's rows.
+    const rb = try serve(s, 0, &b_ids);
+    try testing.expectEqual(@as(u8, 1), rb.window);
+    try testing.expectEqual(@as(u32, 0), rb.plan.n_persistent);
+    for (rb.plan.loadsOf()) |l| {
+        try testing.expect(!l.persistent);
+        try testing.expect(l.slot >= 16 + max_route_ids and l.slot < 16 + 2 * max_route_ids);
+    }
+    try expectServed(s, &sb, ra, &a_ids);
+    try expectServed(s, &sb, rb, &b_ids);
+    s.release(ra);
+    s.release(rb);
+    try s.flush();
+    // After both went back, a route takes window 0 again and may evict their persistent rows.
+    var c_ids: [8]u16 = .{ 100, 101, 102, 103, 104, 105, 106, 107 };
+    const rc = try serve(s, 0, &c_ids);
+    try testing.expectEqual(@as(u8, 0), rc.window);
+    try testing.expectEqual(@as(u32, 8), rc.plan.n_persistent);
+    try expectServed(s, &sb, rc, &c_ids);
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, (2 * max_route_ids + 8) * sb.bank.layers[0].logical_bytes), st.expert_bytes_read);
+    s.release(rc);
+    try s.flush();
+}
+
+test "dsv41 stream: wide depth 1 plans as before (one window, a live route's slots are not held)" {
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = test_pool });
+    defer s.deinit();
+    var ids: [8]u16 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const r = try serve(s, 0, &ids);
+    try testing.expectEqual(@as(u8, 0), r.window);
+    for (r.plan.loadsOf()) |l| try testing.expect(l.persistent and l.slot < 16);
+    s.release(r);
+    try s.flush();
 }

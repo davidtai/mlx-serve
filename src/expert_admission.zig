@@ -148,6 +148,9 @@ pub const Inputs = struct {
     /// The lookahead pool's speculative staging charge; paid out of the ROWSX
     /// credit when that is on, else charged like the other members.
     lookahead_staging_bytes: u64 = 0,
+    /// The wide lane's read-ahead windows: transient rows past the first 48,
+    /// resident from construction, charged in every phase, the prefill included.
+    wide_window_bytes: u64 = 0,
     /// Host bytes beyond the envelope's (pipeline host, comparison reserve).
     host_reserve_bytes: u64,
     /// The prefill members' charge on the prefill cache allowance.
@@ -368,8 +371,9 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
     const group: i64 = projection_bytes;
     // The draft head's residents beyond (or short of) the envelope's.
     const head_extra: i64 = if (in.draft_pruned_bytes) |p| @as(i64, @intCast(env.draft_pruned_bytes)) - @as(i64, @intCast(p)) else 0;
+    const wide: i64 = @intCast(in.wide_window_bytes);
     const charge: i64 = @as(i64, @intCast(in.phase_reserve_bytes - base_pipeline_bytes)) +
-        (if (in.rowsx == null) @as(i64, @intCast(in.lookahead_staging_bytes)) else 0) - @as(i64, @intCast(credit)) + head_extra;
+        (if (in.rowsx == null) @as(i64, @intCast(in.lookahead_staging_bytes)) else 0) - @as(i64, @intCast(credit)) + head_extra + wide;
     var ph = [4]i64{
         transition_fixed + group,
         seed_fixed + group,
@@ -397,8 +401,8 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
         }
     };
     const fit: Fit = .{ .box = @intCast(box.box_bytes), .base = base, .host = host, .wired = wired, .wired_ceiling = @intCast(box.wired_bytes), .allocator_limit = allocator_limit };
-    const entry_fixed = transition_fixed + projection_bytes - retired_tail + post_reserve + head_extra;
-    const prefill_base: i64 = @as(i64, @intCast(env.prefill_active_bytes)) + prefill_engine_remainder + transform_reserve + head_extra;
+    const entry_fixed = transition_fixed + projection_bytes - retired_tail + post_reserve + head_extra + wide;
+    const prefill_base: i64 = @as(i64, @intCast(env.prefill_active_bytes)) + prefill_engine_remainder + transform_reserve + head_extra + wide;
     const raw_band: i64 = n_layers * raw_record;
 
     // The prefill: the largest predecessor-record row budget whose active and
@@ -1135,4 +1139,31 @@ test "dsv41 admission: every pass-2 admission, synthetic cell and refusal equals
     try testing.expect(f.receipts.len >= 10 and counts[0][0] == f.receipts.len);
     try testing.expect(counts[2][0] == 0 and counts[3][0] == f.canned.len and counts[4][0] >= 3);
     std.debug.print("admission parity: {d} pass-2 receipts planned equal; synthetic {d} planned + {d} refused + {d} typed; refusal cells {d} refused + {d} typed; canned {d} planned equal; envelope variants {d} planned + {d} refused\n", .{ counts[0][0], counts[1][0], counts[1][1], counts[1][2], counts[2][1], counts[2][2], counts[3][0], counts[4][0], counts[4][1] });
+}
+
+test "dsv41 admission: the wide lane's read-ahead window is charged in every phase, the prefill included" {
+    const window: u64 = 48 * exl3_record; // one more window of max_route_ids transient rows
+    try testing.expectEqual(@as(u64, 639_148_032), window);
+    var in0 = pass2Fast(7_755_397_656, 3_377_741_824, 140);
+    in0.peak_fill = null;
+    var in1 = in0;
+    in1.wide_window_bytes = window;
+    const a0 = (try Admission.plan(.dsv41_pass2, in0)).admission;
+    const a1 = (try Admission.plan(.dsv41_pass2, in1)).admission;
+    try testing.expectEqual(a0.decode_rows, a1.decode_rows);
+    try expectPhaseValues(a1.phases, a0.phases.growth + window, a0.phases.seed + window, a0.phases.prime + window, a0.phases.decode + window);
+    // The prefill pays with rows when it must: each row it gives up is a raw record per layer.
+    try testing.expect(a1.prefill_rows <= a0.prefill_rows);
+    const rows_given: u64 = @as(u64, a0.prefill_rows - a1.prefill_rows) * n_layers * raw_record;
+    try testing.expectEqual(a0.retirement_entry_bytes + window - rows_given, a1.retirement_entry_bytes);
+    try testing.expectEqual(a0.prefill_active_bytes + window - rows_given, a1.prefill_active_bytes);
+    // AUTO rows: the window costs rows, never headroom.
+    var auto0 = in0;
+    auto0.fixed_rows = null;
+    var auto1 = in1;
+    auto1.fixed_rows = null;
+    const r0 = (try Admission.plan(.dsv41_pass2, auto0)).admission;
+    const r1 = (try Admission.plan(.dsv41_pass2, auto1)).admission;
+    try testing.expect(r1.decode_rows <= r0.decode_rows);
+    try testing.expect(r1.physical_bound_bytes <= r0.physical_bound_bytes + window);
 }

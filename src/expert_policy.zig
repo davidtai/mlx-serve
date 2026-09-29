@@ -98,6 +98,13 @@ pub const LayerPolicy = struct {
     victims: []u32,
     available: []u32,
     admission: []u32,
+    /// Persistent slots another live route of this layer still serves from
+    /// (`PlanOpts.held`, set for one plan): never a victim.
+    held: std.DynamicBitSetUnmanaged,
+
+    /// A plan beside other live routes of the layer: their slots (`held`) are
+    /// never victims, and its transient loads take rows from `transient_base`.
+    pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{} };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
         if (n_experts == 0 or n_experts >= no_expert or capacity > n_experts) return error.InvalidCapacity;
@@ -123,6 +130,7 @@ pub const LayerPolicy = struct {
             .victims = undefined,
             .available = undefined,
             .admission = undefined,
+            .held = undefined,
         };
         errdefer a.free(p.slot_to_expert);
         p.expert_to_slot = try a.alloc(u32, n);
@@ -156,6 +164,8 @@ pub const LayerPolicy = struct {
         p.available = try a.alloc(u32, n);
         errdefer a.free(p.available);
         p.admission = try a.alloc(u32, n);
+        errdefer a.free(p.admission);
+        p.held = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
         @memset(p.slot_to_expert, no_expert);
         @memset(p.expert_to_slot, no_slot);
         @memset(p.prefill_freq, 0);
@@ -186,6 +196,7 @@ pub const LayerPolicy = struct {
         a.free(p.victims);
         a.free(p.available);
         a.free(p.admission);
+        p.held.deinit(a);
         p.* = undefined;
     }
 
@@ -262,7 +273,13 @@ pub const LayerPolicy = struct {
     /// (< n_experts, repeats allowed: M rows x top-k); the transient scratch
     /// must hold `max_route_ids` slots.
     pub fn plan(p: *LayerPolicy, ids: []const u16, phase: Phase, out: *Plan) void {
+        p.planWith(ids, phase, out, .{});
+    }
+
+    pub fn planWith(p: *LayerPolicy, ids: []const u16, phase: Phase, out: *Plan, opts: PlanOpts) void {
         std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
+        for (opts.held) |s| p.held.set(s);
+        defer for (opts.held) |s| p.held.unset(s);
         out.* = .{ .phase = phase, .n_ids = @intCast(ids.len) };
         var unique_buf: [max_route_ids]u16 = undefined;
         var n_unique: usize = 0;
@@ -344,7 +361,7 @@ pub const LayerPolicy = struct {
         }
         out.n_persistent = out.n_loads;
         for (transient_buf[0..n_transient], 0..) |e, k| {
-            out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + @as(u32, @intCast(k)), .persistent = false };
+            out.loads[out.n_loads] = .{ .expert = e, .slot = p.capacity + opts.transient_base + @as(u32, @intCast(k)), .persistent = false };
             out.n_loads += 1;
         }
         for (ids, 0..) |e, i| out.slots[i] = p.slotFor(e, out);
@@ -379,7 +396,7 @@ pub const LayerPolicy = struct {
         var best: ?u32 = null;
         var best_recency: u64 = 0;
         for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
-            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e)) continue;
+            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s)) continue;
             if (best == null or p.recency[e] < best_recency) {
                 best = @intCast(s);
                 best_recency = p.recency[e];
@@ -880,4 +897,21 @@ test "dsv41 policy: the recorded trace plans exactly like the Python bank" {
         }
     }
     std.debug.print("policy parity: {d} plans ({d} decode routes) equal the Python bank's; {d} reads, {d} skipped\n", .{ n_plans, f.routes.len, n_reads, n_skips });
+}
+
+test "dsv41 policy: a plan beside a live route never evicts its held slots and loads transient at its window" {
+    var p = try LayerPolicy.init(testing.allocator, 32, 4);
+    defer p.deinit(testing.allocator);
+    var out: Plan = undefined;
+    p.plan(&.{ 0, 1, 2, 3 }, .prefill, &out);
+    try testing.expectEqual(@as(u32, 4), out.n_persistent);
+    // Slots 0..3 held: the next route's misses go transient, from row 48 of the transient rows.
+    p.planWith(&.{ 4, 5 }, .prefill, &out, .{ .transient_base = 48, .held = &.{ 0, 1, 2, 3 } });
+    try testing.expectEqual(@as(u32, 0), out.n_persistent);
+    try testing.expectEqual(@as(u32, 4 + 48), out.loads[0].slot);
+    try testing.expectEqual(@as(u32, 4 + 49), out.loads[1].slot);
+    // Two held: the other two are victims.
+    p.planWith(&.{ 6, 7 }, .prefill, &out, .{ .held = &.{ 0, 1 } });
+    try testing.expectEqual(@as(u32, 2), out.n_persistent);
+    for (out.loadsOf()) |l| try testing.expect(l.slot == 2 or l.slot == 3);
 }
