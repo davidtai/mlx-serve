@@ -311,6 +311,18 @@ pub fn Model(comptime G: type) type {
             return Tr.expandEmbedding(g, &self.c, try self.embed.of(g, a, ids, self.c.hidden_size));
         }
 
+        /// Device bytes the model builds at construction beyond the checkpoint's
+        /// residents (the bill's resident term): W97's dense f32 wo_a per layer, an
+        /// mxfp8 head's codes and scales (the dense head stays resident). The
+        /// rotary tables (< 1 MB) aside.
+        pub fn builtBytes(self: *const Self) u64 {
+            const c = &self.c;
+            var n: u64 = 0;
+            if (self.tier.routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
+            if (self.tier.routes.head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
+            return n;
+        }
+
         /// The input table's bytes (bf16 `[vocab, dim]`): what retiring it frees,
         /// the admission's post-prefill embedding credit.
         pub fn embeddingBytes(self: *const Self) u64 {

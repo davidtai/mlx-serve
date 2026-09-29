@@ -105,6 +105,11 @@ pub const Routes = struct {
     pub const Head = enum { f32, bf16, mxfp8 };
 };
 
+/// W97's dense f32 grouped wo_a of one attention block (`[g, rank, in]`, f32).
+pub fn woaDenseBytes(c: *const v41.Config) u64 {
+    return @as(u64, c.o_groups) * c.o_lora_rank * (@as(u64, c.n_heads) * c.head_dim / c.o_groups) * 4;
+}
+
 pub const attn_compile_max_rows = 32;
 pub const core_compile_max_rows = 8;
 pub const hc_compile_max_rows = 7;

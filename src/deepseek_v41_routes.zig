@@ -25,6 +25,9 @@ pub const Tier = struct {
     chunk_target_bytes: f64 = kvc.default_chunk_target_bytes,
     /// K16: every layer over all chunks before the next (one routed-bank read).
     layer_major: bool = false,
+    /// W103 `MTPLX_DSV41_DRAFT_HEAD_BF16`: the draft's head pass as a bf16 GEMV
+    /// over a dense head (a quantized head keeps its own path).
+    draft_head_bf16: bool = false,
     /// Levers of the DSpark draft (M2) and the expert streamer (phase 1 / 2),
     /// accepted here and applied by their owners.
     deferred: [max_deferred][]const u8 = undefined,
@@ -35,6 +38,46 @@ pub const Tier = struct {
     pub fn deferredLevers(self: *const Tier) []const []const u8 {
         return self.deferred[0..self.n_deferred];
     }
+
+    /// The draft head's routes: the trunk's, with the head codec of the draft's
+    /// `forward_head` (deepseek_v41_dspark.py:780-791): a dense head in f32, or in
+    /// bf16 under W103; a quantized head through its own path either way.
+    pub fn draftRoutes(self: *const Tier) graph.Routes {
+        var r = self.routes;
+        r.head = switch (self.routes.head) {
+            .mxfp8 => .mxfp8,
+            .f32, .bf16 => if (self.draft_head_bf16) .bf16 else .f32,
+        };
+        return r;
+    }
+};
+
+/// Every lever unset: the Python stock path (the parity harnesses' references).
+pub const stock: Tier = .{};
+
+/// The tier of record's trunk and draft levers this build binds on the served
+/// path: the arm `cell16k_ring_v2_draft_attn_pf0` (ab_decode_env_levers.py:
+/// 1589-1596) without its Metal kernels (SINKHORN_METAL, ATTN_FUSED_PROJ: the
+/// rounding-class tier's step), K16 layer-major prefill (a device run first),
+/// K4 / K35 (the cell's DSV41_LAYER_COMPILE: a device window first) and the
+/// dropped runner levers. KV_BOUNDED is not the arm's: requests take it through
+/// `Model.boundedKv` once M5BOUND passes.
+pub const served_levers = [_][2][]const u8{
+    .{ "MTPLX_DSV41_SELECTED_KEYS", "1" }, // A18 K30
+    .{ "MTPLX_DSV41_ATTN_COMPILE", "1" }, // A19 K22 (warmed at construction: Loop.warm)
+    .{ "MTPLX_DSV41_ATTN_WO_A_CACHE", "1" }, // A20 W97 (billed: builtBytes)
+    .{ "MTPLX_DSV41_PREFILL_SCORE_PATH", "lean" }, // A21 W50
+    .{ "MTPLX_DSV41_HEAD_MODE", "bf16" }, // A22
+    .{ "MTPLX_DSV41_WINDOW_RING", "1" }, // G3's ring
+    .{ "MTPLX_DSV41_DRAFT_COMPILE", "1" }, // A25 K33
+    .{ "MTPLX_DSV41_DRAFT_HEAD_BF16", "1" }, // A26 W103
+    .{ "MTPLX_DSV41_ATTN_WIN_MEMO", "1" }, // by design
+    .{ "MTPLX_DSV41_ATTN_LEAN_CASTS", "1" }, // by design
+};
+
+pub const served: Tier = blk: {
+    @setEvalBranchQuota(200_000);
+    break :blk parse(&served_levers, null) catch unreachable;
 };
 
 const Kind = enum {
@@ -90,7 +133,7 @@ const levers = [_]Lever{
     .{ .name = "DSPARK_VERIFY_K29", .kind = .kernel },
     .{ .name = "DSPARK_DECODE_KERNELS", .kind = .kernel },
     .{ .name = "DRAFT_COMPILE", .kind = .route },
-    .{ .name = "DRAFT_HEAD_BF16", .kind = .deferred },
+    .{ .name = "DRAFT_HEAD_BF16", .kind = .route },
     .{ .name = "MTP", .kind = .deferred },
     .{ .name = "DSPARK_CONF_THRESHOLD", .kind = .deferred },
     .{ .name = "DSPARK_VERIFY_DECODE_PHASE", .kind = .deferred },
@@ -201,6 +244,8 @@ pub fn parse(pairs: []const [2][]const u8, diag: ?*v41.Diag) Refusal!Tier {
                     if (!oneOf(val, &.{ "", "default", "off", "none", "control", "f32", "fp32", "float32" })) return refuse(diag, error.LeverValue, "{s}={s}: only the f32 score path is ported", .{ kv[0], val });
                 } else if (std.mem.eql(u8, name, "PREFILL_SCORE_KEY_CHUNK")) {
                     if (!oneOf(val, &.{ "", "0", "off", "none", "default" })) return refuse(diag, error.LeverValue, "{s}={s}: the split-K score path is not ported", .{ kv[0], val });
+                } else if (std.mem.eql(u8, name, "DRAFT_HEAD_BF16")) {
+                    t.draft_head_bf16 = try truthy(name, val, diag);
                 } else if (std.mem.eql(u8, name, "HEAD_MODE")) {
                     if (std.mem.eql(u8, val, "bf16")) {
                         r.head = .bf16;
@@ -312,9 +357,41 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     try testing.expectEqual(kvc.Route.window_ring, t.kv.route);
     try testing.expectEqual(@as(?u32, null), t.kv.max_kv);
     try testing.expect(t.layer_major);
-    // K33 draft compile is a route now (the draft head applies it); the other draft levers stay deferred.
+    // K33 draft compile and W103 are routes now (the draft head applies them); the other draft levers stay deferred.
     try testing.expectEqual(graph.draft_compile_max_rows, r.draft_rows);
-    try testing.expectEqual(@as(usize, 8), t.deferredLevers().len);
+    try testing.expect(t.draft_head_bf16);
+    try testing.expectEqual(@as(usize, 7), t.deferredLevers().len);
+    // The served tier is that tier's trunk and draft without K16 (a device run first).
+    var trunk = t;
+    trunk.layer_major = false;
+    trunk.n_deferred = 0;
+    try testing.expectEqual(trunk.routes, served.routes);
+    try testing.expectEqual(trunk.kv, served.kv);
+    try testing.expectEqual(trunk.draft_head_bf16, served.draft_head_bf16);
+    try testing.expectEqual(trunk.prefill_chunk, served.prefill_chunk);
+    try testing.expect(!served.layer_major and served.n_deferred == 0);
+}
+
+test "dsv41 routes: the draft head takes the trunk's routes with its own head codec" {
+    const Head = graph.Routes.Head;
+    const Case = struct { trunk: Head, bf16: bool, draft: Head };
+    for ([_]Case{
+        .{ .trunk = .f32, .bf16 = false, .draft = .f32 },
+        .{ .trunk = .bf16, .bf16 = false, .draft = .f32 },
+        .{ .trunk = .f32, .bf16 = true, .draft = .bf16 },
+        .{ .trunk = .bf16, .bf16 = true, .draft = .bf16 },
+        .{ .trunk = .mxfp8, .bf16 = false, .draft = .mxfp8 },
+        .{ .trunk = .mxfp8, .bf16 = true, .draft = .mxfp8 },
+    }) |cs| {
+        var t: Tier = .{ .draft_head_bf16 = cs.bf16 };
+        t.routes.head = cs.trunk;
+        t.routes.draft_rows = 7;
+        const d = t.draftRoutes();
+        try testing.expectEqual(cs.draft, d.head);
+        try testing.expectEqual(@as(u32, 7), d.draft_rows);
+    }
+    try testing.expectEqual(Head.bf16, served.draftRoutes().head);
+    try testing.expectEqual(Head.f32, stock.draftRoutes().head);
 }
 
 test "dsv41 routes: an explicit prefill chunk narrower than a verify forward is refused by name" {
@@ -356,7 +433,10 @@ test "dsv41 routes: every lever the build cannot run the same way refuses, by na
     try testing.expectEqual(kvc.Route.bounded, t.kv.route);
     try testing.expectEqual(@as(?u32, 17664), t.kv.max_kv);
     try testing.expectEqual(@as(?i64, 32), t.prefill_chunk);
-    const stock = try parse(&.{}, null);
-    try testing.expectEqual(kvc.Route.full_history, stock.kv.route);
-    try testing.expectEqual(graph.Routes{}, stock.routes);
+    // No lever: the stock path, the parity harnesses' tier.
+    const none = try parse(&.{}, null);
+    try testing.expectEqual(kvc.Route.full_history, none.kv.route);
+    try testing.expectEqual(graph.Routes{}, none.routes);
+    try testing.expectEqual(stock.routes, none.routes);
+    try testing.expectEqual(stock.kv, none.kv);
 }
