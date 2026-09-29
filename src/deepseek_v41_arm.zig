@@ -196,6 +196,14 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         };
 
         pub fn init(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, diag: *Diag) !*Self {
+            return initHooked(a, io, g, math_arg, opt, .{}, diag);
+        }
+
+        /// The hook's construction inputs the arm's routes need beyond `Options`: every routed layer's gate
+        /// (`.lookahead`: the predictor reads the next layer's) and the stream's event (`.gated`).
+        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null };
+
+        pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             var p = try planRows(a, io, opt, diag);
@@ -231,7 +239,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
-            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .prefill = opt.prefill }) catch |e|
+            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .prefill = opt.prefill, .gates = hx.gates, .event = hx.event }) catch |e|
                 return refuse(diag, e, "routed-expert hook: {s}", .{@errorName(e)});
             return self;
         }

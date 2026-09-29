@@ -35,8 +35,12 @@ const log = std.log.scoped(.dsv41);
 
 const G = ops.MlxOps;
 /// The expert source: the exact tier's op chain around the kernels' EXL3 decode GEMV, the wide
-/// (prefill) routed calls on the kernels' DIG-X route.
-pub const A = arm_mod.ArmWith(G, xp.EagerChain(G, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(G) });
+/// (prefill) routed calls on the kernels' DIG-X route, the next layer's reads started from the predictor
+/// (LOOKAHEAD3: the stream's lookahead class, host waits).
+pub const A = arm_mod.ArmWith(G, xp.EagerChain(G, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(G), .lookahead = true });
+
+/// The exact tier's read-ahead (`DSV41_LOOKAHEAD3=8:inf:2`): top 8 by the predictor, no threshold, 2 records per call.
+pub const lookahead: @import("expert_stream.zig").Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2 };
 const M = mdl.Model(G);
 const H = dh.Head(G);
 
@@ -63,6 +67,8 @@ pub const Module = struct {
     fenced: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
+    /// Every routed layer's gate, borrowed from the residents: the predictor's inputs.
+    gates: []A.Hook.Gate = &.{},
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
@@ -80,7 +86,9 @@ pub const Module = struct {
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
         errdefer setCacheLimit(self.prev_cache_limit);
-        self.arm = A.init(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
+        self.gates = try routerGates(gpa, weights, config.num_hidden_layers);
+        errdefer gpa.free(self.gates);
+        self.arm = A.initHooked(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
             .model_dir = dir,
             .envelope = envelope,
             .baseline_bytes = config.memory_baseline_bytes,
@@ -88,7 +96,8 @@ pub const Module = struct {
             .slot_memory = .{ .mlx = s },
             .prefill = .{ .reg = &self.kernels.reg },
             .draft_pruned_bytes = 0,
-        }, &diag) catch |e| return refused(e, &diag);
+            .lookahead = lookahead,
+        }, .{ .gates = self.gates }, &diag) catch |e| return refused(e, &diag);
         errdefer self.arm.deinit();
         checkArmBanks(self.arm, &self.g, &self.kernels.reg, &diag) catch |e| return refused(e, &diag);
         self.arm.grown_check = .{ .ctx = &self.kernels.reg, .check = GrownBanks.check };
@@ -114,6 +123,7 @@ pub const Module = struct {
         self.embed_rows.close();
         self.engram.deinit();
         self.arm.deinit();
+        gpa.free(self.gates);
         self.dropKernels();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
@@ -161,6 +171,23 @@ pub const Module = struct {
         return out;
     }
 };
+
+/// `layers.<l>.ffn.gate.{weight,bias}` of every routed layer, refused by name when one is missing.
+fn routerGates(gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]A.Hook.Gate {
+    const gates = try gpa.alloc(A.Hook.Gate, n_layers);
+    errdefer gpa.free(gates);
+    var buf: [64]u8 = undefined;
+    for (gates, 0..) |*gt, l| {
+        const w = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.weight", .{l}));
+        const b = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.bias", .{l}));
+        if (w == null or b == null) {
+            log.err("refused: MissingWeight layers.{d}.ffn.gate", .{l});
+            return error.MissingWeight;
+        }
+        gt.* = .{ .w = w.?, .bias = b.? };
+    }
+    return gates;
+}
 
 fn setCacheLimit(limit: usize) void {
     var prev: usize = 0;
@@ -243,6 +270,7 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         .fixed_rows = if (std.c.getenv("DSV41_MODULE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else null,
         .slot_memory = .host,
         .draft_pruned_bytes = if (std.c.getenv("DSV41_MODULE_HEAD") != null) null else 0,
+        .lookahead = lookahead,
     }, &diag) catch |e| {
         std.debug.print("refused: {s}\n", .{diag.message()});
         return e;

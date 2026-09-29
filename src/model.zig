@@ -3174,6 +3174,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.model_type = "deepseek_v41";
         // Routed experts, as deepseek_v4's arm states them: not a batched-decode model.
         config.num_experts = v41c.n_routed_experts;
+        config.num_hidden_layers = v41c.n_layers;
         config.dsv41_prefill = .of(&v41c);
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
         config.nocache_weights = true;
@@ -7609,6 +7610,7 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
     try testing.expect(!c.perRequestPrefillChunk());
     try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.dsv41_prefill != null);
+    try testing.expectEqual(@as(u32, 40), c.num_hidden_layers);
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
