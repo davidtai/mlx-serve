@@ -3672,6 +3672,14 @@ pub const Weights = struct {
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }
+
+    /// Forget `name`, freeing the map's handle (arrays built from it keep what they read).
+    pub fn drop(self: *Weights, name: []const u8) void {
+        if (self.map.fetchRemove(name)) |kv| {
+            _ = mlx.mlx_array_free(kv.value);
+            self.allocator.free(kv.key);
+        }
+    }
 };
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
