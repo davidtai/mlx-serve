@@ -183,13 +183,18 @@ fn rowsVars(rows: u64) Vars {
     return v;
 }
 
+/// `G` declares `name` as a function (a wrapper backend declares an absent capability as `{}`).
+fn declaresFn(comptime G: type, comptime name: []const u8) bool {
+    return @hasDecl(G, name) and @typeInfo(@TypeOf(@field(G, name))) == .@"fn";
+}
+
 /// A decode kernel's launch at every row count 1..n (the kernel's `rows` bound), built once at a
 /// route's construction; a call indexes it by M, the one launch value that varies per call. A
 /// backend that prepares launches (`Prepared`, `prepareLaunch`, `launchPrepared`,
 /// `releasePrepared`; chosen at compile time) gets each launch's mlx config built here too, so a
 /// call builds none; any other backend takes the per-call `launch` (deprecated for decode).
 fn RowPlans(comptime G: type, comptime n: usize) type {
-    const prepared = @hasDecl(G, "prepareLaunch");
+    const prepared = declaresFn(G, "prepareLaunch");
     return struct {
         const Self = @This();
         e: *const Entry,
@@ -1329,6 +1334,15 @@ pub const StartupOptions = struct {
 /// own (evalAll, asyncEval, concat, take, mark, resetTo) and checks them itself.
 const backend_methods = [_][]const u8{ "launch", "shapeOf", "dtypeOf", "hostArray", "keep", "release", "reshape", "astype" };
 
+/// Where acceptAtStartup installs the launcher: the backend's `launcher: ?*const xk.Bound`
+/// field, or its base backend's under a wrapper that declares `Inner` and `base()`
+/// (`dsv41_profile.Profiled`); null when neither has one.
+fn launcherSlot(comptime G: type, g: *G) ?*?*const xk.Bound {
+    if (@hasField(G, "launcher")) return &g.launcher;
+    if (@hasDecl(G, "Inner")) return launcherSlot(G.Inner, g.base());
+    return null;
+}
+
 /// The first route method `G` lacks, or null.
 pub fn missingBackendMethod(comptime G: type) ?[]const u8 {
     inline for (backend_methods) |m| if (!@hasDecl(G, m)) return m;
@@ -1359,7 +1373,7 @@ pub fn Accepted(comptime G: type) type {
         /// then frees the kernels, the plan's results and the registry.
         pub fn deinit(self: *Self, g: *G) void {
             self.gemv.deinit(g);
-            if (@hasField(G, "launcher")) g.launcher = null;
+            if (launcherSlot(G, g)) |s| s.* = null;
             self.bound.deinit();
             self.report.deinit(self.a);
             self.reg.deinit();
@@ -1425,9 +1439,10 @@ pub fn acceptAtStartup(comptime G: type, a: Allocator, g: *G, opts: StartupOptio
     }
     try selfcheck.judge(&acc.report, diag);
     // the launcher first: a backend that prepares launches prepares them through it
-    if (@hasField(G, "launcher")) g.launcher = &acc.bound;
-    errdefer if (@hasField(G, "launcher")) {
-        g.launcher = null;
+    const slot = launcherSlot(G, g);
+    if (slot) |s| s.* = &acc.bound;
+    errdefer if (slot) |s| {
+        s.* = null;
     };
     acc.gemv = try Gemv(G).init(g, &acc.reg);
     return acc;
@@ -2658,4 +2673,53 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
     gv.deinit(&t);
     try testing.expectEqual(n_launch, t.launches.items.len);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
+test "dsv41 kernels ops: the routes launch the same through the profiling backend (dsv41_profile.Profiled over the host trace)" {
+    const prof = @import("dsv41_profile.zig");
+    const P = prof.Profiled(Trace);
+    const a = testing.allocator;
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var clock: u64 = 0;
+    var pt = try P.init(a, .{ .a = a }, .{ .manual = &clock }, 2);
+    defer pt.inner.deinit();
+    defer pt.deinit();
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    // startup through the wrapper: the launcher lands on the wrapped backend; the GEMV route
+    // prepares its 96 configs through the wrapper (RowPlans sees the wrapped capability)
+    var diag: xk.Diag = .{};
+    const acc = try acceptAtStartup(P, a, &pt, .{ .device = .{ .stub = .{} } }, &diag);
+    try testing.expectEqual(@as(*const xk.Bound, &acc.bound), pt.inner.launcher.?);
+    try testing.expectEqual(@as(isize, 96), pt.inner.prepared_live);
+    // the router at the lane's samples, wrapped (inside a phase) and not
+    const pe, const te = .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) };
+    var rp = try Router(P).init(&pt, &reg, try pt.inner.arg(pe, "w", &no_vars), try pt.inner.arg(te, "bias", &no_vars), null);
+    var rt = try Router(Trace).init(&t, &reg, try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars), null);
+    try testing.expectEqual(@as(isize, 96 + 16), pt.inner.prepared_live);
+    prof.cycleBegin(&pt);
+    prof.beginPhase(&pt, .barrier);
+    for (pe.samples) |*s| {
+        _ = try rp.call(&pt, try pt.inner.arg(pe, "x", &s.vars));
+        _ = try rt.call(&t, try t.arg(pe, "x", &s.vars));
+    }
+    prof.endPhase(&pt);
+    prof.cycleEnd(&pt);
+    // the same launches in the same order (kernel, inputs, config, prepared), none added
+    try testing.expect(t.launches.items.len >= 2);
+    try testing.expectEqual(t.launches.items.len, pt.inner.launches.items.len);
+    for (t.launches.items, pt.inner.launches.items) |x, y| {
+        try testing.expect(x.k == y.k and x.n_in == y.n_in and x.prepared and y.prepared);
+        try testing.expect(std.meta.eql(x.cfg, y.cfg));
+    }
+    // each counted once, in the phase that was open
+    const c = pt.prof.stored[0].tags[@backingInt(prof.Tag.barrier)];
+    try testing.expectEqual(@as(u32, @intCast(t.launches.items.len)), c.launches);
+    try testing.expectEqual(@as(u32, 1), c.calls);
+    rp.deinit(&pt);
+    rt.deinit(&t);
+    acc.deinit(&pt);
+    try testing.expect(pt.inner.launcher == null);
+    try testing.expectEqual(@as(isize, 0), pt.inner.prepared_live);
 }

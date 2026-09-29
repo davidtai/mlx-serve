@@ -48,6 +48,7 @@ test {
     _ = @import("exl3_selfcheck.zig");
     _ = @import("exl3_kernel_ops.zig");
     _ = @import("exl3_kernel_ops_gate.zig");
+    _ = @import("dsv41_profile.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
