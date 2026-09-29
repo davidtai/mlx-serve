@@ -120,7 +120,7 @@ pub const Module = struct {
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
-        self.model = try M.init(gpa, &self.g, c, routes.served, weights, &self.engram);
+        self.model = try M.initWith(gpa, &self.g, c, routes.served, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
         errdefer self.head.deinit(&self.g);

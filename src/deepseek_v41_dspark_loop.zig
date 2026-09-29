@@ -876,7 +876,10 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         var g = TraceOps.init(a);
         defer g.deinit();
         const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
-        const model_ = try Loop(TraceOps).M.init(a, &g, c, t.tier, &lookup, &src);
+        var kd: @import("exl3_kernels.zig").Diag = .{};
+        var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
+        defer reg.deinit();
+        const model_ = try Loop(TraceOps).M.initWith(a, &g, c, t.tier, &lookup, &src, .{ .registry = &reg });
         defer model_.deinit(&g);
         var st = try model_.newState();
         defer st.deinit(&g, a);

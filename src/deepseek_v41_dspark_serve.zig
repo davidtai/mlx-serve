@@ -145,6 +145,7 @@ pub fn openEmbeddingRows(a: std.mem.Allocator, io: std.Io, model_dir: []const u8
 
 const testing = std.testing;
 const TraceOps = ops.TraceOps;
+const xk = @import("exl3_kernels.zig");
 const TraceArm = arm_mod.Arm(TraceOps, arm_mod.StandInMath(TraceOps));
 const Loop = dsl.Loop(TraceOps);
 
@@ -256,6 +257,8 @@ const Rig = struct {
     arm: *TraceArm,
     model: *Loop.M,
     head: *Loop.H,
+    /// The trunk routes' registry the RC tier's kernel routes bind over (host: no device).
+    reg: xk.Registry,
 
     fn create() !*Rig {
         return createAt(routes.stock);
@@ -279,7 +282,10 @@ const Rig = struct {
         };
         errdefer r.arm.deinit();
         r.lookup = .{ .g = &r.g, .spec = r.mini.spec };
-        r.model = try Loop.M.init(a, &r.g, r.mini.c, tier, &r.lookup, &r.mini.src);
+        var kd: xk.Diag = .{};
+        r.reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+        errdefer r.reg.deinit();
+        r.model = try Loop.M.initWith(a, &r.g, r.mini.c, tier, &r.lookup, &r.mini.src, .{ .registry = &r.reg });
         errdefer r.model.deinit(&r.g);
         r.head = try Loop.H.init(a, &r.g, r.mini.c, tier.draftRoutes(), &r.lookup);
         return r;
@@ -294,6 +300,7 @@ const Rig = struct {
     fn destroy(r: *Rig) void {
         r.head.deinit(&r.g);
         r.model.deinit(&r.g);
+        r.reg.deinit();
         r.arm.deinit();
         r.g.deinit();
         r.mini.deinit();
@@ -383,6 +390,14 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
             return n;
         }
     }.count;
+    // A Sinkhorn op chain's row softmax over `[..., 4, 4]` combs.
+    const sinkhornOps = struct {
+        fn count(g: *const TraceOps, from: usize) usize {
+            var n: usize = 0;
+            for (g.nodes.items[from..]) |nd| n += @intFromBool(nd.op == .softmax and nd.shape.n >= 2 and nd.shape.dim(-1) == 4 and nd.shape.dim(-2) == 4);
+            return n;
+        }
+    }.count;
     const depth2: dsl.Config = .{ .k_request = 2, .max_tokens = std.math.maxInt(u32) };
     {
         const r = try Rig.createAt(routes.served);
@@ -411,6 +426,11 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
         try testing.expectEqualSlices(u64, &.{ 0, 0, 0, 0 }, peaks);
         try testing.expect(r.g.compiles > c0);
         try testing.expectEqual(@as(usize, 0), woaDequants(&r.g, &r.mini.c, n0));
+        // C12: every trunk HC mix's Sinkhorn is the kernel route; only the draft block's stages
+        // (their attention and ffn mixes) keep the op chain until C16 binds the draft's routes (bitwise equal: the
+        // 16-lane kernel's manifest note).
+        try testing.expect(r.model.kx.sinkhorn != null);
+        try testing.expectEqual(2 * r.head.nStages(), sinkhornOps(&r.g, n0));
         // Depth-1 requests verify 1 or 2 rows (then the draft block); depth 0 decodes only; the
         // module widens the warm-up to every width up to the compiled regions' bound.
         const p1 = try Loop.warmFor(&r.g, a, r.model, r.head, &r.arm.hook, .{ .k_request = 1, .max_tokens = std.math.maxInt(u32) }, 0);
@@ -431,6 +451,7 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
     const m0 = st.g.nodes.items.len;
     a.free(try Loop.warmFor(&st.g, a, st.model, st.head, &st.arm.hook, depth2, 0));
     try testing.expectEqual(3 * @as(usize, st.mini.c.n_layers) + st.head.nStages(), woaDequants(&st.g, &st.mini.c, m0));
+    try testing.expect(sinkhornOps(&st.g, m0) > 0);
     try testing.expectEqual(@as(u64, 0), st.model.builtBytes() + st.head.builtBytes());
 }
 

@@ -12,6 +12,8 @@ const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const kvc = @import("deepseek_v41_cache.zig");
+const xk = @import("exl3_kernels.zig");
+const kr = @import("dsv41_kernel_routes.zig");
 
 const Dtype = ops.Dtype;
 
@@ -80,6 +82,9 @@ pub fn Shared(comptime T: type) type {
 /// that are pure MLX. The default is the stock eager path (every lever off);
 /// kernel levers are refused where the routes are built (`deepseek_v41_routes.zig`).
 pub const Routes = struct {
+    /// C12: the RCTAIL sinkhorn (the 16-lane kernel up to 32 matrices, the stock K3 text
+    /// above; bitwise the stock op chain, manifest note), bound in `Trunk.Kernels`.
+    rc_sinkhorn: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -125,6 +130,14 @@ pub const NoProbe = struct {
     pub fn put(_: NoProbe, _: []const u8, _: anytype) !void {}
 };
 
+/// The rounding-class tier's kernel routes one layer calls (null: the stock op chain):
+/// a view of the model's `Trunk(G).Kernels`, bound once at construction.
+pub fn LayerKernels(comptime G: type) type {
+    return struct {
+        sinkhorn: ?*const kr.Sinkhorn(G) = null,
+    };
+}
+
 pub fn Trunk(comptime G: type) type {
     return struct {
         pub const T = G.T;
@@ -134,6 +147,38 @@ pub fn Trunk(comptime G: type) type {
         pub const Mixes = struct { pre: T, post: T, comb: T };
         pub const CosSin = struct { cos: T, sin: T };
         pub const Out = struct { h: T, pre_mix: T };
+        pub const LK = LayerKernels(G);
+
+        /// The kernel routes the tier's RC members bind, over the accepted trunk routes'
+        /// registry: built once (a geometry the kernels do not take refused by name), then
+        /// read by each layer through `at`.
+        pub const Kernels = struct {
+            sinkhorn: ?kr.Sinkhorn(G) = null,
+
+            pub fn needed(rt: *const Routes) bool {
+                return rt.rc_sinkhorn;
+            }
+
+            pub fn init(g: *G, reg: *const xk.Registry, c: *const v41.Config, rt: *const Routes) !Kernels {
+                var k: Kernels = .{};
+                errdefer k.deinit(g);
+                if (rt.rc_sinkhorn) {
+                    // q3dk_sinkhorn16_hc4_it20 / mtplx_dsv4_sinkhorn_hc4_it20: hc 4, 20 iterations, eps 1e-6 baked in.
+                    if (c.hc_mult != 4 or c.hc_sinkhorn_iters != 20 or @as(f32, @floatCast(c.hc_eps)) != @as(f32, 1e-6)) return error.SinkhornGeometry;
+                    k.sinkhorn = try kr.Sinkhorn(G).init(g, reg);
+                }
+                return k;
+            }
+
+            pub fn deinit(self: *Kernels, g: *G) void {
+                if (self.sinkhorn) |*x| x.deinit(g);
+                self.* = .{};
+            }
+
+            pub fn at(self: *const Kernels, _: usize) LK {
+                return .{ .sinkhorn = if (self.sinkhorn) |*x| x else null };
+            }
+        };
 
         /// The arrays a layer hands the next: its hidden and pre-mix, and every
         /// array of the shared runtime (the published compressed lanes, masks,
@@ -341,7 +386,7 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// `DecoderLayer._mixes` + `hc_split_sinkhorn`: the pre / post / Sinkhorn comb mixes.
-        pub fn hcMixes(g: *G, c: *const v41.Config, x: T, fnw: T, base: T, scale: T) !Mixes {
+        pub fn hcMixes(g: *G, c: *const v41.Config, lk: LK, x: T, fnw: T, base: T, scale: T) !Mixes {
             const hc: c_int = @intCast(c.hc_mult);
             const xf = try g.astype(x, .float32);
             const sh = g.shapeOf(xf);
@@ -364,7 +409,8 @@ pub fn Trunk(comptime G: type) type {
             cshape.d[ms.n] = hc;
             cshape.n += 1;
             comb = try g.reshape(comb, cshape.slice());
-            return .{ .pre = pre, .post = post, .comb = try sinkhorn(g, comb, c.hc_sinkhorn_iters, eps) };
+            const sk = if (lk.sinkhorn) |k| try k.call(g, comb) else try sinkhorn(g, comb, c.hc_sinkhorn_iters, eps);
+            return .{ .pre = pre, .post = post, .comb = sk };
         }
 
         /// `DecoderLayer._hc_pre`: collapse the hc copies with the threaded pre mix.
@@ -952,17 +998,17 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
         /// attention RMSNorm. Out: attention input, pre, post, comb.
-        pub fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
-            const m = try hcMixes(g, c, h, fnw, base, scale);
+        pub fn hcAttnPrep(g: *G, c: *const v41.Config, lk: LK, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
+            const m = try hcMixes(g, c, lk, h, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
             return .{ x, m.pre, m.post, m.comb };
         }
 
         /// `_hc_ffn_prep_impl`: the attention HC post, the ffn mixes, collapse and
         /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
-        pub fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+        pub fn hcFfnPrep(g: *G, c: *const v41.Config, lk: LK, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
-            const m = try hcMixes(g, c, h1, fnw, base, scale);
+            const m = try hcMixes(g, c, lk, h1, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
             return .{ x, h1, m.post, m.comb, m.pre };
         }
@@ -973,7 +1019,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 4;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
-                out[0..4].* = try hcAttnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5]);
+                out[0..4].* = try hcAttnPrep(g, ctx, .{}, in[0], in[1], in[2], in[3], in[4], in[5]);
             }
         };
 
@@ -983,7 +1029,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 5;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
-                out[0..5].* = try hcFfnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+                out[0..5].* = try hcFfnPrep(g, ctx, .{}, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
             }
         };
 
@@ -1005,7 +1051,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 8;
             pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
-                const f = try hcFfnPrep(g, c, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+                const f = try hcFfnPrep(g, c, .{}, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
                 const xf = try g.reshape(f[0], &.{ -1, @intCast(c.hidden_size) });
                 const pre = try gatePrefix(g, xf, in[9], in[10]);
                 const r = try gateSelect(g, c, pre[0], pre[1]);
@@ -1043,7 +1089,7 @@ pub fn Trunk(comptime G: type) type {
         /// Hyper-Connection pre / post, the pre mix threaded across sublayers.
         /// At decode / verify rows K35 runs three compiled segments; K4 compiles
         /// the HC prep / combine; the eager body otherwise.
-        pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
+        pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
             const rows = rowsOf(g, h, 2);
             if (rows <= rt.small_rows) {
                 var s1: [4]T = undefined;
@@ -1063,7 +1109,7 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("out.pre_mix", s2[7]);
                 return .{ .h = s3[0], .pre_mix = s2[7] };
             }
-            const half = try attnAndMoeInput(g, p, c, rt, li, w, inv_freq, h, pre_mix, positions, cache, shared);
+            const half = try attnAndMoeInput(g, p, c, rt, lk, li, w, inv_freq, h, pre_mix, positions, cache, shared);
             const mo = try moe(g, p, c, rt, w, half.moe_in, routed);
             try p.put("moe.y", mo);
             const out = if (rows <= rt.hc_rows) blk: {
@@ -1082,13 +1128,13 @@ pub fn Trunk(comptime G: type) type {
         /// `DecoderLayer.attn_and_moe_input`: the attention Hyper-Connection
         /// (which writes this layer's KV), the ffn mixes and the MoE input
         /// (K4 compiles both HC preps at rows <= 7).
-        pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
+        pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
             const hc_tape = rowsOf(g, h, 2) <= rt.hc_rows;
             var a: [4]T = undefined;
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
             } else {
-                a = try hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
+                a = try hcAttnPrep(g, c, lk, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
                 try p.put("attn.pre", a[1]);
                 try p.put("attn.post", a[2]);
                 try p.put("attn.comb", a[3]);
@@ -1099,7 +1145,7 @@ pub fn Trunk(comptime G: type) type {
             if (hc_tape) {
                 try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
             } else {
-                f = try hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+                f = try hcFfnPrep(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
                 try p.put("hc1.h", f[1]);
                 try p.put("ffn.pre", f[4]);
                 try p.put("ffn.post", f[2]);
@@ -1356,6 +1402,33 @@ test "dsv41 graph: rmsnorm traces _rmsnorm's op sequence and keeps the input dty
     try testing.expectEqualSlices(O, &.{ .square, .mean, .scalar, .add, .rsqrt, .mul, .astype, .mul }, seq2);
 }
 
+test "dsv41 graph: the RC sinkhorn binds on the kernels' geometry, refuses another by name, and takes every HC comb" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var c = try realConfig();
+    const rt: Routes = .{ .rc_sinkhorn = true };
+    var k = try Tr.Kernels.init(&g, &reg, &c, &rt);
+    defer k.deinit(&g);
+    const lk = k.at(0);
+    try testing.expect(lk.sinkhorn != null);
+    const w = try traceLayerW(&g, &c, c.layers[0]);
+    const h = try g.input(&.{ 1, 3, @intCast(c.hc_mult), @intCast(c.hidden_size) }, .bfloat16);
+    const n0 = g.nodes.items.len;
+    const m = try Tr.hcMixes(&g, &c, lk, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
+    try expectShape(&g, m.comb, &.{ 1, 3, 4, 4 }, .float32);
+    for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .softmax);
+    var bad = c;
+    bad.hc_sinkhorn_iters = 19;
+    try testing.expectError(error.SinkhornGeometry, Tr.Kernels.init(&g, &reg, &bad, &rt));
+    // No RC member on the tier: nothing bound, the op chain stays.
+    var none = try Tr.Kernels.init(&g, &reg, &c, &.{});
+    defer none.deinit(&g);
+    try testing.expect(none.at(0).sinkhorn == null and !Tr.Kernels.needed(&.{}));
+}
+
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
@@ -1363,7 +1436,7 @@ test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 
     const h = try g.input(&.{ 1, 3, 4, 5120 }, .bfloat16);
     const w = try traceLayerW(&g, &c, c.layers[0]);
     const mark = g.nodes.items.len;
-    const m = try Tr.hcMixes(&g, &c, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
+    const m = try Tr.hcMixes(&g, &c, .{}, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
     try expectShape(&g, m.pre, &.{ 1, 3, 4 }, .float32);
     try expectShape(&g, m.post, &.{ 1, 3, 4 }, .float32);
     try expectShape(&g, m.comb, &.{ 1, 3, 4, 4 }, .float32);
@@ -1402,7 +1475,7 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     defer cache.deinit(&g);
     var shared: Tr.Share = .{};
     const pos = try g.arange(0, 5, 1, .int32);
-    const out = try Tr.layer(&g, &p, &c, &stock, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
+    const out = try Tr.layer(&g, &p, &c, &stock, .{}, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
     try expectStage(&g, &p, "attn.x", &.{ 1, 5, 5120 }, .bfloat16);
     try expectStage(&g, &p, "attn.qr", &.{ 1, 5, 1280 }, .bfloat16);
     try expectStage(&g, &p, "attn.q", &.{ 1, 5, 64, 512 }, .bfloat16);
@@ -1685,7 +1758,7 @@ fn layerOps(rt: *const Routes, rows: c_int) ![]ops.Op {
     var shared: Tr.Share = .{};
     try Tr.prepareRegions(&g, &c, rt, false);
     const mark = g.nodes.items.len;
-    _ = try Tr.layer(&g, NoProbe{}, &c, rt, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
+    _ = try Tr.layer(&g, NoProbe{}, &c, rt, .{}, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
     return g.opsSince(testing.allocator, mark);
 }
 
@@ -1906,7 +1979,7 @@ test "dsv41 graph: the all-layer chain's per-layer held bytes at a 2,048-token p
             const from = g.nodes.items.len;
             p.names.clearRetainingCapacity();
             p.nodes.clearRetainingCapacity();
-            const out = try Tr.layer(&g, &p, &c, &stock, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
+            const out = try Tr.layer(&g, &p, &c, &stock, .{}, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
             h = out.h;
             pm = out.pre_mix;
             const hb = heldBytes(&g, from, g.nodes.items.len);
