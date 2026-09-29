@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "8fe825e9a1c8001743a6d8585f07cf96aaba719d71c4c53d1a658d069f4529e4";
+pub const manifest_sha256 = "e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -67,6 +67,7 @@ pub const Kernel = enum {
     q3ht_combine_collapse_norm__f32,
     q3ht_combine_collapse_norm__f32_rbf16,
     q3drc_mxfp8_fma_f32x,
+    q3rc_mxfp8_fma__draft,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -658,8 +659,13 @@ fn checkVariants(entries: *const [n_kernels]Entry, diag: ?*Diag) Refusal!void {
         const b = &entries[@backingInt(e.variant_of orelse continue)];
         if (!std.mem.eql(u8, &e.text_sha256, &b.text_sha256) or e.header != b.header)
             return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: not the text of {t}", .{ e.kernel, b.kernel });
-        if (e.launch != .rule or b.launch != .rule or !sameTemplateShape(e.template, b.template))
-            return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: template names / kinds are not those of {t}", .{ e.kernel, b.kernel });
+        const shape_ok = switch (e.launch) {
+            .rule => b.launch == .rule and sameTemplateShape(e.template, b.template),
+            .plans => |ps| b.launch == .plans and for (ps) |pe| {
+                if (!sameTemplateShape(pe.template, b.launch.plans[0].template)) break false;
+            } else true,
+        };
+        if (!shape_ok) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: template names / kinds are not those of {t}", .{ e.kernel, b.kernel });
         if (e.inputs.len != b.inputs.len) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
         for (e.inputs, b.inputs) |p, q| if (!std.mem.eql(u8, p.name, q.name)) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t}: inputs are not those of {t}", .{ e.kernel, b.kernel });
     }
@@ -667,7 +673,12 @@ fn checkVariants(entries: *const [n_kernels]Entry, diag: ?*Diag) Refusal!void {
         if (!std.mem.eql(u8, &x.text_sha256, &y.text_sha256) or x.header != y.header or !sameInputDtypes(x, y)) continue;
         const same = switch (x.launch) {
             .rule => y.launch == .rule and sameTemplateShape(x.template, y.template) and sameTemplateValues(x.template, y.template),
-            .plans => true,
+            .plans => |xs| y.launch == .plans and for (xs) |px| {
+                const hit = for (y.launch.plans) |py| {
+                    if (sameTemplateShape(px.template, py.template) and sameTemplateValues(px.template, py.template)) break true;
+                } else false;
+                if (hit) break true;
+            } else false,
         };
         if (same) return refuse(diag, error.VariantInvalid, "exl3 kernels: {t} and {t} are the same (text, template values, input dtypes)", .{ x.kernel, y.kernel });
     };
@@ -914,7 +925,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 40), n_kernels);
+    try testing.expectEqual(@as(usize, 41), n_kernels);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1039,14 +1050,31 @@ test "dsv41 kernels: the DRAFTRC variants are their base texts at recorded templ
     // the two fused variants share template values and differ only by the residual's dtype
     try testing.expectEqual(mlx.mlx_dtype.float32, reg.get(.q3ht_combine_collapse_norm__f32).inputs[1].dtype);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, reg.get(.q3ht_combine_collapse_norm__f32_rbf16).inputs[1].dtype);
-    // the f32-x text is a text of record (its own file and name), plans at the five verify sites
+    // the f32-x text is a text of record (its own file and name), plans at the eight draft sites
     const f = reg.get(.q3drc_mxfp8_fma_f32x);
     try testing.expectEqual(@as(?Kernel, null), f.variant_of);
     try testing.expectEqualStrings("q3drc_mxfp8_fma_f32x", f.mlx_name);
     try testing.expectEqual(mlx.mlx_dtype.float32, f.inputs[2].dtype);
-    try testing.expectEqual(@as(usize, 5), f.sites.len);
-    for (f.sites) |s| try testing.expect(reg.get(.q3rc_mxfp8_fma).site(s.name) != null);
-    try testing.expect(f.site("shared_w13") == null and f.site("main_proj") == null);
+    try testing.expectEqual(@as(usize, 8), f.sites.len);
+    // the bf16 FMA at the three draft-only sites is a plan variant; the verify entry keeps its sites
+    const d = reg.get(.q3rc_mxfp8_fma__draft);
+    try testing.expectEqual(@as(?Kernel, .q3rc_mxfp8_fma), d.variant_of);
+    try testing.expectEqual(@as(usize, 3), d.sites.len);
+    for ([_][]const u8{ "main_proj", "shared_w13", "shared_w2" }) |s| {
+        try testing.expect(d.site(s) != null and f.site(s) != null);
+        try testing.expect(reg.get(.q3rc_mxfp8_fma).site(s) == null);
+    }
+    // the pinned draft geometry (Q3_DECODE_DRAFTRC_INSTALL proj.geometry): R / KS as template ints at M 6
+    const Pin = struct { site: []const u8, R: i32, KS: i32 };
+    for ([_]Pin{ .{ .site = "main_proj", .R = 2, .KS = 2 }, .{ .site = "shared_w13", .R = 1, .KS = 4 }, .{ .site = "shared_w2", .R = 1, .KS = 1 } }) |pin| {
+        for (d.launch.plans) |pl| {
+            if (!std.mem.eql(u8, pl.site, pin.site) or pl.rows != 6) continue;
+            for (pl.template) |x| {
+                if (std.mem.eql(u8, x.name, "R")) try testing.expectEqual(pin.R, x.value.int);
+                if (std.mem.eql(u8, x.name, "KS")) try testing.expectEqual(pin.KS, x.value.int);
+            }
+        }
+    }
 }
 
 /// `text` with the first `needle` after `anchor` replaced (caller frees).

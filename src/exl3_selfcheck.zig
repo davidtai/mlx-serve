@@ -56,7 +56,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k),
-        .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x,
+        .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
         .mlx_chain => switch (k) {
             .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
             else => false,
@@ -101,6 +101,16 @@ pub fn runAll(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, rep
 /// naming the first failure) unless every check passes. Nothing may launch the kernels before.
 pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report, diag: ?*xk.Diag) !void {
     try runAll(a, reg, bound, report);
+    try judge(report, diag);
+}
+
+/// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming
+/// the first failing kernel / check / site) unless every result passed and the plan ran.
+pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
+    if (report.results.items.len == 0) {
+        if (diag) |d| d.len = (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check produced no result", .{}) catch unreachable).len;
+        return error.SelfCheckFailed;
+    }
     for (report.results.items) |r| {
         if (r.ok) continue;
         if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err })) |m| m.len else |_| d.buf.len;

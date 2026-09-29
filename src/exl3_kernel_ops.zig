@@ -15,6 +15,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const xk = @import("exl3_kernels.zig");
+const selfcheck = @import("exl3_selfcheck.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -884,7 +885,16 @@ pub const PrefillRows = struct { slot: []const u32, act_row: ?[]const u32 = null
 /// the join and the result, a carried call leaves its last waves in flight and async-evaluates
 /// the result; `finish` (the prefill boundary) drains them. The lane's rebuild-ahead is the next
 /// wave's two host tables (no GPU work) and has no counterpart here.
+///
+/// Wave lifecycle (the backend's `mark` / `resetTo`: `resetTo` frees every array tracked since
+/// the mark, kept handles survive): each wave's ops run between a mark and a `resetTo` right
+/// after the wave is submitted, so its intermediates live only while the GPU still needs them
+/// (a pending graph holds its inputs); the wave's output survives as two kept handles (the
+/// join's, the in-flight queue's). The join runs between its own mark and `resetTo`; `call`
+/// returns a KEPT result (the caller releases it). Nothing else the call builds outlives it.
 pub fn DigXPrefill(comptime G: type) type {
+    if (!@hasDecl(G, "mark") or !@hasDecl(G, "resetTo"))
+        @compileError("exl3 kernel ops: DigXPrefill needs a backend with mark / resetTo (the wave lifecycle)");
     return struct {
         const Self = @This();
         const hidden = 5120;
@@ -922,6 +932,7 @@ pub fn DigXPrefill(comptime G: type) type {
         /// Releases the waves still in flight (without evaluating them) and the scratch.
         pub fn deinit(self: *Self, g: *G) void {
             for (self.flight.items) |x| g.release(x);
+            for (self.parts.items) |x| g.release(x);
             self.flight.deinit(self.a);
             self.parts.deinit(self.a);
             inline for (.{ &self.group_of, &self.gslot, &self.gcount, &self.gnext, &self.snake, &self.sorted, &self.grows, &self.pos, &self.ridx, &self.rhs, &self.inv }) |l| l.deinit(self.a);
@@ -938,8 +949,8 @@ pub fn DigXPrefill(comptime G: type) type {
             try g.evalAll(&.{x});
         }
 
-        /// act bf16 [a_rows, 5120], `rows` (A assignment rows), the call's bank -> f32 [A, 5120]
-        /// in assignment-row order (the lane's `result`). Refused: A outside 1..the kernels' row
+        /// act bf16 [a_rows, 5120], `rows` (A assignment rows), the call's bank -> a KEPT f32
+        /// [A, 5120] in assignment-row order (the lane's `result`; release it). Refused: A outside 1..the kernels' row
         /// bound (RowsOutOfPlan), a slot outside the bank (SlotOutOfBank), act rows that are not
         /// A (no act_row) or an act_row outside act (RouteInput).
         pub fn call(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !G.T {
@@ -953,6 +964,7 @@ pub fn DigXPrefill(comptime G: type) type {
             const a = self.a;
             const cnt = self.gcount.items;
             const order = self.snake.items;
+            for (self.parts.items) |x| g.release(x);
             self.parts.clearRetainingCapacity();
             var i: usize = 0;
             var off: usize = 0;
@@ -971,24 +983,33 @@ pub fn DigXPrefill(comptime G: type) type {
                     off += cnt[gi];
                 }
                 const r0 = off - wave_rows;
+                try self.parts.ensureUnusedCapacity(a, 1);
+                try self.flight.ensureUnusedCapacity(a, 1);
+                const m = g.mark();
                 const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off]);
-                try self.parts.append(a, y);
+                self.parts.appendAssumeCapacity(g.keep(y));
                 if (solo) {
                     try g.evalAll(&.{y});
                 } else {
                     try g.asyncEval(&.{y});
-                    try self.flight.ensureUnusedCapacity(a, 1);
                     self.flight.appendAssumeCapacity(g.keep(y));
                 }
+                g.resetTo(m);
             }
             if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
+            const m = g.mark();
             const joined = try g.concat(self.parts.items, 0);
+            for (self.parts.items) |x| g.release(x);
+            self.parts.clearRetainingCapacity();
             if (!carried) try g.evalAll(&.{joined});
             for (self.pos.items, 0..) |p, j| self.inv.items[p] = @intCast(j);
             const ord = try g.hostArray(std.mem.sliceAsBytes(self.inv.items), &.{@intCast(n_rows)}, .uint32);
             const result = try g.take(joined, ord, 0);
+            const kept = g.keep(result);
+            errdefer g.release(kept);
             if (carried) try g.asyncEval(&.{result}) else try g.evalAll(&.{result});
-            return result;
+            g.resetTo(m);
+            return kept;
         }
 
         /// One wave's five launches -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
@@ -1082,6 +1103,129 @@ pub fn DigXPrefill(comptime G: type) type {
     };
 }
 
+// ── Startup acceptance: the arm's one entry (registry, device self-check, typed handles) ──
+
+/// What the startup acceptance runs on.
+pub const Device = union(enum) {
+    /// the arm's GPU stream: every kernel is built on it and the self-check plan runs there
+    stream: mlx.mlx_stream,
+    /// host tests: no kernel object and no MLX array; the plan's results are scripted
+    stub: StubDevice,
+};
+
+/// A scripted device: every (kernel, check) of the plan passes, except `fail` when set.
+pub const StubDevice = struct {
+    fail: ?struct { kernel: Kernel, check: xk.Check } = null,
+};
+
+pub const StartupOptions = struct {
+    device: Device,
+    /// the texts the registry checks against the pin (production: the embedded ones)
+    texts: *const xk.Texts = &xk.embedded,
+    pin: []const u8 = xk.manifest_sha256,
+};
+
+/// The backend methods every route uses (the phase-3 contract); the prefill route adds its
+/// own (evalAll, asyncEval, concat, take, mark, resetTo) and checks them itself.
+const backend_methods = [_][]const u8{ "launch", "shapeOf", "dtypeOf", "hostArray", "keep", "release", "reshape", "astype" };
+
+/// The first route method `G` lacks, or null.
+pub fn missingBackendMethod(comptime G: type) ?[]const u8 {
+    inline for (backend_methods) |m| if (!@hasDecl(G, m)) return m;
+    return null;
+}
+
+/// The accepted registry on one device: the typed handles the arm keeps (heap-allocated: the
+/// backend's launcher and the routes point into it). `deinit` after the last launch drained.
+pub fn Accepted(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        a: Allocator,
+        reg: xk.Registry,
+        bound: xk.Bound,
+        /// the self-check plan's results (its receipt: `report.writeJsonLines(a)`)
+        report: selfcheck.Report,
+        gemv: Gemv(G),
+
+        /// The EXL3 decode GEMV as the caller's `GemvT` = { ctx, project_fn(ctx, g: *G, k, out_dim, xh,
+        /// ids, code) anyerror!G.T } (EagerChain's MlxGemv): xh f32 [rows, in] rotated, ids u32 [rows]
+        /// (each row's slot), code the projection's bank code; out_dim 2304 (gate / up) or 5120
+        /// (down); k 3 (the bank). The output is a launch output the backend owns.
+        pub fn gemvRoute(self: *const Self, comptime GemvT: type) GemvT {
+            return .{ .ctx = &self.gemv, .project_fn = GemvFn(G).project };
+        }
+
+        /// Releases the route statics, the kernels, the plan's results and the registry.
+        pub fn deinit(self: *Self, g: *G) void {
+            self.gemv.deinit(g);
+            self.bound.deinit();
+            self.report.deinit(self.a);
+            self.reg.deinit();
+            self.a.destroy(self);
+        }
+    };
+}
+
+fn GemvFn(comptime G: type) type {
+    return struct {
+        fn project(ctx: *const anyopaque, g: *G, k: u32, out_dim: u32, xh: G.T, ids: G.T, code: G.T) anyerror!G.T {
+            const r: *const Gemv(G) = @ptrCast(@alignCast(ctx));
+            if (k != xk.bank_ks[0]) return error.GemvKNotRegistered;
+            const proj: Proj = switch (out_dim) {
+                2304 => .gate,
+                5120 => .down,
+                else => return error.GemvOutDim,
+            };
+            return r.project(g, proj, xh, ids, code);
+        }
+    };
+}
+
+/// The stub device's plan: one scripted result per (kernel, check) of the registry's plan.
+fn stubPlan(a: Allocator, reg: *const xk.Registry, stub: StubDevice, report: *selfcheck.Report) !void {
+    for (&reg.entries) |*e| {
+        var it = e.checks.iterator();
+        while (it.next()) |c| {
+            const fails = if (stub.fail) |f| f.kernel == e.kernel and f.check == c else false;
+            try report.results.append(a, .{ .kernel = e.kernel, .check = c, .words = 1, .ok = !fails, .err = if (fails) "stub device: scripted failure" else "" });
+        }
+    }
+}
+
+/// The arm's one startup entry: builds the registry (every text against the pinned manifest),
+/// builds every kernel on the device, runs the device self-check plan (the KSELF plan of this
+/// registry, ~30 s and ~1.6 GB on the GPU: before the model loads) and judges it, points the
+/// backend's `launcher: ?*const xk.Bound` at the accepted kernels (when the backend has that
+/// field: `deepseek_v41_ops.MlxOps` at m1 c8411cf+), and builds the GEMV route's statics.
+/// Refused by name: a registry refusal (xk.Refusal: TextSha256Mismatch, ManifestNotPinned,
+/// LanePinMismatch, ...; `diag` names the text), NotGpuStream / KernelCreateFailed at bind,
+/// SelfCheckFailed (`diag` names the first failing kernel / check / site); a backend without a
+/// route method does not compile (the method is named).
+pub fn acceptAtStartup(comptime G: type, a: Allocator, g: *G, opts: StartupOptions, diag: *xk.Diag) !*Accepted(G) {
+    comptime {
+        if (missingBackendMethod(G)) |m| @compileError("exl3 kernel ops: the backend " ++ @typeName(G) ++ " lacks " ++ m ++ " (acceptAtStartup)");
+    }
+    const acc = try a.create(Accepted(G));
+    errdefer a.destroy(acc);
+    acc.* = .{ .a = a, .reg = undefined, .bound = undefined, .report = .{}, .gemv = undefined };
+    acc.reg = try xk.Registry.init(a, opts.texts, opts.pin, diag);
+    errdefer acc.reg.deinit();
+    acc.bound = switch (opts.device) {
+        .stream => |s| try acc.reg.bind(s, diag),
+        .stub => .{ .reg = &acc.reg, .stream = .{}, .kernels = @splat(.{}) },
+    };
+    errdefer acc.bound.deinit();
+    errdefer acc.report.deinit(a);
+    switch (opts.device) {
+        .stream => try selfcheck.runAll(a, &acc.reg, &acc.bound, &acc.report),
+        .stub => |st| try stubPlan(a, &acc.reg, st, &acc.report),
+    }
+    try selfcheck.judge(&acc.report, diag);
+    acc.gemv = try Gemv(G).init(g, &acc.reg);
+    if (@hasField(G, "launcher")) g.launcher = &acc.bound;
+    return acc;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1095,6 +1239,7 @@ const Trace = struct {
     const Node = struct { shape: Shape, dtype: Dtype, bytes: []u8, origin: Origin = .none };
     const Launch = struct { k: Kernel, cfg: LaunchConfig, inputs: [16]T = undefined, n_in: usize, outs: [xk.max_outputs]T = undefined };
     const Ev = union(enum) { launch: u32, eval: []T, async_eval: []T, concat: []T, take: [2]T };
+    const Freed = struct { from: u32, to: u32, at: u32 };
 
     a: Allocator,
     nodes: std.ArrayList(Node) = .empty,
@@ -1103,6 +1248,14 @@ const Trace = struct {
     cats: u32 = 0,
     takes: u32 = 0,
     keeps: isize = 0,
+    /// node ranges a `resetTo` freed, [from, to), with the log length when it ran, in call order
+    freed: std.ArrayList(Freed) = .empty,
+    /// nodes with a kept handle (one entry per keep)
+    held: std.ArrayList(T) = .empty,
+    /// every keep, in order, with the number of resets before it (append-only)
+    kept: std.ArrayList(struct { node: T, resets: u32 }) = .empty,
+    /// the model backend's kernel launcher (`MlxOps.launcher: ?*const xk.Bound`), set by acceptAtStartup
+    launcher: ?*const xk.Bound = null,
 
     fn deinit(t: *Trace) void {
         for (t.nodes.items) |n| t.a.free(n.bytes);
@@ -1113,6 +1266,30 @@ const Trace = struct {
             else => {},
         };
         t.log.deinit(t.a);
+        t.freed.deinit(t.a);
+        t.held.deinit(t.a);
+        t.kept.deinit(t.a);
+    }
+
+    pub fn mark(t: *const Trace) u32 {
+        return @intCast(t.nodes.items.len);
+    }
+
+    pub fn resetTo(t: *Trace, m: u32) void {
+        t.freed.append(t.a, .{ .from = m, .to = @intCast(t.nodes.items.len), .at = @intCast(t.log.items.len) }) catch @panic("trace: out of memory");
+    }
+
+    /// A node no `resetTo` freed and no kept handle holds (a leak past the call).
+    fn leaked(t: *const Trace, x: T) bool {
+        for (t.freed.items) |r| if (x >= r.from and x < r.to) return false;
+        return std.mem.indexOfScalar(T, t.held.items, x) == null;
+    }
+
+    /// The node a view resolves to (reshape chains to their source).
+    fn root(t: *const Trace, x: T) T {
+        var n = x;
+        while (t.nodes.items[n].origin == .view) n = t.nodes.items[n].origin.view;
+        return n;
     }
 
     fn node(t: *Trace, shape: []const c_int, dt: Dtype, bytes: []const u8) !T {
@@ -1146,11 +1323,14 @@ const Trace = struct {
 
     pub fn keep(t: *Trace, x: T) T {
         t.keeps += 1;
+        t.held.append(t.a, x) catch @panic("trace: out of memory");
+        t.kept.append(t.a, .{ .node = x, .resets = @intCast(t.freed.items.len) }) catch @panic("trace: out of memory");
         return x;
     }
 
-    pub fn release(t: *Trace, _: T) void {
+    pub fn release(t: *Trace, x: T) void {
         t.keeps -= 1;
+        if (std.mem.indexOfScalar(T, t.held.items, x)) |i| _ = t.held.swapRemove(i);
     }
 
     pub fn reshape(t: *Trace, x: T, shape: []const c_int) !T {
@@ -1759,6 +1939,65 @@ fn expectEvents(t: *const Trace, from: usize, want: []const []const u8, case: []
     }
 }
 
+/// Each wave's `resetTo` runs right after the wave's five launches and its eval / async_eval
+/// (only drains of older waves may come between) and frees those launches' outputs; the last
+/// `resetTo` of the call follows the join (concatenate, take, the result's eval) and frees the
+/// concatenation and the take.
+fn expectLifecycle(t: *const Trace, log0: usize, resets0: usize, waves: usize, case: []const u8, what: []const u8) !void {
+    var at = log0;
+    for (t.freed.items[resets0..][0..waves], 0..) |r, w| {
+        var launches: usize = 0;
+        var last_out: ?Trace.T = null;
+        var own_eval = false;
+        for (t.log.items[at..r.at]) |e| switch (e) {
+            .launch => |li| {
+                launches += 1;
+                const l = &t.launches.items[li];
+                last_out = l.outs[0];
+                for (l.outs[0..l.cfg.n_out]) |o| if (o < r.from or o >= r.to) {
+                    std.debug.print("prefill {s} {s} wave {d}: launch output {d} outside its reset [{d}, {d})\n", .{ case, what, w, o, r.from, r.to });
+                    return error.TestUnexpectedResult;
+                };
+            },
+            // the wave's own eval / async_eval: its rot_widen1 output (through the reshape)
+            .eval, .async_eval => |xs| own_eval = own_eval or (launches == 5 and xs.len == 1 and last_out != null and t.root(xs[0]) == last_out.?),
+            .concat, .take => {
+                std.debug.print("prefill {s} {s} wave {d}: a join inside a wave's reset\n", .{ case, what, w });
+                return error.TestUnexpectedResult;
+            },
+        };
+        if (launches != 5 or !own_eval) {
+            std.debug.print("prefill {s} {s} wave {d}: {d} launches, own eval {} before its reset\n", .{ case, what, w, launches, own_eval });
+            return error.TestUnexpectedResult;
+        }
+        // its output kept (the join's handle, and the in-flight queue's unless solo) before its reset
+        var keeps: usize = 0;
+        for (t.kept.items) |k| keeps += @intFromBool(k.resets == resets0 + w and t.root(k.node) == last_out.?);
+        if (keeps < 1 or keeps > 2) {
+            std.debug.print("prefill {s} {s} wave {d}: its output kept {d} times before its reset\n", .{ case, what, w, keeps });
+            return error.TestUnexpectedResult;
+        }
+        at = r.at;
+    }
+    const j = t.freed.items[resets0 + waves];
+    var cat = false;
+    var tk = false;
+    for (t.log.items[at..j.at]) |e| switch (e) {
+        .launch => return error.TestUnexpectedResult,
+        .concat => cat = true,
+        .take => tk = true,
+        else => {},
+    };
+    const last = t.nodes.items.len - 1;
+    // the result (the take, the call's last node) kept before the join's reset
+    var result_kept = false;
+    for (t.kept.items) |k| result_kept = result_kept or (k.node == last and k.resets == resets0 + waves);
+    if (!cat or !tk or j.to != last + 1 or !result_kept) {
+        std.debug.print("prefill {s} {s}: the join's reset [{d}, {d}) (concat {}, take {}, result kept {})\n", .{ case, what, j.from, j.to, cat, tk, result_kept });
+        return error.TestUnexpectedResult;
+    }
+}
+
 fn testBank(t: *Trace, cap: c_int) !BankArrays(Trace.T) {
     return .{
         .gate = .{ .code = try t.ext("gate_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("gate_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("gate_proj.rin", &.{ cap, 5120 }, .float16) },
@@ -1790,8 +2029,22 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             try testing.expectEqual(@as(usize, cl.a_rows), slots.len);
             const act = try t.ext("act", &.{ @intCast(slots.len), 5120 }, .bfloat16);
             const launches0 = t.launches.items.len;
+            const nodes0 = t.nodes.items.len;
+            const resets0 = t.freed.items.len;
             const res = try r.call(&t, act, .{ .slot = slots }, bank);
             try expectEvents(&t, mark, cl.events, cs.case, cl.name);
+            // the wave lifecycle: one mark / resetTo per wave and one around the join; nothing the
+            // call built outlives it but the kept result and the waves still in flight
+            const waves = (t.launches.items.len - launches0) / 5;
+            try testing.expectEqual(waves + 1, t.freed.items.len - resets0);
+            try expectLifecycle(&t, mark, resets0, waves, cs.case, cl.name);
+            for (nodes0..t.nodes.items.len) |x| {
+                if (!t.leaked(@intCast(x))) continue;
+                std.debug.print("prefill {s} {s}: node {d} outlives the call\n", .{ cs.case, cl.name, x });
+                return error.TestUnexpectedResult;
+            }
+            try testing.expectEqual(@as(usize, 1 + r.flight.items.len), t.held.items.len);
+            try testing.expect(std.mem.indexOfScalar(Trace.T, t.held.items, res) != null);
             mark = t.log.items.len;
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(a);
@@ -1800,7 +2053,8 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             const rs = t.shapeOf(res);
             for (cl.ret_shape, rs.slice()) |w, d| try testing.expectEqual(w, @as(i64, d));
             n_calls += 1;
-            n_waves += (t.launches.items.len - launches0) / 5;
+            n_waves += waves;
+            t.release(res);
         }
         try r.finish(&t);
         try expectEvents(&t, mark, cs.finish, cs.case, "finish");
@@ -1877,4 +2131,99 @@ test "dsv41 kernels ops: prefill rows read by act_row take the same act words (t
         var k: usize = 0;
         while (k < ba.len) : (k += 4) try testing.expectEqual(@divTrunc(std.mem.readInt(i32, ba[k..][0..4], .little), 6), std.mem.readInt(i32, bb[k..][0..4], .little));
     }
+}
+
+// ── Startup acceptance (stub device) ──
+
+/// `deepseek_v41_experts.MlxGemv`'s shape on the trace backend.
+const TestGemv = struct {
+    ctx: *const anyopaque,
+    project_fn: *const fn (ctx: *const anyopaque, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) anyerror!Trace.T,
+
+    fn project(self: TestGemv, g: *Trace, k: u32, out_dim: u32, xh: Trace.T, ids: Trace.T, code: Trace.T) !Trace.T {
+        return self.project_fn(self.ctx, g, k, out_dim, xh, ids, code);
+    }
+};
+
+test "dsv41 kernels ops: acceptAtStartup (stub device) judges the plan, installs the launcher, hands out the GEMV route" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    const acc = try acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} } }, &diag);
+    // the plan: one result per (kernel, check) of the registry, all passed
+    var n: usize = 0;
+    for (&acc.reg.entries) |*e| n += e.checks.count();
+    try testing.expect(n >= 100);
+    try testing.expectEqual(n, acc.report.results.items.len);
+    try testing.expectEqual(@as(usize, 0), acc.report.failures());
+    const receipt = try acc.report.writeJsonLines(a);
+    defer a.free(receipt);
+    try testing.expectEqual(n, std.mem.count(u8, receipt, "\n"));
+    // the backend's launcher: the accepted kernels
+    try testing.expectEqual(@as(*const xk.Bound, &acc.bound), t.launcher.?);
+    try testing.expectEqual(&acc.reg, acc.bound.reg);
+    // the GEMV route through the caller's type: EagerChain's (k, out_dim, xh, ids, code) -> the lane's launch
+    const gemv = acc.gemvRoute(TestGemv);
+    try testing.expectEqual(@as(*const anyopaque, &acc.gemv), gemv.ctx);
+    for ([_]struct { e: *const Entry, out: u32, st: *const Statics(Trace) }{
+        .{ .e = acc.gemv.gu, .out = 2304, .st = &acc.gemv.gu_statics },
+        .{ .e = acc.gemv.dn, .out = 5120, .st = &acc.gemv.dn_statics },
+    }) |c| for (c.e.samples) |*s| {
+        const xh, const ids, const code = .{ try t.arg(c.e, "xh", &s.vars), try t.arg(c.e, "ids", &s.vars), try t.arg(c.e, "code", &s.vars) };
+        const z = try gemv.project(&t, 3, c.out, xh, ids, code);
+        var want: [9]Trace.T = undefined;
+        want[0..3].* = .{ xh, ids, code };
+        @memcpy(want[3..], c.st.arrays[3..9]);
+        try expectLaunch(t.back(1), c.e, s, &want);
+        try testing.expectEqual(t.back(1).outs[0], z);
+    };
+    const e = acc.gemv.gu;
+    const s = &e.samples[0];
+    const xh, const ids, const code = .{ try t.arg(e, "xh", &s.vars), try t.arg(e, "ids", &s.vars), try t.arg(e, "code", &s.vars) };
+    const launches = t.launches.items.len;
+    try testing.expectError(error.GemvKNotRegistered, gemv.project(&t, 2, 2304, xh, ids, code));
+    try testing.expectError(error.GemvOutDim, gemv.project(&t, 3, 1280, xh, ids, code));
+    try testing.expectEqual(launches, t.launches.items.len);
+    try testing.expect(t.keeps > 0);
+    acc.deinit(&t);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+}
+
+test "dsv41 kernels ops: acceptAtStartup refuses by name (text, pin, self-check) and a backend without a route method" {
+    const a = testing.allocator;
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    // a self-check failure names its kernel and check; nothing is handed out
+    try testing.expectError(error.SelfCheckFailed, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{ .fail = .{ .kernel = .q3rc_router_tail__n128_top3, .check = .f64 } } } }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "q3rc_router_tail__n128_top3 f64") != null);
+    try testing.expect(t.launcher == null);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
+    // a text that is not the pinned manifest's
+    var texts = xk.embedded;
+    const k = Kernel.q3drc_mxfp8_fma_f32x;
+    const bad = try a.dupeSentinel(u8, xk.embedded.sources[@backingInt(k)], 0);
+    defer a.free(bad);
+    bad[bad.len / 3] ^= 0x04;
+    texts.sources[@backingInt(k)] = bad;
+    try testing.expectError(error.TextSha256Mismatch, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .texts = &texts }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), @tagName(k)) != null);
+    // another pin
+    try testing.expectError(error.ManifestNotPinned, acceptAtStartup(Trace, a, &t, .{ .device = .{ .stub = .{} }, .pin = "0000000000000000000000000000000000000000000000000000000000000000" }, &diag));
+    try testing.expect(t.launcher == null);
+    // the route methods: the first one a backend lacks (acceptAtStartup names it at compile time)
+    try testing.expect(missingBackendMethod(Trace) == null);
+    try testing.expectEqualStrings("launch", missingBackendMethod(struct {}).?);
+    const NoRelease = struct {
+        pub const T = u32;
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn reshape() void {}
+        pub fn astype() void {}
+    };
+    try testing.expectEqualStrings("release", missingBackendMethod(NoRelease).?);
 }
