@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "9fbf4ab873c953728555fc010a5a6b81726f42690f0db667bc3b51b336803091";
+pub const manifest_sha256 = "6811a8bbad51fcc0ddea845c83b1f75a7156bae04aabeed999e5262e31fcb786";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -124,18 +124,31 @@ pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, rou
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
 
-/// The manifest and every text, as `Registry.init` reads them.
+/// The manifest and every text, as `Registry.init` reads them. `addenda`: the port's own text
+/// appended to a lane header at bind ("" for a header without one; manifest `port_addenda`).
 pub const Texts = struct {
     manifest: []const u8,
     sources: [n_kernels][:0]const u8,
     headers: [n_headers][:0]const u8,
+    addenda: [n_headers][:0]const u8,
 };
+
+/// The lane headers the port appends its own text to (file port_<tag>.metal): pf_hc's q3pf_ld
+/// twin for `const constant` inputs (MLX binds an input of fewer than 8 elements as constant).
+pub const ported = [_]Header{.pf_hc};
 
 pub const embedded: Texts = .{
     .manifest = @embedFile(dir ++ "manifest.json"),
     .sources = embedAll(Kernel, ""),
     .headers = embedAll(Header, "header_"),
+    .addenda = embedAddenda(),
 };
+
+fn embedAddenda() [n_headers][:0]const u8 {
+    var out: [n_headers][:0]const u8 = @splat("");
+    for (ported) |h| out[@backingInt(h)] = @embedFile(dir ++ "port_" ++ @tagName(h) ++ ".metal");
+    return out;
+}
 
 fn embedAll(comptime E: type, comptime prefix: []const u8) [std.meta.fieldNames(E).len][:0]const u8 {
     @setEvalBranchQuota(100_000);
@@ -374,7 +387,10 @@ pub const Golden = struct {
 pub const Registry = struct {
     arena: std.heap.ArenaAllocator,
     entries: [n_kernels]Entry,
+    /// the lane's header texts (what the lane pins cover)
     headers: [n_headers][:0]const u8,
+    /// what a kernel compiles with: the lane header, + the port addendum where the manifest lists one
+    compiled: [n_headers][:0]const u8,
     golden: Golden,
     codebook: []const u8,
     multiplier: u64,
@@ -396,6 +412,7 @@ pub const Registry = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .entries = undefined,
             .headers = texts.headers,
+            .compiled = texts.headers,
             .golden = undefined,
             .codebook = "",
             .multiplier = 0,
@@ -416,6 +433,7 @@ pub const Registry = struct {
         reg.multiplier = m.bank.multiplier;
         reg.ks = m.bank.K;
         try reg.adoptHeaders(texts, m.headers, diag);
+        try reg.adoptAddenda(a, texts, m.port_addenda, diag);
         try reg.adoptKernels(a, texts, m.kernels, diag);
         reg.golden = try adoptGolden(m.golden, diag);
         reg.predecessors = try adoptPredecessors(a, m.predecessors, diag);
@@ -438,8 +456,29 @@ pub const Registry = struct {
         return &self.entries[@backingInt(k)];
     }
 
+    /// The header text `e` compiles with (the lane's, + the port addendum when there is one).
     pub fn header(self: *const Registry, e: *const Entry) [:0]const u8 {
-        return if (e.header) |h| self.headers[@backingInt(h)] else "";
+        return if (e.header) |h| self.compiled[@backingInt(h)] else "";
+    }
+
+    /// Every embedded addendum is listed once, with its text's sha256 and size, and every listed
+    /// one is embedded; the compiled header is the lane header followed by it.
+    fn adoptAddenda(self: *Registry, a: Allocator, texts: *const Texts, js: []const JText, diag: ?*Diag) (Refusal || Allocator.Error)!void {
+        var seen: std.EnumSet(Header) = .empty;
+        for (js) |j| {
+            const id = std.meta.stringToEnum(Header, j.id orelse "") orelse return refuse(diag, error.UnknownHeader, "exl3 kernels: port addendum for header \"{s}\", not one this build embeds", .{j.id orelse ""});
+            if (seen.contains(id)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: port addendum {t} listed twice", .{id});
+            seen.insert(id);
+            const text = texts.addenda[@backingInt(id)];
+            if (text.len == 0) return refuse(diag, error.SchemaInvalid, "exl3 kernels: the manifest lists a port addendum for {t}, this build embeds none", .{id});
+            var what: [48]u8 = undefined;
+            try checkText(text, j, std.fmt.bufPrint(&what, "port addendum {t}", .{id}) catch unreachable, diag);
+            self.compiled[@backingInt(id)] = try std.mem.concatWithSentinel(a, u8, &.{ self.headers[@backingInt(id)], text }, 0);
+        }
+        for (std.enums.values(Header)) |h| {
+            if (texts.addenda[@backingInt(h)].len > 0 and !seen.contains(h))
+                return refuse(diag, error.SchemaInvalid, "exl3 kernels: this build embeds a port addendum for {t}, the manifest lists none", .{h});
+        }
     }
 
     fn adoptHeaders(self: *Registry, texts: *const Texts, hs: []const JText, diag: ?*Diag) Refusal!void {
@@ -623,7 +662,7 @@ const JGolden = struct {
 };
 const JBank = struct { codebook: []const u8, multiplier: u64, K: []const u32 };
 const JPredecessor = struct { manifest_sha256: []const u8, kernels: []const []const u8, headers: []const []const u8 };
-const JManifest = struct { format: []const u8, bank: JBank, headers: []const JText, kernels: []const JKernel, golden: JGolden, predecessors: []const JPredecessor = &.{} };
+const JManifest = struct { format: []const u8, bank: JBank, headers: []const JText, kernels: []const JKernel, golden: JGolden, predecessors: []const JPredecessor = &.{}, port_addenda: []const JText = &.{} };
 
 /// The predecessors' sha256s, each checked: 64 hex, and every kernel / header it lists is one this
 /// build embeds (a predecessor names a subset of this manifest).
@@ -1057,7 +1096,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 2), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 3), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
@@ -1179,6 +1218,61 @@ test "dsv41 kernels: a manifest that is not the pinned one is refused" {
     m[m.len / 2] ^= 0x01;
     texts.manifest = m;
     try testing.expectError(error.ManifestNotPinned, Registry.init(a, &texts, manifest_sha256, null));
+}
+
+test "dsv41 kernels: the pf_hc port addendum compiles with its lane header; the lane pins cover the lane text alone" {
+    const a = testing.allocator;
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    const lane = embedded.headers[@backingInt(Header.pf_hc)];
+    const port = embedded.addenda[@backingInt(Header.pf_hc)];
+    // the lane header is the lane's file of record (its manifest sha, which every pf_hc lane pin
+    // covers with the source); the port text adds only q3pf_ld's `const constant` twin
+    try testing.expectEqualStrings("1640340afd8108a3398181a95355e167c1dd4a104bed1783e18dfd1a2da2fab2", &shaHex(lane));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, lane, "q3pf_ld(const device U* p"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, port, "q3pf_ld(const constant U* p"));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, port, "device"));
+    inline for (.{ Kernel.q3pf_hc_mix_rsqrt, Kernel.q3pf_hc_pre_norm, Kernel.q3pf_hc_mix_rsqrt__f32, Kernel.q3pf_hc_pre_norm__f32 }) |k| {
+        const h = reg.header(reg.get(k));
+        try testing.expect(std.mem.startsWith(u8, h, lane));
+        try testing.expectEqualStrings(port, h[lane.len..]);
+    }
+    // every other header compiles as the lane's text
+    for (&reg.entries) |*e| {
+        const id = e.header orelse continue;
+        if (id != .pf_hc) try testing.expectEqual(embedded.headers[@backingInt(id)].ptr, reg.header(e).ptr);
+    }
+    // 9fbf4ab8 (before the addendum) stays a predecessor for every kernel but the four pf_hc ones
+    try testing.expect(reg.acceptsManifest("9fbf4ab873c953728555fc010a5a6b81726f42690f0db667bc3b51b336803091"));
+    // refusals: a tampered addendum, one the manifest lists but the build lacks, one the build
+    // embeds but the manifest does not list
+    {
+        var texts = embedded;
+        const bad = try a.dupeSentinel(u8, port, 0);
+        defer a.free(bad);
+        bad[bad.len / 2] ^= 0x20;
+        texts.addenda[@backingInt(Header.pf_hc)] = bad;
+        var diag: Diag = .{};
+        try testing.expectError(error.TextSha256Mismatch, Registry.init(a, &texts, manifest_sha256, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "port addendum pf_hc") != null);
+    }
+    {
+        var texts = embedded;
+        texts.addenda[@backingInt(Header.pf_hc)] = "";
+        var diag: Diag = .{};
+        try testing.expectError(error.SchemaInvalid, Registry.init(a, &texts, manifest_sha256, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "embeds none") != null);
+    }
+    {
+        const m = try replaceFirst(a, embedded.manifest, "\"port_addenda\": [", "\"port_addenda_off\": [");
+        defer a.free(m);
+        var texts = embedded;
+        texts.manifest = m;
+        const pin = shaHex(m);
+        var diag: Diag = .{};
+        try testing.expectError(error.SchemaInvalid, Registry.init(a, &texts, &pin, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "the manifest lists none") != null);
+    }
 }
 
 test "dsv41 kernels: an unknown kernel name is refused" {
