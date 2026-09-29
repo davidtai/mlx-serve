@@ -102,6 +102,10 @@ pub const Routes = struct {
     /// q-latent RMSNorm, KV RMSNorm + k_pe RoPE, query RoPE, the output's inverse RoPE to bf16),
     /// bound per layer over its norm weights; rides C14's route (needs rc_proj).
     rc_fused_proj: bool = false,
+    /// C11: the verify head at rows <= 8 on `dsv41_head_m1rows` (the bf16 head, the M = 1
+    /// order per row), M 5 / 7 padded to M + 1 (RCTAIL headpad: the kernel's odd-M cliff; every
+    /// row is the kernel's M-invariant row); bound by the model over its head weight.
+    rc_head: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -245,7 +249,7 @@ pub fn Trunk(comptime G: type) type {
             fused: std.ArrayList(kr.FusedProj(G)) = .empty,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -608,6 +612,23 @@ pub fn Trunk(comptime G: type) type {
                 .bf16 => g.astype(try linear(g, try g.astype(x, g.dtypeOf(hw.dense)), hw.dense), .float32),
                 .mxfp8 => g.astype(try qlinear(g, try g.astype(x, .float32), hw.mxfp8), .float32),
             };
+        }
+
+        /// C11: the head on `dsv41_head_m1rows` (x [..., K] with <= 8 rows, cast to the head's bf16)
+        /// -> f32 logits [..., N]; M 5 / 7 run as M + 1 rows (a zero row appended, first M kept).
+        pub fn headRows(g: *G, hr: *const kr.HeadRows(G), x: T) !T {
+            const sh = g.shapeOf(x);
+            const k = sh.dim(-1);
+            const m = rowsOf(g, x, 1);
+            var x2 = try g.reshape(try g.astype(x, .bfloat16), &.{ m, k });
+            const pad = m == 5 or m == 7;
+            if (pad) x2 = try g.concat(&.{ x2, try g.zeros(&.{ 1, k }, .bfloat16) }, 0);
+            var y = try hr.call(g, x2);
+            const n = g.shapeOf(y).dim(-1);
+            if (pad) y = try g.slice(y, &.{ 0, 0 }, &.{ m, n }, &.{ 1, 1 });
+            var out = sh;
+            out.d[out.n - 1] = n;
+            return g.astype(try g.reshape(y, out.slice()), .float32);
         }
 
         /// `_MXFP8Head.__init__`: the dense head quantized once (mxfp8 gs32).
@@ -1862,6 +1883,29 @@ test "dsv41 graph: the K36 fused glue binds per layer beside RCPROJ, takes the v
     _ = try Tr.attention(&g, &p, &c, &rt, lk, li, &ws[0], inv, try g.input(&.{ 1, 9, 5120 }, .bfloat16), try g.arange(5, 14, 1, .int32), &cache, &shared);
     try testing.expectEqual(l0 + 9, g.prepared_launches);
     try testing.expect(!noneOf(&g, n0, .rsqrt));
+}
+
+test "dsv41 graph: the m1rows head takes rows 1..8, M 5 and 7 padded to M + 1, f32 logits of x's rows" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var hr = try kr.HeadRows(TraceOps).init(&g, &reg, try g.input(&.{ 129280, 5120 }, .bfloat16), null);
+    defer hr.deinit(&g);
+    for (1..9) |mu| {
+        const m: c_int = @intCast(mu);
+        const l0 = g.prepared_launches;
+        const n0 = g.nodes.items.len;
+        const y = try Tr.headRows(&g, &hr, try g.input(&.{ 1, m, 5120 }, .bfloat16));
+        try expectShape(&g, y, &.{ 1, m, 129280 }, .float32);
+        try testing.expectEqual(l0 + 1, g.prepared_launches);
+        var padded = false;
+        for (g.nodes.items[n0..]) |nd| padded = padded or (nd.op == .concat and nd.shape.eql(ops.Shape.of(&.{ m + 1, 5120 })));
+        try testing.expectEqual(mu == 5 or mu == 7, padded);
+    }
+    // Another head shape is refused (the kernel's pinned [129280, 5120]).
+    try testing.expectError(error.RouteInput, kr.HeadRows(TraceOps).init(&g, &reg, try g.input(&.{ 4096, 5120 }, .bfloat16), null));
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {

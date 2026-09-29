@@ -905,6 +905,14 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         // Released score chains: the stock tier's masked-full chunk keeps two 8 GB score blocks of its
         // five (plus the indexer's), under half its layer wave; K30's gathered chain under 3 / 5 of it.
         if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else try testing.expect(5 * worst.wave < 3 * worst.layer);
+        // A 5-row verify after the prompt: the served tier's head is C11's m1rows with the headpad
+        // (a [6, dim] bf16 concat), the stock tier's the dense head.
+        const n5 = g.nodes.items.len;
+        const r5 = try model_.forward(&g, &st, prompt[0..5], .{ .logits = .all }, stand, graph.NoProbe{});
+        try testing.expect(g.shapeOf(r5.logits.?).eql(ops.Shape.of(&.{ 1, 5, @intCast(c.vocab_size) })));
+        var padded = false;
+        for (g.nodes.items[n5..]) |nd| padded = padded or (nd.op == .concat and nd.shape.eql(ops.Shape.of(&.{ 6, @intCast(c.hidden_size) })));
+        try testing.expectEqual(!std.mem.eql(u8, t.name, "stock"), padded);
     }
 }
 

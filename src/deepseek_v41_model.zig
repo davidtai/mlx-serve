@@ -13,6 +13,7 @@ const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const graph = @import("deepseek_v41_graph.zig");
+const kr = @import("dsv41_kernel_routes.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
@@ -58,6 +59,8 @@ pub fn Model(comptime G: type) type {
         owned: std.ArrayList(T) = .empty,
         /// The tier's RC kernel routes (C12 ...), bound at `initWith`; empty on a stock tier.
         kx: Tr.Kernels = .{},
+        /// C11: the verify head's m1rows route (rows <= 8), over the dense bf16 head.
+        head_rows: ?kr.HeadRows(G) = null,
 
         const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
 
@@ -167,7 +170,14 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
-            if (opts.registry) |reg| self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
+            if (opts.registry) |reg| {
+                self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
+                if (tier.routes.rc_head) {
+                    // The kernel reads the bf16 head (HEAD_MODE bf16: the served head's weight as bound).
+                    if (tier.routes.head != .bf16) return error.HeadRowsNeedsBf16;
+                    self.head_rows = kr.HeadRows(G).init(g, reg, self.head.dense, null) catch |e| return if (e == error.RouteInput) error.HeadRowsGeometry else e;
+                }
+            }
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
@@ -177,6 +187,7 @@ pub fn Model(comptime G: type) type {
             for (self.owned.items) |x| g.release(x);
             self.owned.deinit(self.gpa);
             self.kx.deinit(g);
+            if (self.head_rows) |*x| x.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
         }
@@ -479,14 +490,23 @@ pub fn Model(comptime G: type) type {
             var res: Result = .{ .hidden = hidden, .main_hidden = main };
             switch (want.logits) {
                 .none => {},
-                .all => res.logits = try Tr.head(g, &self.tier.routes, hidden, self.head),
+                .all => res.logits = try self.headOf(g, hidden),
                 .last => {
                     const s = g.shapeOf(hidden);
                     const last = try g.slice(hidden, &.{ 0, s.d[1] - 1, 0 }, s.slice(), &.{ 1, 1, 1 });
-                    res.logits = try Tr.head(g, &self.tier.routes, last, self.head);
+                    res.logits = try self.headOf(g, last);
                 },
             }
             return res;
+        }
+
+        /// The head under its route: C11's m1rows at <= 8 rows when bound (a phase route), else `Tr.head`.
+        fn headOf(self: *const Self, g: *G, x: T) !T {
+            if (self.head_rows) |*hr| {
+                const s = g.shapeOf(x);
+                if (s.d[0] * s.d[1] <= graph.rc_max_rows) return Tr.headRows(g, hr, x);
+            }
+            return Tr.head(g, &self.tier.routes, x, self.head);
         }
 
         /// Greedy AR (the M3 token-parity run): the prompt in forwards of at
