@@ -862,6 +862,13 @@ pub const Runner = struct {
         defer g.deinit();
         const Tr = graph.Trunk(ops.MlxOps);
         const rt: graph.Routes = .{};
+        // Bound: MlxOps holds every op output of a layer until its reset (a
+        // 2,048-token ratio-1 layer holds 16.0 GiB, the host trace in graph.zig),
+        // and the MLX buffer cache would keep each layer type's freed set on top.
+        // No cache: a layer's buffers go back at its reset.
+        var prev_cache_limit: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&prev_cache_limit, 0);
+        defer _ = mlx.mlx_set_cache_limit(&prev_cache_limit, prev_cache_limit);
 
         var weights = model.Weights.init(gpa);
         defer weights.deinit();
@@ -982,6 +989,14 @@ pub const Runner = struct {
                 persist(&g, &shared.candidates, &masks[1]);
                 persist(&g, &shared.win_mask, &masks[2]);
                 g.reset();
+                _ = mlx.mlx_clear_cache();
+                if (p == 0) {
+                    var act: usize = 0;
+                    var peak: usize = 0;
+                    _ = mlx.mlx_get_active_memory(&act);
+                    _ = mlx.mlx_get_peak_memory(&peak);
+                    std.debug.print("dsv41 chain: p0 L{d} done; MLX active {d:.2} GiB, peak {d:.2} GiB\n", .{ l, @as(f64, @floatFromInt(act)) / (1 << 30), @as(f64, @floatFromInt(peak)) / (1 << 30) });
+                }
             }
             const norm_w = try g.adopt(try arrayFrom(norm_bytes, norm_t));
             const fin = try Tr.finalNorm(&g, &c, cur.h, cur.pre_mix, norm_w);

@@ -1632,3 +1632,79 @@ test "dsv41 graph: the W50 lean prefill score folds the sink instead of concaten
         try testing.expectEqual(lean, std.mem.count(ops.Op, seq, &.{.exp}) == 2);
     }
 }
+
+/// Bytes the MLX backend holds for one traced node range: MlxOps tracks every
+/// op output until the per-layer `reset`, so an evaluated layer keeps all of
+/// them at once. Views (reshape / transpose / expand / broadcast / slice) and
+/// leaves share or own no new buffer and are left out.
+fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, max: u64, max_op: ops.Op } {
+    var sum: u64 = 0;
+    var mx: u64 = 0;
+    var mop: ops.Op = .input;
+    for (g.nodes.items[from..to]) |n| {
+        switch (n.op) {
+            .input, .host, .scalar, .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => continue,
+            else => {},
+        }
+        const b: u64 = @as(u64, @intCast(n.shape.numel())) * ops.dtypeSize(n.dtype);
+        sum += b;
+        if (b > mx) {
+            mx = b;
+            mop = n.op;
+        }
+    }
+    return .{ .sum = sum, .max = mx, .max_op = mop };
+}
+
+// The window-2 stage-3 bound (host only): the chained 40-layer stock trunk at a
+// 2,048-token pass, then three 1-token passes, as the parity runner drives it.
+test "dsv41 graph: the all-layer chain's per-layer held bytes at a 2,048-token pass" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const nl = c.n_layers;
+    const ws = try testing.allocator.alloc(LayerW(u32), nl);
+    defer testing.allocator.free(ws);
+    const caches = try testing.allocator.alloc(Tr.Cache, nl);
+    defer testing.allocator.free(caches);
+    for (ws, caches, 0..) |*w, *cc, l| {
+        w.* = try traceLayerW(&g, &c, c.layers[l]);
+        cc.* = Tr.Cache.init(c.layers[l], c.window, .{});
+    }
+    defer for (caches) |*cc| cc.deinit(&g);
+    const inv_s = try Tr.swaInvFreq(&g, &c);
+    const inv_y = try Tr.yarnInvFreq(&g, &c);
+    const stand: StandIn(TraceOps) = .{ .scale = try g.input(&.{ci(c.n_routed_experts)}, .float32) };
+    const passes = [_]c_int{ 2048, 1, 1, 1 };
+    var tok: c_int = 0;
+    var worst: u64 = 0;
+    var worst_l: usize = 0;
+    for (passes, 0..) |s, pi| {
+        var shared: Tr.Share = .{};
+        const pos = try g.arange(@floatFromInt(tok), @floatFromInt(tok + s), 1, .int32);
+        const e = try Tr.expandEmbedding(&g, &c, try g.input(&.{ 1, s, ci(c.hidden_size) }, .bfloat16));
+        var h = e.h;
+        var pm = e.pre_mix;
+        for (0..nl) |l| {
+            const li = c.layers[l];
+            const from = g.nodes.items.len;
+            p.names.clearRetainingCapacity();
+            p.nodes.clearRetainingCapacity();
+            const out = try Tr.layer(&g, &p, &c, &stock, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
+            h = out.h;
+            pm = out.pre_mix;
+            const hb = heldBytes(&g, from, g.nodes.items.len);
+            if (pi == 0) std.debug.print("dsv41 bound: L{d} ratio {d} held {d:.2} GiB, largest {d:.2} GiB ({s})\n", .{ l, li.ratio, @as(f64, @floatFromInt(hb.sum)) / (1 << 30), @as(f64, @floatFromInt(hb.max)) / (1 << 30), @tagName(hb.max_op) });
+            if (hb.sum > worst) {
+                worst = hb.sum;
+                worst_l = l;
+            }
+        }
+        for (caches) |*cc| cc.advance(@intCast(s));
+        tok += s;
+    }
+    std.debug.print("dsv41 bound: worst layer L{d} holds {d:.2} GiB at eval\n", .{ worst_l, @as(f64, @floatFromInt(worst)) / (1 << 30) });
+    try testing.expect(worst > 0);
+}
