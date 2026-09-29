@@ -321,6 +321,12 @@ pub const MlxOps = struct {
         freeFrom(T, &g.live, 0, freeArray);
     }
 
+    /// Return MLX's cached (freed) buffers to the system: the phase boundaries' release (the prompt
+    /// fence, the phase change, construction), owned by the backend like every other allocation.
+    pub fn clearCache(_: *MlxOps) void {
+        _ = mlx.mlx_clear_cache();
+    }
+
     /// The current scope point (a wave's start).
     pub fn mark(g: *const MlxOps) Mark {
         return .{ .n = g.live.items.len };

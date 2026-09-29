@@ -993,7 +993,7 @@ pub const Runner = struct {
                 persist(&g, &shared.candidates, &masks[1]);
                 persist(&g, &shared.win_mask, &masks[2]);
                 g.reset();
-                _ = mlx.mlx_clear_cache();
+                g.clearCache();
                 if (p == 0) {
                     var act: usize = 0;
                     var peak: usize = 0;

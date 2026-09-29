@@ -125,7 +125,7 @@ pub const Module = struct {
         // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
         const ceiling = boxCeiling(config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet(), c0.n_routed_experts);
         errdefer self.dropKernels();
-        _ = mlx.mlx_clear_cache();
+        self.g.clearCache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
         errdefer setCacheLimit(self.prev_cache_limit);
@@ -160,7 +160,7 @@ pub const Module = struct {
             inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows),
         };
         errdefer gpa.free(self.warm_peaks);
-        _ = mlx.mlx_clear_cache();
+        self.g.clearCache();
         log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
         // The bill against the warm-up's measured peak (C4 G7): the widest decode-width wave, the tier's head.
         if (config.dsv41_prefill) |bill| {
@@ -282,7 +282,7 @@ pub const Module = struct {
             self.fenced = true;
         }
         // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
-        _ = mlx.mlx_clear_cache();
+        self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),

@@ -109,7 +109,7 @@ pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *qwen
     _ = try model.retireEmbedding(g, rows);
     owner.drop("embed.weight");
     if (G == ops.MlxOps) {
-        _ = mlx.mlx_clear_cache();
+        g.clearCache();
         if (before -| activeBytes(G, g) < model.embeddingBytes()) return error.EmbeddingNotReleased;
     }
 }
