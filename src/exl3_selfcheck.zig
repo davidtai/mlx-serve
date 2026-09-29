@@ -56,7 +56,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k),
-        .layout_guard => k == .q3rc_mxfp8_fma,
+        .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x,
         .mlx_chain => switch (k) {
             .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
             else => false,
@@ -64,6 +64,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .f64 => switch (k) {
             .q3_exl3_prep_gu_epi, .q3rc_router_tail, .q3rc_premix_fin, .q3dk_sinkhorn16_hc4_it20, .q3ht_combine, .q3ht_collapse_norm, .q3ht_combine_collapse_norm, .q3ht_mixfin, .q3_prefill_dig2_swiglu_2304_x => true,
             .mtplx_dsv4_sinkhorn_hc4_it20, .mtplx_dsv41_fp_rmsnorm_tg128_d1280, .mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64, .mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd, .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv => true,
+            .q3rc_router_tail__n128_top3, .q3ht_combine__f32, .q3ht_collapse_norm__f32, .q3ht_combine_collapse_norm__f32, .q3ht_combine_collapse_norm__f32_rbf16 => true,
             else => isDigGemm(k),
         },
     };
@@ -889,7 +890,9 @@ fn checkF64(h: *H, k: Kernel) !void {
             }
             try recordTol(h, k, got.len, maxErrOverRowRms(got, ref, 2304), 1.0 / 256.0);
         },
-        .q3rc_router_tail => try routerF64(h, &sc),
+        .q3rc_router_tail => try routerF64(h, &sc, .q3rc_gate_part, .q3rc_router_tail),
+        .q3rc_router_tail__n128_top3 => try routerF64(h, &sc, .q3rc_gate_part__n128, .q3rc_router_tail__n128_top3),
+        .q3ht_combine__f32, .q3ht_collapse_norm__f32, .q3ht_combine_collapse_norm__f32, .q3ht_combine_collapse_norm__f32_rbf16 => try hctapeF32(h, &sc, k),
         .q3rc_premix_fin => try premixF64(h, &sc),
         .q3dk_sinkhorn16_hc4_it20, .mtplx_dsv4_sinkhorn_hc4_it20 => try sinkhornF64(h, &sc, k),
         .mtplx_dsv41_fp_rmsnorm_tg128_d1280, .mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64, .mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd, .mtplx_dsv41_fp_rope_h64_hd512_rd64_inv => try k36F64(h, &sc, k),
@@ -902,17 +905,23 @@ fn recordTol(h: *H, k: Kernel, words: usize, metric: f64, limit: f64) !void {
     try h.record(.{ .kernel = k, .check = .f64, .words = words, .metric = metric, .limit = limit, .ok = metric <= limit and words > 0 });
 }
 
-/// q3rc_gate_part then q3rc_router_tail vs float64: indices equal (rows whose 6th / 7th
-/// biased scores are within 1e-5 skipped), weights within 1e-5 relative.
-fn routerF64(h: *H, sc: *Scope) !void {
-    const pe = h.reg.get(.q3rc_gate_part);
-    const te = h.reg.get(.q3rc_router_tail);
+fn templateInt(e: *const Entry, name: []const u8) usize {
+    for (e.template) |x| if (std.mem.eql(u8, x.name, name)) return @intCast(x.value.int);
+    unreachable;
+}
+
+/// gate part then router tail (the verify router, or the draft's N 128 / top-3 variants) vs
+/// float64: indices equal (rows whose top-k-th / next biased scores are within 1e-5 skipped),
+/// weights within 1e-5 relative.
+fn routerF64(h: *H, sc: *Scope, part_k: Kernel, tail_k: Kernel) !void {
+    const pe = h.reg.get(part_k);
+    const te = h.reg.get(tail_k);
     var vars = defaultVars(pe);
     const wave: Wave = .{};
     const pins = try genAll(h, sc, pe, &vars, null, &wave);
-    const part = try launch(h, sc, .q3rc_gate_part, pins[0..pe.inputs.len], &vars, null);
+    const part = try launch(h, sc, part_k, pins[0..pe.inputs.len], &vars, null);
     const bias = try genInput(h, sc, &te.inputs[1], &vars, &wave);
-    const outs = try launch(h, sc, .q3rc_router_tail, &.{ part[0], bias }, &vars, null);
+    const outs = try launch(h, sc, tail_k, &.{ part[0], bias }, &vars, null);
     const x = try hostF64(h, pins[0]);
     defer h.a.free(x);
     const w = try hostF64(h, pins[1]);
@@ -923,37 +932,41 @@ fn routerF64(h: *H, sc: *Scope) !void {
     defer h.a.free(wt);
     const ix = try hostF64(h, outs[1]);
     defer h.a.free(ix);
-    const n_exp = 384;
+    const max_exp = 384;
+    const n_exp = templateInt(te, "N");
+    const topk = templateInt(te, "TOPK");
+    std.debug.assert(n_exp <= max_exp and topk < n_exp);
     const kdim = 5120;
     const rows: usize = @intCast(vars.get(.rows));
     var bad: u64 = 0;
     var worst: f64 = 0;
     for (0..rows) |r| {
-        var score: [n_exp]f64 = undefined;
-        var biased: [n_exp]f64 = undefined;
+        var score: [max_exp]f64 = undefined;
+        var biased: [max_exp]f64 = undefined;
         for (0..n_exp) |n| {
             var acc: f64 = 0;
             for (0..kdim) |c| acc += x[r * kdim + c] * w[n * kdim + c];
             score[n] = @sqrt(softplus(acc));
             biased[n] = score[n] + b[n];
         }
-        var order: [n_exp]u16 = undefined;
-        for (&order, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sort(u16, &order, @as(*const [n_exp]f64, &biased), struct {
-            fn lt(bs: *const [n_exp]f64, a: u16, c: u16) bool {
+        var order_buf: [max_exp]u16 = undefined;
+        const order = order_buf[0..n_exp];
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u16, order, @as(*const [max_exp]f64, &biased), struct {
+            fn lt(bs: *const [max_exp]f64, a: u16, c: u16) bool {
                 return bs[a] > bs[c] or (bs[a] == bs[c] and a < c);
             }
         }.lt);
-        if (biased[order[5]] - biased[order[6]] < 1e-5) continue;
+        if (biased[order[topk - 1]] - biased[order[topk]] < 1e-5) continue;
         var sum: f64 = 0;
-        for (order[0..6]) |n| sum += score[n];
-        for (0..6) |t| {
-            if (@as(usize, @intFromFloat(ix[r * 6 + t])) != order[t]) bad += 1;
+        for (order[0..topk]) |n| sum += score[n];
+        for (0..topk) |t| {
+            if (@as(usize, @intFromFloat(ix[r * topk + t])) != order[t]) bad += 1;
             const want = score[order[t]] / (sum + 1e-20) * 1.5;
-            worst = @max(worst, @abs(wt[r * 6 + t] - want) / @abs(want));
+            worst = @max(worst, @abs(wt[r * topk + t] - want) / @abs(want));
         }
     }
-    try h.record(.{ .kernel = .q3rc_router_tail, .check = .f64, .words = rows * 6, .bad = bad, .metric = worst, .limit = 1e-5, .ok = bad == 0 and worst < 1e-5 });
+    try h.record(.{ .kernel = tail_k, .check = .f64, .words = rows * topk, .bad = bad, .metric = worst, .limit = 1e-5, .ok = bad == 0 and worst < 1e-5 });
 }
 
 /// q3rc_premix_part then q3rc_premix_fin vs float64: |out - x w^T| / (|x| |w|^T) < 1e-5.
@@ -1225,6 +1238,106 @@ fn hctapeF64(h: *H, sc: *Scope, k: Kernel) !void {
         },
         else => return error.NoF64ForKernel,
     }
+}
+
+/// The draft's f32-stream HCTAPE variants vs float64: h (combine / fused) within 8 f32 ulps of
+/// its terms' magnitude of post x + sum_j comb[j, k] r_j, the fused hf == h word for word (an
+/// f32 stream has no rounding in between), ssq within 1e-5 relative, the fused y within 1e-5
+/// rms relative of w * col / rms(col) (col = sum_k pre[k] h_k).
+fn hctapeF32(h: *H, sc: *Scope, k: Kernel) !void {
+    const e = h.reg.get(k);
+    var vars = defaultVars(e);
+    const wave: Wave = .{};
+    const ins = try genAll(h, sc, e, &vars, null, &wave);
+    const outs = try launch(h, sc, k, ins[0..e.inputs.len], &vars, null);
+    const rows: usize = @intCast(vars.get(.rows));
+    const d = 5120;
+    const hc = 4;
+    var in_host: [6][]f64 = undefined;
+    var n_in: usize = 0;
+    defer for (in_host[0..n_in]) |x| h.a.free(x);
+    for (0..e.inputs.len) |i| {
+        in_host[i] = try hostF64(h, ins[i]);
+        n_in += 1;
+    }
+    if (k == .q3ht_collapse_norm__f32) {
+        const s = in_host[0];
+        const got = try hostF64(h, outs[1]);
+        defer h.a.free(got);
+        const ref = try h.a.alloc(f64, rows);
+        defer h.a.free(ref);
+        for (0..rows) |r| {
+            var acc: f64 = 0;
+            for (s[r * hc * d ..][0 .. hc * d]) |v| acc += v * v;
+            ref[r] = acc;
+        }
+        return recordTol(h, k, rows, maxRel(got, ref), 1e-5);
+    }
+    const x, const r_, const post, const comb = .{ in_host[0], in_host[1], in_host[2], in_host[3] };
+    const n = rows * hc * d;
+    const href = try h.a.alloc(f64, n);
+    defer h.a.free(href);
+    const got_h = try hostF64(h, outs[0]);
+    defer h.a.free(got_h);
+    var beyond: u64 = 0;
+    var worst: f64 = 0;
+    for (0..rows) |m| for (0..hc) |kk| for (0..d) |c| {
+        var v: f64 = post[m * hc + kk] * x[m * d + c];
+        var mag: f64 = @abs(v);
+        for (0..hc) |j| {
+            const t = comb[m * 16 + j * hc + kk] * r_[(m * hc + j) * d + c];
+            v += t;
+            mag += @abs(t);
+        }
+        const at = (m * hc + kk) * d + c;
+        href[at] = v;
+        const err = @abs(got_h[at] - v);
+        const lim = 0x1p-21 * mag;
+        beyond += @intFromBool(err > lim);
+        if (mag > 0) worst = @max(worst, err / mag);
+    };
+    try h.record(.{ .kernel = k, .check = .f64, .site = "h", .words = n, .bad = beyond, .metric = worst, .limit = 0x1p-21, .ok = beyond == 0 });
+    if (k == .q3ht_combine__f32) return;
+    const hw = try hostCopy(h, outs[0]);
+    defer h.a.free(hw);
+    const hfw = try hostCopy(h, outs[1]);
+    defer h.a.free(hfw);
+    try h.record(.{ .kernel = k, .check = .f64, .site = "hf", .words = n, .bad = countDiff(hw, hfw, 4), .ok = std.mem.eql(u8, hw, hfw) });
+    const pre, const w = .{ in_host[4], in_host[5] };
+    const ssq_got = try hostF64(h, outs[2]);
+    defer h.a.free(ssq_got);
+    const y_got = try hostF64(h, outs[3]);
+    defer h.a.free(y_got);
+    const ssq_ref = try h.a.alloc(f64, rows);
+    defer h.a.free(ssq_ref);
+    const y_ref = try h.a.alloc(f64, rows * d);
+    defer h.a.free(y_ref);
+    const cbuf = try h.a.alloc(f64, d);
+    defer h.a.free(cbuf);
+    for (0..rows) |m| {
+        var acc: f64 = 0;
+        for (href[m * hc * d ..][0 .. hc * d]) |v| acc += v * v;
+        ssq_ref[m] = acc;
+        var var_: f64 = 0;
+        for (0..d) |c| {
+            var col: f64 = 0;
+            for (0..hc) |kk| col += pre[m * hc + kk] * href[(m * hc + kk) * d + c];
+            cbuf[c] = col;
+            var_ += col * col;
+        }
+        const inv = 1.0 / @sqrt(var_ / d + 1e-20);
+        for (0..d) |c| y_ref[m * d + c] = w[c] * cbuf[c] * inv;
+    }
+    const ssq_rel = maxRel(ssq_got, ssq_ref);
+    try h.record(.{ .kernel = k, .check = .f64, .site = "ssq", .words = rows, .metric = ssq_rel, .limit = 1e-5, .ok = ssq_rel < 1e-5 });
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (y_got, y_ref) |a, b| {
+        num += (a - b) * (a - b);
+        den += b * b;
+    }
+    const rel = @sqrt(num / @max(den, 1e-30));
+    try h.record(.{ .kernel = k, .check = .f64, .site = "y", .words = rows * d, .metric = rel, .limit = 1e-5, .ok = rel < 1e-5 });
 }
 
 /// |f32 statements - f64 value| bound for K36, relative to the terms' magnitude (a tree sum of

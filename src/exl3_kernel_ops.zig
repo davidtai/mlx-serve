@@ -1471,8 +1471,12 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         }
     }
     for (t.launches.items) |l| hit.insert(l.k);
-    // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check only)
-    for (reg.entries) |e| try testing.expectEqual(!std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_"), hit.contains(e.kernel));
+    // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
+    // only) and the DRAFTRC entries (their routes land with the model lane's draft block, M4)
+    for (reg.entries) |e| {
+        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_");
+        try testing.expectEqual(!unrouted, hit.contains(e.kernel));
+    }
     try testing.expectEqual(@as(isize, 0), t.keeps);
 }
 
