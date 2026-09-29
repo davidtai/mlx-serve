@@ -77,3 +77,23 @@ pub fn openNoCache(path: [*:0]const u8, opts: NoCacheOptions) error{ FileNotFoun
     try noCache(fd, opts);
     return fd;
 }
+
+/// A whole file read past the page cache (`openNoCache`), at most `limit` bytes; caller frees.
+pub fn readAllNoCache(a: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    const z = try std.fmt.allocPrintSentinel(a, "{s}", .{path}, 0);
+    defer a.free(z);
+    const fd = try openNoCache(z.ptr, .{});
+    defer _ = std.c.close(fd);
+    const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (size < 0) return error.OpenFailed;
+    if (@as(u64, @intCast(size)) > limit) return error.FileTooBig;
+    const buf = try a.alloc(u8, @intCast(size));
+    errdefer a.free(buf);
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(done));
+        if (n <= 0) return error.ReadFailed;
+        done += @intCast(n);
+    }
+    return buf;
+}

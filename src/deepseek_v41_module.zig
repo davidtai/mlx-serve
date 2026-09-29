@@ -763,7 +763,19 @@ test "dsv41 module: the served request's forward schedule against the AR harness
         rows[ri] = try aa.dupe(u32, rec.rows.items);
         grown[ri] = try aa.dupe(usize, rec.grown_at.items);
     }
-    std.debug.print("\nDSV41_SCHEDULE harness rows {any} grown before forward {any}\nDSV41_SCHEDULE served rows {any} grown before forward {any}\n", .{ rows[0], grown[0], rows[1], grown[1] });
+    // The lane per forward, by the hook's own rule: a routed call of at most max_route_ids ids is the decode lane.
+    var wide: [2]usize = .{ 0, 0 };
+    for (rows, 0..) |rs, ri| for (rs, 0..) |r, fi| {
+        const lane_wide = r * c.n_experts_per_tok > xp.max_route_ids;
+        if (lane_wide) wide[ri] += 1;
+        // Every forward of 8 rows or fewer (the last prompt token and every generated id) is the decode lane.
+        if (r <= mdl.Model(ops.TraceOps).scratch_rows) try std.testing.expect(!lane_wide);
+        _ = fi;
+    };
+    std.debug.print("\nDSV41_SCHEDULE harness rows {any} wide-lane forwards {d} grown before forward {any}\nDSV41_SCHEDULE served rows {any} wide-lane forwards {d} grown before forward {any}\n", .{ rows[0], wide[0], grown[0], rows[1], wide[1], grown[1] });
+    // The harness never takes the wide lane; the served route takes it once, for the prompt but its last token.
+    try std.testing.expectEqual(@as(usize, 0), wide[0]);
+    try std.testing.expectEqual(@as(usize, 1), wide[1]);
     // Same ids fed, same Engram history: the plumbing feeds the model what the harness does.
     try std.testing.expectEqualSlices(u32, fed[0].items, fed[1].items);
     try std.testing.expectEqualSlices(i64, hist[0], hist[1]);

@@ -8,6 +8,7 @@
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const qwen4 = @import("qwen4_exp.zig");
+const io_util = @import("io_util.zig");
 
 pub const max_ngram = 8;
 pub const max_heads = 16;
@@ -244,12 +245,12 @@ pub const TokenMap = struct {
         if (meta.pad_id != h.pad_id) return refuse(diag, error.EngramTokenMap, "token map pad id {d}, the manifest's {d}", .{ meta.pad_id, h.pad_id });
         if (!std.mem.eql(u8, meta.manifest_sha256, bank.manifest_sha256)) return refuse(diag, error.EngramTokenMap, "token map built for manifest {s}, this bank's is {s}", .{ meta.manifest_sha256, bank.manifest_sha256 });
         const tok_path = try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{bank_dir});
-        const tok = std.Io.Dir.cwd().readFileAlloc(io, tok_path, a, .limited(256 << 20)) catch |e| switch (e) {
+        const tok = io_util.readAllNoCache(a, tok_path, 256 << 20) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ tok_path, @errorName(e) }),
         };
         if (!std.mem.eql(u8, &sha256Hex(tok), meta.tokenizer_sha256)) return refuse(diag, error.EngramTokenMap, "token map built from tokenizer {s}, the bank's tokenizer.json is {s}", .{ meta.tokenizer_sha256, &sha256Hex(tok) });
-        const raw = std.Io.Dir.cwd().readFileAlloc(io, map_path, a, .limited(64 << 20)) catch |e| switch (e) {
+        const raw = io_util.readAllNoCache(a, map_path, 64 << 20) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ map_path, @errorName(e) }),
         };
