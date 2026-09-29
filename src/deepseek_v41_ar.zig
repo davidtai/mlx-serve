@@ -729,7 +729,7 @@ const ProfCycle = struct { k_eff: u32, accepted: u32, draft_ms: f64, verify_ms: 
 const Stamper = struct {
     io: std.Io,
     last: std.Io.Timestamp,
-    ns: [std.meta.fields(dsl.Phase).len]u64 = @splat(0),
+    ns: [@intFromEnum(dsl.Phase.tail) + 1]u64 = @splat(0),
 
     fn begin(self: *Stamper) void {
         self.ns = @splat(0);
