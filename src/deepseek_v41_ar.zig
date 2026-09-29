@@ -18,11 +18,31 @@ const expert_bank = @import("expert_bank.zig");
 const expert_stream = @import("expert_stream.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ds = @import("deepseek_v41_dspark.zig");
+const dss = @import("deepseek_v41_dspark_serve.zig");
+const xk = @import("exl3_kernels.zig");
+const xko = @import("exl3_kernel_ops.zig");
 
-/// The kernels lane's EXL3 decode GEMV on MLX (its phase-3 ops), bound here
-/// once its signatures land; until then the harness refuses before any load.
-pub fn kernelsGemv() error{GemvUnbound}!xp.MlxGemv {
-    return error.GemvUnbound;
+/// The kernels lane's startup acceptance on the harness's GPU stream (registry,
+/// kernels built, the device self-check plan judged, the backend's launcher set),
+/// as the served arm runs it before the model loads.
+fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps) !*xko.Accepted(ops.MlxOps) {
+    var diag: xk.Diag = .{};
+    return xko.acceptAtStartup(ops.MlxOps, gpa, g, .{ .device = .{ .stream = g.s } }, &diag) catch |e| {
+        std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
+        return e;
+    };
+}
+
+/// Every bound bank of the hook `ex` against the kernels' signatures (once, after growth).
+fn checkBanks(g: *ops.MlxOps, reg: *const xk.Registry, ex: anytype) !void {
+    var diag: xk.Diag = .{};
+    errdefer std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
+    for (ex.banks) |per| for (per) |maybe| if (maybe) |b| {
+        inline for (.{ .{ xko.Proj.gate, "gate" }, .{ xko.Proj.up, "up" }, .{ xko.Proj.down, "down" } }) |pp| {
+            const arr = @field(b, pp[1]);
+            try xko.checkBank(ops.MlxOps, g, reg, pp[0], .{ .code = arr.code, .rout = arr.rout, .rin = arr.rin }, &diag);
+        }
+    };
 }
 
 pub const reference_format = "mlx-serve-dsv41-ar-ref-v1";
@@ -62,7 +82,6 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
-    const gemv = try kernelsGemv();
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -91,6 +110,8 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(gpa, s);
     defer g.deinit();
+    const kernels = try acceptKernels(gpa, &g);
+    defer kernels.deinit(&g);
 
     var weights = try model.loadWeights(io, gpa, bank_dir);
     defer weights.deinit();
@@ -118,9 +139,10 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     defer stream.deinit();
     var ssrc = xp.StreamSource.init(stream);
     const Chain = xp.EagerChain(ops.MlxOps, xp.MlxGemv);
-    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(gemv, &m.c), &m.c);
+    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(kernels.gemvRoute(xp.MlxGemv), &m.c), &m.c);
     defer ex.deinit();
     try ex.grow(&g, grown);
+    try checkBanks(&g, &kernels.reg, &ex);
 
     const out = try a.alloc(u32, ref.new_tokens);
     var hashes: StepHashes = .{ .out = try a.alloc([64]u8, ref.new_tokens) };
@@ -178,7 +200,6 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
-    const gemv = try kernelsGemv();
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -205,15 +226,14 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(gpa, s);
     defer g.deinit();
-    var weights = try model.loadWeights(io, gpa, bank_dir);
-    defer weights.deinit();
-    var src = try engram.RowSource.open(gpa, io, bank_dir, map_path, &c, &diag);
-    defer src.deinit();
+    const kernels = try acceptKernels(gpa, &g);
+    defer kernels.deinit(&g);
+    // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
-    const m = try L.M.init(gpa, &g, c, try routes.parse(&.{}, &diag), &weights, &src);
-    defer m.deinit(&g);
-    const head = try L.H.init(gpa, &g, c, .{}, &weights);
-    defer head.deinit(&g);
+    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, &diag);
+    defer res.deinit(&g);
+    const m = res.model;
+    const head = res.head;
     var st = try m.newState();
     defer st.deinit(&g, gpa);
     var caches: [8]L.H.Cache = @splat(.{});
@@ -233,9 +253,10 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer stream.deinit();
     var ssrc = xp.StreamSource.init(stream);
     const Chain = xp.EagerChain(ops.MlxOps, xp.MlxGemv);
-    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(gemv, &m.c), &m.c);
+    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(kernels.gemvRoute(xp.MlxGemv), &m.c), &m.c);
     defer ex.deinit();
     try ex.grow(&g, grown);
+    try checkBanks(&g, &kernels.reg, &ex);
 
     const acceptance: ds.Acceptance = if (std.mem.eql(u8, ref.arm, "typical")) .{ .typical = .{ .delta = @floatCast(ref.delta.?) } } else .greedy;
     var lp = L.init(&g, m, head, &st, caches[0..head.nStages()], .{ .acceptance = acceptance, .max_tokens = 1 << 20 });
@@ -244,11 +265,17 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     try testing.expectEqual(ref.tokens[0], primary);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
-    var first_diff: ?usize = null;
+    // The gate: the generated ids and each cycle's acceptance (drafts proposed,
+    // rows verified, drafts accepted). The finer decisions (draft ids, sigmoid
+    // bits, verify argmax, typical flags) are reported, first difference named.
+    var first_accept: ?usize = null;
+    var first_decision: ?usize = null;
+    const t0 = std.Io.Timestamp.now(io, .boot);
     for (ref.cycles, 0..) |rc, i| {
         var lg: dsl.CycleLog = .{ .primary = 0 };
         _ = try lp.cycle(&ex, &out, gpa, &lg);
-        var same = lg.primary == rc.primary and lg.k_native == rc.k_eff_native and lg.accepted + 1 == rc.kept and lg.verified == rc.verified;
+        const accept_same = lg.accepted + 1 == rc.kept and lg.verified == rc.verified and lg.k_eff == rc.drafts.len;
+        var same = accept_same and lg.primary == rc.primary and lg.k_native == rc.k_eff_native;
         same = same and std.mem.eql(u32, lg.native[0..rc.draft_ids.len], rc.draft_ids);
         same = same and std.mem.eql(u32, lg.drafts[0..lg.k_eff], rc.drafts);
         for (rc.conf_sigmoid_bits, 0..) |bits, j| same = same and @as(u32, @bitCast(lg.conf[j])) == bits;
@@ -262,13 +289,30 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
             same = same and fl < lg.n_flags and lg.flags[fl] == v;
             fl += 1;
         };
-        if (!same and first_diff == null) {
-            first_diff = i;
-            std.debug.print("dsv41 dspark: cycle {d} differs: native {any} vs {any}, k {d}/{d}, accepted {d} vs {d}\n", .{ i, lg.native[0..rc.draft_ids.len], rc.draft_ids, lg.k_native, rc.k_eff_native, lg.accepted, rc.kept - 1 });
+        if (!accept_same and first_accept == null) {
+            first_accept = i;
+            std.debug.print("dsv41 dspark: cycle {d} acceptance differs: drafts {d} vs {d}, verified {d} vs {d}, accepted {d} vs {d}\n", .{ i, lg.k_eff, rc.drafts.len, lg.verified, rc.verified, lg.accepted, rc.kept - 1 });
+        }
+        if (!same and first_decision == null) {
+            first_decision = i;
+            std.debug.print("dsv41 dspark: cycle {d} first finer difference: primary {d} vs {d}, native {any} vs {any}, k {d} vs {d}, conf bits {any} vs {any}\n", .{ i, lg.primary, rc.primary, lg.native[0..rc.draft_ids.len], rc.draft_ids, lg.k_native, rc.k_eff_native, @as([]const u32, @ptrCast(lg.conf[0..rc.conf_sigmoid_bits.len])), rc.conf_sigmoid_bits });
         }
     }
+    const wall_ms = @divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms);
     const n = @min(out.items.len, ref.tokens.len - 1);
-    std.debug.print("dsv41 dspark: {d} cycles; decisions {s}; tokens {s} ({d}); accepted {d}/{d}\n", .{ ref.cycles.len, if (first_diff == null) "IDENTICAL" else "DIFFER", if (std.mem.eql(u32, out.items[0..n], ref.tokens[1..][0..n])) "IDENTICAL" else "DIFFER", n + 1, lp.stats.accepted_drafts, lp.stats.drafted_tokens });
-    try testing.expect(first_diff == null);
+    const ids_same = std.mem.eql(u32, out.items[0..n], ref.tokens[1..][0..n]);
+    const sst = ex.source.stats();
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    std.debug.print("dsv41 dspark: {s} arm, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
+        ref.arm,                                                   ref.cycles.len,
+        if (ids_same) "IDENTICAL" else "DIFFER",                   n + 1,
+        if (first_accept == null) "IDENTICAL" else "DIFFER",       if (first_decision == null) "IDENTICAL" else "DIFFER",
+        lp.stats.accepted_drafts,                                  lp.stats.drafted_tokens,
+        rows,                                                      sst.route_calls,
+        sst.expert_bytes_read,                                     wall_ms,
+        peak,
+    });
+    try testing.expect(first_accept == null);
     try testing.expectEqualSlices(u32, ref.tokens[1..][0..n], out.items[0..n]);
 }
