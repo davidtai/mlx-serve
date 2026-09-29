@@ -341,11 +341,12 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     }
     if (eq(u8, f, "draft_tape")) {
         const r = try ops.HcTape(MlxG).init(reg, .float32, null);
+        const mixed = try ops.HcTapeMixed(MlxG).init(reg, null);
         const x, const rr, const rb, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "rb"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
         outs[1..4].* = try r.collapseNorm(g, rr, pre, w);
         outs[4..8].* = try r.combineCollapseNorm(g, x, rr, post, comb, pre, w);
-        outs[8..12].* = try r.combineCollapseNormResidualBf16(g, x, rb, post, comb, pre, w);
+        outs[8..12].* = try mixed.call(g, x, rb, post, comb, pre, w);
         return 12;
     }
     if (eq(u8, f, "router")) {
@@ -400,7 +401,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "prep")) {
-        const r = ops.RinPrep(MlxG).init(reg);
+        const r = try ops.RinPrep(MlxG).init(reg);
         const ids = in(ins, "ids");
         outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
         outs[2] = try r.guEpi(g, in(ins, "zg"), in(ins, "zu"), in(ins, "rout_g"), in(ins, "rout_u"), ids);

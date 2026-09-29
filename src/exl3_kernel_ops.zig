@@ -183,6 +183,35 @@ fn rowsVars(rows: u64) Vars {
     return v;
 }
 
+/// A rule kernel's launch at every row count 1..n (the kernel's `rows` bound), built once at
+/// construction: a call indexes it by M, the one launch value that varies per call.
+fn RowPlans(comptime n: usize) type {
+    return struct {
+        const Self = @This();
+        e: *const Entry,
+        cfg: [n]LaunchConfig,
+
+        fn init(e: *const Entry, diag: ?*xk.Diag) Refusal!Self {
+            const b = e.bounds.get(.rows) orelse return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} has no row bound", .{e.kernel});
+            if (b[0] != 1 or b[1] != n) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} takes rows {d}..{d}, the route's table 1..{d}", .{ e.kernel, b[0], b[1], n });
+            var p: Self = .{ .e = e, .cfg = undefined };
+            for (&p.cfg, 1..) |*c, m| c.* = xk.launchFor(e, &rowsVars(m), null) catch unreachable;
+            return p;
+        }
+
+        /// The launch at M rows; RowsOutOfPlan outside 1..n (the caller's phase route owns those).
+        fn at(p: *const Self, m: u64) Refusal!*const LaunchConfig {
+            if (m < 1 or m > n) return error.RowsOutOfPlan;
+            return &p.cfg[m - 1];
+        }
+
+        fn launch(p: *const Self, comptime G: type, g: *G, m: u64, inputs: []const G.T, out: []G.T) !void {
+            const cfg = try p.at(m);
+            try g.launch(p.e.kernel, inputs, cfg, out[0..cfg.n_out]);
+        }
+    };
+}
+
 // ── RCTAIL (DSV41_DECODE_RCTAIL = router, hcpremix, sinkhorn) ──
 
 /// router: the MoE gate on q3rc_gate_part (split-K logits) + q3rc_router_tail (sqrt(softplus),
@@ -192,6 +221,8 @@ pub fn Router(comptime G: type) type {
         const Self = @This();
         part: *const Entry,
         tail: *const Entry,
+        part_p: RowPlans(8),
+        tail_p: RowPlans(8),
         w: G.T,
         bias: G.T,
 
@@ -207,7 +238,7 @@ pub fn Router(comptime G: type) type {
             };
             try expectInput(G, g, part, "w", w, &no_vars, diag);
             try expectInput(G, g, tail, "bias", bias, &no_vars, diag);
-            return .{ .part = part, .tail = tail, .w = g.keep(w), .bias = g.keep(bias) };
+            return .{ .part = part, .tail = tail, .part_p = try .init(part, diag), .tail_p = try .init(tail, diag), .w = g.keep(w), .bias = g.keep(bias) };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -222,11 +253,11 @@ pub fn Router(comptime G: type) type {
 
         /// x [M, 5120] f32 -> (weights [M, top-k] f32, indices [M, top-k] i32): top-6 / top-3.
         pub fn call(self: *const Self, g: *G, x: G.T) ![2]G.T {
-            const vars = rowsVars(rowsOf(G, g, x, 0));
+            const m = rowsOf(G, g, x, 0);
             var part: [1]G.T = undefined;
-            try launchRule(G, g, self.part, &vars, &.{ x, self.w }, &part);
+            try self.part_p.launch(G, g, m, &.{ x, self.w }, &part);
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.tail, &vars, &.{ part[0], self.bias }, &out);
+            try self.tail_p.launch(G, g, m, &.{ part[0], self.bias }, &out);
             return out;
         }
     };
@@ -238,13 +269,16 @@ pub fn Premix(comptime G: type) type {
         const Self = @This();
         part: *const Entry,
         fin: *const Entry,
+        part_p: RowPlans(8),
+        fin_p: RowPlans(8),
         w: G.T,
 
         /// `w` the premix weight (f32 [24, 20480]).
         pub fn init(g: *G, reg: *const xk.Registry, w: G.T, diag: ?*xk.Diag) Refusal!Self {
             const part = reg.get(.q3rc_premix_part);
+            const fin = reg.get(.q3rc_premix_fin);
             try expectInput(G, g, part, "w", w, &no_vars, diag);
-            return .{ .part = part, .fin = reg.get(.q3rc_premix_fin), .w = g.keep(w) };
+            return .{ .part = part, .fin = fin, .part_p = try .init(part, diag), .fin_p = try .init(fin, diag), .w = g.keep(w) };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -268,11 +302,11 @@ pub fn Premix(comptime G: type) type {
 
         /// x [M, 20480] f32 -> out [M, 24] f32.
         pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
-            const vars = rowsVars(rowsOf(G, g, x, 0));
+            const m = rowsOf(G, g, x, 0);
             var part: [1]G.T = undefined;
-            try launchRule(G, g, self.part, &vars, &.{ x, self.w }, &part);
+            try self.part_p.launch(G, g, m, &.{ x, self.w }, &part);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.fin, &vars, &.{part[0]}, &out);
+            try self.fin_p.launch(G, g, m, &.{part[0]}, &out);
             return out[0];
         }
     };
@@ -474,76 +508,85 @@ pub fn DraftProj(comptime G: type) type {
 
 /// The HC tail kernels: `HcTapeKernels` (combine, collapse_norm, combine_collapse_norm,
 /// mixfin). The stream dtype is a template (OT): bf16 = the verify barrier's texts, f32 = the
-/// DSpark draft stages' variants (DRAFTRC member tape; the norm weight stays bf16).
+/// DSpark draft stages' variants (DRAFTRC member tape; the norm weight stays bf16). The f32
+/// stream's fused call on a bf16 residual is its own route (`HcTapeMixed`).
 pub fn HcTape(comptime G: type) type {
     return struct {
         const Self = @This();
         combine_e: *const Entry,
         collapse_e: *const Entry,
         fused_e: *const Entry,
-        /// the f32 stream's fused call with a bf16 residual (the draft's stage-0 first ffn prep)
-        fused_rbf16_e: ?*const Entry,
         mixfin_e: *const Entry,
+        combine_p: RowPlans(8),
+        collapse_p: RowPlans(8),
+        fused_p: RowPlans(8),
+        mixfin_p: RowPlans(8),
 
         pub fn init(reg: *const xk.Registry, stream: Dtype, diag: ?*xk.Diag) Refusal!Self {
-            return switch (stream) {
-                .bfloat16 => .{
-                    .combine_e = reg.get(.q3ht_combine),
-                    .collapse_e = reg.get(.q3ht_collapse_norm),
-                    .fused_e = reg.get(.q3ht_combine_collapse_norm),
-                    .fused_rbf16_e = null,
-                    .mixfin_e = reg.get(.q3ht_mixfin),
-                },
-                .float32 => .{
-                    .combine_e = reg.get(.q3ht_combine__f32),
-                    .collapse_e = reg.get(.q3ht_collapse_norm__f32),
-                    .fused_e = reg.get(.q3ht_combine_collapse_norm__f32),
-                    .fused_rbf16_e = reg.get(.q3ht_combine_collapse_norm__f32_rbf16),
-                    .mixfin_e = reg.get(.q3ht_mixfin),
-                },
-                else => refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries bf16 and f32", .{stream}),
+            const ce, const le, const fe = switch (stream) {
+                .bfloat16 => .{ reg.get(.q3ht_combine), reg.get(.q3ht_collapse_norm), reg.get(.q3ht_combine_collapse_norm) },
+                .float32 => .{ reg.get(.q3ht_combine__f32), reg.get(.q3ht_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32) },
+                else => return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: HCTAPE stream {t} (OT): the registry carries bf16 and f32", .{stream}),
+            };
+            const me = reg.get(.q3ht_mixfin);
+            return .{
+                .combine_e = ce,
+                .collapse_e = le,
+                .fused_e = fe,
+                .mixfin_e = me,
+                .combine_p = try .init(ce, diag),
+                .collapse_p = try .init(le, diag),
+                .fused_p = try .init(fe, diag),
+                .mixfin_p = try .init(me, diag),
             };
         }
 
         /// x [M, D], r [M, 4, D], post [M, 4] f32, comb [M, 16] f32 -> h [M, 4, D].
         pub fn combine(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T) !G.T {
-            const vars = rowsVars(rowsOf(G, g, x, 0));
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.combine_e, &vars, &.{ x, r, post, comb }, &out);
+            try self.combine_p.launch(G, g, rowsOf(G, g, x, 0), &.{ x, r, post, comb }, &out);
             return out[0];
         }
 
         /// s [M, 4, D], pre [M, 4] f32, w [D] -> (sf [M, 4 D] f32, ssq [M] f32, y [M, D]).
         pub fn collapseNorm(self: *const Self, g: *G, s: G.T, pre: G.T, w: G.T) ![3]G.T {
-            const vars = rowsVars(rowsOf(G, g, s, 0));
             var out: [3]G.T = undefined;
-            try launchRule(G, g, self.collapse_e, &vars, &.{ s, pre, w }, &out);
+            try self.collapse_p.launch(G, g, rowsOf(G, g, s, 0), &.{ s, pre, w }, &out);
             return out;
         }
 
         /// -> (h [M, 4, D], hf [M, 4 D] f32, ssq [M] f32, y [M, D]).
         pub fn combineCollapseNorm(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T, pre: G.T, w: G.T) ![4]G.T {
-            const vars = rowsVars(rowsOf(G, g, x, 0));
             var out: [4]G.T = undefined;
-            try launchRule(G, g, self.fused_e, &vars, &.{ x, r, post, comb, pre, w }, &out);
-            return out;
-        }
-
-        /// The f32 stream's fused call on a bf16 residual r [M, 4, D] (x f32): the draft's stage-0
-        /// first ffn prep. A bf16-stream route has no such call (TemplateNotRegistered).
-        pub fn combineCollapseNormResidualBf16(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T, pre: G.T, w: G.T) ![4]G.T {
-            const e = self.fused_rbf16_e orelse return error.TemplateNotRegistered;
-            const vars = rowsVars(rowsOf(G, g, x, 0));
-            var out: [4]G.T = undefined;
-            try launchRule(G, g, e, &vars, &.{ x, r, post, comb, pre, w }, &out);
+            try self.fused_p.launch(G, g, rowsOf(G, g, x, 0), &.{ x, r, post, comb, pre, w }, &out);
             return out;
         }
 
         /// mm [M, 24] f32, ssq [M] f32, scale [3] f32, base [24] f32 -> (pre [M, 4], post [M, 4], comb [M, 16]) f32.
         pub fn mixfin(self: *const Self, g: *G, mm: G.T, ssq: G.T, scale: G.T, base: G.T) ![3]G.T {
-            const vars = rowsVars(rowsOf(G, g, mm, 0));
             var out: [3]G.T = undefined;
-            try launchRule(G, g, self.mixfin_e, &vars, &.{ mm, ssq, scale, base }, &out);
+            try self.mixfin_p.launch(G, g, rowsOf(G, g, mm, 0), &.{ mm, ssq, scale, base }, &out);
+            return out;
+        }
+    };
+}
+
+/// The f32 stream's fused call on a bf16 residual (x f32, r [M, 4, D] bf16: the DSpark draft's
+/// stage-0 first ffn prep): `q3ht_combine_collapse_norm__f32_rbf16`, its own route so that no
+/// call checks which stream it serves.
+pub fn HcTapeMixed(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        fused_p: RowPlans(8),
+
+        pub fn init(reg: *const xk.Registry, diag: ?*xk.Diag) Refusal!Self {
+            return .{ .fused_p = try .init(reg.get(.q3ht_combine_collapse_norm__f32_rbf16), diag) };
+        }
+
+        /// -> (h [M, 4, D] f32, hf [M, 4 D] f32, ssq [M] f32, y [M, D] f32).
+        pub fn call(self: *const Self, g: *G, x: G.T, r: G.T, post: G.T, comb: G.T, pre: G.T, w: G.T) ![4]G.T {
+            var out: [4]G.T = undefined;
+            try self.fused_p.launch(G, g, rowsOf(G, g, x, 0), &.{ x, r, post, comb, pre, w }, &out);
             return out;
         }
     };
@@ -569,6 +612,10 @@ pub fn FusedProj(comptime G: type) type {
         rms_statics: Statics(G),
         rope_statics: Statics(G),
         ints: [max_rows]G.T,
+        rms_p: RowPlans(max_rows),
+        rms_rope_p: RowPlans(max_rows),
+        fwd_p: RowPlans(max_rows),
+        inv_p: RowPlans(max_rows),
 
         /// `q_norm` / `kv_norm`: the layer's q_norm (bf16 [1280]) and kv_norm (bf16 [512]) weights.
         pub fn init(g: *G, reg: *const xk.Registry, q_norm: G.T, kv_norm: G.T, diag: ?*xk.Diag) !Self {
@@ -576,7 +623,10 @@ pub fn FusedProj(comptime G: type) type {
             const rms_rope = reg.get(.mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64);
             try expectInput(G, g, rms, "weight", q_norm, &no_vars, diag);
             try expectInput(G, g, rms_rope, "weight", kv_norm, &no_vars, diag);
-            var s: Self = .{ .rms = rms, .rms_rope = rms_rope, .fwd = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd), .inv = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_inv), .q_norm = undefined, .kv_norm = undefined, .rms_statics = try Statics(G).init(g, rms), .rope_statics = undefined, .ints = undefined };
+            const fwd = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd);
+            const inv = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_inv);
+            var s: Self = .{ .rms = rms, .rms_rope = rms_rope, .fwd = fwd, .inv = inv, .q_norm = undefined, .kv_norm = undefined, .rms_statics = undefined, .rope_statics = undefined, .ints = undefined, .rms_p = try .init(rms, diag), .rms_rope_p = try .init(rms_rope, diag), .fwd_p = try .init(fwd, diag), .inv_p = try .init(inv, diag) };
+            s.rms_statics = try Statics(G).init(g, rms);
             errdefer s.rms_statics.deinit(g);
             s.rope_statics = try Statics(G).init(g, rms_rope);
             errdefer s.rope_statics.deinit(g);
@@ -621,7 +671,7 @@ pub fn FusedProj(comptime G: type) type {
         pub fn qNorm(self: *const Self, g: *G, x: G.T) !G.T {
             const sh, const rows = try rowsIn(g, x, 1280);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.rms, &rowsVars(rows), &.{ try g.reshape(x, &.{ @intCast(rows), 1280 }), self.q_norm, self.rms_statics.arrays[2] }, &out);
+            try self.rms_p.launch(G, g, rows, &.{ try g.reshape(x, &.{ @intCast(rows), 1280 }), self.q_norm, self.rms_statics.arrays[2] }, &out);
             return g.reshape(out[0], sh.slice());
         }
 
@@ -629,10 +679,8 @@ pub fn FusedProj(comptime G: type) type {
         pub fn kvNormRope(self: *const Self, g: *G, x: G.T, cos: G.T, sin: G.T) !G.T {
             const sh, const rows = try rowsIn(g, x, 512);
             const seq = try seqOf(g, cos, rows);
-            var vars = rowsVars(rows);
-            vars.set(.seq, seq);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.rms_rope, &vars, &.{ try g.reshape(x, &.{ @intCast(rows), 512 }), self.kv_norm, self.rope_statics.arrays[2], cos, sin, self.ints[seq - 1] }, &out);
+            try self.rms_rope_p.launch(G, g, rows, &.{ try g.reshape(x, &.{ @intCast(rows), 512 }), self.kv_norm, self.rope_statics.arrays[2], cos, sin, self.ints[seq - 1] }, &out);
             return g.reshape(out[0], sh.slice());
         }
 
@@ -640,11 +688,9 @@ pub fn FusedProj(comptime G: type) type {
         pub fn ropeHeads(self: *const Self, g: *G, x: G.T, cos: G.T, sin: G.T, dir: RopeDir) !G.T {
             const sh, const rows = try rowsIn(g, x, 64 * 512);
             const seq = try seqOf(g, cos, rows);
-            var vars = rowsVars(rows);
-            vars.set(.seq, seq);
             var out: [1]G.T = undefined;
-            const e = if (dir == .fwd) self.fwd else self.inv;
-            try launchRule(G, g, e, &vars, &.{ try g.reshape(x, &.{ @intCast(rows), 64, 512 }), cos, sin, self.ints[rows - 1], self.ints[seq - 1] }, &out);
+            const p = if (dir == .fwd) &self.fwd_p else &self.inv_p;
+            try p.launch(G, g, rows, &.{ try g.reshape(x, &.{ @intCast(rows), 64, 512 }), cos, sin, self.ints[rows - 1], self.ints[seq - 1] }, &out);
             return g.reshape(out[0], sh.slice());
         }
     };
@@ -689,13 +735,17 @@ pub fn Gemv(comptime G: type) type {
         dn: *const Entry,
         gu_statics: Statics(G),
         dn_statics: Statics(G),
+        gu_p: RowPlans(48),
+        dn_p: RowPlans(48),
 
         pub fn init(g: *G, reg: *const xk.Registry) !Self {
             const gu = reg.get(.dsv41_exl3_mul1h_k3_2304);
             const dn = reg.get(.dsv41_exl3_mul1h_k3_5120);
+            const gu_p: RowPlans(48) = try .init(gu, null);
+            const dn_p: RowPlans(48) = try .init(dn, null);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn) };
+            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -706,16 +756,14 @@ pub fn Gemv(comptime G: type) type {
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's
         /// bank code -> z [rows, out] f32 (gate / up: out 2304, down: out 5120).
         pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T) !G.T {
-            const e, const st = if (proj == .down) .{ self.dn, &self.dn_statics } else .{ self.gu, &self.gu_statics };
-            var vars = rowsVars(rowsOf(G, g, xh, 0));
-            vars.set(.cap, rowsOf(G, g, code, 0));
+            const e, const st, const p = if (proj == .down) .{ self.dn, &self.dn_statics, &self.dn_p } else .{ self.gu, &self.gu_statics, &self.gu_p };
             var ins: [9]G.T = undefined;
             ins[0] = xh;
             ins[1] = ids;
             ins[2] = code;
             for (3..e.inputs.len) |i| ins[i] = st.arrays[i];
             var out: [1]G.T = undefined;
-            try launchRule(G, g, e, &vars, ins[0..e.inputs.len], &out);
+            try p.launch(G, g, rowsOf(G, g, xh, 0), ins[0..e.inputs.len], &out);
             return out[0];
         }
     };
@@ -729,46 +777,42 @@ pub fn RinPrep(comptime G: type) type {
         gu_epi_e: *const Entry,
         din_rin_e: *const Entry,
         dpost_e: *const Entry,
+        in_rin_p: RowPlans(48),
+        gu_epi_p: RowPlans(48),
+        din_rin_p: RowPlans(48),
+        dpost_p: RowPlans(48),
 
-        pub fn init(reg: *const xk.Registry) Self {
-            return .{ .in_rin_e = reg.get(.q3_exl3_prep_in_rin), .gu_epi_e = reg.get(.q3_exl3_prep_gu_epi), .din_rin_e = reg.get(.q3_exl3_prep_din_rin), .dpost_e = reg.get(.q3_moeprep_dpost) };
+        pub fn init(reg: *const xk.Registry) Refusal!Self {
+            const a, const b, const c, const d = .{ reg.get(.q3_exl3_prep_in_rin), reg.get(.q3_exl3_prep_gu_epi), reg.get(.q3_exl3_prep_din_rin), reg.get(.q3_moeprep_dpost) };
+            return .{ .in_rin_e = a, .gu_epi_e = b, .din_rin_e = c, .dpost_e = d, .in_rin_p = try .init(a, null), .gu_epi_p = try .init(b, null), .din_rin_p = try .init(c, null), .dpost_p = try .init(d, null) };
         }
 
         /// x [tokens, 5120] bf16, tok [rows] i32, rg / ru = gate / up rin, ids [rows] u32 ->
         /// (xg, xu) [rows, 5120] f32 = t128(x[tok] * rin[ids]).
         pub fn inRin(self: *const Self, g: *G, x: G.T, tok: G.T, rg: G.T, ru: G.T, ids: G.T) ![2]G.T {
-            var vars = rowsVars(rowsOf(G, g, tok, 0));
-            vars.set(.m_tokens, rowsOf(G, g, x, 0));
-            vars.set(.cap, rowsOf(G, g, rg, 0));
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.in_rin_e, &vars, &.{ x, tok, rg, ru, ids }, &out);
+            try self.in_rin_p.launch(G, g, rowsOf(G, g, tok, 0), &.{ x, tok, rg, ru, ids }, &out);
             return out;
         }
 
         /// zg / zu [rows, 2304] f32, rg / ru = gate / up rout -> clamped SwiGLU [rows, 2304] f32.
         pub fn guEpi(self: *const Self, g: *G, zg: G.T, zu: G.T, rg: G.T, ru: G.T, ids: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, zg, 0));
-            vars.set(.cap, rowsOf(G, g, rg, 0));
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.gu_epi_e, &vars, &.{ zg, zu, rg, ru, ids }, &out);
+            try self.gu_epi_p.launch(G, g, rowsOf(G, g, zg, 0), &.{ zg, zu, rg, ru, ids }, &out);
             return out[0];
         }
 
         /// hid [rows, 2304] f32, rn = down rin -> t128(hid * rin[ids]) [rows, 2304] f32.
         pub fn dinRin(self: *const Self, g: *G, hid: G.T, rn: G.T, ids: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, hid, 0));
-            vars.set(.cap, rowsOf(G, g, rn, 0));
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.din_rin_e, &vars, &.{ hid, rn, ids }, &out);
+            try self.din_rin_p.launch(G, g, rowsOf(G, g, hid, 0), &.{ hid, rn, ids }, &out);
             return out[0];
         }
 
         /// zd [rows, 5120] f32, rd = down rout -> t128(zd) * rout[ids] [rows, 5120] f32.
         pub fn dpost(self: *const Self, g: *G, zd: G.T, rd: G.T, ids: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, zd, 0));
-            vars.set(.cap, rowsOf(G, g, rd, 0));
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.dpost_e, &vars, &.{ zd, rd, ids }, &out);
+            try self.dpost_p.launch(G, g, rowsOf(G, g, zd, 0), &.{ zd, rd, ids }, &out);
             return out[0];
         }
     };
@@ -799,7 +843,6 @@ pub fn Rebuild(comptime G: type) type {
         pub fn call(self: *const Self, g: *G, gate: ProjArrays(G.T), up: ProjArrays(G.T), down: ProjArrays(G.T), slots: G.T, experts: u32) ![3]G.T {
             var vars: Vars = .initFill(0);
             vars.set(.experts, experts);
-            vars.set(.cap, rowsOf(G, g, gate.code, 0));
             var out: [3]G.T = undefined;
             try launchRule(G, g, self.e, &vars, &.{ gate.code, gate.rout, gate.rin, up.code, up.rout, up.rin, down.code, down.rout, down.rin, slots }, &out);
             return out;
@@ -869,7 +912,6 @@ pub fn DigX(comptime G: type) type {
         pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32) ![2]G.T {
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
-            vars.set(.cap, rowsOf(G, g, code_g, 0));
             var out: [2]G.T = undefined;
             try launchRule(G, g, self.gemm_gu, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
             return out;
@@ -879,7 +921,6 @@ pub fn DigX(comptime G: type) type {
         pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32) !G.T {
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
-            vars.set(.cap, rowsOf(G, g, code_d, 0));
             var out: [1]G.T = undefined;
             try launchRule(G, g, self.gemm_dn, &vars, &.{ x, code_d, tbl }, &out);
             return out[0];
@@ -888,9 +929,7 @@ pub fn DigX(comptime G: type) type {
         /// act [A, 5120] bf16 rows ridx [rows] i32, rhs [rows] u32 (expert per row), slots = a
         /// table -> (f16(t128(act * rin_g[slot])), f16(t128(act * rin_u[slot]))) [rows, 1, 5120].
         pub fn take2(self: *const Self, g: *G, act: G.T, ridx: G.T, rhs: G.T, slots: G.T, rin_g: G.T, rin_u: G.T) ![2]G.T {
-            var vars = rowsVars(rowsOf(G, g, ridx, 0));
-            vars.set(.a_rows, rowsOf(G, g, act, 0));
-            vars.set(.cap, rowsOf(G, g, rin_g, 0));
+            const vars = rowsVars(rowsOf(G, g, ridx, 0));
             var out: [2]G.T = undefined;
             try launchRule(G, g, self.take2_e, &vars, &.{ act, ridx, rhs, slots, rin_g, rin_u }, &out);
             return out;
@@ -898,8 +937,7 @@ pub fn DigX(comptime G: type) type {
 
         /// act [rows, 1, 2304] f32 -> f16(t128(act * rin_d[slot])) [rows, 1, 2304].
         pub fn roundx(self: *const Self, g: *G, act: G.T, rhs: G.T, slots: G.T, rin_d: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, act, 0));
-            vars.set(.cap, rowsOf(G, g, rin_d, 0));
+            const vars = rowsVars(rowsOf(G, g, act, 0));
             var out: [1]G.T = undefined;
             try launchRule(G, g, self.roundx_e, &vars, &.{ act, rhs, slots, rin_d }, &out);
             return out[0];
@@ -907,8 +945,7 @@ pub fn DigX(comptime G: type) type {
 
         /// zg / zu [rows, 2304] f32 -> hd = f16(t128(clamped SwiGLU(t128(zg) rout_g, t128(zu) rout_u) rin_d)) [rows, 1, 2304].
         pub fn onePass(self: *const Self, g: *G, zg: G.T, zu: G.T, rhs: G.T, tbl: G.T, rout_g: G.T, rout_u: G.T, rin_d: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, zg, 0));
-            vars.set(.cap, rowsOf(G, g, rout_g, 0));
+            const vars = rowsVars(rowsOf(G, g, zg, 0));
             var out: [1]G.T = undefined;
             try launchRule(G, g, self.onepass_e, &vars, &.{ zg, zu, rhs, tbl, rout_g, rout_u, rin_d }, &out);
             return out[0];
@@ -916,8 +953,7 @@ pub fn DigX(comptime G: type) type {
 
         /// act_g / act_u [rows, 2304] f32 -> t128(act) * rout[slot] [rows, 1, 2304] f32 each.
         pub fn widen2(self: *const Self, g: *G, act_g: G.T, act_u: G.T, rhs: G.T, slots: G.T, rout_g: G.T, rout_u: G.T) ![2]G.T {
-            var vars = rowsVars(rowsOf(G, g, act_g, 0));
-            vars.set(.cap, rowsOf(G, g, rout_g, 0));
+            const vars = rowsVars(rowsOf(G, g, act_g, 0));
             var out: [2]G.T = undefined;
             try launchRule(G, g, self.widen2_e, &vars, &.{ act_g, act_u, rhs, slots, rout_g, rout_u }, &out);
             return out;
@@ -925,8 +961,7 @@ pub fn DigX(comptime G: type) type {
 
         /// act [rows, 5120] f32 -> t128(act) * rout_d[slot] [rows, 1, 5120] f32.
         pub fn widen1(self: *const Self, g: *G, act: G.T, rhs: G.T, slots: G.T, rout_d: G.T) !G.T {
-            var vars = rowsVars(rowsOf(G, g, act, 0));
-            vars.set(.cap, rowsOf(G, g, rout_d, 0));
+            const vars = rowsVars(rowsOf(G, g, act, 0));
             var out: [1]G.T = undefined;
             try launchRule(G, g, self.widen1_e, &vars, &.{ act, rhs, slots, rout_d }, &out);
             return out[0];
@@ -1667,7 +1702,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         }
     }
     {
-        const r = RinPrep(Trace).init(&reg);
+        const r = try RinPrep(Trace).init(&reg);
         for (r.in_rin_e.samples) |*s| {
             const e, const v = .{ r.in_rin_e, &s.vars };
             const x, const tok, const rg, const ru, const ids = .{ try t.arg(e, "x", v), try t.arg(e, "tok", v), try t.arg(e, "rg", v), try t.arg(e, "ru", v), try t.arg(e, "ids", v) };
@@ -2379,6 +2414,7 @@ test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the l
     {
         const ce, const le, const fe, const fr = .{ reg.get(.q3ht_combine__f32), reg.get(.q3ht_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32), reg.get(.q3ht_combine_collapse_norm__f32_rbf16) };
         const r = try HcTape(Trace).init(&reg, .float32, &diag);
+        const mixed = try HcTapeMixed(Trace).init(&reg, &diag);
         for (ce.samples) |*s| {
             const v = &s.vars;
             const x, const rr, const post, const comb = .{ try t.arg(ce, "x", v), try t.arg(ce, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v) };
@@ -2390,12 +2426,9 @@ test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the l
             try expectLaunch(t.back(1), le, sampleAt(le, null, v.get(.rows)), &.{ rr, pre, w });
             _ = try r.combineCollapseNorm(&t, x, rr, post, comb, pre, w);
             try expectLaunch(t.back(1), fe, sampleAt(fe, null, v.get(.rows)), &.{ x, rr, post, comb, pre, w });
-            _ = try r.combineCollapseNormResidualBf16(&t, x, rb, post, comb, pre, w);
+            _ = try mixed.call(&t, x, rb, post, comb, pre, w);
             try expectLaunch(t.back(1), fr, sampleAt(fr, null, v.get(.rows)), &.{ x, rb, post, comb, pre, w });
         }
-        const b = try HcTape(Trace).init(&reg, .bfloat16, &diag);
-        const v = &ce.samples[0].vars;
-        try testing.expectError(error.TemplateNotRegistered, b.combineCollapseNormResidualBf16(&t, try t.arg(ce, "x", v), try t.arg(fr, "r", v), try t.arg(ce, "post", v), try t.arg(ce, "comb", v), try t.arg(fe, "pre", v), try t.arg(fe, "w", v)));
     }
     // every DRAFTRC entry is some route's
     var hit: std.EnumSet(Kernel) = .empty;
@@ -2408,4 +2441,48 @@ test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the l
     try testing.expectError(error.TemplateNotRegistered, DraftProj(Trace).init(&t, &reg, .wq_a, .float16, w, sc, &diag));
     try testing.expectError(error.RouteInput, DraftProj(Trace).init(&t, &reg, .main_proj, .float32, w, sc, &diag));
     try testing.expectEqual(@as(isize, 0), t.keeps);
+}
+
+fn expectRowPlans(comptime n: usize, e: *const Entry) !usize {
+    const p = try RowPlans(n).init(e, null);
+    for (1..n + 1) |m| {
+        const want = try xk.launchFor(e, &rowsVars(m), null);
+        try testing.expect(std.meta.eql(want, (try p.at(m)).*));
+    }
+    try testing.expectError(error.RowsOutOfPlan, p.at(0));
+    try testing.expectError(error.RowsOutOfPlan, p.at(n + 1));
+    return n;
+}
+
+test "dsv41 kernels ops: the prebuilt per-M launches are the per-call launches they replace (every decode rule kernel, every M)" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var entries: usize = 0;
+    var launches: usize = 0;
+    for (&reg.entries) |*e| {
+        if (e.launch != .rule) continue;
+        const b = e.bounds.get(.rows) orelse continue;
+        launches += switch (b[1]) {
+            8 => try expectRowPlans(8, e),
+            48 => try expectRowPlans(48, e),
+            else => continue, // prefill rules (rows up to 2^20): their launch stays per call
+        };
+        entries += 1;
+    }
+    // router 2 + 2 draft, premix 2, HCTAPE 4 + 3 draft (+ the mixed one), K36 4, GEMV 2, PREP 4
+    try testing.expectEqual(@as(usize, 24), entries);
+    try testing.expect(launches >= 6 * 48 + 18 * 8);
+    // a route refuses M outside its table before any launch
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    const pe, const te = .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) };
+    var r = try Router(Trace).init(&t, &reg, try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars), null);
+    defer r.deinit(&t);
+    try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .float32, &.{})));
+    var gv = try Gemv(Trace).init(&t, &reg);
+    defer gv.deinit(&t);
+    const ge = reg.get(.dsv41_exl3_mul1h_k3_2304);
+    const s = &ge.samples[0];
+    try testing.expectError(error.RowsOutOfPlan, gv.project(&t, .gate, try t.node(&.{ 49, 5120 }, .float32, &.{}), try t.node(&.{49}, .uint32, &.{}), try t.arg(ge, "code", &s.vars)));
+    try testing.expectEqual(@as(usize, 0), t.launches.items.len);
 }
