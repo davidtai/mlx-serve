@@ -780,6 +780,12 @@ const CellReceipt = struct {
     decode_stream: ?StreamPhase = null,
     /// Set by a decode-profile run only (not a timed cell: its stamps sit in the loop).
     decode_profile: ?[]const ProfCycle = null,
+    /// The prefill ladder's routes the Module was built with (null = the setting's default, off).
+    layer_major: ?bool = null,
+    event_gates: ?bool = null,
+    wide_feed: ?bool = null,
+    wide_depth: ?u8 = null,
+    wide_cold_rows: ?u8 = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -828,12 +834,40 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     defer md.deinit();
     memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
 
+    // Either arm the configuration builds: host waits (the served default) or event gates (C6).
+    switch (md.arm) {
+        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path }),
+    }
+}
+
+const CellCtx = struct {
+    a: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    md: *module.Module,
+    config: *const model.ModelConfig,
+    prompt: []const u32,
+    delta: f64,
+    max_tokens: u32,
+    case_id: ?[]const u8,
+    prompt_path: []const u8,
+    out_path: []const u8,
+};
+
+/// The timed cell over the Module's arm (`arm` the host-waits or the event-gated one).
+fn cellRun(arm: anytype, cx: CellCtx) !void {
+    const a = cx.a;
+    const gpa = cx.gpa;
+    const io = cx.io;
+    const md = cx.md;
+    const config = cx.config;
+    const prompt = cx.prompt;
+    const delta = cx.delta;
+    const max_tokens = cx.max_tokens;
+    const case_id = cx.case_id;
+    const prompt_path = cx.prompt_path;
+    const out_path = cx.out_path;
     const g = &md.g;
-    // The host-waits arm (the served default: no event gates configured).
-    const arm = switch (md.arm) {
-        .host_waits => |t| t.arm,
-        else => return error.CellArmVariant,
-    };
     const L = dsl.Loop(ops.MlxOps);
     // The request's bounded lanes: the prompt, the token cap, one verify block (Module.prefill's rule).
     var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(prompt.len, prompt.len + max_tokens)));
@@ -942,6 +976,11 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
         // The decode window starts at the prompt's end: it includes the phase change's grow.
         .decode_stream = StreamPhase.of(s_prompt, s_end),
         .decode_profile = if (profile) prof.items else null,
+        .layer_major = config.layer_major_prefill,
+        .event_gates = config.expert_event_gates,
+        .wide_feed = config.expert_wide_feed,
+        .wide_depth = config.expert_wide_depth,
+        .wide_cold_rows = config.expert_wide_cold_rows,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -969,6 +1008,29 @@ fn cellConfig(config: *model.ModelConfig) !void {
     config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
     config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
     if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    // The prefill ladder's routes (all off by default; the Module refuses what it cannot build):
+    // K16 layer-major, the wide read schedule's feed and depth, the cold rows on the decode GEMV.
+    if (envStr("DSV41_CELL_LAYER_MAJOR")) |v| config.layer_major_prefill = try cellBool("DSV41_CELL_LAYER_MAJOR", v);
+    // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
+    if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
+    if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
+    if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
+        const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
+        if (d < 1 or d > 2) return error.CellWideDepth;
+        config.expert_wide_depth = d;
+    }
+    if (envStr("DSV41_CELL_WIDE_COLD_ROWS")) |v| {
+        const r = std.fmt.parseInt(u8, v, 10) catch return error.CellWideColdRows;
+        if (r > 8) return error.CellWideColdRows;
+        config.expert_wide_cold_rows = r;
+    }
+}
+
+fn cellBool(comptime name: []const u8, v: []const u8) !bool {
+    if (std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "0")) return false;
+    std.debug.print("dsv41 served cell: {s}={s} (0 or 1)\n", .{ name, v });
+    return error.CellBoolValue;
 }
 
 /// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
@@ -1001,15 +1063,17 @@ pub const CellBill = struct {
     draft_wave: u64,
     /// The admission's host reserve (pools, tables, the token map, the process).
     host_reserve: u64,
+    /// The wide read schedule's depth window (the admission's `wide_window_bytes`: process lifetime).
+    wide_window: u64 = 0,
     /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in both phases.
     unbilled_overhead: u64 = unbilled_process_overhead_bytes,
 
     pub fn prefillTotal(b: CellBill) u64 {
-        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead;
+        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window;
     }
 
     pub fn decodeTotal(b: CellBill) u64 {
-        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.unbilled_overhead;
+        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.unbilled_overhead + b.wide_window;
     }
 
     pub fn processBound(b: CellBill) u64 {
@@ -1064,13 +1128,15 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
         .residents = m.totalBytes(),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes() + engram.row_cache_host_bytes,
-        .prefill_wave = bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        // K16 (the layer-major route) bills its own wave: every chunk's kept state + one sub-wave.
+        .prefill_wave = (if (config.layer_major_prefill orelse false) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served)) / 4 * 5,
         .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
         .decode_wave = decode_wave,
         .draft_wave = decode_wave,
         .host_reserve = p.inputs.host_reserve_bytes,
+        .wide_window = p.inputs.wide_window_bytes,
     };
 }
 
@@ -1092,6 +1158,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
+        .{ .name = "wide read window (depth 2)", .p = b.wide_window, .d = b.wide_window },
         .{ .name = "unbilled process overhead (measured, unattributed)", .p = b.unbilled_overhead, .d = b.unbilled_overhead },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
@@ -1302,6 +1369,8 @@ test "dsv41 served cell: the window's inputs pass on the host (the standard prom
     // The admission inputs come from the runner's environment (refused by name without them).
     var cfg = inputs.config;
     if (std.c.getenv("DSV41_CELL_BASELINE_GB") == null) try testing.expectError(error.CellBaselineMissing, cellConfig(&cfg));
+    try testing.expectError(error.CellBoolValue, cellBool("X", "yes"));
+    try testing.expect(try cellBool("X", "1") and !try cellBool("X", "0"));
     const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_source = "x", .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
     const json = try std.json.Stringify.valueAlloc(a, rec, .{});
     try testing.expect(std.mem.indexOf(u8, json, "\"decode_rows_per_layer\":2") != null);
