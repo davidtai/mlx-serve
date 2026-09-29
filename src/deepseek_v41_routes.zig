@@ -84,6 +84,7 @@ pub const served: Tier = blk: {
     t.routes.rc_premix = true; // C13 RCTAIL hcpremix (rows <= 8)
     t.routes.rc_proj = true; // C14 RCPROJ mxfp8 + woarc (rows <= 8); W97 left the levers with it
     t.routes.rc_tape = true; // C15 HCTAPE all (rows <= 8, over C14's bf16 stream)
+    t.routes.rc_fused_proj = true; // A9 K36 ATTN_FUSED_PROJ (rows <= 8, beside C14)
     break :blk t;
 };
 
@@ -378,10 +379,11 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.rc_premix = false;
     rc_off.rc_proj = false;
     rc_off.rc_tape = false;
+    rc_off.rc_fused_proj = false;
     // C14 drops W97 (the dense f32 wo_a, 5.37 GB over 40 layers): the tier's arm keeps it.
     rc_off.wo_a_f32 = true;
     try testing.expectEqual(trunk.routes, rc_off);
-    try testing.expect(served.routes.rc_sinkhorn and served.routes.rc_router and served.routes.rc_premix and served.routes.rc_proj and served.routes.rc_tape);
+    try testing.expect(served.routes.rc_sinkhorn and served.routes.rc_router and served.routes.rc_premix and served.routes.rc_proj and served.routes.rc_tape and served.routes.rc_fused_proj);
     try testing.expect(!served.routes.wo_a_f32);
     try testing.expectEqual(trunk.kv, served.kv);
     try testing.expectEqual(trunk.draft_head_bf16, served.draft_head_bf16);

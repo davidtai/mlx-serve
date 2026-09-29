@@ -98,6 +98,10 @@ pub const Routes = struct {
     /// C15: HCTAPE at rows <= 8 (the fused HC combine / collapse / norm tail and the mixes'
     /// split, one weight-free route over the bf16 stream C14 keeps); needs rc_proj.
     rc_tape: bool = false,
+    /// A9 K36 (ATTN_FUSED_PROJ): the projection chain's glue at rows <= 8 as four kernels (the
+    /// q-latent RMSNorm, KV RMSNorm + k_pe RoPE, query RoPE, the output's inverse RoPE to bf16),
+    /// bound per layer over its norm weights; rides C14's route (needs rc_proj).
+    rc_fused_proj: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -200,6 +204,7 @@ pub fn LayerKernels(comptime G: type) type {
         premix_ffn: ?*const kr.Premix(G) = null,
         proj: ?*const RcProjs(G) = null,
         tape: ?*const kr.HcTape(G) = null,
+        fused: ?*const kr.FusedProj(G) = null,
 
         pub fn attnMix(self: Self) MixKernels(G) {
             return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn };
@@ -236,9 +241,11 @@ pub fn Trunk(comptime G: type) type {
             proj: std.ArrayList(RcProjs(G)) = .empty,
             /// C15: the HC tail over the bf16 stream (every layer; weights are call inputs).
             tape: ?kr.HcTape(G) = null,
+            /// A9, per layer: the fused projection glue over its q / kv norm weights.
+            fused: std.ArrayList(kr.FusedProj(G)) = .empty,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -280,6 +287,14 @@ pub fn Trunk(comptime G: type) type {
                     if (c.hidden_size != 5120 or c.hc_mult != 4 or @as(f32, @floatCast(c.rms_norm_eps)) != @as(f32, 1e-20) or @as(f32, @floatCast(c.hc_eps)) != @as(f32, 1e-6)) return error.HcTapeGeometry;
                     k.tape = try kr.HcTape(G).init(g, reg, .bfloat16, null);
                 }
+                if (rt.rc_fused_proj) {
+                    // The glue sits between the RCPROJ projections (bf16 in / out at these rows).
+                    if (!rt.rc_proj) return error.FusedProjNeedsProj;
+                    // Baked: 64 heads x 512, RoPE 64, the q latent 1280 (the kv latent = head_dim).
+                    if (c.n_heads != 64 or c.head_dim != 512 or c.rope_head_dim != 64 or c.q_lora_rank != 1280) return error.FusedProjGeometry;
+                    try k.fused.ensureTotalCapacity(gpa, layers.len);
+                    for (layers) |*w| k.fused.appendAssumeCapacity(kr.FusedProj(G).init(g, reg, w.q_norm, w.kv_norm, null) catch |e| return if (e == error.RouteInput) error.FusedProjGeometry else e);
+                }
                 return k;
             }
 
@@ -289,10 +304,12 @@ pub fn Trunk(comptime G: type) type {
                 for (self.premix.items) |*p| for (p) |*x| x.deinit(g);
                 for (self.proj.items) |*x| x.deinit(g);
                 if (self.tape) |*x| x.deinit(g);
+                for (self.fused.items) |*x| x.deinit(g);
                 if (self.gpa) |a| {
                     self.router.deinit(a);
                     self.premix.deinit(a);
                     self.proj.deinit(a);
+                    self.fused.deinit(a);
                 }
                 self.* = .{};
             }
@@ -305,6 +322,7 @@ pub fn Trunk(comptime G: type) type {
                     .premix_ffn = if (self.premix.items.len > 0) &self.premix.items[l][1] else null,
                     .proj = if (self.proj.items.len > 0) &self.proj.items[l] else null,
                     .tape = if (self.tape) |*x| x else null,
+                    .fused = if (self.fused.items.len > 0) &self.fused.items[l] else null,
                 };
             }
         };
@@ -975,9 +993,18 @@ pub fn Trunk(comptime G: type) type {
             var kv_new: T = undefined;
             if (rc) |pj| {
                 if (std.debug.runtime_safety) std.debug.assert(g.dtypeOf(x) == .bfloat16);
-                qr = try rmsnorm(g, try pj.wq_a.linear(g, x), w.q_norm, c.rms_norm_eps);
-                q = try ropeLast(g, try g.reshape(try pj.wq_b.linear(g, qr), &.{ b, s, H, hd }), cs, false);
-                kv_new = try ropeLast(g, try rmsnorm(g, try pj.wkv.linear(g, x), w.kv_norm, c.rms_norm_eps), cs, false);
+                const qa = try pj.wq_a.linear(g, x);
+                const kva = try pj.wkv.linear(g, x);
+                if (lk.fused) |fp| {
+                    // A9: the glue as the K36 kernels (bf16 stores).
+                    qr = try fp.qNorm(g, qa);
+                    q = try fp.ropeHeads(g, try g.reshape(try pj.wq_b.linear(g, qr), &.{ b, s, H, hd }), cs.cos, cs.sin, .fwd);
+                    kv_new = try fp.kvNormRope(g, kva, cs.cos, cs.sin);
+                } else {
+                    qr = try rmsnorm(g, qa, w.q_norm, c.rms_norm_eps);
+                    q = try ropeLast(g, try g.reshape(try pj.wq_b.linear(g, qr), &.{ b, s, H, hd }), cs, false);
+                    kv_new = try ropeLast(g, try rmsnorm(g, kva, w.kv_norm, c.rms_norm_eps), cs, false);
+                }
             } else if (compiled) {
                 var o: [3]T = undefined;
                 try g.tape(QkvPrep, c, &.{ x, cs.cos, cs.sin, w.q_norm, w.kv_norm, w.wq_a.w, w.wq_a.s, w.wq_b.w, w.wq_b.s, w.wkv.w, w.wkv.s }, &o);
@@ -1022,7 +1049,7 @@ pub fn Trunk(comptime G: type) type {
             try p.put("attn.o", o0);
             if (rc) |pj| {
                 // woarc: the query-RoPE removal to bf16, the grouped wo_a on its packed pair, wo_b.
-                const o1 = try g.astype(try ropeLast(g, o0, cs, true), .bfloat16);
+                const o1 = if (lk.fused) |fp| try fp.ropeHeads(g, o0, cs.cos, cs.sin, .inv) else try g.astype(try ropeLast(g, o0, cs, true), .bfloat16);
                 const o2 = try pj.woa.call(g, try g.reshape(o1, &.{ b * s, -1 }));
                 const out = try pj.wo_b.linear(g, try g.reshape(o2, &.{ b, s, -1 }));
                 try p.put("attn.out", out);
@@ -1794,6 +1821,47 @@ test "dsv41 graph: the HC tape binds over the bf16 stream only, takes the verify
     const o = try Tr.layer(&g, &p, &c, &lrt, lkx.at(0), c.layers[0], w, try Tr.swaInvFreq(&g, &c), try g.input(&.{ 1, 5, 4, 5120 }, bf), try g.input(&.{ 1, 5, 4 }, f32_), try g.arange(0, 5, 1, .int32), &cache, &shared, si);
     try expectShape(&g, o.h, &.{ 1, 5, 4, 5120 }, bf);
     try testing.expectEqual(l1 + 12, g.prepared_launches);
+}
+
+test "dsv41 graph: the K36 fused glue binds per layer beside RCPROJ, takes the verify rows' norms and RoPEs, and leaves prefill widths stock" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const li = c.layers[0];
+    const ws = [_]LayerW(u32){ try traceLayerW(&g, &c, li), try traceLayerW(&g, &c, c.layers[3]) };
+    try testing.expectError(error.FusedProjNeedsProj, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &.{ .rc_fused_proj = true }, &ws));
+    var bad = c;
+    bad.n_heads = 32;
+    try testing.expectError(error.FusedProjGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_fused_proj = true, .rc_proj = true }, &ws));
+    const rt: Routes = .{ .rc_proj = true, .rc_fused_proj = true, .selected_keys = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &ws);
+    defer k.deinit(&g);
+    const lk = k.at(0);
+    try testing.expectEqual(ws[0].q_norm, lk.fused.?.q_norm);
+    try testing.expectEqual(ws[1].kv_norm, k.at(1).fused.?.kv_norm);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
+    var shared: Tr.Share = .{};
+    // Verify rows (5): 5 RCPROJ + 4 glue launches; no eager RMSNorm (rsqrt) in the chain.
+    const l0 = g.prepared_launches;
+    var n0 = g.nodes.items.len;
+    const out = try Tr.attention(&g, &p, &c, &rt, lk, li, &ws[0], inv, try g.input(&.{ 1, 5, 5120 }, .bfloat16), try g.arange(0, 5, 1, .int32), &cache, &shared);
+    try expectShape(&g, out, &.{ 1, 5, 5120 }, .bfloat16);
+    try expectStage(&g, &p, "attn.q", &.{ 1, 5, 64, 512 }, .bfloat16);
+    try expectStage(&g, &p, "attn.kv_new", &.{ 1, 5, 512 }, .bfloat16);
+    try testing.expectEqual(l0 + 9, g.prepared_launches);
+    try testing.expect(noneOf(&g, n0, .rsqrt));
+    // A prefill width: no launch, the eager glue.
+    n0 = g.nodes.items.len;
+    _ = try Tr.attention(&g, &p, &c, &rt, lk, li, &ws[0], inv, try g.input(&.{ 1, 9, 5120 }, .bfloat16), try g.arange(5, 14, 1, .int32), &cache, &shared);
+    try testing.expectEqual(l0 + 9, g.prepared_launches);
+    try testing.expect(!noneOf(&g, n0, .rsqrt));
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {
