@@ -20,40 +20,53 @@ pub const max_rank = 6;
 pub const PrefillBill = struct {
     n_heads: u64,
     index_heads: u64,
+    /// The keys a selected attention row reads (the window and the indexer's top-k).
+    selected_keys: u64,
     /// The chunk rule's smallest positive compression ratio (`prefillScoreBytesPerRow`).
     min_ratio: u64,
-    /// f32 bytes one position adds to the stock tier's lanes (every layer's window history, the sources' lanes).
+    /// f32 bytes one position adds: the stock tier keeps every layer's window history, the served tier's
+    /// window is a ring (its fixed bytes below) and only the sources' compressed and index lanes grow.
     kv_pos_bytes: u64,
-    /// The head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
+    kv_source_pos_bytes: u64,
+    window_ring_bytes: u64,
+    /// The stock head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
     head_promotion_bytes: u64,
     /// The allocator cache the module holds MLX to during the prefill.
     cache_bytes: u64,
 
-    /// Score-sized f32 arrays one attention wave holds (scores, scale, mask, sink column, softmax) and the indexer's.
-    pub const score_copies = 5;
-    pub const index_copies = 3;
+    /// The trunk's attention: the stock tier scores every position (masked full), the served tier the selected keys.
+    pub const Tier = enum { stock, served };
+    /// A score chain runs in its own sub-wave: at most two of its arrays live at once.
+    pub const chain_copies = 2;
     /// A wave's bytes independent of its rows (the grouped wo_a dequantized and cast) and per chunk row.
     pub const wave_fixed_bytes: u64 = 256 << 20;
-    pub const wave_row_bytes: u64 = 4 << 20;
+    pub const wave_row_bytes: u64 = 5 << 20;
+    /// What a prompt forward keeps per position across its chunks (each chunk's hidden and taps until the concat).
+    pub const kept_pos_bytes: u64 = 256 << 10;
     /// `default_chunk_target_bytes` of the chunk rule the model forwards its prompt by.
     pub const chunk_target_bytes: f64 = 8e9;
 
     pub fn of(c: *const Config) PrefillBill {
         var min_ratio: u64 = 0;
         var kv: u64 = 0;
+        var src: u64 = 0;
         for (c.layers[0 .. c.n_layers + c.dspark.n_stages], 0..) |li, l| {
             if (li.ratio > 0 and (min_ratio == 0 or li.ratio < min_ratio)) min_ratio = li.ratio;
             if (l >= c.n_layers) continue;
             kv += @as(u64, c.head_dim) * 4;
             if (li.ratio == 0) continue;
-            if (li.kv_source) kv += @as(u64, c.head_dim) * 4 / li.ratio;
-            if (li.index_source) kv += @as(u64, c.index_head_dim) * 4 / li.ratio;
+            if (li.kv_source) src += @as(u64, c.head_dim) * 4 / li.ratio;
+            if (li.index_source) src += @as(u64, c.index_head_dim) * 4 / li.ratio;
         }
+        kv += src;
         return .{
             .n_heads = c.n_heads,
             .index_heads = c.index_n_heads,
+            .selected_keys = @as(u64, c.window) + c.index_topk,
             .min_ratio = min_ratio,
             .kv_pos_bytes = kv,
+            .kv_source_pos_bytes = src,
+            .window_ring_bytes = @as(u64, c.n_layers) * c.window * c.head_dim * 4,
             .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
             .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
         };
@@ -68,19 +81,29 @@ pub const PrefillBill = struct {
         return @max(1, @min(chunk, seq));
     }
 
-    /// The widest wave of a chunk of `rows` whose attention reads `positions` positions.
-    pub fn waveBytes(b: PrefillBill, rows: u64, positions: u64) u64 {
-        const t = positions + (if (b.min_ratio > 0) positions / b.min_ratio else 0);
-        return wave_fixed_bytes + rows * wave_row_bytes + score_copies * rows * b.n_heads * (t + 1) * 4 +
-            index_copies * rows * b.index_heads * positions * 4;
+    /// The widest wave of a chunk of `rows` whose attention reads `positions` positions: the rows' arrays, the
+    /// widest score chain (the attention's or the indexer's) at its two largest arrays, the earlier chunks' outputs.
+    pub fn waveBytes(b: PrefillBill, rows: u64, positions: u64, tier: Tier) u64 {
+        const keys = switch (tier) {
+            .stock => positions + (if (b.min_ratio > 0) positions / b.min_ratio else 0),
+            .served => b.selected_keys,
+        };
+        const attn = rows * b.n_heads * (keys + 1) * 4;
+        const index = rows * b.index_heads * positions * 4;
+        return wave_fixed_bytes + rows * wave_row_bytes + chain_copies * @max(attn, index) + positions * kept_pos_bytes;
     }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
-    /// a full chunk reading every prompt position), the head's promotion at the logits, the allocator cache.
-    pub fn bytes(b: PrefillBill, seq: u64, max_tokens: u64) u64 {
-        const wave = b.waveBytes(b.chunkRows(seq), seq);
-        const kv = (seq + max_tokens + 8) * b.kv_pos_bytes;
-        return wave / 4 * 5 + kv + b.head_promotion_bytes + b.cache_bytes;
+    /// a full chunk reading every prompt position), the stock head's promotion at the logits, the allocator cache.
+    pub fn bytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
+        const wave = b.waveBytes(b.chunkRows(seq), seq, tier);
+        const positions = seq + max_tokens + 8;
+        const kv = switch (tier) {
+            .stock => positions * b.kv_pos_bytes,
+            .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
+        };
+        const head = if (tier == .stock) b.head_promotion_bytes else 0;
+        return wave / 4 * 5 + kv + head + b.cache_bytes;
     }
 };
 

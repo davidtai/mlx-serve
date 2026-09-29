@@ -348,8 +348,9 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
     try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= 110_000_000_000);
 }
 
-/// The bytes one traced forward `[from, to)` holds under its waves: every node outside the outermost waves plus the
-/// widest outermost wave (its inner waves counted as live at once: an upper bound).
+/// The bytes one traced forward `[from, to)` holds, as MlxOps frees its waves (the model lane's bank accounting):
+/// each outermost wave's nodes, less its nested sub-waves' (released at their reset, their last array kept),
+/// plus the widest sub-wave's two largest arrays live at once; the widest such wave plus the nodes outside all.
 const WaveBound = struct {
     reset: u64,
     outside: u64,
@@ -365,9 +366,29 @@ const WaveBound = struct {
                 if (j != i and v.from <= w.from and w.to <= v.to and (v.from != w.from or v.to != w.to)) break true;
             } else false;
             if (inner) continue;
-            const b = graph.heldBytes(g, w.from, w.to).sum;
-            in_waves += b;
-            widest = @max(widest, b);
+            const all = graph.heldBytes(g, w.from, w.to).sum;
+            in_waves += all;
+            var kept = all;
+            var live: u64 = 0;
+            for (freed) |r| {
+                if (r.from >= w.from and r.to <= w.to and (r.from != w.from or r.to != w.to) and r.to > r.from) {
+                    var a: u64 = 0;
+                    var b: u64 = 0;
+                    var out: u64 = 0;
+                    for (r.from..r.to) |k| {
+                        const x = graph.heldBytes(g, k, k + 1).sum;
+                        if (x == 0) continue;
+                        out = x;
+                        if (x > a) {
+                            b = a;
+                            a = x;
+                        } else if (x > b) b = x;
+                    }
+                    kept = kept - graph.heldBytes(g, r.from, r.to).sum + out;
+                    live = @max(live, a + b);
+                }
+            }
+            widest = @max(widest, kept + live);
         }
         return .{ .reset = total, .outside = total -| in_waves, .widest = widest };
     }
@@ -410,8 +431,6 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     defer g.deinit();
     const TM = mdl.Model(ops.TraceOps);
     const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
-    const model_ = try TM.init(a, &g, c, try routes.parse(&.{}, null), &lookup, &src);
-    defer model_.deinit(&g);
     var kd: xk.Diag = .{};
     var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
     defer reg.deinit();
@@ -425,32 +444,41 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     defer ex.deinit();
     var rid: RandomIds = .{ .n_experts = @intCast(c.n_routed_experts) };
     g.host_values = rid.values();
-    const prompt = try aa.alloc(u32, 2048);
+    const prompt = try aa.alloc(u32, 16384);
     for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
-    // (positions already in the state, rows of the measured forward): the decode lane, the gate's prompt, wide chunks.
-    for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 256 }, .{ 0, 953 }, .{ 0, 2048 }, .{ 1024, 256 }, .{ 1024, 953 } }) |pn| {
-        var st = try model_.newState();
-        defer st.deinit(&g, a);
-        if (pn[0] > 0) {
-            const r0 = try model_.forward(&g, &st, prompt[0..pn[0]], .{ .logits = .none }, &ex, graph.NoProbe{});
-            try TM.fence(&g, &st, &.{r0.hidden});
+    for ([_]struct { name: []const u8, tier: routes.Tier, attn: v41.PrefillBill.Tier }{
+        .{ .name = "stock", .tier = routes.stock, .attn = .stock },
+        .{ .name = "served", .tier = routes.served, .attn = .served },
+    }) |t| {
+        const model_ = try TM.init(a, &g, c, t.tier, &lookup, &src);
+        defer model_.deinit(&g);
+        // (positions already in the state, rows): the decode lane, the gate's prompt, wide chunks, the 16K prompt.
+        for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 953 }, .{ 1024, 953 }, .{ 0, 16384 } }) |pn| {
+            var st = try model_.newState();
+            defer st.deinit(&g, a);
+            if (pn[0] > 0) {
+                const r0 = try model_.forward(&g, &st, prompt[0..pn[0]], .{ .logits = .none }, &ex, graph.NoProbe{});
+                try TM.fence(&g, &st, &.{r0.hidden});
+                try ex.flush();
+                g.reset();
+            }
+            const n = pn[1];
+            const f0 = g.nodes.items.len;
+            const w0 = g.freed.items.len;
+            const r = try model_.forward(&g, &st, prompt[pn[0]..][0..n], .{ .logits = .last }, &ex, graph.NoProbe{});
+            const h = WaveBound.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+            try TM.fence(&g, &st, &.{r.logits.?});
             try ex.flush();
             g.reset();
+            // The widest wave is a whole chunk's: the model's chunk, reading the whole prompt at its end.
+            const chunk = @min(n, bill.chunkRows(pn[0] + n));
+            const billed = bill.waveBytes(chunk, pn[0] + n, t.attn);
+            std.debug.print("\nDSV41_HELD {{\"tier\": \"{s}\", \"positions\": {d}, \"rows\": {d}, \"outside\": {d}, \"widest\": {d}, \"billed\": {d}}}", .{ t.name, pn[0], n, h.outside, h.widest, billed });
+            try std.testing.expect(h.outside + h.widest <= billed);
         }
-        const n = pn[1];
-        const f0 = g.nodes.items.len;
-        const w0 = g.freed.items.len;
-        const r = try model_.forward(&g, &st, prompt[pn[0]..][0..n], .{ .logits = .last }, &ex, graph.NoProbe{});
-        const h = WaveBound.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
-        try TM.fence(&g, &st, &.{r.logits.?});
-        try ex.flush();
-        g.reset();
-        const billed = bill.waveBytes(n, pn[0] + n);
-        std.debug.print("\nDSV41_HELD {{\"positions\": {d}, \"rows\": {d}, \"one_reset\": {d}, \"waves\": {d}, \"billed\": {d}}}", .{ pn[0], n, h.reset, h.outside + h.widest, billed });
-        try std.testing.expect(h.outside + h.widest <= billed);
     }
     // The bill's chunk is the model's.
     for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
         try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));
-    std.debug.print("\nDSV41_PREFILL_BILL {{\"kv_pos_bytes\": {d}, \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}\n", .{ bill.kv_pos_bytes, bill.bytes(64, 32), bill.bytes(16384, 1024), bill.waveBytes(bill.chunkRows(16384), 16384) });
+    inline for (.{ .stock, .served }) |t| std.debug.print("\nDSV41_PREFILL_BILL {{\"tier\": \"{t}\", \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}", .{ @as(v41.PrefillBill.Tier, t), bill.bytes(64, 32, t), bill.bytes(16384, 1024, t), bill.waveBytes(bill.chunkRows(16384), 16384, t) });
 }
