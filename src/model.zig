@@ -3165,11 +3165,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Native DeepSeek-V4.1: the arch's own parse refuses by name; the module
         // (deepseek_v41_module.zig) owns everything past the shell's generic fields.
         var diag: deepseek_v41.Diag = .{};
-        _ = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
+        const v41c = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
             log.err("deepseek_v41: {s}\n", .{diag.message()});
             return e;
         };
         config.model_type = "deepseek_v41";
+        // Routed experts, as deepseek_v4's arm states them: not a batched-decode model.
+        config.num_experts = v41c.n_routed_experts;
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
         config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
@@ -7603,6 +7605,7 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     try testing.expectEqualStrings("deepseek_v41", c.model_type);
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
     try testing.expect(!c.perRequestPrefillChunk());
+    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode());
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
