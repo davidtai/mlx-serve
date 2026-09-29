@@ -26,13 +26,28 @@ pub const Result = struct {
     limit: f64 = 0,
     ok: bool = false,
     err: []const u8 = "",
+    /// the latched MLX message of a raised check (owned by the Report); "" otherwise
+    msg: []const u8 = "",
 };
 
 pub const Report = struct {
     results: std.ArrayList(Result) = .empty,
+    /// the copies of the latched MLX messages the results point at
+    msgs: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *Report, a: Allocator) void {
+        for (self.msgs.items) |m| a.free(m);
+        self.msgs.deinit(a);
         self.results.deinit(a);
+    }
+
+    /// Records a check that raised: its error name and the latched MLX message (copied).
+    pub fn appendRaised(self: *Report, a: Allocator, k: Kernel, c: Check, err: anyerror, msg: []const u8) !void {
+        try self.msgs.ensureUnusedCapacity(a, 1);
+        try self.results.ensureUnusedCapacity(a, 1);
+        const copy = try a.dupe(u8, msg);
+        self.msgs.appendAssumeCapacity(copy);
+        self.results.appendAssumeCapacity(.{ .kernel = k, .check = c, .ok = false, .err = @errorName(err), .msg = copy });
     }
 
     pub fn failures(self: *const Report) usize {
@@ -45,10 +60,32 @@ pub const Report = struct {
     pub fn writeJsonLines(self: *const Report, a: Allocator) ![]u8 {
         var j: std.ArrayList(u8) = .empty;
         errdefer j.deinit(a);
-        for (self.results.items) |r| try j.print(a, "{{\"kernel\":\"{t}\",\"check\":\"{t}\",\"site\":\"{s}\",\"words\":{d},\"bad\":{d},\"metric\":{e},\"limit\":{e},\"ok\":{},\"err\":\"{s}\"}}\n", .{ r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.ok, r.err });
+        for (self.results.items) |r| {
+            try j.print(a, "{{\"kernel\":\"{t}\",\"check\":\"{t}\",\"site\":\"{s}\",\"words\":{d},\"bad\":{d},\"metric\":{e},\"limit\":{e},\"ok\":{},\"err\":\"{s}\"", .{ r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.ok, r.err });
+            // a raised check carries the MLX message (a line without one is byte-identical to before)
+            if (r.msg.len > 0) {
+                try j.appendSlice(a, ",\"msg\":\"");
+                try appendJsonEscaped(&j, a, r.msg);
+                try j.append(a, '"');
+            }
+            try j.appendSlice(a, "}\n");
+        }
         return j.toOwnedSlice(a);
     }
 };
+
+/// `s` as the body of a JSON string: quote, backslash and control bytes escaped.
+fn appendJsonEscaped(j: *std.ArrayList(u8), a: Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try j.appendSlice(a, "\\\""),
+        '\\' => try j.appendSlice(a, "\\\\"),
+        '\n' => try j.appendSlice(a, "\\n"),
+        '\t' => try j.appendSlice(a, "\\t"),
+        '\r' => try j.appendSlice(a, "\\r"),
+        0...8, 11, 12, 14...0x1f, 0x7f => try j.print(a, "\\u{x:0>4}", .{c}),
+        else => try j.append(a, c),
+    };
+}
 
 /// Which (kernel, check) pairs this executor implements; the host test holds the manifest to it.
 pub fn implemented(k: Kernel, c: Check) bool {
@@ -103,7 +140,7 @@ fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: 
                 var buf: [512]u8 = undefined;
                 const msg = mlx.takeError(&buf) orelse "";
                 std.debug.print("[exl3 selfcheck] {t} {t}: {t} {s}\n", .{ e.kernel, c, err, msg });
-                try report.results.append(a, .{ .kernel = e.kernel, .check = c, .ok = false, .err = @errorName(err) });
+                try report.appendRaised(a, e.kernel, c, err, msg);
             };
             if (report.results.items.len == before)
                 try report.results.append(a, .{ .kernel = e.kernel, .check = c, .ok = false, .err = "no result" });
@@ -1712,6 +1749,32 @@ test "dsv41 kernels: every self-check the manifest plans has an executor" {
         }
     }
     try testing.expect(planned >= 2 * xk.n_kernels);
+}
+
+test "dsv41 kernels: a raised self-check's receipt line carries the MLX message, as valid JSON" {
+    const a = testing.allocator;
+    var report: Report = .{};
+    defer report.deinit(a);
+    try report.results.append(a, .{ .kernel = .q3pf_hc_pre_norm, .check = .compile, .ok = true });
+    const msg = "[metal::Device] Unable to build metal library from source\nutils.h:520:30: error: no matching function for call to 'q3pf_ld'\n\t\"x\" \\ \x01";
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..msg.len], msg);
+    try report.appendRaised(a, .q3pf_hc_pre_norm, .row_invariance, error.MlxError, buf[0..msg.len]);
+    @memset(&buf, 0); // the latch buffer is reused: the report keeps its own copy
+    const lines = try report.writeJsonLines(a);
+    defer a.free(lines);
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    // a passing line is the receipt format of record, byte for byte
+    try testing.expectEqualStrings("{\"kernel\":\"q3pf_hc_pre_norm\",\"check\":\"compile\",\"site\":\"\",\"words\":0,\"bad\":0,\"metric\":0e0,\"limit\":0e0,\"ok\":true,\"err\":\"\"}", it.next().?);
+    const Line = struct { kernel: []const u8, check: []const u8, site: []const u8, words: u64, bad: u64, metric: f64, limit: f64, ok: bool, err: []const u8, msg: []const u8 };
+    const parsed = try std.json.parseFromSlice(Line, a, it.next().?, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("row_invariance", parsed.value.check);
+    try testing.expectEqualStrings("MlxError", parsed.value.err);
+    try testing.expectEqualStrings(msg, parsed.value.msg);
+    try testing.expect(!parsed.value.ok);
+    try testing.expectEqualStrings("", it.next().?);
+    try testing.expect(it.next() == null);
 }
 
 test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not one f64-rounded word" {
