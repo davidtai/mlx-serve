@@ -398,13 +398,13 @@ pub fn Head(comptime G: type) type {
             var a: [4]T = undefined;
             if (use) {
                 try g.tape(Tr.HcAttnPrep, &self.mc, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
-            } else a = try Tr.hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
+            } else a = try Tr.hcAttnPrep(g, c, .{}, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
             const ao = try self.attention(g, st, a[0], main_x, cache);
             var f: [5]T = undefined;
             if (use) {
                 try g.tape(Tr.HcFfnPrep, &self.mc, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
-            } else f = try Tr.hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
-            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, w, f[0], Resident{ .ex = &st.experts, .limit = c.swiglu_limit, .lut = st.lut });
+            } else f = try Tr.hcFfnPrep(g, c, .{}, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, .{}, w, f[0], Resident{ .ex = &st.experts, .limit = c.swiglu_limit, .lut = st.lut });
             if (use) {
                 var o: [1]T = undefined;
                 try g.tape(Tr.HcPost, &self.mc, &.{ mo, f[1], f[2], f[3] }, &o);

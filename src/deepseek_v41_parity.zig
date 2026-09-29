@@ -536,7 +536,7 @@ pub const Runner = struct {
                 const h = try self.dumpArray(&g, &dump, pre, "in.h");
                 const pm = try self.dumpArray(&g, &dump, pre, "in.pre_mix");
                 const routed: DumpRouted = .{ .arr = try self.dumpArray(&g, &dump, pre, "moe.routed") };
-                _ = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
+                _ = try Tr.layer(&g, &probe, &c, &rt, .{}, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
                 const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));
@@ -751,7 +751,7 @@ pub const Runner = struct {
                 const h = try self.dumpArray(&g, &dump, pre, "in.h");
                 const pm = try self.dumpArray(&g, &dump, pre, "in.pre_mix");
                 const routed: DumpRouted = .{ .arr = try self.dumpArray(&g, &dump, pre, "moe.routed") };
-                _ = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
+                _ = try Tr.layer(&g, &probe, &c, &rt, .{}, c.layers[l], &lws[i], inv[i], h, pm, positions, &caches[i], &shared, routed);
                 const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));
@@ -975,7 +975,7 @@ pub const Runner = struct {
                 };
                 try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "{s}in.h", .{pre}), cur.h);
                 try self.checkDigest(&g, &dg, try std.fmt.allocPrint(a, "{s}in.pre_mix", .{pre}), cur.pre_mix);
-                const out = try Tr.layer(&g, &probe, &c, &rt, c.layers[l], &lws[i], inv[i], cur.h, cur.pre_mix, pos, &caches[i], &shared, stand_in);
+                const out = try Tr.layer(&g, &probe, &c, &rt, .{}, c.layers[l], &lws[i], inv[i], cur.h, cur.pre_mix, pos, &caches[i], &shared, stand_in);
                 const vec = mlx.mlx_vector_array_new_data(probe.arrays.items.ptr, probe.arrays.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));

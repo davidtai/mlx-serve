@@ -12,6 +12,8 @@ const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const kvc = @import("deepseek_v41_cache.zig");
+const xk = @import("exl3_kernels.zig");
+const kr = @import("dsv41_kernel_routes.zig");
 
 const Dtype = ops.Dtype;
 
@@ -80,6 +82,15 @@ pub fn Shared(comptime T: type) type {
 /// that are pure MLX. The default is the stock eager path (every lever off);
 /// kernel levers are refused where the routes are built (`deepseek_v41_routes.zig`).
 pub const Routes = struct {
+    /// C12: the RCTAIL sinkhorn (the 16-lane kernel up to 32 matrices, the stock K3 text
+    /// above; bitwise the stock op chain, manifest note), bound in `Trunk.Kernels`.
+    rc_sinkhorn: bool = false,
+    /// C13: the RCTAIL router (split-K gate GEMV + the stock top-k tail) at rows <= 8, bound
+    /// per layer in `Trunk.Kernels` (the prefill widths keep the K22 / eager gate: a phase route).
+    rc_router: bool = false,
+    /// C13: the RCTAIL HC premix (split-K f32 GEMV of the [24, 20480] HC fn) at rows <= 8,
+    /// bound per layer for the attn and ffn mixes.
+    rc_premix: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -111,6 +122,10 @@ pub fn woaDenseBytes(c: *const v41.Config) u64 {
 }
 
 pub const attn_compile_max_rows = 32;
+/// A forward wider than this releases its score chains inside the layer
+/// (`closeScores`): the prefill widths, where a chain's arrays are score-sized;
+/// a decode / verify forward keeps no per-layer host calls for it.
+pub const score_wave_min_rows = attn_compile_max_rows;
 pub const core_compile_max_rows = 8;
 pub const hc_compile_max_rows = 7;
 pub const small_stages_max_rows = 7;
@@ -121,6 +136,38 @@ pub const NoProbe = struct {
     pub fn put(_: NoProbe, _: []const u8, _: anytype) !void {}
 };
 
+/// The decode / verify rows the RC routes' kernels take (the Python `MAX_ROWS`); wider
+/// forwards (prefill) keep the stock path.
+pub const rc_max_rows = 8;
+
+/// The kernel routes one HC mix calls (null: the stock op chain).
+pub fn MixKernels(comptime G: type) type {
+    return struct {
+        sinkhorn: ?*const kr.Sinkhorn(G) = null,
+        premix: ?*const kr.Premix(G) = null,
+    };
+}
+
+/// The rounding-class tier's kernel routes one layer calls (null: the stock op chain):
+/// a view of the model's `Trunk(G).Kernels`, bound once at construction.
+pub fn LayerKernels(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        sinkhorn: ?*const kr.Sinkhorn(G) = null,
+        router: ?*const kr.Router(G) = null,
+        premix_attn: ?*const kr.Premix(G) = null,
+        premix_ffn: ?*const kr.Premix(G) = null,
+
+        pub fn attnMix(self: Self) MixKernels(G) {
+            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn };
+        }
+
+        pub fn ffnMix(self: Self) MixKernels(G) {
+            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_ffn };
+        }
+    };
+}
+
 pub fn Trunk(comptime G: type) type {
     return struct {
         pub const T = G.T;
@@ -130,6 +177,73 @@ pub fn Trunk(comptime G: type) type {
         pub const Mixes = struct { pre: T, post: T, comb: T };
         pub const CosSin = struct { cos: T, sin: T };
         pub const Out = struct { h: T, pre_mix: T };
+        pub const LK = LayerKernels(G);
+        pub const MK = MixKernels(G);
+
+        /// The kernel routes the tier's RC members bind, over the accepted trunk routes'
+        /// registry: built once (a geometry the kernels do not take refused by name), then
+        /// read by each layer through `at`.
+        pub const Kernels = struct {
+            gpa: ?std.mem.Allocator = null,
+            sinkhorn: ?kr.Sinkhorn(G) = null,
+            /// C13, per layer: the router over its gate, the attn / ffn premixes over its HC fns.
+            router: std.ArrayList(kr.Router(G)) = .empty,
+            premix: std.ArrayList([2]kr.Premix(G)) = .empty,
+
+            pub fn needed(rt: *const Routes) bool {
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix;
+            }
+
+            /// `layers`: the model's bound layer weights (the router and premix routes keep
+            /// references to each layer's gate and HC fns; nothing is copied).
+            pub fn init(gpa: std.mem.Allocator, g: *G, reg: *const xk.Registry, c: *const v41.Config, rt: *const Routes, layers: []const W) !Kernels {
+                var k: Kernels = .{ .gpa = gpa };
+                errdefer k.deinit(g);
+                if (rt.rc_sinkhorn) {
+                    // q3dk_sinkhorn16_hc4_it20 / mtplx_dsv4_sinkhorn_hc4_it20: hc 4, 20 iterations, eps 1e-6 baked in.
+                    if (c.hc_mult != 4 or c.hc_sinkhorn_iters != 20 or @as(f32, @floatCast(c.hc_eps)) != @as(f32, 1e-6)) return error.SinkhornGeometry;
+                    k.sinkhorn = try kr.Sinkhorn(G).init(g, reg);
+                }
+                if (rt.rc_router) {
+                    // q3rc_router_tail bakes 384 experts over 5120, sqrt(softplus) / temp 1, top-6,
+                    // normalised, x 1.5 (the Python `router_config_check` constants).
+                    if (c.n_routed_experts != 384 or c.hidden_size != 5120 or c.n_experts_per_tok != 6 or !c.norm_topk_prob or c.routed_scaling_factor != 1.5) return error.RouterGeometry;
+                    try k.router.ensureTotalCapacity(gpa, layers.len);
+                    for (layers) |*w| k.router.appendAssumeCapacity(try kr.Router(G).init(g, reg, w.gate_w, w.gate_bias, null));
+                }
+                if (rt.rc_premix) {
+                    // q3rc_premix_part / _fin: N (2 + hc) hc = 24 over K hc x hidden = 20480.
+                    if (c.hcMix() != 24 or c.hc_mult * c.hidden_size != 20480) return error.PremixGeometry;
+                    try k.premix.ensureTotalCapacity(gpa, layers.len);
+                    for (layers) |*w| {
+                        var pa = try kr.Premix(G).init(g, reg, w.hc_attn_fn, null);
+                        errdefer pa.deinit(g);
+                        k.premix.appendAssumeCapacity(.{ pa, try kr.Premix(G).init(g, reg, w.hc_ffn_fn, null) });
+                    }
+                }
+                return k;
+            }
+
+            pub fn deinit(self: *Kernels, g: *G) void {
+                if (self.sinkhorn) |*x| x.deinit(g);
+                for (self.router.items) |*x| x.deinit(g);
+                for (self.premix.items) |*p| for (p) |*x| x.deinit(g);
+                if (self.gpa) |a| {
+                    self.router.deinit(a);
+                    self.premix.deinit(a);
+                }
+                self.* = .{};
+            }
+
+            pub fn at(self: *const Kernels, l: usize) LK {
+                return .{
+                    .sinkhorn = if (self.sinkhorn) |*x| x else null,
+                    .router = if (self.router.items.len > 0) &self.router.items[l] else null,
+                    .premix_attn = if (self.premix.items.len > 0) &self.premix.items[l][0] else null,
+                    .premix_ffn = if (self.premix.items.len > 0) &self.premix.items[l][1] else null,
+                };
+            }
+        };
 
         /// The arrays a layer hands the next: its hidden and pre-mix, and every
         /// array of the shared runtime (the published compressed lanes, masks,
@@ -202,6 +316,7 @@ pub fn Trunk(comptime G: type) type {
         /// to the layer's reset (a 953-row prefill chunk's attention and indexer
         /// arrays are 8 GB each at 16K).
         fn closeScores(g: *G, m: ops.Mark, outs: []const *T) !void {
+            std.debug.assert(outs.len <= 2);
             var kept: [2]T = undefined;
             for (outs, 0..) |o, i| kept[i] = g.keep(o.*);
             g.resetTo(m);
@@ -336,7 +451,7 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// `DecoderLayer._mixes` + `hc_split_sinkhorn`: the pre / post / Sinkhorn comb mixes.
-        pub fn hcMixes(g: *G, c: *const v41.Config, x: T, fnw: T, base: T, scale: T) !Mixes {
+        pub fn hcMixes(g: *G, c: *const v41.Config, mk: MK, x: T, fnw: T, base: T, scale: T) !Mixes {
             const hc: c_int = @intCast(c.hc_mult);
             const xf = try g.astype(x, .float32);
             const sh = g.shapeOf(xf);
@@ -345,7 +460,9 @@ pub fn Trunk(comptime G: type) type {
             fs.d[fs.n - 1] = hc * sh.dim(-1);
             const flat = try g.reshape(xf, fs.slice());
             const rs = try g.rsqrt(try g.add(try g.mean(try g.square(flat), -1, true), try g.scalar(c.rms_norm_eps, .float32)));
-            const mixes = try g.mul(try g.matmul(flat, try g.transpose(try g.astype(fnw, .float32))), rs);
+            // C13 hcpremix at <= 8 rows (the kernel's plans; wider: the stock GEMM).
+            const mm = if (mk.premix) |k| (if (rowsOf(g, flat, 1) <= rc_max_rows) try k.mm(g, flat) else null) else null;
+            const mixes = try g.mul(mm orelse try g.matmul(flat, try g.transpose(try g.astype(fnw, .float32))), rs);
             const total: c_int = @intCast(c.hcMix());
             const eps = c.hc_eps;
             const pre_in = try g.add(try g.mul(try sliceLast(g, mixes, 0, hc), try index0(g, scale, 0)), try sliceLast(g, base, 0, hc));
@@ -359,7 +476,8 @@ pub fn Trunk(comptime G: type) type {
             cshape.d[ms.n] = hc;
             cshape.n += 1;
             comb = try g.reshape(comb, cshape.slice());
-            return .{ .pre = pre, .post = post, .comb = try sinkhorn(g, comb, c.hc_sinkhorn_iters, eps) };
+            const sk = if (mk.sinkhorn) |k| try k.call(g, comb) else try sinkhorn(g, comb, c.hc_sinkhorn_iters, eps);
+            return .{ .pre = pre, .post = post, .comb = sk };
         }
 
         /// `DecoderLayer._hc_pre`: collapse the hc copies with the threaded pre mix.
@@ -562,9 +680,11 @@ pub fn Trunk(comptime G: type) type {
             if (li.index_source) {
                 const lens = try g.floorDiv(try g.add(positions, try g.scalar(1, .int32)), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const cand = if (li.candidate_source) null else shared.candidates;
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (rowsOf(g, x, 1) > score_wave_min_rows) g.mark() else null;
                 var sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source);
-                if (sel.cand) |*cd| try closeScores(g, scores, &.{ &sel.mask, cd }) else try closeScores(g, scores, &.{&sel.mask});
+                if (scores) |m| {
+                    if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd }) else try closeScores(g, m, &.{&sel.mask});
+                }
                 shared.topk_mask = sel.mask;
                 if (li.candidate_source) shared.candidates = sel.cand;
                 mask = sel.mask;
@@ -811,9 +931,9 @@ pub fn Trunk(comptime G: type) type {
                     ckv = comp.kv;
                     cidx = shared.selected_idx;
                 };
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                 o0 = try sparseAttendSelected(g, c, rt, w, q, window, drop, ckv, cidx, positions);
-                try closeScores(g, scores, &.{&o0});
+                if (scores) |m| try closeScores(g, m, &.{&o0});
             } else {
                 var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), drop, b, s);
                 var keys = window;
@@ -823,9 +943,9 @@ pub fn Trunk(comptime G: type) type {
                         attend = try g.concat(&.{ attend, comp.mask }, -1);
                     }
                 }
-                const scores = g.mark();
+                const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                 o0 = if (s > 1 and rt.lean_prefill_score) try sparseAttendLean(g, c, w, q, keys, attend) else try sparseAttend(g, c, w, q, keys, attend);
-                try closeScores(g, scores, &.{&o0});
+                if (scores) |m| try closeScores(g, m, &.{&o0});
             }
             try p.put("attn.o", o0);
             const w_ol = try woaDense(g, c, w);
@@ -876,7 +996,16 @@ pub fn Trunk(comptime G: type) type {
         /// `Gate.__call__`: sqrtsoftplus scores, noaux_tc biased selection,
         /// unbiased normalised weights x route scale (the prefix a K22 tape at
         /// rows <= 32; the selection eager, it feeds the routing barrier).
-        pub fn router(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, xf: T) !Route {
+        pub fn router(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, xf: T) !Route {
+            if (lk.router) |k| {
+                if (g.shapeOf(xf).dim(0) <= rc_max_rows) {
+                    // C13 RCTAIL router: the whole gate (split-K logits, the stock tail) at <= 8 rows.
+                    const o = try k.gateTopk(g, xf);
+                    try p.put("gate.indices", o[1]);
+                    try p.put("gate.weights", o[0]);
+                    return .{ .weights = o[0], .indices = o[1] };
+                }
+            }
             var pre: [2]T = undefined;
             if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
                 try g.tape(GatePrefix, c, &.{ xf, w.gate_w, w.gate_bias }, &pre);
@@ -926,11 +1055,11 @@ pub fn Trunk(comptime G: type) type {
 
         /// `MoE.__call__`: gate, routed experts (`routed.routed(g, xf, indices)`
         /// returns the unweighted `[n, k, dim]` outputs), shared expert, f32 combine.
-        pub fn moe(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, x: T, routed: anytype) !T {
+        pub fn moe(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype) !T {
             const sh = g.shapeOf(x);
             const dim: c_int = @intCast(c.hidden_size);
             const xf = try g.reshape(x, &.{ -1, dim });
-            const r = try router(g, p, c, rt, w, xf);
+            const r = try router(g, p, c, rt, lk, w, xf);
             const ro = try routed.routed(g, xf, r.indices);
             try p.put("moe.routed", ro);
             const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
@@ -945,17 +1074,17 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_hc_attn_prep_impl`: the attn HC mixes, the pre-mix collapse and the
         /// attention RMSNorm. Out: attention input, pre, post, comb.
-        pub fn hcAttnPrep(g: *G, c: *const v41.Config, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
-            const m = try hcMixes(g, c, h, fnw, base, scale);
+        pub fn hcAttnPrep(g: *G, c: *const v41.Config, lk: LK, h: T, pre_mix: T, fnw: T, base: T, scale: T, norm_w: T) ![4]T {
+            const m = try hcMixes(g, c, lk.attnMix(), h, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
             return .{ x, m.pre, m.post, m.comb };
         }
 
         /// `_hc_ffn_prep_impl`: the attention HC post, the ffn mixes, collapse and
         /// ffn RMSNorm. Out: moe input, h1, ffn post, ffn comb, ffn pre.
-        pub fn hcFfnPrep(g: *G, c: *const v41.Config, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+        pub fn hcFfnPrep(g: *G, c: *const v41.Config, lk: LK, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
-            const m = try hcMixes(g, c, h1, fnw, base, scale);
+            const m = try hcMixes(g, c, lk.ffnMix(), h1, fnw, base, scale);
             const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
             return .{ x, h1, m.post, m.comb, m.pre };
         }
@@ -966,7 +1095,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 4;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
-                out[0..4].* = try hcAttnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5]);
+                out[0..4].* = try hcAttnPrep(g, ctx, .{}, in[0], in[1], in[2], in[3], in[4], in[5]);
             }
         };
 
@@ -976,7 +1105,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 5;
             pub fn run(g: *G, ctx: *const Ctx, in: []const T, out: []T) !void {
-                out[0..5].* = try hcFfnPrep(g, ctx, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+                out[0..5].* = try hcFfnPrep(g, ctx, .{}, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
             }
         };
 
@@ -998,7 +1127,7 @@ pub fn Trunk(comptime G: type) type {
             pub const Ctx = v41.Config;
             pub const n_out = 8;
             pub fn run(g: *G, c: *const Ctx, in: []const T, out: []T) !void {
-                const f = try hcFfnPrep(g, c, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
+                const f = try hcFfnPrep(g, c, .{}, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8]);
                 const xf = try g.reshape(f[0], &.{ -1, @intCast(c.hidden_size) });
                 const pre = try gatePrefix(g, xf, in[9], in[10]);
                 const r = try gateSelect(g, c, pre[0], pre[1]);
@@ -1036,7 +1165,7 @@ pub fn Trunk(comptime G: type) type {
         /// Hyper-Connection pre / post, the pre mix threaded across sublayers.
         /// At decode / verify rows K35 runs three compiled segments; K4 compiles
         /// the HC prep / combine; the eager body otherwise.
-        pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
+        pub fn layer(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share, routed: anytype) !Out {
             const rows = rowsOf(g, h, 2);
             if (rows <= rt.small_rows) {
                 var s1: [4]T = undefined;
@@ -1056,8 +1185,8 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("out.pre_mix", s2[7]);
                 return .{ .h = s3[0], .pre_mix = s2[7] };
             }
-            const half = try attnAndMoeInput(g, p, c, rt, li, w, inv_freq, h, pre_mix, positions, cache, shared);
-            const mo = try moe(g, p, c, rt, w, half.moe_in, routed);
+            const half = try attnAndMoeInput(g, p, c, rt, lk, li, w, inv_freq, h, pre_mix, positions, cache, shared);
+            const mo = try moe(g, p, c, rt, lk, w, half.moe_in, routed);
             try p.put("moe.y", mo);
             const out = if (rows <= rt.hc_rows) blk: {
                 var o: [1]T = undefined;
@@ -1075,13 +1204,13 @@ pub fn Trunk(comptime G: type) type {
         /// `DecoderLayer.attn_and_moe_input`: the attention Hyper-Connection
         /// (which writes this layer's KV), the ffn mixes and the MoE input
         /// (K4 compiles both HC preps at rows <= 7).
-        pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
+        pub fn attnAndMoeInput(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, li: v41.LayerInfo, w: *const W, inv_freq: T, h: T, pre_mix: T, positions: T, cache: *Cache, shared: *Share) !Half {
             const hc_tape = rowsOf(g, h, 2) <= rt.hc_rows;
             var a: [4]T = undefined;
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
             } else {
-                a = try hcAttnPrep(g, c, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
+                a = try hcAttnPrep(g, c, lk, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
                 try p.put("attn.pre", a[1]);
                 try p.put("attn.post", a[2]);
                 try p.put("attn.comb", a[3]);
@@ -1092,7 +1221,7 @@ pub fn Trunk(comptime G: type) type {
             if (hc_tape) {
                 try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
             } else {
-                f = try hcFfnPrep(g, c, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+                f = try hcFfnPrep(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
                 try p.put("hc1.h", f[1]);
                 try p.put("ffn.pre", f[4]);
                 try p.put("ffn.post", f[2]);
@@ -1349,6 +1478,89 @@ test "dsv41 graph: rmsnorm traces _rmsnorm's op sequence and keeps the input dty
     try testing.expectEqualSlices(O, &.{ .square, .mean, .scalar, .add, .rsqrt, .mul, .astype, .mul }, seq2);
 }
 
+test "dsv41 graph: the RC sinkhorn binds on the kernels' geometry, refuses another by name, and takes every HC comb" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var c = try realConfig();
+    const rt: Routes = .{ .rc_sinkhorn = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+    defer k.deinit(&g);
+    const lk = k.at(0);
+    try testing.expect(lk.sinkhorn != null);
+    const w = try traceLayerW(&g, &c, c.layers[0]);
+    const h = try g.input(&.{ 1, 3, @intCast(c.hc_mult), @intCast(c.hidden_size) }, .bfloat16);
+    const n0 = g.nodes.items.len;
+    const m = try Tr.hcMixes(&g, &c, lk.attnMix(), h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
+    try expectShape(&g, m.comb, &.{ 1, 3, 4, 4 }, .float32);
+    for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .softmax);
+    var bad = c;
+    bad.hc_sinkhorn_iters = 19;
+    try testing.expectError(error.SinkhornGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &rt, &.{}));
+    // No RC member on the tier: nothing bound, the op chain stays.
+    var none = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &.{}, &.{});
+    defer none.deinit(&g);
+    const n = none.at(0);
+    try testing.expect(n.sinkhorn == null and n.router == null and n.premix_attn == null and !Tr.Kernels.needed(&.{}));
+}
+
+test "dsv41 graph: the RC router and HC premix bind per layer on the kernels' geometry, take verify rows, and leave prefill widths stock" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const ws = [_]LayerW(u32){ try traceLayerW(&g, &c, c.layers[0]), try traceLayerW(&g, &c, c.layers[3]) };
+    const rt: Routes = .{ .rc_router = true, .rc_premix = true };
+    try testing.expect(Tr.Kernels.needed(&rt));
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &ws);
+    defer k.deinit(&g);
+    // Each layer reads its own routes (over its own gate and HC fns).
+    const lk = k.at(1);
+    try testing.expect(lk.router.? == &k.router.items[1] and lk.premix_attn.? == &k.premix.items[1][0] and lk.premix_ffn.? == &k.premix.items[1][1]);
+    try testing.expectEqual(ws[1].gate_w, lk.router.?.w);
+    try testing.expectEqual(ws[1].hc_ffn_fn, lk.premix_ffn.?.w);
+    try testing.expect(lk.sinkhorn == null);
+    const noneOf = struct {
+        fn f(tg: *const TraceOps, from: usize, op: anytype) bool {
+            for (tg.nodes.items[from..]) |nd| if (nd.op == op) return false;
+            return true;
+        }
+    }.f;
+    // Verify rows (5): the whole gate is the two router kernels; each HC mix's GEMM the two premix kernels.
+    const l0 = g.prepared_launches;
+    var n0 = g.nodes.items.len;
+    const r = try Tr.router(&g, &p, &c, &.{}, lk, &ws[1], try g.input(&.{ 5, 5120 }, .float32));
+    try expectShape(&g, r.indices, &.{ 5, 6 }, .int32);
+    try expectShape(&g, r.weights, &.{ 5, 6 }, .float32);
+    try testing.expectEqual(r.indices, p.get("gate.indices").?);
+    try testing.expectEqual(l0 + 2, g.prepared_launches);
+    try testing.expect(noneOf(&g, n0, .argpartition) and noneOf(&g, n0, .matmul));
+    n0 = g.nodes.items.len;
+    const m = try Tr.hcMixes(&g, &c, lk.attnMix(), try g.input(&.{ 1, 5, 4, 5120 }, .bfloat16), ws[1].hc_attn_fn, ws[1].hc_attn_base, ws[1].hc_attn_scale);
+    try expectShape(&g, m.comb, &.{ 1, 5, 4, 4 }, .float32);
+    try testing.expectEqual(l0 + 4, g.prepared_launches);
+    try testing.expect(noneOf(&g, n0, .matmul));
+    // A prefill width (9 rows): the stock gate and GEMM, no launch.
+    n0 = g.nodes.items.len;
+    _ = try Tr.router(&g, &p, &c, &.{}, lk, &ws[1], try g.input(&.{ 9, 5120 }, .float32));
+    _ = try Tr.hcMixes(&g, &c, lk.ffnMix(), try g.input(&.{ 1, 9, 4, 5120 }, .bfloat16), ws[1].hc_ffn_fn, ws[1].hc_ffn_base, ws[1].hc_ffn_scale);
+    try testing.expectEqual(l0 + 4, g.prepared_launches);
+    try testing.expect(!noneOf(&g, n0, .argpartition) and !noneOf(&g, n0, .matmul));
+    // Another geometry is refused by name at construction.
+    var bad = c;
+    bad.n_routed_experts = 128;
+    try testing.expectError(error.RouterGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_router = true }, &ws));
+    bad = c;
+    bad.hc_mult = 2;
+    try testing.expectError(error.PremixGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_premix = true }, &ws));
+}
+
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
@@ -1356,7 +1568,7 @@ test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 
     const h = try g.input(&.{ 1, 3, 4, 5120 }, .bfloat16);
     const w = try traceLayerW(&g, &c, c.layers[0]);
     const mark = g.nodes.items.len;
-    const m = try Tr.hcMixes(&g, &c, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
+    const m = try Tr.hcMixes(&g, &c, .{}, h, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale);
     try expectShape(&g, m.pre, &.{ 1, 3, 4 }, .float32);
     try expectShape(&g, m.post, &.{ 1, 3, 4 }, .float32);
     try expectShape(&g, m.comb, &.{ 1, 3, 4, 4 }, .float32);
@@ -1395,7 +1607,7 @@ test "dsv41 graph: the real layer-0 (SWA) forward turns the bf16 residual f32 at
     defer cache.deinit(&g);
     var shared: Tr.Share = .{};
     const pos = try g.arange(0, 5, 1, .int32);
-    const out = try Tr.layer(&g, &p, &c, &stock, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
+    const out = try Tr.layer(&g, &p, &c, &stock, .{}, li, &w, inv, e.h, e.pre_mix, pos, &cache, &shared, TraceRouted{});
     try expectStage(&g, &p, "attn.x", &.{ 1, 5, 5120 }, .bfloat16);
     try expectStage(&g, &p, "attn.qr", &.{ 1, 5, 1280 }, .bfloat16);
     try expectStage(&g, &p, "attn.q", &.{ 1, 5, 64, 512 }, .bfloat16);
@@ -1555,7 +1767,7 @@ test "dsv41 graph: router, shared expert and Engram apply keep the Python dtypes
     const c = try realConfig();
     const w = try traceLayerW(&g, &c, c.layers[3]);
     const xf = try g.input(&.{ 5, 5120 }, .float32);
-    const r = try Tr.router(&g, &p, &c, &stock, &w, xf);
+    const r = try Tr.router(&g, &p, &c, &stock, .{}, &w, xf);
     try expectShape(&g, r.indices, &.{ 5, 6 }, .int32);
     try expectShape(&g, r.weights, &.{ 5, 6 }, .float32);
     try expectStage(&g, &p, "gate.scores", &.{ 5, 384 }, .float32);
@@ -1678,7 +1890,7 @@ fn layerOps(rt: *const Routes, rows: c_int) ![]ops.Op {
     var shared: Tr.Share = .{};
     try Tr.prepareRegions(&g, &c, rt, false);
     const mark = g.nodes.items.len;
-    _ = try Tr.layer(&g, NoProbe{}, &c, rt, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
+    _ = try Tr.layer(&g, NoProbe{}, &c, rt, .{}, li, &w, inv, h, pm, try g.arange(0, @floatFromInt(rows), 1, .int32), &cache, &shared, TraceRouted{});
     return g.opsSince(testing.allocator, mark);
 }
 
@@ -1899,7 +2111,7 @@ test "dsv41 graph: the all-layer chain's per-layer held bytes at a 2,048-token p
             const from = g.nodes.items.len;
             p.names.clearRetainingCapacity();
             p.nodes.clearRetainingCapacity();
-            const out = try Tr.layer(&g, &p, &c, &stock, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
+            const out = try Tr.layer(&g, &p, &c, &stock, .{}, li, &ws[l], if (li.ratio > 0) inv_y else inv_s, h, pm, pos, &caches[l], &shared, stand);
             h = out.h;
             pm = out.pre_mix;
             const hb = heldBytes(&g, from, g.nodes.items.len);

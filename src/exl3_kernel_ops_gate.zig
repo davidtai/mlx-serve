@@ -7,7 +7,9 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const xk = @import("exl3_kernels.zig");
-const ops = @import("exl3_kernel_ops.zig");
+const kr = @import("kernel_routes.zig");
+const tr = @import("dsv41_kernel_routes.zig");
+const xq = @import("exl3_quant.zig");
 
 const Allocator = std.mem.Allocator;
 const Dtype = mlx.mlx_dtype;
@@ -50,7 +52,7 @@ pub const MlxG = struct {
         return x;
     }
 
-    pub fn shapeOf(_: *MlxG, x: T) ops.Shape {
+    pub fn shapeOf(_: *MlxG, x: T) kr.Shape {
         return .of(mlx.getShape(x));
     }
 
@@ -171,11 +173,13 @@ const JGen = struct {
 };
 const JArray = struct { name: []const u8, dtype: []const u8, shape: []const i64, gen: ?JGen = null, sha256: []const u8, file: ?[]const u8 = null };
 const JVars = struct { rows: u64 = 0, cap: u64 = 0, experts: u64 = 0 };
-const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, inputs: []const JArray, outputs: []const JArray };
+const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, eps: ?f64 = null, inputs: []const JArray, outputs: []const JArray };
 const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const JCase };
 
 const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
 const draft_fixture_format = "mlx-serve-exl3-kernel-draft-fixture-v1";
+const decode2_fixture_format = "mlx-serve-exl3-kernel-decode2-fixture-v1";
+const prefill2_fixture_format = "mlx-serve-exl3-kernel-prefill2-fixture-v1";
 const golden: u64 = 0x9E3779B97F4A7C15;
 
 fn sm(seed: u64, i: u64) u64 {
@@ -188,7 +192,7 @@ fn sm(seed: u64, i: u64) u64 {
 fn dtypeOf(name: []const u8) Dtype {
     const map = [_]struct { []const u8, Dtype }{
         .{ "float32", .float32 }, .{ "float16", .float16 }, .{ "bfloat16", .bfloat16 }, .{ "int16", .int16 },
-        .{ "int32", .int32 },     .{ "uint32", .uint32 },   .{ "uint8", .uint8 },
+        .{ "int32", .int32 },     .{ "uint32", .uint32 },   .{ "uint8", .uint8 },       .{ "bool", .bool_ },
     };
     for (map) |m| if (std.mem.eql(u8, m[0], name)) return m[1];
     unreachable;
@@ -196,7 +200,7 @@ fn dtypeOf(name: []const u8) Dtype {
 
 fn size(dt: Dtype) usize {
     return switch (dt) {
-        .uint8 => 1,
+        .uint8, .bool_ => 1,
         .int16, .float16, .bfloat16 => 2,
         .int32, .uint32, .float32 => 4,
         else => unreachable,
@@ -205,7 +209,7 @@ fn size(dt: Dtype) usize {
 
 fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
     switch (dt) {
-        .uint8 => b[i] = @truncate(v),
+        .uint8, .bool_ => b[i] = @truncate(v),
         .int32, .uint32 => std.mem.writeInt(u32, b[i * 4 ..][0..4], @truncate(v), .little),
         else => unreachable,
     }
@@ -215,9 +219,9 @@ fn putInt(b: []u8, i: usize, dt: Dtype, v: u64) void {
 fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
     const b = try a.alloc(u8, n * size(dt));
     errdefer a.free(b);
-    const kind = std.meta.stringToEnum(enum { bits, uniform, index, range, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
+    const kind = std.meta.stringToEnum(enum { bits, bf16bits, uniform, index, range, srange, wave_rhs, wave_table, slots16, values }, gen.kind) orelse return error.FixtureGenerator;
     switch (kind) {
-        .bits => {
+        .bits, .bf16bits => {
             var w: usize = 0;
             while (w * 8 < b.len) : (w += 1) {
                 var le: [8]u8 = undefined;
@@ -225,6 +229,11 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
                 const end = @min(b.len, w * 8 + 8);
                 @memcpy(b[w * 8 .. end], le[0 .. end - w * 8]);
             }
+            // bf16bits: the stream's u16 words as bf16, exponent pinned to 0x78..0x7B
+            if (kind == .bf16bits) for (0..n) |i| {
+                const v = std.mem.readInt(u16, b[i * 2 ..][0..2], .little);
+                std.mem.writeInt(u16, b[i * 2 ..][0..2], (v & 0x807F) | ((0x78 + ((v >> 7) & 3)) << 7), .little);
+            };
         },
         .uniform => for (0..n) |i| {
             const t = @as(f64, @floatFromInt(sm(gen.seed, i) >> 11)) * 0x1p-53;
@@ -241,6 +250,8 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
         },
         .index => for (0..n) |i| putInt(b, i, dt, sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi))),
         .range => for (0..n) |i| putInt(b, i, dt, @as(u64, @intFromFloat(gen.lo)) + sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi - gen.lo))),
+        // prefill batch 2: a signed range (lo may be negative: the compressed selection's -1 = no key)
+        .srange => for (0..n) |i| putInt(b, i, dt, @bitCast(@as(i64, @intFromFloat(gen.lo)) + @as(i64, @intCast(sm(gen.seed, i) % @as(u64, @intFromFloat(gen.hi - gen.lo)))))),
         .wave_rhs => {
             var r: usize = 0;
             for (gen.rows, 0..) |rows, j| for (0..rows) |_| {
@@ -249,13 +260,13 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
             };
         },
         .wave_table => {
-            var ex: [ops.wave_max]ops.WaveExpert = undefined;
+            var ex: [xq.wave_max]xq.WaveExpert = undefined;
             for (gen.slots, gen.rows, 0..) |s, r, j| ex[j] = .{ .slot = s, .rows = r };
-            const t = ops.digTable(ex[0..gen.slots.len], gen.tiles);
+            const t = xq.digTable(ex[0..gen.slots.len], gen.tiles);
             @memcpy(b, std.mem.sliceAsBytes(&t.table));
         },
         .slots16 => {
-            const t = ops.rebuildSlots(gen.slots);
+            const t = xq.rebuildSlots(gen.slots);
             @memcpy(b, std.mem.sliceAsBytes(&t));
         },
         .values => for (0..n) |i| std.mem.writeInt(u32, b[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(gen.values[i]))), .little),
@@ -335,11 +346,84 @@ fn in(ins: *std.StringHashMapUnmanaged(mlx.mlx_array), name: []const u8) mlx.mlx
 fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.StringHashMapUnmanaged(mlx.mlx_array), outs: *[16]mlx.mlx_array) !usize {
     const f = c.family;
     const eq = std.mem.eql;
+    // decode batch 2 (dump_kernel_decode2_fixture.py): the members the RC tiers still run,
+    // ATTN_FUSE softmax, INDEX_TOPK and the wo_a ring transpose
+    if (eq(u8, f, "woa_transpose")) {
+        var r = try tr.WoaRingTranspose(MlxG).init(g, reg);
+        defer r.deinit(g);
+        try r.checkLayer(g, in(ins, "packed"), in(ins, "scales"), null);
+        outs[0] = try r.call(g, in(ins, "packed"), in(ins, "scales"));
+        return 1;
+    }
+    if (eq(u8, f, "index_topk")) {
+        var r = try tr.IndexTopk(MlxG).init(g, reg);
+        defer r.deinit(g);
+        outs[0..2].* = try r.select(g, in(ins, "score"), in(ins, "clen"));
+        return 2;
+    }
+    if (eq(u8, f, "attn_fuse")) {
+        var r = try tr.AttnSoftmax(MlxG).init(g, reg, null);
+        defer r.deinit(g);
+        outs[0..2].* = try r.call(g, in(ins, "qk"), in(ins, "valid"), in(ins, "sink"));
+        return 2;
+    }
+    // x1..x8: one call per M on the case's one weight
+    const x_names = [_][]const u8{ "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8" };
+    if (eq(u8, f, "mxfp8_rows")) {
+        const site = std.meta.stringToEnum(tr.M1Site, c.site.?) orelse return error.FixtureSite;
+        var r = try tr.Mxfp8Rows(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
+    if (eq(u8, f, "head_rows")) {
+        var r = try tr.HeadRows(MlxG).init(g, reg, in(ins, "w"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
+    if (eq(u8, f, "smallm")) {
+        const site = std.meta.stringToEnum(tr.SmallMSite, c.site.?) orelse return error.FixtureSite;
+        var r = try tr.SmallM(MlxG).init(g, reg, site, in(ins, "w"), null);
+        defer r.deinit(g);
+        for (0..8) |i| outs[i] = try r.call(g, in(ins, x_names[i]));
+        return 8;
+    }
+    // prefill batch 2 (dump_kernel_prefill2_fixture.py): the P line's prefill-rows texts; the
+    // prefill-rows index top-k replays through the index_topk branch above
+    if (eq(u8, f, "idxscore")) {
+        const r = tr.IdxScore(MlxG).init(reg);
+        outs[0] = try r.call(g, in(ins, "q"), in(ins, "k"), in(ins, "w"), in(ins, "clen"));
+        return 1;
+    }
+    if (eq(u8, f, "core_vec") or eq(u8, f, "core_rope")) {
+        const kind: tr.CoreKind = if (eq(u8, f, "core_vec")) .vec else .rope;
+        const ckv = ins.get("ckv");
+        var r = try tr.PrefillAttn(MlxG).init(g, reg, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
+        defer r.deinit(g);
+        const cmp: ?[2]mlx.mlx_array = if (ckv) |store| .{ store, in(ins, "cidx") } else null;
+        const rope: ?[2]mlx.mlx_array = if (kind == .rope) .{ in(ins, "qcos"), in(ins, "qsin") } else null;
+        outs[0] = try r.attend(g, in(ins, "q"), in(ins, "win"), in(ins, "widx"), in(ins, "wval"), cmp, in(ins, "sink"), rope);
+        return 1;
+    }
+    if (eq(u8, f, "hcnorm")) {
+        const x = in(ins, "x");
+        var r = try tr.HcNorm(MlxG).init(g, reg, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
+        defer r.deinit(g);
+        outs[0] = try r.rsqrt(g, x);
+        outs[1] = try r.preNorm(g, x, in(ins, "pre"), in(ins, "w"));
+        return 2;
+    }
+    if (eq(u8, f, "smallk")) {
+        const r = tr.SmallKCombine(MlxG).init(reg);
+        outs[0] = try r.call(g, in(ins, "routed"), in(ins, "weights"), in(ins, "shared"));
+        return 1;
+    }
     // DRAFTRC (dump_draftrc_fixture.py): the draft routes, outputs in the dump's order
     if (eq(u8, f, "draft_proj")) {
-        const site = std.meta.stringToEnum(ops.DraftSite, c.site.?) orelse return error.FixtureSite;
+        const site = std.meta.stringToEnum(tr.DraftSite, c.site.?) orelse return error.FixtureSite;
         const x1 = in(ins, "x1");
-        var r = try ops.DraftProj(MlxG).init(g, reg, site, g.dtypeOf(x1), in(ins, "w"), in(ins, "scales"), null);
+        var r = try tr.DraftProj(MlxG).init(g, reg, site, g.dtypeOf(x1), in(ins, "w"), in(ins, "scales"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, x1);
         outs[1] = try r.call(g, in(ins, "x6"));
@@ -347,7 +431,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 3;
     }
     if (eq(u8, f, "draft_router")) {
-        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        var r = try tr.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
         defer r.deinit(g);
         outs[0..2].* = try r.call(g, in(ins, "x1"));
         outs[2..4].* = try r.call(g, in(ins, "x6"));
@@ -355,9 +439,9 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 6;
     }
     if (eq(u8, f, "draft_tape")) {
-        var r = try ops.HcTape(MlxG).init(g, reg, .float32, null);
+        var r = try tr.HcTape(MlxG).init(g, reg, .float32, null);
         defer r.deinit(g);
-        var mixed = try ops.HcTapeMixed(MlxG).init(g, reg, null);
+        var mixed = try tr.HcTapeMixed(MlxG).init(g, reg, null);
         defer mixed.deinit(g);
         const x, const rr, const rb, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "rb"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
@@ -367,32 +451,32 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 12;
     }
     if (eq(u8, f, "router")) {
-        var r = try ops.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
+        var r = try tr.Router(MlxG).init(g, reg, in(ins, "w"), in(ins, "bias"), null);
         defer r.deinit(g);
         outs[0..2].* = try r.call(g, in(ins, "x"));
         return 2;
     }
     if (eq(u8, f, "premix")) {
-        var r = try ops.Premix(MlxG).init(g, reg, in(ins, "w"), null);
+        var r = try tr.Premix(MlxG).init(g, reg, in(ins, "w"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "x"));
         return 1;
     }
     if (eq(u8, f, "sinkhorn")) {
-        var r = try ops.Sinkhorn(MlxG).init(g, reg);
+        var r = try tr.Sinkhorn(MlxG).init(g, reg);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "comb"));
         return 1;
     }
     if (eq(u8, f, "rcproj")) {
-        const site = std.meta.stringToEnum(ops.RcSite, c.site.?).?;
-        var r = try ops.RcProj(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
+        const site = std.meta.stringToEnum(tr.RcSite, c.site.?).?;
+        var r = try tr.RcProj(MlxG).init(g, reg, site, in(ins, "w"), in(ins, "scales"), null);
         defer r.deinit(g);
         outs[0] = try r.call(g, in(ins, "x"));
         return 1;
     }
     if (eq(u8, f, "hctape")) {
-        var r = try ops.HcTape(MlxG).init(g, reg, .bfloat16, null);
+        var r = try tr.HcTape(MlxG).init(g, reg, .bfloat16, null);
         defer r.deinit(g);
         const x, const rr, const post, const comb, const pre, const w = .{ in(ins, "x"), in(ins, "r"), in(ins, "post"), in(ins, "comb"), in(ins, "pre"), in(ins, "w") };
         outs[0] = try r.combine(g, x, rr, post, comb);
@@ -402,7 +486,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 11;
     }
     if (eq(u8, f, "fused_proj")) {
-        var r = try ops.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
+        var r = try tr.FusedProj(MlxG).init(g, reg, in(ins, "q_norm"), in(ins, "kv_norm"), null);
         defer r.deinit(g);
         const cos, const sin = .{ in(ins, "cos"), in(ins, "sin") };
         outs[0] = try r.qNorm(g, in(ins, "x_q"));
@@ -412,14 +496,14 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 4;
     }
     if (eq(u8, f, "gemv")) {
-        var r = try ops.Gemv(MlxG).init(g, reg);
+        var r = try xq.Gemv(MlxG).init(g, reg);
         defer r.deinit(g);
-        const proj: ops.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
+        const proj: xq.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
         outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"));
         return 1;
     }
     if (eq(u8, f, "prep")) {
-        var r = try ops.RinPrep(MlxG).init(g, reg);
+        var r = try xq.RinPrep(MlxG).init(g, reg);
         defer r.deinit(g);
         const ids = in(ins, "ids");
         outs[0..2].* = try r.inRin(g, in(ins, "x"), in(ins, "tok"), in(ins, "rin_g"), in(ins, "rin_u"), ids);
@@ -428,20 +512,20 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         outs[4] = try r.dpost(g, in(ins, "zd"), in(ins, "rout_d"), ids);
         return 5;
     }
-    const gate: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
-    const up: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
-    const down: ops.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
+    const gate: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
+    const up: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
+    const down: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
     if (eq(u8, f, "rebuild")) {
-        const r = ops.Rebuild(MlxG).init(reg);
+        const r = xq.Rebuild(MlxG).init(reg);
         outs[0..3].* = try r.call(g, gate, up, down, in(ins, "slots"), @intCast(c.vars.experts));
         return 3;
     }
     if (eq(u8, f, "digx")) {
-        const r = ops.DigX(MlxG).init(reg);
+        const r = xq.DigX(MlxG).init(reg);
         const rhs = in(ins, "rhs");
         const tgs_gu = try tableTgs(g, in(ins, "tbl_gu"));
         const tgs_dn = try tableTgs(g, in(ins, "tbl_dn"));
-        const gu: ops.DigTableArray(MlxG) = .{ .tbl = in(ins, "tbl_gu"), .tgs = tgs_gu };
+        const gu: xq.DigTableArray(MlxG) = .{ .tbl = in(ins, "tbl_gu"), .tgs = tgs_gu };
         const x = try r.take2(g, in(ins, "act"), in(ins, "ridx"), rhs, gu.tbl, gate.rin, up.rin);
         const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
         const hd = try r.onePass(g, z[0], z[1], rhs, gu.tbl, gate.rout, up.rout, down.rin);
@@ -504,17 +588,17 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
         };
         try ins.put(a, i.name, x);
     }
-    const P = ops.ProjArrays(mlx.mlx_array);
-    const bank: ops.BankArrays(mlx.mlx_array) = .{
+    const P = xq.ProjArrays(mlx.mlx_array);
+    const bank: xq.BankArrays(mlx.mlx_array) = .{
         .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin") },
         .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin") },
         .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin") },
     };
-    try ops.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
-    try ops.checkBank(MlxG, g, reg, .up, bank.up, diag);
-    try ops.checkBank(MlxG, g, reg, .down, bank.down, diag);
-    const shape: ops.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
-    var r = try ops.DigXPrefill(MlxG).init(a, reg, shape, diag);
+    try xq.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
+    try xq.checkBank(MlxG, g, reg, .up, bank.up, diag);
+    try xq.checkBank(MlxG, g, reg, .down, bank.down, diag);
+    const shape: xq.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
+    var r = try xq.DigXPrefill(MlxG).init(a, reg, shape, diag);
     defer r.deinit(g);
     var results: std.ArrayList(mlx.mlx_array) = .empty;
     defer results.deinit(a);
@@ -565,13 +649,15 @@ fn replayFixture(dir: []const u8, format: []const u8, filter: ?[]const u8, recei
     defer parsed.deinit();
     const spec = parsed.value;
     try testing.expectEqualStrings(format, spec.format);
-    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
     var diag: xk.Diag = .{};
     var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
         std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
         return e;
     };
     defer reg.deinit();
+    // this manifest or a predecessor whose kernels are unchanged here (the exporter's check)
+    if (!reg.acceptsManifest(spec.manifest_sha256)) std.debug.print("fixture manifest {s} is neither {s} nor a predecessor\n", .{ spec.manifest_sha256, xk.manifest_sha256 });
+    try testing.expect(reg.acceptsManifest(spec.manifest_sha256));
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var bound = try reg.bind(stream, &diag);
@@ -624,6 +710,22 @@ test "dsv41 kernels ops gpu: the DRAFTRC routes reproduce the lane's own draft k
     try replayFixture(dir, draft_fixture_format, null, std.c.getenv("DSV41_KERNEL_DRAFT_RECEIPT"), "kernel draft gate");
 }
 
+// The guarded window only (decode batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DECODE2_FIXTURE=<dir>
+// (the dump_kernel_decode2_fixture.py fixture); DSV41_KERNEL_DECODE2_RECEIPT=<path> keeps the lines.
+test "dsv41 kernels ops gpu: the decode batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_DECODE2_FIXTURE") orelse return error.SkipZigTest);
+    try replayFixture(dir, decode2_fixture_format, null, std.c.getenv("DSV41_KERNEL_DECODE2_RECEIPT"), "kernel decode2 gate");
+}
+
+// The guarded window only (prefill batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL2_FIXTURE=<dir>
+// (the dump_kernel_prefill2_fixture.py fixture); DSV41_KERNEL_PREFILL2_RECEIPT=<path> keeps the lines.
+test "dsv41 kernels ops gpu: the prefill batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_PREFILL2_FIXTURE") orelse return error.SkipZigTest);
+    try replayFixture(dir, prefill2_fixture_format, null, std.c.getenv("DSV41_KERNEL_PREFILL2_RECEIPT"), "kernel prefill2 gate");
+}
+
 // The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
 // DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
 test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
@@ -639,13 +741,13 @@ test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own di
     defer parsed.deinit();
     const spec = parsed.value;
     try testing.expectEqualStrings(prefill_format, spec.format);
-    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
     var diag: xk.Diag = .{};
     var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
         std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
         return e;
     };
     defer reg.deinit();
+    try testing.expect(reg.acceptsManifest(spec.manifest_sha256));
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var bound = try reg.bind(stream, &diag);
@@ -693,6 +795,11 @@ test "dsv41 kernels ops: the fixture generators are the dump's (sha256 of its --
         .{ .{ .kind = "wave_table", .slots = &.{ 3, 0, 2 }, .rows = &.{ 70, 37, 20 }, .tiles = 72 }, .int32, 80, "e7c9e15972414d0b85f223fc695913b94650858ba19f877f499ff124961b2968" },
         .{ .{ .kind = "slots16", .slots = &.{ 3, 1 } }, .int32, 16, "631b74d731b6e3635ad3bf3bb463aba6f2c678e26f9aa0fb5f5ca4b6d1d29f2f" },
         .{ .{ .kind = "values", .values = &.{ 0.3, 0.7, 1.1 } }, .float32, 3, "bcadc79e95123af764e6813ecf10b40cab57dafc8ef17f8f60118dfcf23ccbfd" },
+        // decode batch 2 (dump_kernel_decode2_fixture.py --golden): bool bytes and the bf16 head weight words
+        .{ .{ .kind = "range", .seed = 21, .lo = 0, .hi = 2 }, .bool_, 13, "61e3fd288705a89f08816c151a557cdd31d7a9ef95ba607c437d6bd4f66095e3" },
+        .{ .{ .kind = "bf16bits", .seed = 22 }, .bfloat16, 11, "7b6c6bc9a8d38b9b98954f6abd0aee09c1693bbbe62c9bac446bde806cf9d0f1" },
+        // prefill batch 2 (dump_kernel_prefill2_fixture.py --golden): the signed range (-1 .. -64 = no key)
+        .{ .{ .kind = "srange", .seed = 23, .lo = -64, .hi = 2048 }, .int32, 13, "967d23bfcc0bc9205fd577bcd469258765f0c31131017d7fb326be0c5a4a325e" },
     };
     for (cases) |c| {
         const b = try generate(a, c[0], c[1], c[2]);

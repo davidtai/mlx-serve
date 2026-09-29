@@ -84,11 +84,18 @@ pub fn Loop(comptime G: type) type {
         main_h: ?T = null,
         primary: u32 = 0,
 
-        pub fn init(g: *G, model: *M, head: *const H, st: *M.State, caches: []H.Cache, cfg: Config) Self {
+        /// The draft depth and the widest verify a request under `cfg` reaches with `head`.
+        pub const Shapes = struct { k_cap: u32, max_rows: u32 };
+        pub fn shapesOf(head: *const H, cfg: Config) Shapes {
             const k_cap = @min(cfg.k_request, head.blockSize());
             const extra: u32 = if (cfg.lookup) |l| (if (k_cap == ds.Lookup.key_len) l.extra_tokens else 0) else 0;
-            var self: Self = .{ .g = g, .model = model, .head = head, .st = st, .caches = caches, .cfg = cfg, .k_cap = k_cap, .max_rows = k_cap + extra + 1 };
-            self.stats.speculative_depth = k_cap + extra;
+            return .{ .k_cap = k_cap, .max_rows = k_cap + extra + 1 };
+        }
+
+        pub fn init(g: *G, model: *M, head: *const H, st: *M.State, caches: []H.Cache, cfg: Config) Self {
+            const sh = shapesOf(head, cfg);
+            var self: Self = .{ .g = g, .model = model, .head = head, .st = st, .caches = caches, .cfg = cfg, .k_cap = sh.k_cap, .max_rows = sh.max_rows };
+            self.stats.speculative_depth = sh.max_rows - 1;
             return self;
         }
 
@@ -204,40 +211,43 @@ pub fn Loop(comptime G: type) type {
         /// shape raised MLX's high-water mark by, measured once here (row counts
         /// 1 .. `max_rows`, then the draft block): the bill's per-shape terms.
         pub fn warm(self: *Self, a: std.mem.Allocator, ex: anytype, peaks: ?[]u64) !void {
-            return self.warmShapes(a, ex, peaks);
+            return warmShapes(self.g, a, self.model, self.head, self.k_cap, self.max_rows, ex, peaks);
         }
 
         /// The install warm-up of a model and head a caller constructs (the
-        /// module's init, before any request): `warm` at the shapes a request
-        /// under `cfg` reaches (its depth and lookup set the widest verify:
-        /// `k_request` 0 is decode forwards only, no draft block), on a loop
-        /// that lives for the call.
-        pub fn warmFor(g: *G, a: std.mem.Allocator, model: *M, head: *const H, ex: anytype, cfg: Config, peaks: ?[]u64) !void {
-            var st = try model.newState();
-            defer st.deinit(g, a);
-            const caches = try a.alloc(H.Cache, head.nStages());
-            defer a.free(caches);
-            @memset(caches, .{});
-            var lp = init(g, model, head, &st, caches, cfg);
-            defer lp.deinit();
-            try lp.warmShapes(a, ex, peaks);
+        /// module's init, before any request): every forward width 1 ..
+        /// max(`widths`, the widest verify of a request under `cfg`) (the
+        /// compiled regions trace per width up to their row bound), then a draft
+        /// block when `cfg` drafts. Returns the per-shape peaks (owned): one per
+        /// width, then the draft block's (0 when none).
+        pub fn warmFor(g: *G, a: std.mem.Allocator, model: *M, head: *const H, ex: anytype, cfg: Config, widths: u32) ![]u64 {
+            const sh = shapesOf(head, cfg);
+            const rows = @max(sh.max_rows, widths);
+            const peaks = try a.alloc(u64, rows + 1);
+            errdefer a.free(peaks);
+            @memset(peaks, 0);
+            try warmShapes(g, a, model, head, sh.k_cap, rows, ex, peaks);
+            return peaks;
         }
 
-        fn warmShapes(self: *Self, a: std.mem.Allocator, ex: anytype, peaks: ?[]u64) !void {
-            const g = self.g;
-            var st = try self.model.newState();
+        const max_warm_rows = 64;
+
+        fn warmShapes(g: *G, a: std.mem.Allocator, model: *M, head: *const H, k_cap: u32, rows: u32, ex: anytype, peaks: ?[]u64) !void {
+            if (rows > max_warm_rows) return error.WarmTooWide;
+            if (peaks) |p| std.debug.assert(p.len >= rows + @intFromBool(k_cap > 0));
+            var st = try model.newState();
             defer st.deinit(g, a);
             var caches: [8]H.Cache = @splat(.{});
-            const n_st = self.head.nStages();
+            const n_st = head.nStages();
             defer for (caches[0..n_st]) |*x| x.deinit(g);
-            var ids: [ds.max_block + 1]u32 = @splat(1);
+            var ids: [max_warm_rows]u32 = @splat(1);
             var main: ?T = null;
             defer if (main) |x| g.release(x);
-            for (1..self.max_rows + 1) |m| {
+            for (1..rows + 1) |m| {
                 const base = g.peakFrom();
-                const r = try self.model.forward(g, &st, ids[0..m], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
+                const r = try model.forward(g, &st, ids[0..m], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
                 try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
-                try self.head.seedMain(g, r.main_hidden.?, caches[0..n_st]);
+                try head.seedMain(g, r.main_hidden.?, caches[0..n_st]);
                 var ws: [8]T = undefined;
                 var nw: usize = 0;
                 for (caches[0..n_st]) |c| if (c.window) |w| {
@@ -253,11 +263,11 @@ pub fn Loop(comptime G: type) type {
                 try ex.flush();
                 g.reset();
             }
-            if (self.k_cap > 0) {
+            if (k_cap > 0) {
                 const base = g.peakFrom();
-                const d = try self.head.draftBlock(g, main.?, 1, caches[0..n_st], self.model.embed, self.model.head);
+                const d = try head.draftBlock(g, main.?, 1, caches[0..n_st], model.embed, model.head);
                 try g.evalAll(&.{ d.ids, d.logits, d.conf });
-                if (peaks) |p| p[self.max_rows] = g.peakAbove(base);
+                if (peaks) |p| p[rows] = g.peakAbove(base);
                 g.reset();
             }
         }
@@ -866,7 +876,10 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         var g = TraceOps.init(a);
         defer g.deinit();
         const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
-        const model_ = try Loop(TraceOps).M.init(a, &g, c, t.tier, &lookup, &src);
+        var kd: @import("exl3_kernels.zig").Diag = .{};
+        var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
+        defer reg.deinit();
+        const model_ = try Loop(TraceOps).M.initWith(a, &g, c, t.tier, &lookup, &src, .{ .registry = &reg });
         defer model_.deinit(&g);
         var st = try model_.newState();
         defer st.deinit(&g, a);
@@ -1114,7 +1127,7 @@ test "dsv41 dspark loop: on a bounded state the lookup's history and key map are
 
 /// The loop on MLX with the served expert source, analysed on the host (never run): the
 /// MLX backend's warm-up measurement, the logged verify reads and the cycle compile.
-fn mlxSmoke(lp: *Loop(ops.MlxOps), a: std.mem.Allocator, ex: *xp.Experts(ops.MlxOps, xp.StreamSource, xp.EagerChain(ops.MlxOps, xp.MlxGemv)), out: *std.ArrayList(u32)) !void {
+fn mlxSmoke(lp: *Loop(ops.MlxOps), a: std.mem.Allocator, ex: *xp.ExpertsWith(ops.MlxOps, xp.StreamSource, xp.QuantMath(ops.MlxOps, @import("exl3_quant.zig").Accepted(ops.MlxOps)), .{ .prefill = true }), out: *std.ArrayList(u32)) !void {
     var peaks: [ds.max_block + 2]u64 = undefined;
     try lp.warm(a, ex, &peaks);
     var lg: CycleLog = .{ .primary = 0, .want_top = true };
@@ -1128,8 +1141,7 @@ test "dsv41 dspark loop: the MLX instantiation of the loop analyses (host, nothi
 /// A wide route that records each call: its layer (routes are built in layer
 /// order), rows, act rows and slots, in the order the forward makes them.
 const WideLog = struct {
-    const xk = @import("exl3_kernels.zig");
-    const xko = @import("exl3_kernel_ops.zig");
+    const quant = @import("quant.zig");
     var next_layer: u32 = 0;
     var order: [512]u32 = undefined;
     var n_order: usize = 0;
@@ -1139,12 +1151,11 @@ const WideLog = struct {
     finishes: u32 = 0,
     ok: bool = true,
 
-    pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !WideLog {
+    pub fn init() WideLog {
         next_layer += 1;
         return .{ .layer = next_layer - 1 };
     }
-    pub fn deinit(_: *WideLog, _: *TraceOps) void {}
-    pub fn call(self: *WideLog, g: *TraceOps, act: u32, r: xko.PrefillRows, bank: xko.BankArrays(u32)) !u32 {
+    pub fn call(self: *WideLog, g: *TraceOps, act: u32, r: quant.PrefillRows, bank: xp.BankArraysOf(u32)) !u32 {
         self.calls += 1;
         self.rows += @intCast(r.slot.len);
         order[n_order] = self.layer;
@@ -1163,7 +1174,6 @@ const WideLog = struct {
 
 test "dsv41 dspark loop: the served prompt pass is one forward the model chunks; its wide chunks run through the wide lane, chunk-major" {
     const a = testing.allocator;
-    const xk = @import("exl3_kernels.zig");
     const m = try mdl.Mini.init();
     defer m.deinit();
     var g = TraceOps.init(a);
@@ -1179,13 +1189,13 @@ test "dsv41 dspark loop: the served prompt pass is one forward the model chunks;
     var rows0: [8]u32 = @splat(@intCast(m.c.n_routed_experts));
     var src = try xp.FakeSource.init(a, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
     defer src.deinit();
-    var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
     WideLog.next_layer = 0;
     WideLog.n_order = 0;
-    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = WideLog });
-    var ex = try Ex.initWith(a, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    var logs: [8]WideLog = undefined;
+    for (logs[0..nl]) |*l| l.* = WideLog.init();
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, WideLog);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = logs[0..nl] }, &m.c);
     defer ex.deinit();
     var script: Script = .{ .n_experts = @intCast(m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
     g.host_values = script.values();
@@ -1209,11 +1219,13 @@ test "dsv41 dspark loop: the served prompt pass is one forward the model chunks;
     try testing.expectEqual(@as(u32, n_prompt), st.offset);
     try testing.expectEqual(@as(u32, n_prompt), caches[0].offset);
     // Every layer's wide route took the two wide chunks' rows (60 x k), act rows indexing the chunk,
-    // slots inside the bank, bf16 act; one finish per call.
-    for (ex.wide_routes) |r| {
+    // slots inside the bank, bf16 act; every call drains every layer's waves (the quant's finishPrefill).
+    var wide_calls: u32 = 0;
+    for (logs[0..nl]) |r| wide_calls += r.calls;
+    for (logs[0..nl]) |r| {
         try testing.expect(r.ok);
         try testing.expectEqual(@as(u32, 60 * k), r.rows);
-        try testing.expectEqual(r.calls, r.finishes);
+        try testing.expectEqual(wide_calls, r.finishes);
     }
     // Chunk-major: chunk 0 through layers 0 .. L-1, then chunk 1 (a layer's calls in a chunk adjacent).
     var runs: [64]u32 = undefined;

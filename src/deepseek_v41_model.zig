@@ -15,6 +15,7 @@ const ops = @import("deepseek_v41_ops.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
+const xk = @import("exl3_kernels.zig");
 const routes = @import("deepseek_v41_routes.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
@@ -55,6 +56,8 @@ pub fn Model(comptime G: type) type {
         engram: ?EngramBind = null,
         /// Arrays the model made (inverse frequencies, the quantized head, f32 wo_a).
         owned: std.ArrayList(T) = .empty,
+        /// The tier's RC kernel routes (C12 ...), bound at `initWith`; empty on a stock tier.
+        kx: Tr.Kernels = .{},
 
         const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
 
@@ -121,6 +124,15 @@ pub fn Model(comptime G: type) type {
         /// has Engram layers. The model must not move afterwards (compiled
         /// regions key on `&self.c`).
         pub fn init(gpa: std.mem.Allocator, g: *G, c: v41.Config, tier: routes.Tier, lookup: anytype, engram_src: ?*const eng.RowSource) !*Self {
+            return initWith(gpa, g, c, tier, lookup, engram_src, .{});
+        }
+
+        /// `registry`: the accepted trunk routes' registry, required when the tier binds kernel
+        /// routes (refused otherwise: TierNeedsKernels, before any resident binds).
+        pub const Options = struct { registry: ?*const xk.Registry = null };
+
+        pub fn initWith(gpa: std.mem.Allocator, g: *G, c: v41.Config, tier: routes.Tier, lookup: anytype, engram_src: ?*const eng.RowSource, opts: Options) !*Self {
+            if (Tr.Kernels.needed(&tier.routes) and opts.registry == null) return error.TierNeedsKernels;
             const self = try gpa.create(Self);
             self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed = undefined, .norm_w = undefined, .head = undefined };
             errdefer self.deinit(g);
@@ -155,6 +167,7 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
+            if (opts.registry) |reg| self.kx = try Tr.Kernels.init(gpa, g, reg, &self.c, &self.tier.routes, self.layers);
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
@@ -163,6 +176,7 @@ pub fn Model(comptime G: type) type {
         pub fn deinit(self: *Self, g: *G) void {
             for (self.owned.items) |x| g.release(x);
             self.owned.deinit(self.gpa);
+            self.kx.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
         }
@@ -379,7 +393,7 @@ pub fn Model(comptime G: type) type {
                     mains[n_main] = g.keep(try mainOf(g, h));
                     n_main += 1;
                 }
-                const out = try Tr.layer(g, probe, c, rt, li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
+                const out = try Tr.layer(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
                 h = out.h;
                 pm = out.pre_mix;
                 carry.persist(g, &h, &pm, &shared);
@@ -548,14 +562,14 @@ pub fn Model(comptime G: type) type {
                     var h = hs[i];
                     if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
-                    halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
+                    halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
                     try fence(g, st, &.{ halves[i].moe_in, halves[i].ffn_pre });
                 }
                 if (want_main and li.dspark_target) n_main += 1;
                 // Per chunk: the resident gate (M == the chunk, as chunk-major).
                 for (halves, xfs, routes_) |hf, *xf, *r| {
                     xf.* = try g.reshape(hf.moe_in, &.{ -1, dim });
-                    r.* = try Tr.router(g, probe, c, rt, lw, xf.*);
+                    r.* = try Tr.router(g, probe, c, rt, self.kx.at(l), lw, xf.*);
                 }
                 // The routed call over consecutive chunks up to the row cap.
                 var i: usize = 0;
@@ -882,8 +896,7 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
     const xp = @import("deepseek_v41_experts.zig");
-    const xk = @import("exl3_kernels.zig");
-    const xko = @import("exl3_kernel_ops.zig");
+    const quant = @import("quant.zig");
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);
@@ -901,22 +914,17 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
     const Count = struct {
         calls: u32 = 0,
         rows: u32 = 0,
-        pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !@This() {
-            return .{};
-        }
-        pub fn deinit(_: *@This(), _: *TraceOps) void {}
-        pub fn call(self: *@This(), gg: *TraceOps, act: u32, r: xko.PrefillRows, _: xko.BankArrays(u32)) !u32 {
+        pub fn call(self: *@This(), gg: *TraceOps, act: u32, r: quant.PrefillRows, _: xp.BankArraysOf(u32)) !u32 {
             self.calls += 1;
             self.rows += @intCast(r.slot.len);
             return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
         }
         pub fn finish(_: *@This(), _: *TraceOps) !void {}
     };
-    var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
-    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = Count });
-    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    var counts: [8]Count = @splat(.{});
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, Count);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(testing.allocator, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = counts[0..nl] }, &m.c);
     defer ex.deinit();
     const Host = struct {
         n: u16,
@@ -941,7 +949,7 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
     try model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {});
     try testing.expectEqualSlices(u32, &.{ 7, 7, 7 }, &out);
     try testing.expectEqual(@as(u32, 27), st.offset);
-    for (ex.wide_routes) |r| {
+    for (counts[0..nl]) |r| {
         try testing.expectEqual(@as(u32, 1), r.calls);
         try testing.expectEqual(@as(u32, 25 * k), r.rows);
     }
@@ -989,8 +997,7 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
         const first: u32 = @intCast(g.nodes.items.len);
         const waves0 = g.freed.items.len;
         const r = try model_.forward(&g, &st, span, .{ .logits = .all, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
-        // The layer waves, in order; each layer's score chains (attention, and the indexer's on an
-        // index source) are sub-waves released inside it, before the layer's own reset.
+        // The layer waves, in order (a prefill-width layer's score chains would be sub-waves inside it).
         var layers: [16]TraceOps.Freed = undefined;
         var n_layers: usize = 0;
         var n_sub: usize = 0;
@@ -1017,7 +1024,8 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
             }
         }
         try testing.expectEqual(@as(usize, m.c.n_layers), n_layers);
-        try testing.expect(n_sub >= m.c.n_layers);
+        // Decode / verify widths keep their score chains in the layer wave (prefill widths release them).
+        try testing.expectEqual(@as(usize, 0), n_sub);
         prev = layers[n_layers - 1].to;
         // The final norm, the head and the taps' concat come after the last wave.
         try testing.expect(r.logits.? >= prev and r.main_hidden.? >= prev and r.hidden >= prev);

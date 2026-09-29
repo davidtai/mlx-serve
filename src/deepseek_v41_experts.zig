@@ -12,13 +12,15 @@
 //! in the router's order as `[n, k, hidden]` f32; the trunk combines them.
 //! `grow` is the one phase change; `flush` follows the forward's last eval.
 //! A call of more rows than a route takes (a prefill chunk) is the wide lane:
-//! the kernels' DIG-X prefill route over the slots its experts are served in.
+//! the math's `prefill` over the slots its experts are served in.
 //!
 //! Sources: `StreamSource` (the streamer's `Stream`) and `FakeSource` (the
 //! streamer's residency policy with no reads, for host tests). The math of a
-//! group of rows sharing a bank is a seam: `EagerChain` is the exact tier's
-//! op chain around the EXL3 decode GEMV, which the kernels lane binds
-//! (`MlxGemv`); `TraceGemv` / `TraceMath` stand in on the trace backend.
+//! group of rows sharing a bank is the C2 `quant` seam (quant.zig): `QuantMath`
+//! over an accepted quant (the EXL3 quant: PREP=rin + the decode GEMV, DIG-X
+//! prefill waves) is the served math; `EagerChain` is the stock tier's op chain
+//! around the quant's decode GEMV (the parity harnesses); `TraceGemv` /
+//! `TraceMath` stand in on the trace backend.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -31,7 +33,8 @@ const expert_stream = @import("expert_stream.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
 const xk = @import("exl3_kernels.zig");
-const xko = @import("exl3_kernel_ops.zig");
+const quant = @import("quant.zig");
+const xq = @import("exl3_quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
 pub const BankKind = expert_stream.BankKind;
@@ -54,13 +57,11 @@ pub const Served = struct {
 /// One projection's slot arrays in a bank (the streamer's `ProjArrays` over
 /// any backend): code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out],
 /// rin f16 [rows, in].
-pub fn ProjOf(comptime T: type) type {
-    return struct { code: T, rout: T, rin: T };
-}
+pub const ProjOf = xq.ProjArrays;
 
-/// A bank's nine arrays by projection (the streamer's `BankArrays`).
+/// A bank's nine arrays by projection (the streamer's `BankArrays`; the quant seam's).
 pub fn BankArraysOf(comptime T: type) type {
-    return struct { gate: ProjOf(T), up: ProjOf(T), down: ProjOf(T) };
+    return quant.BankArrays(ProjOf(T));
 }
 
 // ── The source contract ──
@@ -524,25 +525,22 @@ pub const FakeSource = struct {
 /// `128 ** -0.5` as the Python float rounds to the f32 MLX takes.
 const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
 
-/// The exact tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
+/// The stock tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
 /// per projection `t128(gemv(t128(x * rin[slot])) ) * rout[slot]` (f32), the
-/// clamped SwiGLU between gate/up and down. `Gemv.project(g, k, out_dim, xh,
-/// ids, code)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis
-/// domain, f32 [rows, out_dim]), which the kernels lane binds.
+/// clamped SwiGLU between gate/up and down. `Gemv.project(g, proj, xh, ids,
+/// code)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
+/// f32 [rows, out]): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`).
+/// The parity harnesses' math (the stock path reads f32 routed rows).
 pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
     return struct {
         const Self = @This();
         const T = G.T;
 
         gemv: Gemv,
-        hidden: u32,
-        inter: u32,
-        /// Trellis bits per weight (3 on every layer of the bank of record).
-        k: u32 = 3,
         swiglu_limit: f64,
 
         pub fn init(gemv: Gemv, c: *const v41.Config) Self {
-            return .{ .gemv = gemv, .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .swiglu_limit = c.swiglu_limit };
+            return .{ .gemv = gemv, .swiglu_limit = c.swiglu_limit };
         }
 
         /// `tcq_runtime._t128`: the normalised 128-block Walsh-Hadamard over the last axis.
@@ -557,10 +555,10 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         }
 
         /// `Exl3PackedOps._project`.
-        fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), out_dim: u32) !T {
+        fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
             const rin = try g.astype(try g.take(p.rin, ids, 0), .float32);
             const xh = try t128(g, try g.mul(try g.astype(x, .float32), rin));
-            const z = try self.gemv.project(g, self.k, out_dim, xh, ids, p.code);
+            const z = try self.gemv.project(g, proj, xh, ids, p.code);
             const rout = try g.astype(try g.take(p.rout, ids, 0), .float32);
             return g.mul(try t128(g, z), rout);
         }
@@ -568,8 +566,8 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         /// Gate and up of rows `x` [rows, hidden] at slot rows `ids` [rows]
         /// (uint32), then `_clamped_swiglu(g, u, limit)`: f32 [rows, inter].
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: ProjOf(T), up: ProjOf(T)) !T {
-            const gg = try self.project(g, x, ids, gate, self.inter);
-            const uu = try self.project(g, x, ids, up, self.inter);
+            const gg = try self.project(g, x, ids, gate, .gate);
+            const uu = try self.project(g, x, ids, up, .up);
             const lim = self.swiglu_limit;
             const uc = try g.clip(uu, try g.scalar(-lim, .float32), try g.scalar(lim, .float32));
             const gc = try g.minimum(gg, try g.scalar(lim, .float32));
@@ -578,83 +576,84 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
 
         /// Down of the SwiGLU rows `h` [rows, inter]: f32 [rows, hidden].
         pub fn down(self: *const Self, g: *G, h: T, ids: T, d: ProjOf(T)) !T {
-            return self.project(g, h, ids, d, self.hidden);
+            return self.project(g, h, ids, d, .down);
         }
     };
 }
 
-/// The lane of record's decode chain around the EXL3 GEMV (PREP=rin, the
-/// kernels' `RinPrep` route): gate and up `in_rin` in one dispatch, the two
-/// GEMVs, `gu_epi` (the clamped SwiGLU), `din_rin`, the down GEMV, `dpost`
-/// (4 prepared launches + 3 GEMVs per bank group, where `EagerChain` builds
-/// about 11 graph ops per projection). Bit-identical to `EagerChain` on bf16
-/// activations (check_q3_exl3_rinprep.py "real"); `in_rin` reads bf16 rows, so
-/// it serves a tier whose MoE input is bf16 (the lane of record's).
-pub fn RinChain(comptime G: type, comptime Gemv: type) type {
+/// The served routed-expert math: an accepted C2 quant (`quant.checkAccepted`),
+/// its decode `gateUp` / `down` (the EXL3 quant: PREP=rin around the decode
+/// GEMV) and its prefill waves. The quant reads bf16 routed rows: a call whose
+/// rows arrive in another dtype is rounded to bf16 once, here (the RC tier's
+/// MoE input is bf16 already).
+pub fn QuantMath(comptime G: type, comptime Q: type) type {
     return struct {
         const Self = @This();
         const T = G.T;
+        q: *Q,
 
-        prep: *const xko.RinPrep(G),
-        gemv: Gemv,
-        hidden: u32,
-        inter: u32,
-        /// Trellis bits per weight (3 on every layer of the bank of record).
-        k: u32 = 3,
-
-        /// The route (built after the kernels' startup acceptance, owned by the caller) and the GEMV.
-        pub const Arg = struct { prep: *const xko.RinPrep(G), gemv: Gemv };
-
-        pub fn init(arg: Arg, c: *const v41.Config) Self {
-            return .{ .prep = arg.prep, .gemv = arg.gemv, .hidden = c.hidden_size, .inter = c.moe_intermediate_size };
+        pub fn init(q: *Q, _: *const v41.Config) Self {
+            return .{ .q = q };
         }
 
-        /// Gate and up of rows `x` [rows, hidden] bf16 at slot rows `ids`: the
-        /// clamped SwiGLU f32 [rows, inter]. The rows are already taken, so
-        /// `in_rin` reads them in order.
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: ProjOf(T), up: ProjOf(T)) !T {
-            std.debug.assert(g.dtypeOf(x) == .bfloat16);
-            const tok = try g.arange(0, @floatFromInt(g.shapeOf(x).dim(0)), 1, .int32);
-            const xs = try self.prep.inRin(g, x, tok, gate.rin, up.rin, ids);
-            const zg = try self.gemv.project(g, self.k, self.inter, xs[0], ids, gate.code);
-            const zu = try self.gemv.project(g, self.k, self.inter, xs[1], ids, up.code);
-            return self.prep.guEpi(g, zg, zu, gate.rout, up.rout, ids);
+            const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
+            return self.q.gateUp(g, xb, ids, gate, up);
         }
 
-        /// Down of the SwiGLU rows `h` [rows, inter]: f32 [rows, hidden].
         pub fn down(self: *const Self, g: *G, h: T, ids: T, d: ProjOf(T)) !T {
-            const hd = try self.prep.dinRin(g, h, d.rin, ids);
-            const zd = try self.gemv.project(g, self.k, self.hidden, hd, ids, d.code);
-            return self.prep.dpost(g, zd, d.rout, ids);
+            return self.q.down(g, h, ids, d);
+        }
+
+        pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T)) !T {
+            return self.q.prefill(g, layer, x, rows, bank);
+        }
+
+        pub fn finishPrefill(self: *const Self, g: *G) !void {
+            return self.q.finishPrefill(g);
         }
     };
 }
 
-/// The EXL3 decode GEMV on MLX, bound by the kernels lane (phase-3 ops): an
-/// output the backend owns (`g.adopt`), f32 [rows, out_dim]. Construction-time
-/// binding; nothing is looked up per call.
-pub const MlxGemv = struct {
-    ctx: *const anyopaque,
-    project_fn: *const fn (ctx: *const anyopaque, g: *ops.MlxOps, k: u32, out_dim: u32, xh: mlx.mlx_array, ids: mlx.mlx_array, code: mlx.mlx_array) anyerror!mlx.mlx_array,
+/// A decode math `D` with one prefill route `P` per layer (`call(g, x, rows,
+/// bank)` / `finish(g)`: the quant's prefill shape), for host tests.
+pub fn WithPrefillRoutes(comptime G: type, comptime D: type, comptime P: type) type {
+    return struct {
+        const Self = @This();
+        const T = G.T;
+        d: D,
+        routes: []P,
 
-    pub fn project(self: MlxGemv, g: *ops.MlxOps, k: u32, out_dim: u32, xh: mlx.mlx_array, ids: mlx.mlx_array, code: mlx.mlx_array) !mlx.mlx_array {
-        return self.project_fn(self.ctx, g, k, out_dim, xh, ids, code);
-    }
-};
+        pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: ProjOf(T), up: ProjOf(T)) !T {
+            return self.d.gateUp(g, x, ids, gate, up);
+        }
+
+        pub fn down(self: *const Self, g: *G, h: T, ids: T, d: ProjOf(T)) !T {
+            return self.d.down(g, h, ids, d);
+        }
+
+        pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T)) !T {
+            return self.routes[layer].call(g, x, rows, bank);
+        }
+
+        pub fn finishPrefill(self: *const Self, g: *G) !void {
+            for (self.routes) |*r| try r.finish(g);
+        }
+    };
+}
 
 /// The GEMV's launch contract on the trace backend (the kernel manifest's
 /// inputs: xh f32 [rows, in], ids uint32 [rows], code int16 [cap, in/16,
-/// out/16, 16K]); the output is a kernel node f32 [rows, out_dim].
+/// out/16, 48] at K 3); the output is a kernel node f32 [rows, out].
 pub const TraceGemv = struct {
-    pub fn project(_: TraceGemv, g: *ops.TraceOps, k: u32, out_dim: u32, xh: u32, ids: u32, code: u32) !u32 {
+    pub fn project(_: TraceGemv, g: *ops.TraceOps, _: xq.Proj, xh: u32, ids: u32, code: u32) !u32 {
         const sx = g.shapeOf(xh);
         const si = g.shapeOf(ids);
         const sc = g.shapeOf(code);
         if (g.dtypeOf(xh) != .float32 or g.dtypeOf(ids) != .uint32 or g.dtypeOf(code) != .int16) return error.GemvDtype;
         if (sx.n != 2 or si.n != 1 or sc.n != 4 or si.d[0] != sx.d[0]) return error.GemvShape;
-        const out: c_int = @intCast(out_dim);
-        if (sc.d[1] * 16 != sx.d[1] or sc.d[2] * 16 != out or sc.d[3] != 16 * @as(c_int, @intCast(k))) return error.GemvShape;
-        return g.kernel(&.{ sx.d[0], out }, .float32);
+        if (sc.d[1] * 16 != sx.d[1] or sc.d[3] != 48) return error.GemvShape;
+        return g.kernel(&.{ sx.d[0], sc.d[2] * 16 }, .float32);
     }
 };
 
@@ -694,17 +693,10 @@ pub const Routes = struct {
     /// Event gates instead of host waits: every wave is built at once over
     /// event-wait aliases of the bank arrays (the typical tier's gate).
     gated: bool = false,
-    /// The wide lane (calls of more than `max_route_ids` routed rows): one
-    /// route of this type per layer (`exl3_kernel_ops.DigXPrefill(G)`); null
-    /// refuses a wide call (`PrefillLaneNotPorted`).
-    prefill: ?type = null,
-};
-
-/// What the wide lane's routes are built from (`initWith`, once per layer).
-pub const PrefillInit = struct {
-    reg: *const xk.Registry,
-    shape: xko.PrefillShape = .tier,
-    diag: ?*xk.Diag = null,
+    /// The wide lane (calls of more than `max_route_ids` routed rows) through
+    /// the math's `prefill(g, layer, x, rows, bank)` (a KEPT result) and
+    /// `finishPrefill(g)`; off refuses a wide call (`PrefillLaneNotPorted`).
+    prefill: bool = false,
 };
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
@@ -739,16 +731,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         gates: []const Gate = &.{},
         /// Gated: the event the stream signals (an MLX backend's MTLSharedEvent).
         event: expert_event.Event = .{ .id = 0, .object = 0 },
-        /// The backend the banks and the wide routes were bound on.
+        /// The backend the banks were bound on.
         g: *G,
-        /// The wide lane: one route per layer (empty when not installed).
-        wide_routes: []Wide = &.{},
         wide: WideScratch = .{},
 
-        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, prefill: ?PrefillInit = null };
-
-        /// The wide lane's route (void when not installed).
-        pub const Wide = routes.prefill orelse void;
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null };
 
         /// The wide lane's host scratch, reused across calls.
         const WideScratch = struct {
@@ -778,22 +765,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             errdefer a.free(banks);
             for (banks, 0..) |*b, l| {
                 b.* = @splat(null);
-                for ([_]BankKind{ .base, .transient }) |kind| b[@intFromEnum(kind)] = try bind(g, source, @intCast(l), kind);
+                for ([_]BankKind{ .base, .transient }) |kind| b[@backingInt(kind)] = try bind(g, source, @intCast(l), kind);
             }
             var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g };
             if (opt.event) |e| self.event = e;
-            if (routes.prefill) |P| {
-                const pi = opt.prefill orelse return error.PrefillNeedsRegistry;
-                const rs = try a.alloc(P, c.n_layers);
-                errdefer a.free(rs);
-                var built: usize = 0;
-                errdefer for (rs[0..built]) |*r| r.deinit(g);
-                for (rs) |*r| {
-                    r.* = try P.init(a, pi.reg, pi.shape, pi.diag);
-                    built += 1;
-                }
-                self.wide_routes = rs;
-            }
             return self;
         }
 
@@ -826,10 +801,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn deinit(self: *Self) void {
-            if (routes.prefill != null) {
-                for (self.wide_routes) |*r| r.deinit(self.g);
-                self.a.free(self.wide_routes);
-            }
             self.wide.deinit(self.a);
             self.a.free(self.banks);
             self.* = undefined;
@@ -845,7 +816,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// The one phase change: the source grows, the grown rows are bound.
         pub fn grow(self: *Self, g: *G, decode_rows: []const u32) !void {
             try self.source.grow(decode_rows);
-            for (self.banks, 0..) |*b, l| b[@intFromEnum(BankKind.ext)] = try bind(g, self.source, @intCast(l), .ext);
+            for (self.banks, 0..) |*b, l| b[@backingInt(BankKind.ext)] = try bind(g, self.source, @intCast(l), .ext);
         }
 
         /// After the forward's last eval: settles and unpins released calls.
@@ -901,7 +872,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 gr.n += 1;
             }
             for (wave.groups[0..wave.n], 0..) |*gr, i| {
-                const arrays = (if (over) |o| o[@intFromEnum(gr.bank)] else self.banks[layer][@intFromEnum(gr.bank)]).?;
+                const arrays = (if (over) |o| o[@backingInt(gr.bank)] else self.banks[layer][@backingInt(gr.bank)]).?;
                 var tok: [max_route_ids]i32 = undefined;
                 var rows: [max_route_ids]u32 = undefined;
                 for (gr.pos[0..gr.n], tok[0..gr.n], rows[0..gr.n]) |pos, *t, *r| {
@@ -920,7 +891,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         fn downWave(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) ![]const T {
             const first = acc.n_outs;
             for (wave.groups[0..wave.n], 0..) |*gr, i| {
-                const arrays = (if (over) |o| o[@intFromEnum(gr.bank)] else self.banks[layer][@intFromEnum(gr.bank)]).?;
+                const arrays = (if (over) |o| o[@backingInt(gr.bank)] else self.banks[layer][@backingInt(gr.bank)]).?;
                 acc.outs[acc.n_outs] = try self.math.down(g, wave.h[i], wave.ids[i], arrays.down);
                 acc.n_outs += 1;
                 for (gr.pos[0..gr.n]) |pos| {
@@ -938,7 +909,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         fn gatedParts(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) !void {
             var gu: [n_banks]?Arrays = @splat(null);
             for (sv.waves, sv.refs) |w, ref| {
-                const b = @intFromEnum(ref.bank);
+                const b = @backingInt(ref.bank);
                 if (w == 0 or gu[b] != null) continue;
                 const arrays = self.banks[layer][b].?;
                 gu[b] = .{ .gate = try self.waitProj(g, arrays.gate, gates.gu, &.{}), .up = try self.waitProj(g, arrays.up, gates.gu, &.{}), .down = arrays.down };
@@ -978,7 +949,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // and verify, <= 8 rows of top-6) are the decode lane; wider calls
             // are the wide lane (the DIG kernels), when it is installed.
             if (n_ids > max_route_ids) {
-                if (comptime routes.prefill == null) {
+                if (comptime !routes.prefill) {
                     return error.PrefillLaneNotPorted;
                 } else {
                     return self.runWide(g, layer, xf, indices, n, k);
@@ -1046,7 +1017,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 try w.distinct.append(a, e);
             };
             const act = if (g.dtypeOf(xf) == .bfloat16) xf else try g.astype(xf, .bfloat16);
-            const route = &self.wide_routes[layer];
             w.pos.clearRetainingCapacity();
             w.kept.clearRetainingCapacity();
             errdefer {
@@ -1077,15 +1047,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         try w.pos.append(a, @intCast(row));
                     }
                     if (w.slot.items.len == 0) continue;
-                    const b = self.banks[layer][@intFromEnum(kind)].?;
+                    const b = self.banks[layer][@backingInt(kind)].?;
                     try w.kept.ensureUnusedCapacity(a, 1);
-                    const y = try route.call(g, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, .{
-                        .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin },
-                        .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin },
-                        .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
-                    });
+                    const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
                     w.kept.appendAssumeCapacity(y);
-                    try route.finish(g);
+                    try self.math.finishPrefill(g);
                     try g.evalAll(&.{y});
                 }
                 self.source.release(call);
@@ -1155,8 +1121,8 @@ fn groupsOf(sv: Served, w: u8) usize {
     var seen: [n_banks]bool = @splat(false);
     var n: usize = 0;
     for (sv.waves, sv.refs) |wv, ref| {
-        if (wv != w or seen[@intFromEnum(ref.bank)]) continue;
-        seen[@intFromEnum(ref.bank)] = true;
+        if (wv != w or seen[@backingInt(ref.bank)]) continue;
+        seen[@backingInt(ref.bank)] = true;
         n += 1;
     }
     return n;
@@ -1200,9 +1166,9 @@ test "dsv41 experts: a decode call runs the residents, then each part's gate/up 
     const Ex = Experts(TraceOps, FakeSource, Chain);
     var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
     defer ex.deinit();
-    try testing.expect(ex.banks[1][@intFromEnum(BankKind.ext)] == null);
+    try testing.expect(ex.banks[1][@backingInt(BankKind.ext)] == null);
     try ex.grow(&g, &.{ 8, 8 });
-    try testing.expect(ex.banks[1][@intFromEnum(BankKind.ext)] != null);
+    try testing.expect(ex.banks[1][@backingInt(BankKind.ext)] != null);
     src.log.clearRetainingCapacity();
     src.trace = &g;
 
@@ -1301,7 +1267,7 @@ const RecRoute = struct {
 
     const Rec = struct { slot: []u32, act_row: []u32, bank_code: u32, route: u64, refs: []SlotRef, at: usize, node: usize, act_dtype: ops.Dtype };
 
-    pub fn init(a: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !RecRoute {
+    pub fn init(a: std.mem.Allocator) RecRoute {
         return .{ .a = a };
     }
 
@@ -1314,7 +1280,7 @@ const RecRoute = struct {
         self.calls.deinit(self.a);
     }
 
-    pub fn call(self: *RecRoute, g: *TraceOps, act: u32, rows: xko.PrefillRows, bank: xko.BankArrays(u32)) !u32 {
+    pub fn call(self: *RecRoute, g: *TraceOps, act: u32, rows: quant.PrefillRows, bank: BankArraysOf(u32)) !u32 {
         const src = source.?;
         const live = for (&src.calls) |*c| {
             if (c.state == .live) break c;
@@ -1351,8 +1317,11 @@ test "dsv41 experts: a wide call routes its experts in groups and runs each bank
     RecRoute.source = &src;
     defer RecRoute.source = null;
     const Chain = EagerChain(TraceOps, TraceGemv);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .prefill = RecRoute });
-    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    var rrs = [_]RecRoute{RecRoute.init(a)};
+    defer rrs[0].deinit(&g);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
     defer ex.deinit();
     // 20 tokens x top-6 over 64 experts: 120 rows, every expert id distinct within a token.
     const n = 20;
@@ -1386,7 +1355,7 @@ test "dsv41 experts: a wide call routes its experts in groups and runs each bank
     // Each recorded call is exactly its group's rows in one bank, in routed order, read
     // from the slot the source serves the expert in, after the group's waits and before
     // its release; together they cover every row once.
-    const rr = &ex.wide_routes[0];
+    const rr = &rrs[0];
     try testing.expect(rr.calls.items.len >= n_groups);
     try testing.expectEqual(@as(u32, @intCast(rr.calls.items.len)), rr.finishes);
     var rows_seen: usize = 0;
@@ -1394,7 +1363,7 @@ test "dsv41 experts: a wide call routes its experts in groups and runs each bank
         try testing.expectEqual(ops.Dtype.bfloat16, rec.act_dtype);
         const gidx: usize = @intCast(rec.route - 1);
         const kind: BankKind = for ([_]BankKind{ .base, .ext, .transient }) |kd| {
-            if (ex.banks[0][@intFromEnum(kd)]) |b| if (b.gate.code == rec.bank_code) break kd;
+            if (ex.banks[0][@backingInt(kd)]) |b| if (b.gate.code == rec.bank_code) break kd;
         } else return error.UnknownBank;
         var want_slot: std.ArrayList(u32) = .empty;
         defer want_slot.deinit(a);
@@ -1452,7 +1421,7 @@ test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the m
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
     {
-        var gemv = try xko.Gemv(TraceOps).init(&g, &reg);
+        var gemv = try xq.Gemv(TraceOps).init(&g, &reg);
         defer gemv.deinit(&g);
         try testing.expect(g.prepared_live > 0);
         // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
@@ -1461,38 +1430,6 @@ test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the m
         try testing.expectEqual(@as(usize, 1), g.prepared_launches);
     }
     try testing.expectEqual(@as(usize, 0), g.prepared_live);
-}
-
-test "dsv41 experts: the PREP=rin chain runs a group as in_rin, two GEMVs, gu_epi, din_rin, the down GEMV and dpost" {
-    var reg = try hostRegistry();
-    defer reg.deinit();
-    var g = TraceOps.init(testing.allocator);
-    defer g.deinit();
-    var prep = try xko.RinPrep(TraceOps).init(&g, &reg);
-    defer prep.deinit(&g);
-    var c = testConfig(5120, 2304, 1);
-    c.n_routed_experts = 64;
-    const Chain = RinChain(TraceOps, TraceGemv);
-    const chain = Chain.init(.{ .prep = &prep, .gemv = .{} }, &c);
-    const cap = 64;
-    const proj = struct {
-        fn f(gg: *TraceOps, in: c_int, out: c_int) !ProjOf(u32) {
-            return .{ .code = try gg.input(&.{ cap, @divExact(in, 16), @divExact(out, 16), 48 }, .int16), .rout = try gg.input(&.{ cap, out }, .float16), .rin = try gg.input(&.{ cap, in }, .float16) };
-        }
-    }.f;
-    const ids = try g.input(&.{6}, .uint32);
-    const first = g.nodes.items.len;
-    const h = try chain.gateUp(&g, try g.input(&.{ 6, 5120 }, .bfloat16), ids, try proj(&g, 5120, 2304), try proj(&g, 5120, 2304));
-    try testing.expect(g.shapeOf(h).eql(ops.Shape.of(&.{ 6, 2304 })));
-    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(h));
-    const y = try chain.down(&g, h, ids, try proj(&g, 2304, 5120));
-    try testing.expect(g.shapeOf(y).eql(ops.Shape.of(&.{ 6, 5120 })));
-    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(y));
-    // The four PREP kernels from configs prepared at construction; the three GEMVs (TraceGemv) aside.
-    try testing.expectEqual(@as(usize, 4), g.prepared_launches);
-    var kernels: usize = 0;
-    for (g.nodes.items[first..]) |nd| kernels += @intFromBool(nd.op == .kernel);
-    try testing.expectEqual(@as(usize, 2 + 1 + 1 + 1 + 3), kernels); // in_rin 2 outputs, gu_epi, din_rin, dpost, 3 GEMVs
 }
 
 test "dsv41 experts: the joined outputs are put back in routed order" {
@@ -1524,8 +1461,11 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
     var g = TraceOps.init(a);
     defer g.deinit();
     const Chain = EagerChain(TraceOps, TraceGemv);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .prefill = xko.DigXPrefill(TraceOps) });
-    var ex = try Ex.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    const Math = WithPrefillRoutes(TraceOps, Chain, xq.DigXPrefill(TraceOps));
+    var digx = [_]xq.DigXPrefill(TraceOps){try xq.DigXPrefill(TraceOps).init(a, &reg, .tier, null)};
+    defer digx[0].deinit(&g);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &digx }, &c);
     defer ex.deinit();
     // The sample calls one route serves whole (at most max_route_ids distinct experts),
     // their rows as tokens x k: the lane's slots are this call's experts.
@@ -1599,7 +1539,7 @@ fn expectRowsHold(s: *expert_stream.Stream, sb: *const SynthBank, layer: u32, id
         try testing.expectEqual(s.slotRef(layer, slot), ref);
         const off = sb.bank.recordOffset(layer, e);
         for (geom.segments, 0..) |seg, comp| {
-            try testing.expectEqualSlices(u8, sb.image[off + seg.offset ..][0..seg.length], s.slotRow(layer, slot, @enumFromInt(comp))[0..seg.length]);
+            try testing.expectEqualSlices(u8, sb.image[off + seg.offset ..][0..seg.length], s.slotRow(layer, slot, @fromBackingInt(@intCast(comp)))[0..seg.length]);
         }
     }
 }
@@ -1618,9 +1558,9 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
     var ex = try Ex.init(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c);
     defer ex.deinit();
     // Base rows and the shared transient bank are bound in the stream's geometry.
-    const base = ex.banks[0][@intFromEnum(BankKind.base)].?;
+    const base = ex.banks[0][@backingInt(BankKind.base)].?;
     try testing.expect(g.shapeOf(base.gate.code).eql(ops.Shape.of(&.{ 4, 4, 2, 48 })));
-    try testing.expect(g.shapeOf(ex.banks[1][@intFromEnum(BankKind.transient)].?.down.rin).eql(ops.Shape.of(&.{ 12, 32 })));
+    try testing.expect(g.shapeOf(ex.banks[1][@backingInt(BankKind.transient)].?.down.rin).eql(ops.Shape.of(&.{ 12, 32 })));
 
     var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 9, 1, 12, 2, 20, 21 }, &.{ 20, 12, 9, 22, 23, 1 } } };
     g.host_values = script.values();
@@ -1632,18 +1572,22 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
     try testing.expectEqual(@as(u32, 1), src.served(&src.calls[0]).n_parts);
     // Growth binds layer 1's grown rows; decode routes cut parts of <= 3 records.
     try ex.grow(&g, &.{ 4, 8 });
-    try testing.expect(g.shapeOf(ex.banks[1][@intFromEnum(BankKind.ext)].?.up.rout).eql(ops.Shape.of(&.{ 4, 32 })));
-    try testing.expect(ex.banks[0][@intFromEnum(BankKind.ext)] == null);
+    try testing.expect(g.shapeOf(ex.banks[1][@backingInt(BankKind.ext)].?.up.rout).eql(ops.Shape.of(&.{ 4, 32 })));
+    try testing.expect(ex.banks[0][@backingInt(BankKind.ext)] == null);
     _ = try ex.at(1).routed(&g, xf, idx);
-    const r1 = src.calls[for (src.calls, 0..) |cl, i| {
-        if (cl.route != null and cl.route.?.state == .released and cl.route.?.layer == 1) break i;
-    } else unreachable];
+    const r1 = src.calls[
+        for (src.calls, 0..) |cl, i| {
+            if (cl.route != null and cl.route.?.state == .released and cl.route.?.layer == 1) break i;
+        } else unreachable
+    ];
     try expectRowsHold(s, &sb, 1, script.calls[1], src.served(&r1));
     try testing.expectEqual(@as(u32, 2), src.served(&r1).n_parts); // six misses: 1, 2, 9 | 12, 20, 21
     _ = try ex.at(1).routed(&g, xf, idx);
-    const r2 = src.calls[for (src.calls, 0..) |cl, i| {
-        if (cl.route != null and cl.route.?.state == .released and cl.route.?.layer == 1 and cl.route.?.plan.n_hits > 0) break i;
-    } else unreachable];
+    const r2 = src.calls[
+        for (src.calls, 0..) |cl, i| {
+            if (cl.route != null and cl.route.?.state == .released and cl.route.?.layer == 1 and cl.route.?.plan.n_hits > 0) break i;
+        } else unreachable
+    ];
     const sv2 = src.served(&r2);
     try expectRowsHold(s, &sb, 1, script.calls[2], sv2);
     // 20, 12, 9, 1 are resident (wave 0); 22 and 23 load in one part.
@@ -1770,7 +1714,7 @@ test "dsv41 experts: the gated route builds every wave at once over event-wait a
     // Gate/up arrays waited once per miss bank (6 each); each part's down arrays (3 per bank) at its own value.
     var kinds: [n_banks]bool = @splat(false);
     for (sv.waves, sv.refs) |w, r| {
-        if (w > 0) kinds[@intFromEnum(r.bank)] = true;
+        if (w > 0) kinds[@backingInt(r.bank)] = true;
     }
     var n_kinds: usize = 0;
     for (kinds) |k| n_kinds += @intFromBool(k);

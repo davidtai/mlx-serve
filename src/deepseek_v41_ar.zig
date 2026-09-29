@@ -20,7 +20,8 @@ const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dss = @import("deepseek_v41_dspark_serve.zig");
 const xk = @import("exl3_kernels.zig");
-const xko = @import("exl3_kernel_ops.zig");
+const kernel_set = @import("kernel_set.zig");
+const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
@@ -38,27 +39,45 @@ fn memProbe(harness: []const u8, phase: []const u8) void {
     _ = mlx.mlx_reset_peak_memory();
 }
 
-/// The kernels lane's startup acceptance on the harness's GPU stream (registry,
-/// kernels built, the device self-check plan judged, the backend's launcher set),
-/// as the served arm runs it before the model loads.
-fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps) !*xko.Accepted(ops.MlxOps) {
+/// The load context's kernels on the harness's GPU stream, as the served module takes them
+/// (C2, kernels note sec. 19): the kernel set (registry, kernels built), the backend's
+/// launcher installed, then the EXL3 quant accepted (its self-check subset judged; its
+/// decode GEMV is the stock chain's).
+const Kernels = struct {
+    set: *kernel_set.Set,
+    exl3: *xq.Accepted(ops.MlxOps),
+
+    fn deinit(self: Kernels, g: *ops.MlxOps) void {
+        _ = mlx.mlx_synchronize(g.s);
+        self.exl3.deinit(g);
+        kernel_set.Set.uninstall(ops.MlxOps, g);
+        self.set.deinit();
+    }
+};
+
+fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps, c: *const v41.Config) !Kernels {
     var diag: xk.Diag = .{};
-    return xko.acceptAtStartup(ops.MlxOps, gpa, g, .{ .device = .{ .stream = g.s } }, &diag) catch |e| {
-        std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
-        return e;
-    };
+    errdefer std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
+    const set = try kernel_set.Set.init(gpa, .{ .device = .{ .stream = g.s } }, &diag);
+    errdefer set.deinit();
+    set.install(ops.MlxOps, g);
+    errdefer kernel_set.Set.uninstall(ops.MlxOps, g);
+    const exl3 = try xq.accept(ops.MlxOps, gpa, g, .{ .kernels = set }, .{
+        .hidden = c.hidden_size,
+        .inter = c.moe_intermediate_size,
+        .top_k = c.n_experts_per_tok,
+        .n_layers = c.n_layers,
+        .act = .{ .swiglu_clamped = c.swiglu_limit },
+        .input = .bfloat16,
+    }, &diag);
+    return .{ .set = set, .exl3 = exl3 };
 }
 
 /// Every bound bank of the hook `ex` against the kernels' signatures (once, after growth).
-fn checkBanks(g: *ops.MlxOps, reg: *const xk.Registry, ex: anytype) !void {
+fn checkBanks(g: *ops.MlxOps, k: Kernels, ex: anytype) !void {
     var diag: xk.Diag = .{};
     errdefer std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
-    for (ex.banks) |per| for (per) |maybe| if (maybe) |b| {
-        inline for (.{ .{ xko.Proj.gate, "gate" }, .{ xko.Proj.up, "up" }, .{ xko.Proj.down, "down" } }) |pp| {
-            const arr = @field(b, pp[1]);
-            try xko.checkBank(ops.MlxOps, g, reg, pp[0], .{ .code = arr.code, .rout = arr.rout, .rin = arr.rin }, &diag);
-        }
-    };
+    for (ex.banks) |per| for (per) |maybe| if (maybe) |b| try k.exl3.checkBank(g, b, &diag);
 }
 
 pub const reference_format = "mlx-serve-dsv41-ar-ref-v1";
@@ -132,7 +151,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     memProbe("dsv41 ar", "start");
-    const kernels = try acceptKernels(gpa, &g);
+    const kernels = try acceptKernels(gpa, &g, &c);
     defer kernels.deinit(&g);
     memProbe("dsv41 ar", "kernels accepted (the startup self-check)");
 
@@ -161,11 +180,11 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const stream = try expert_stream.Stream.init(gpa, &ebank, .{ .rows = none, .slot_memory = .{ .mlx = s } });
     defer stream.deinit();
     var ssrc = xp.StreamSource.init(stream);
-    const Chain = xp.EagerChain(ops.MlxOps, xp.MlxGemv);
-    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(kernels.gemvRoute(xp.MlxGemv), &m.c), &m.c);
+    const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
+    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
     try ex.grow(&g, grown);
-    try checkBanks(&g, &kernels.reg, &ex);
+    try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 ar", "slots grown (the residents are loaded lazily, at first use)");
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -323,7 +342,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     memProbe("dsv41 dspark", "start");
-    const kernels = try acceptKernels(gpa, &g);
+    const kernels = try acceptKernels(gpa, &g, &c);
     defer kernels.deinit(&g);
     memProbe("dsv41 dspark", "kernels accepted (the startup self-check)");
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
@@ -353,11 +372,11 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const stream = try expert_stream.Stream.init(gpa, &ebank, .{ .rows = none, .slot_memory = .{ .mlx = s } });
     defer stream.deinit();
     var ssrc = xp.StreamSource.init(stream);
-    const Chain = xp.EagerChain(ops.MlxOps, xp.MlxGemv);
-    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(kernels.gemvRoute(xp.MlxGemv), &m.c), &m.c);
+    const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
+    var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
     try ex.grow(&g, grown);
-    try checkBanks(&g, &kernels.reg, &ex);
+    try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 dspark", "residents and the draft head built, slots grown");
 
     const acceptance: ds.Acceptance = if (std.mem.eql(u8, ref.arm, "typical")) .{ .typical = .{ .delta = @floatCast(ref.delta.?) } } else .greedy;

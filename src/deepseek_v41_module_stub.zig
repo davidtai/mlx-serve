@@ -10,7 +10,7 @@ pub const Module = struct {
         return error.Dsv41NotBuiltForThisTarget;
     }
     pub fn deinit(_: *Module) void {}
-    pub fn prefill(_: *Module, _: []const u32) !mlx.mlx_array {
+    pub fn prefill(_: *Module, _: []const u32, _: u64) !mlx.mlx_array {
         return error.Dsv41NotBuiltForThisTarget;
     }
     pub fn extend(_: *Module, _: []const u32) !mlx.mlx_array {

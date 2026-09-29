@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 as a module-owned arch of mlx-serve (the deepseek_v4 pattern): `Transformer.dsv41`
 //! holds a `Module` that `Transformer.init` builds from the loaded residents and `forwardWith` runs,
 //! its per-request state rebuilt at `cache.step == 0`. Construction refuses by name, in order:
-//!   1. the kernels (`exl3_kernel_ops.acceptAtStartup`: the registry against the pinned manifest,
+//!   1. the kernels (C2, kernels note sec. 19: the load context's `kernel_set.Set`, the registry against the pinned manifest,
 //!      every kernel built on the device, the device self-check judged);
 //!   2. the expert source (`deepseek_v41_arm.ArmWith`: bank, admission, the stream at the admitted
 //!      rows on MLX slot memory, the hook over the kernels' GEMV and the DIG-X prefill route), every
@@ -20,7 +20,10 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const xk = @import("exl3_kernels.zig");
-const xo = @import("exl3_kernel_ops.zig");
+const kernel_set = @import("kernel_set.zig");
+const xq = @import("exl3_quant.zig");
+const trunk_routes = @import("dsv41_kernel_routes.zig");
+const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -38,12 +41,12 @@ const log = std.log.scoped(.dsv41);
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_event = @import("expert_event.zig");
-const Chain = xp.EagerChain(G, xp.MlxGemv);
-/// The expert source: the op chain around the kernels' EXL3 decode GEMV, the wide (prefill) routed calls on
-/// the kernels' DIG-X route, the next layer's reads started from the predictor. `A` waits on the host
-/// (LOOKAHEAD3, the exact tier); `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
-pub const A = arm_mod.ArmWith(G, Chain, .{ .prefill = xo.DigXPrefill(G), .lookahead = true });
-pub const AGated = arm_mod.ArmWith(G, Chain, .{ .prefill = xo.DigXPrefill(G), .lookahead = true, .gated = true });
+const Math = xp.QuantMath(G, xq.Accepted(G));
+/// The expert source: the EXL3 quant's math (C2), the wide (prefill) routed calls on its DIG-X route, the
+/// next layer's reads started from the predictor. `A` waits on the host (LOOKAHEAD3, the exact tier);
+/// `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
+pub const A = arm_mod.ArmWith(G, Math, .{ .prefill = true, .lookahead = true });
+pub const AGated = arm_mod.ArmWith(G, Math, .{ .prefill = true, .lookahead = true, .gated = true });
 
 /// The chosen source and the router gates its predictor reads (borrowed from the residents).
 fn Tiered(comptime AT: type) type {
@@ -60,6 +63,10 @@ const event_watchdog_ms = 2000;
 const M = mdl.Model(G);
 const H = dh.Head(G);
 
+/// The shell's generation headroom for a request that declared no budget
+/// (`transformer.KVCache.RESERVE_GEN_HEADROOM`).
+pub const generation_headroom: u64 = 8192;
+
 /// Beside the model's shards: the Engram token map the converter exports.
 pub const engram_token_map_file = "engram-token-map.u32";
 
@@ -69,7 +76,15 @@ const envelope = expert_admission.Envelope.dsv41_pass2;
 pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
-    kernels: *xo.Accepted(G),
+    /// The load context's kernel set, its launcher installed on `g`.
+    set: *kernel_set.Set,
+    /// The EXL3 quant accepted on the set: the served routed-expert math (C2).
+    exl3: *xq.Accepted(G),
+    /// The trunk routes' self-check results (their acceptance on the set).
+    trunk_report: selfcheck.Report = .{},
+    /// The install warm-up's per-shape MLX peaks (one per forward width, then the draft
+    /// block's): the bill's transient terms (C4, P4).
+    warm_peaks: []u64 = &.{},
     arm: Arm,
     weights: *model_io.Weights,
     engram: eng.RowSource,
@@ -93,11 +108,16 @@ pub const Module = struct {
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .kernels = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         var diag: arm_mod.Diag = .{};
-        self.kernels = acceptKernels(gpa, &self.g, .{ .device = .{ .stream = s } }, &diag) catch |e| return refused(e, &diag);
+        var vd0: v41.Diag = .{};
+        const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
+            log.err("config refused: {s}", .{vd0.message()});
+            return e;
+        };
+        try self.acceptKernels(gpa, &c0, s, &diag);
         errdefer self.dropKernels();
         _ = mlx.mlx_clear_cache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
@@ -118,43 +138,43 @@ pub const Module = struct {
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
-        self.model = try M.init(gpa, &self.g, c, routes.served, weights, &self.engram);
+        self.model = try M.initWith(gpa, &self.g, c, routes.served, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
         self.head = try H.initWith(gpa, &self.g, c, routes.served.draftRoutes(), weights, .{ .subset = subset });
         errdefer self.head.deinit(&self.g);
-        // The install warm-up (P4.3): the served tier's compiled regions trace here, never in a request.
-        // Decode forwards only until the draft round (P5) serves its depth; each shape's MLX peak is the bill's.
-        var peak: [1]u64 = undefined;
-        switch (self.arm) {
-            inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, &peak),
-        }
+        // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
+        // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
+        // shape's MLX peak is kept for the bill (C4).
+        self.warm_peaks = switch (self.arm) {
+            inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows),
+        };
+        errdefer gpa.free(self.warm_peaks);
         _ = mlx.mlx_clear_cache();
-        log.info("warm-up: decode forward peak {d} B above the residents; built residents {d} B (W97)", .{ peak[0], self.model.builtBytes() + self.head.builtBytes() });
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B (W97)", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
         return self;
     }
 
-    /// The expert source at the admitted rows, its banks checked against the kernels (again at the phase change).
+    /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
     fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const model_io.ModelConfig, weights: *const model_io.Weights, s: mlx.mlx_stream, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
-        const arm = AT.initHooked(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, .{
             .model_dir = config.expert_bank_dir.?,
             .envelope = envelope,
             .baseline_bytes = config.memory_baseline_bytes,
             .fixed_rows = config.expert_rows,
             .slot_memory = .{ .mlx = s },
-            .prefill = .{ .reg = &self.kernels.reg },
             .draft_pruned_bytes = 0,
             .lookahead = lookahead,
             .event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null,
         }, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
-        checkArmBanks(arm, &self.g, &self.kernels.reg, diag) catch |e| return refused(e, diag);
-        arm.grown_check = .{ .ctx = &self.kernels.reg, .check = GrownBanks(AT).check };
+        checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
+        arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
 
@@ -175,26 +195,65 @@ pub const Module = struct {
         self.embed_rows.close();
         self.engram.deinit();
         self.dropArm();
+        self.gpa.free(self.warm_peaks);
         self.dropKernels();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
         gpa.destroy(self);
     }
 
+    /// The kernel set, its launcher, then the quant and the trunk routes' acceptance (C2).
+    fn acceptKernels(self: *Module, gpa: std.mem.Allocator, c: *const v41.Config, s: mlx.mlx_stream, diag: *arm_mod.Diag) !void {
+        var kd: xk.Diag = .{};
+        self.set = kernel_set.Set.init(gpa, .{ .device = .{ .stream = s } }, &kd) catch |e| return refuse(diag, e, "kernels: {s}", .{kd.message()});
+        errdefer self.set.deinit();
+        self.set.install(G, &self.g);
+        errdefer kernel_set.Set.uninstall(G, &self.g);
+        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set }, .{
+            .hidden = c.hidden_size,
+            .inter = c.moe_intermediate_size,
+            .top_k = c.n_experts_per_tok,
+            .n_layers = c.n_layers,
+            .act = .{ .swiglu_clamped = c.swiglu_limit },
+            .input = .bfloat16,
+        }, &kd) catch |e| return refuse(diag, e, "exl3 quant: {s}", .{kd.message()});
+        errdefer self.exl3.deinit(&self.g);
+        trunk_routes.accept(gpa, self.set, &self.trunk_report, &kd) catch |e| {
+            self.trunk_report.deinit(gpa);
+            return refuse(diag, e, "trunk routes: {s}", .{kd.message()});
+        };
+    }
+
     /// The kernels go after the last launch drained.
     fn dropKernels(self: *Module) void {
         // The process's teardown frees the registry off the inference thread, which has stopped launching.
         if (std.Thread.getCurrentId() == self.owner) _ = mlx.mlx_synchronize(self.g.s);
-        self.kernels.deinit(&self.g);
+        self.trunk_report.deinit(self.gpa);
+        self.exl3.deinit(&self.g);
+        kernel_set.Set.uninstall(G, &self.g);
+        self.set.deinit();
     }
 
     /// A fresh request: the prompt from a new state (the model chunks it by its own rule);
     /// the last row's logits.
-    pub fn prefill(self: *Module, ids: []const u32) !mlx.mlx_array {
+    ///
+    /// The request's KV lanes are bounded to its positions (M5BOUND48, the served default): the
+    /// ring window, the compress / index / frontier lanes preallocated once and never grown.
+    /// `reserved_tokens` is the request's KV reservation (the shell's `KVCache.reserve`: prompt +
+    /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
+    /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
+    pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
-        self.state = try self.model.newState();
+        self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
         return self.forward(ids);
+    }
+
+    /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
+    /// generation headroom), plus one verify block.
+    pub fn maxPositions(prompt: usize, reserved_tokens: u64) u32 {
+        const budget: u64 = if (reserved_tokens > prompt) reserved_tokens else prompt + generation_headroom;
+        return @intCast(budget + mdl.Model(G).scratch_rows);
     }
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
@@ -230,23 +289,6 @@ pub const Module = struct {
     }
 };
 
-/// `layers.<l>.ffn.gate.{weight,bias}` of every routed layer, refused by name when one is missing.
-fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]Gate {
-    const gates = try gpa.alloc(Gate, n_layers);
-    errdefer gpa.free(gates);
-    var buf: [64]u8 = undefined;
-    for (gates, 0..) |*gt, l| {
-        const w = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.weight", .{l}));
-        const b = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.bias", .{l}));
-        if (w == null or b == null) {
-            log.err("refused: MissingWeight layers.{d}.ffn.gate", .{l});
-            return error.MissingWeight;
-        }
-        gt.* = .{ .w = w.?, .bias = b.? };
-    }
-    return gates;
-}
-
 fn setCacheLimit(limit: usize) void {
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, limit);
@@ -272,26 +314,12 @@ fn refuse(diag: *arm_mod.Diag, err: anytype, comptime fmt: []const u8, args: any
     return err;
 }
 
-/// The kernels, accepted once before the expert source allocates; their message in `diag`.
-fn acceptKernels(a: std.mem.Allocator, g: *G, opts: xo.StartupOptions, diag: *arm_mod.Diag) !*xo.Accepted(G) {
-    var kd: xk.Diag = .{};
-    return xo.acceptAtStartup(G, a, g, opts, &kd) catch |e| return refuse(diag, e, "kernels: {s}", .{kd.message()});
-}
-
-/// A bank's gate / up / down arrays are what the kernels read.
-fn checkBank(g: *G, reg: *const xk.Registry, bank: xp.BankArraysOf(G.T), diag: *xk.Diag) xo.Refusal!void {
-    inline for (.{ .{ xo.Proj.gate, bank.gate }, .{ xo.Proj.up, bank.up }, .{ xo.Proj.down, bank.down } }) |pb| {
-        const p = pb[1];
-        try xo.checkBank(G, g, reg, pb[0], .{ .code = p.code, .rout = p.rout, .rin = p.rin }, diag);
-    }
-}
-
 /// Every bank the hook bound (base and transient; the grown ones after the phase change).
-fn checkArmBanks(arm: anytype, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !void {
+fn checkArmBanks(arm: anytype, g: *G, exl3: *const xq.Accepted(G), diag: *arm_mod.Diag) !void {
     var kd: xk.Diag = .{};
     for (arm.hook.banks, 0..) |banks, l| for (banks, 0..) |maybe, kind| {
         const bank = maybe orelse continue;
-        checkBank(g, reg, bank, &kd) catch |e|
+        exl3.checkBank(g, bank, &kd) catch |e|
             return refuse(diag, e, "kernels: layer {d} {t} bank: {s}", .{ l, @as(xp.BankKind, @fromBackingInt(@intCast(kind))), kd.message() });
     };
 }
@@ -300,14 +328,39 @@ fn checkArmBanks(arm: anytype, g: *G, reg: *const xk.Registry, diag: *arm_mod.Di
 fn GrownBanks(comptime AT: type) type {
     return struct {
         fn check(ctx: *const anyopaque, arm: *AT, g: *G) anyerror!void {
-            const reg: *const xk.Registry = @ptrCast(@alignCast(ctx));
+            const exl3: *const xq.Accepted(G) = @ptrCast(@alignCast(ctx));
             var diag: arm_mod.Diag = .{};
-            checkArmBanks(arm, g, reg, &diag) catch |e| {
+            checkArmBanks(arm, g, exl3, &diag) catch |e| {
                 log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
                 return e;
             };
         }
     };
+}
+
+/// `layers.<l>.ffn.gate.{weight,bias}` of every routed layer, refused by name when one is missing.
+fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]Gate {
+    const gates = try gpa.alloc(Gate, n_layers);
+    errdefer gpa.free(gates);
+    var buf: [64]u8 = undefined;
+    for (gates, 0..) |*gt, l| {
+        const w = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.weight", .{l}));
+        const b = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.bias", .{l}));
+        if (w == null or b == null) {
+            log.err("refused: MissingWeight layers.{d}.ffn.gate", .{l});
+            return error.MissingWeight;
+        }
+        gt.* = .{ .w = w.?, .bias = b.? };
+    }
+    return gates;
+}
+
+test "dsv41 module: a request's bounded lanes hold its reservation, else the prompt plus the shell's headroom, plus a verify block" {
+    try std.testing.expectEqual(@import("transformer.zig").KVCache.RESERVE_GEN_HEADROOM, generation_headroom);
+    // 16K prompt, no declared budget: 16384 + 8192 + 8.
+    try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), Module.maxPositions(16384, 0));
+    // A reservation (prompt + budget + chunk) is the bound.
+    try std.testing.expectEqual(@as(u32, 40000 + 8), Module.maxPositions(32768, 40000));
 }
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
@@ -439,8 +492,12 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = rows });
     defer fsrc.deinit();
     const TChain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
-    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, TChain, .{ .prefill = xo.DigXPrefill(ops.TraceOps) });
-    var ex = try Ex.initWith(a, &g, &fsrc, TChain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    const Wide = xq.DigXPrefill(ops.TraceOps);
+    const digx = try aa.alloc(Wide, c.n_layers);
+    for (digx) |*d| d.* = try Wide.init(a, &reg, .tier, null);
+    defer for (digx) |*d| d.deinit(&g);
+    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, xp.WithPrefillRoutes(ops.TraceOps, TChain, Wide), .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &fsrc, .{ .d = TChain.init(.{}, &c), .routes = digx }, &c);
     defer ex.deinit();
     var rid: RandomIds = .{ .n_experts = @intCast(c.n_routed_experts) };
     g.host_values = rid.values();
@@ -450,7 +507,7 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
         .{ .name = "stock", .tier = routes.stock, .attn = .stock },
         .{ .name = "served", .tier = routes.served, .attn = .served },
     }) |t| {
-        const model_ = try TM.init(a, &g, c, t.tier, &lookup, &src);
+        const model_ = try TM.initWith(a, &g, c, t.tier, &lookup, &src, .{ .registry = &reg });
         defer model_.deinit(&g);
         // (positions already in the state, rows): the decode lane, the gate's prompt, wide chunks, the 16K prompt.
         for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 953 }, .{ 1024, 953 }, .{ 0, 16384 } }) |pn| {

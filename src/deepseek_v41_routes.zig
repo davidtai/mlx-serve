@@ -77,7 +77,13 @@ pub const served_levers = [_][2][]const u8{
 
 pub const served: Tier = blk: {
     @setEvalBranchQuota(200_000);
-    break :blk parse(&served_levers, null) catch unreachable;
+    var t = parse(&served_levers, null) catch unreachable;
+    // The C30 composite's RC members (not levers of the arm's env; the parity parser refuses
+    // the kernel levers): matrix step 3, one row per member.
+    t.routes.rc_sinkhorn = true; // C12 RCTAIL sinkhorn (+ SINKHORN_METAL above 32 matrices)
+    t.routes.rc_router = true; // C13 RCTAIL router (rows <= 8)
+    t.routes.rc_premix = true; // C13 RCTAIL hcpremix (rows <= 8)
+    break :blk t;
 };
 
 const Kind = enum {
@@ -365,7 +371,12 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     var trunk = t;
     trunk.layer_major = false;
     trunk.n_deferred = 0;
-    try testing.expectEqual(trunk.routes, served.routes);
+    var rc_off = served.routes;
+    rc_off.rc_sinkhorn = false;
+    rc_off.rc_router = false;
+    rc_off.rc_premix = false;
+    try testing.expectEqual(trunk.routes, rc_off);
+    try testing.expect(served.routes.rc_sinkhorn and served.routes.rc_router and served.routes.rc_premix);
     try testing.expectEqual(trunk.kv, served.kv);
     try testing.expectEqual(trunk.draft_head_bf16, served.draft_head_bf16);
     try testing.expectEqual(trunk.prefill_chunk, served.prefill_chunk);
