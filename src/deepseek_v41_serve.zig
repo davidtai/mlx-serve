@@ -27,9 +27,9 @@ pub const ServingMath = arm_mod.StandInMath;
 
 pub const Acceptance = union(enum) { greedy, typical: f32 };
 
-/// Serve-level defaults: the lane of record (typical at delta 0.5, DSpark depth 5).
+/// Serve-level defaults: the lane of record (typical at delta 0.3, DSpark depth 5).
 pub const Options = struct {
-    acceptance: Acceptance = .{ .typical = 0.5 },
+    acceptance: Acceptance = .{ .typical = 0.3 },
     depth: u32 = 5,
 };
 
@@ -482,7 +482,7 @@ test "dsv41 serve: the server's engine is refused by name while the decode bindi
 
 test "dsv41 serve: the serve options follow the model's acceptance setting and the depth cap" {
     const d = try optionsFrom(null, 0);
-    try testing.expectEqual(@as(f32, 0.5), d.acceptance.typical);
+    try testing.expectEqual(@as(f32, 0.3), d.acceptance.typical);
     try testing.expectEqual(@as(u32, 5), d.depth);
     try testing.expect((try optionsFrom(.exact, 3)).acceptance == .greedy);
     try testing.expectEqual(@as(u32, 3), (try optionsFrom(.exact, 3)).depth);
