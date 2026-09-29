@@ -401,6 +401,30 @@ pub fn standardPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, target
     return error.PromptIdsNoCell;
 }
 
+/// The seeded fixture (`dsv41-seeded-mtp-comparison-v1`): the Python tier's headline cases (the
+/// FASTEST prompt of record is case code-20260923, the one grade_typical_case.py grades).
+pub const seeded_fixture_schema = "dsv41-seeded-mtp-comparison-v1";
+const FixtureCase = struct { id: []const u8, prompt_ids: []const u32, prompt_ids_sha256: []const u8 };
+const SeededFixture = struct { schema: []const u8, cases: []const FixtureCase };
+
+/// The cell's prompt: case `case_id` of a seeded fixture (DSV41_CELL_CASE; the headline's fastest
+/// prompt), else the standard sweep entry of a prompt-ids file; 16,384 tokens, its json.dumps digest
+/// equal to the file's. Refused by name otherwise.
+pub fn cellPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, case_id: ?[]const u8) ![]const u32 {
+    const id = case_id orelse return standardPrompt(a, io, path, 16384, 20260829);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    const f = try std.json.parseFromSliceLeaky(SeededFixture, a, text, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, f.schema, seeded_fixture_schema)) return error.PromptIdsSchema;
+    for (f.cases) |c| {
+        if (!std.mem.eql(u8, c.id, id)) continue;
+        if (c.prompt_ids.len != 16384) return error.PromptIdsLength;
+        const d = try cell.idsSha256(a, c.prompt_ids);
+        if (!std.mem.eql(u8, &d, c.prompt_ids_sha256)) return error.PromptIdsDigest;
+        return c.prompt_ids;
+    }
+    return error.PromptIdsNoCell;
+}
+
 /// The typical-tier cell's receipt (`mlx-serve-dsv41-served-cell-v1`): the standard cell's
 /// numbers (prefill tok/s, TTFT, decode tok/s, peak GB decimal, wall), the rows admitted, the
 /// per-cycle acceptance and the generated ids.
@@ -411,6 +435,8 @@ const CellReceipt = struct {
     tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
     typical_delta: f64,
     prompt_file: []const u8,
+    /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
+    prompt_source: []const u8,
     prompt_tokens: usize,
     prompt_ids_sha256: []const u8,
     max_tokens: u32,
@@ -453,12 +479,16 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const inputs = try cellInputs(a, io, prompt_path, bank_dir);
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     const prompt = inputs.prompt;
     var config = inputs.config;
     try cellConfig(&config);
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
+    // The cap counts every generated id, the prompt pass's primary included (the Python headline's
+    // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
+    if (max_tokens < 2) return error.CellMaxTokens;
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -497,7 +527,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     var lp = L.init(g, md.model, md.head, &st, caches, .{
         .acceptance = .{ .typical = .{ .delta = @floatCast(delta) } },
         .prompt_chunk = dsl.whole_prompt,
-        .max_tokens = max_tokens,
+        .max_tokens = max_tokens - 1,
         .stop_ids = stops[0..n_stop],
     });
     defer lp.deinit();
@@ -541,6 +571,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const rec: CellReceipt = .{
         .typical_delta = delta,
         .prompt_file = prompt_path,
+        .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
         .prompt_ids_sha256 = &prompt_sha,
         .max_tokens = max_tokens,
@@ -734,8 +765,8 @@ fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
 
 /// The cell's host inputs: the standard prompt (16,384 tokens, seed 20260829, digest checked) and
 /// the shell's config of the bank (its bank / token-map paths, the EOS ids the Generator stops on).
-fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: model.ModelConfig } {
-    const prompt = try standardPrompt(a, io, prompt_path, 16384, 20260829);
+fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: model.ModelConfig } {
+    const prompt = try cellPrompt(a, io, prompt_path, case_id);
     const config = try model.parseConfig(io, a, bank_dir);
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
     if (config.num_eos_tokens == 0) return error.NoEosIds;
@@ -751,16 +782,21 @@ test "dsv41 served cell: the window's inputs pass on the host (the standard prom
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const inputs = try cellInputs(a, testing.io, prompt_path, bank_dir);
+    // Either line: the fastest prompt (a fixture case, DSV41_CELL_CASE) or the standard sweep prompt.
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, testing.io, prompt_path, case_id, bank_dir);
     try testing.expectEqual(@as(usize, 16384), inputs.prompt.len);
     const sha = try cell.idsSha256(a, inputs.prompt);
-    try testing.expectEqualStrings("1a45b35bae742fae0e26d4f40ee0dc1093a2038e5b514460a4f02e9e56d74565", &sha);
-    try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
+    const want = if (case_id) |id| (if (std.mem.eql(u8, id, "code-20260923")) "667506d734cce8152f3c42c9a97639a5b466540c70d9798a72e7564e2361bf86" else "") else "1a45b35bae742fae0e26d4f40ee0dc1093a2038e5b514460a4f02e9e56d74565";
+    if (want.len > 0) try testing.expectEqualStrings(want, &sha);
+    if (case_id != null) {
+        try testing.expectError(error.PromptIdsNoCell, cellPrompt(a, testing.io, prompt_path, "no-such-case"));
+    } else try testing.expectError(error.PromptIdsNoCell, standardPrompt(a, testing.io, prompt_path, 16384, 1));
     try testing.expectEqual(@as(usize, 16384 + 1024 + mdl.Model(ops.MlxOps).scratch_rows), module.Module.maxPositions(16384, 16384 + 1024));
     // The admission inputs come from the runner's environment (refused by name without them).
     var cfg = inputs.config;
     if (std.c.getenv("DSV41_CELL_BASELINE_GB") == null) try testing.expectError(error.CellBaselineMissing, cellConfig(&cfg));
-    const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
+    const rec: CellReceipt = .{ .typical_delta = 0.3, .prompt_file = prompt_path, .prompt_source = "x", .prompt_tokens = 16384, .prompt_ids_sha256 = "x", .max_tokens = 1024, .finish = "stop", .prefill_rows_per_layer = 1, .decode_rows_per_layer = 2, .ttft_s = 1, .prefill_tok_s = 1, .phase_change_s = 0, .decode_wall_s = 1, .decode_tok_s = 1, .decode_tok_s_with_phase_change = 1, .wall_s = 1, .peak_footprint_gb = 1, .mlx_peak_gb = 1, .generated_tokens = 1, .generated_ids = &.{1}, .generated_ids_sha256 = "y", .cycles = &.{.{ .k_eff = 5, .accepted = 3, .verified = 6 }}, .accepted_drafts = 3, .drafted_tokens = 5, .accept_rate = 0.6, .tokens_per_cycle = 4 };
     const json = try std.json.Stringify.valueAlloc(a, rec, .{});
     try testing.expect(std.mem.indexOf(u8, json, "\"decode_rows_per_layer\":2") != null);
 }
