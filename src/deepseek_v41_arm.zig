@@ -141,6 +141,8 @@ pub fn Arm(comptime G: type, comptime M: type) type {
         pub const Hook = xp.Experts(G, xp.StreamSource, M);
 
         a: std.mem.Allocator,
+        /// Borrowed from `Options.model_dir`.
+        model_dir: []const u8,
         config: v41.Config,
         bank: expert_bank.Bank,
         inputs: expert_admission.Inputs,
@@ -167,6 +169,7 @@ pub fn Arm(comptime G: type, comptime M: type) type {
             @memset(decode_rows, p.decode_rows);
             self.* = .{
                 .a = a,
+                .model_dir = opt.model_dir,
                 .config = c,
                 .bank = p.bank,
                 .inputs = p.inputs,
@@ -412,6 +415,15 @@ pub fn StandInMath(comptime G: type) type {
     };
 }
 
+/// What a served request asks of the decode loop (`decode.begin`).
+pub const DecodeConfig = struct {
+    /// DSpark draft depth; a cycle verifies depth + 1 rows.
+    depth: u32,
+    /// null = greedy acceptance (the exact tier); else typical at this delta.
+    typical_delta: ?f32,
+    seed: u64 = 0,
+};
+
 /// Counters of the decode loop, as the receipt's `stats` names them.
 pub const Stats = struct {
     cycles: u32 = 0,
@@ -444,6 +456,13 @@ pub fn StandIn(comptime A: type) type {
 
         pub fn init(seed: u64, rows: u32, max_cycles: u32) Self {
             return .{ .seed = seed, .rows = rows, .max_cycles = max_cycles };
+        }
+
+        /// A served request: `rows` verify rows per cycle (depth + 1), no cycle
+        /// cap (the server stops on stop ids and max_tokens), counters reset.
+        pub fn begin(self: *Self, cfg: DecodeConfig) error{}!void {
+            const forwards = self.forwards;
+            self.* = .{ .seed = cfg.seed, .rows = cfg.depth + 1, .max_cycles = std.math.maxInt(u32), .forwards = forwards };
         }
 
         /// The trace backend reads the routing barrier's ids from here.

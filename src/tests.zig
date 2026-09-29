@@ -59,6 +59,7 @@ test {
     _ = @import("expert_admission.zig");
     _ = @import("deepseek_v41_arm.zig");
     _ = @import("deepseek_v41_cell.zig");
+    _ = @import("deepseek_v41_serve.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
     _ = @import("qwen4_exp.zig");
