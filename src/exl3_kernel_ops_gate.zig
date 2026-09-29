@@ -28,8 +28,18 @@ pub const MlxG = struct {
     }
 
     pub fn reset(g: *MlxG) void {
-        for (g.live.items) |x| _ = mlx.mlx_array_free(x);
-        g.live.clearRetainingCapacity();
+        g.resetTo(0);
+    }
+
+    /// The live list's length (a wave's start).
+    pub fn mark(g: *const MlxG) usize {
+        return g.live.items.len;
+    }
+
+    /// Frees every array tracked since `m`; kept handles survive.
+    pub fn resetTo(g: *MlxG, m: usize) void {
+        for (g.live.items[m..]) |x| _ = mlx.mlx_array_free(x);
+        g.live.shrinkRetainingCapacity(m);
     }
 
     fn track(g: *MlxG, x: T) !T {
@@ -466,6 +476,7 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
         };
         try results.append(a, try r.call(g, act, .{ .slot = cl.slots }, bank));
     }
+    defer for (results.items) |x| g.release(x);
     try r.finish(g);
     try g.evalAll(results.items);
     for (c.calls, results.items) |*cl, got_arr| {
