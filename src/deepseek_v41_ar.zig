@@ -32,6 +32,11 @@ const expert_admission = @import("expert_admission.zig");
 /// high-water mark since the previous probe (then reset), and the process footprint now
 /// (`status.getAppMemFootprintMb`). The gap between the footprint and MLX is the host side.
 fn memProbe(harness: []const u8, phase: []const u8) void {
+    _ = memProbePeak(harness, phase);
+}
+
+/// `memProbe`, returning the MLX peak since the previous probe (the probe resets it).
+fn memProbePeak(harness: []const u8, phase: []const u8) usize {
     var active: usize = 0;
     var peak: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
@@ -41,6 +46,7 @@ fn memProbe(harness: []const u8, phase: []const u8) void {
         harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp_mib << 20)) / 1e9,
     });
     _ = mlx.mlx_reset_peak_memory();
+    return peak;
 }
 
 /// The load context's kernels on the harness's GPU stream, as the served module takes them
@@ -796,11 +802,12 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
-    memProbe("dsv41 served cell", "prompt (one pass)");
+    // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
+    var mlx_peak: usize = memProbePeak("dsv41 served cell", "prompt (one pass)");
     const t1 = std.Io.Timestamp.now(io, .boot);
     try md.phaseChange();
     const phase_s = secondsSince(io, t1);
-    memProbe("dsv41 served cell", "the phase change (embedding fence, slot banks grown)");
+    mlx_peak = @max(mlx_peak, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)"));
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     var cycles: std.ArrayList(CellCycle) = .empty;
@@ -817,13 +824,11 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     };
     const decode_s = secondsSince(io, t2);
     const wall_s = secondsSince(io, t0);
-    memProbe("dsv41 served cell", "cycles");
+    mlx_peak = @max(mlx_peak, memProbePeak("dsv41 served cell", "cycles"));
 
     const ids = try a.alloc(u32, out.items.len + 1);
     ids[0] = primary;
     @memcpy(ids[1..], out.items);
-    var mlx_peak: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&mlx_peak);
     const fp = arm_mod.footprint();
     const stt = lp.stats;
     const prompt_sha = try cell.idsSha256(a, prompt);
@@ -914,19 +919,27 @@ pub const CellBill = struct {
     draft_wave: u64,
     /// The admission's host reserve (pools, tables, the token map, the process).
     host_reserve: u64,
+    /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in both phases.
+    unbilled_overhead: u64 = unbilled_process_overhead_bytes,
 
     pub fn prefillTotal(b: CellBill) u64 {
-        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve;
+        return b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead;
     }
 
     pub fn decodeTotal(b: CellBill) u64 {
-        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve;
+        return b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.unbilled_overhead;
     }
 
     pub fn processBound(b: CellBill) u64 {
         return @max(b.prefillTotal(), b.decodeTotal()) - b.baseline;
     }
 };
+
+/// The measured process overhead the named terms do not cover: the served cells' peak phys_footprint
+/// over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657 GB = 0.637; standard
+/// 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up; re-sized after the
+/// full-admission window. Unattributed so far (Metal libraries / pipelines, allocator slack).
+pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 
 pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
@@ -997,6 +1010,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
+        .{ .name = "unbilled process overhead (measured, unattributed)", .p = b.unbilled_overhead, .d = b.unbilled_overhead },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
     std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()) });
@@ -1017,6 +1031,131 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     const b = try cellBill(a, testing.io, &config, 16384, max_tokens);
     printBill(b);
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
+}
+
+/// The prompt pass's stage profile: the model's probe points (`p.put` in the graph: attn.x ... out.h),
+/// each one evaluated where the model publishes it, the host clock charged to the stage that ends
+/// there (so a segment is everything the graph built and ran since the previous point), per stage
+/// name and per chunk. The routed call's segment ("moe.routed") also carries the expert stream's
+/// read counters. The syncs serialize the pass: the profile's wall exceeds the unprobed TTFT; the
+/// split, not the sum, is the reading.
+const PrefillProbe = struct {
+    const n_max = 40;
+    g: *ops.MlxOps,
+    io: std.Io,
+    stats_of: *const fn (*anyopaque) expert_stream.Stats,
+    stats_ctx: *anyopaque,
+    n_layers: u32,
+    last: std.Io.Timestamp,
+    names: [n_max][]const u8 = undefined,
+    ns: [n_max]u64 = @splat(0),
+    n: usize = 0,
+    layers_done: u64 = 0,
+    chunk_ns: [64]u64 = @splat(0),
+    chunk_rows: [64]u32 = @splat(0),
+    read_wall_ns: u64 = 0,
+    read_bytes: u64 = 0,
+    misses: u64 = 0,
+    before: expert_stream.Stats = .{},
+
+    fn slot(self: *PrefillProbe, name: []const u8) usize {
+        for (self.names[0..self.n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return i;
+        self.names[self.n] = name;
+        self.n += 1;
+        return self.n - 1;
+    }
+
+    pub fn put(self: *PrefillProbe, name: []const u8, x: anytype) !void {
+        if (@TypeOf(x) != ops.MlxOps.T) return;
+        const is_routed = std.mem.eql(u8, name, "moe.routed");
+        if (std.mem.eql(u8, name, "gate.weights")) self.before = self.stats_of(self.stats_ctx);
+        try self.g.evalAll(&.{x});
+        const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+        self.ns[self.slot(name)] += d;
+        const chunk: usize = @min(self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        self.chunk_ns[chunk] += d;
+        if (is_routed) {
+            const after = self.stats_of(self.stats_ctx);
+            self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
+            self.read_bytes += after.expert_bytes_read -| self.before.expert_bytes_read;
+            self.misses += after.expert_cache_misses -| self.before.expert_cache_misses;
+            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(self.g.shapeOf(x).dim(0));
+        }
+        if (std.mem.eql(u8, name, "out.h")) self.layers_done += 1;
+    }
+};
+
+// Profiling window only (the prompt pass, no decode): DSV41_CELL_PROFILE=1 plus the cell's window env
+// (DSV41_CELL_PROMPT_IDS [DSV41_CELL_CASE] DSV41_BANK DSV41_CELL_BASELINE_GB DSV41_CELL_CEILING_GB
+// _GPU_WINDOW_LOCKED). The served module as the cell builds it; the prompt as ONE model forward at the
+// model's chunk rule through the served hook (the cell's prompt pass without the draft seed), probed.
+// Prints PREFILL_PROFILE lines: per stage (seconds, share), per chunk (rows, seconds), the stream's
+// reads (bytes, read-busy wall, misses), the probed wall. Writes nothing.
+test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling window)" {
+    if (std.c.getenv("DSV41_CELL_PROFILE") == null) return error.SkipZigTest;
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
+    const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
+    var config = inputs.config;
+    try cellConfig(&config);
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    defer md.deinit();
+    const arm = switch (md.arm) {
+        .host_waits => |t| t.arm,
+        else => return error.CellArmVariant,
+    };
+    const Hook = @TypeOf(arm.hook);
+    const stats_of = struct {
+        fn f(ctx: *anyopaque) expert_stream.Stats {
+            const h: *Hook = @ptrCast(@alignCast(ctx));
+            return h.source.stats();
+        }
+    }.f;
+    const g = &md.g;
+    var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(inputs.prompt.len, inputs.prompt.len + 1024)));
+    defer st.deinit(g, gpa);
+    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
+    const s0 = stats_of(@ptrCast(&arm.hook));
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    probe.last = t0;
+    const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
+    try g.evalAll(&.{r.logits.?});
+    const wall_s = secondsSince(io, t0);
+    const s1 = stats_of(@ptrCast(&arm.hook));
+    const secs = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e9;
+        }
+    }.f;
+    var total: u64 = 0;
+    for (probe.ns[0..probe.n]) |x| total += x;
+    std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}}}\n", .{
+        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, s1.expert_bytes_read - s0.expert_bytes_read, secs(s1.read_wall_ns - s0.read_wall_ns), s1.expert_cache_misses - s0.expert_cache_misses, secs(probe.read_wall_ns),
+    });
+    for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
+    for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
 }
 
 fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
