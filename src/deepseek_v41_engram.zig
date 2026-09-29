@@ -297,6 +297,9 @@ pub const RowSource = struct {
             const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
             if (fd < 0) return refuse(diag, error.EngramBankFile, "{s}: cannot open", .{path});
             self.fds[i] = fd;
+            // Records are read one by one at random rows: past the page cache, read-ahead off.
+            if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0 or std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0)
+                return refuse(diag, error.EngramBankFile, "{s}: F_NOCACHE / F_RDAHEAD refused", .{path});
             var st: std.c.Stat = undefined;
             if (std.c.fstat(fd, &st) != 0) return refuse(diag, error.EngramBankFile, "{s}: fstat failed", .{path});
             const want = self.bank.rows[i] * self.bank.record_bytes;

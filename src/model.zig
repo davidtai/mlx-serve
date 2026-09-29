@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
+const nocache_reader = @import("nocache_reader.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -3761,7 +3762,9 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+/// `nocache`: read the shards past the page cache (`nocache_reader`): the
+/// load keeps no file pages next to the array buffers.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, nocache: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
@@ -3791,6 +3794,12 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
+}
+
+/// `loadWeights` past the page cache (`nocache_reader`): for a resident set
+/// that nearly fills the box, where cached pages would count twice.
+pub fn loadWeightsNoCache(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(io, allocator, model_dir, .{ .nocache = true });
 }
 
 fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
@@ -3936,7 +3945,15 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+    if (opts.nocache) {
+        const reader = nocache_reader.reader(std.mem.span(path)) catch |e| {
+            log.err("cannot open {s} past the page cache: {s}\n", .{ path, @errorName(e) });
+            return e;
+        };
+        // Drops our reference only: MLX keeps the reader while an array still reads through it.
+        defer _ = mlx.mlx_io_reader_free(reader);
+        try mlx.check(mlx.mlx_load_safetensors_reader(&tensor_map, &meta_map, reader, s));
+    } else try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
