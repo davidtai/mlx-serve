@@ -13,6 +13,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
+const xk = @import("exl3_kernels.zig");
 
 pub const Dtype = mlx.mlx_dtype;
 pub const max_dims = 8;
@@ -108,6 +109,19 @@ pub fn quantGroup(mode: model.QuantMode) u32 {
     };
 }
 
+/// A point in a backend's scope (`mark`). `resetTo` frees every tracked array
+/// built after it; arrays held through `keep` are separate handles and survive.
+/// A mark is spent by `reset` or by a `resetTo` to an earlier mark.
+pub const Mark = struct { n: usize };
+
+/// Frees `list[from..]` and truncates the list: the one release path of
+/// `reset` (from 0) and `resetTo` (from a mark).
+fn freeFrom(comptime E: type, list: *std.ArrayList(E), from: usize, comptime free: fn (E) void) void {
+    std.debug.assert(from <= list.items.len);
+    for (list.items[from..]) |a| free(a);
+    list.shrinkRetainingCapacity(from);
+}
+
 // ── MLX backend ──
 
 pub const MlxOps = struct {
@@ -126,16 +140,9 @@ pub const MlxOps = struct {
     tapes: std.ArrayList(TapeEntry) = .empty,
     /// A region's tracing context: borrows the owner's stream and closures.
     is_child: bool = false,
-    /// The kernels lane's pinned registry bound on this stream (`launch`); set
+    /// The kernels lane's pinned registry, bound on this stream (`launch`); set
     /// once, before any kernel route is built.
-    launcher: ?Launcher = null,
-
-    /// `exl3_kernels.Bound.apply`, type-erased so this backend does not depend on
-    /// the registry module: `apply(ctx, kernel tag, inputs, *const LaunchConfig, outs)`.
-    pub const Launcher = struct {
-        ctx: *const anyopaque,
-        apply: *const fn (ctx: *const anyopaque, kernel: u32, inputs: []const mlx.mlx_array, cfg: *const anyopaque, outs: []mlx.mlx_array) anyerror!void,
-    };
+    launcher: ?*const xk.Bound = null,
 
     const TapeEntry = struct {
         key: usize,
@@ -174,12 +181,11 @@ pub const MlxOps = struct {
         return .{ .gpa = g.gpa, .s = g.s, .silu_fn = g.silu_fn, .softplus_fn = g.softplus_fn, .stream_box = g.stream_box, .is_child = true, .launcher = g.launcher };
     }
 
-    /// One pinned kernel launch (the kernels lane's routes call it with its
-    /// `Kernel` tag and `LaunchConfig`); the outputs join this scope.
-    pub fn launch(g: *MlxOps, k: anytype, inputs: []const T, cfg: anytype, out: []T) !void {
-        const l = g.launcher.?;
-        try l.apply(l.ctx, @intCast(@intFromEnum(k)), inputs, @ptrCast(cfg), out);
-        for (out) |*o| o.* = try g.track(o.*);
+    /// One pinned kernel launch (the kernels contract: its `Kernel` tag and
+    /// `LaunchConfig`): `Bound.apply`, the declared outputs join this scope.
+    pub fn launch(g: *MlxOps, k: xk.Kernel, inputs: []const T, cfg: *const xk.LaunchConfig, out: []T) !void {
+        try g.launcher.?.apply(k, inputs, cfg, out);
+        for (out[0..cfg.n_out]) |*o| o.* = try g.track(o.*);
     }
 
     /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
@@ -252,10 +258,24 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
+    fn freeArray(a: mlx.mlx_array) void {
+        _ = mlx.mlx_array_free(a);
+    }
+
     /// Free every intermediate built since the last reset.
     pub fn reset(g: *MlxOps) void {
-        for (g.live.items) |a| _ = mlx.mlx_array_free(a);
-        g.live.clearRetainingCapacity();
+        freeFrom(T, &g.live, 0, freeArray);
+    }
+
+    /// The current scope point (a wave's start).
+    pub fn mark(g: *const MlxOps) Mark {
+        return .{ .n = g.live.items.len };
+    }
+
+    /// Free every array tracked since `m` (a wave's intermediates, after its
+    /// eval); what the caller kept survives.
+    pub fn resetTo(g: *MlxOps, m: Mark) void {
+        freeFrom(T, &g.live, m.n, freeArray);
     }
 
     /// A reference that outlives `reset` (cache state, outputs); the caller
@@ -996,6 +1016,7 @@ pub const TraceOps = struct {
     host_values: ?HostValues = null,
     /// Each event wait's timeline value and dependency count, in build order.
     waits: std.ArrayList(Wait) = .empty,
+    freed: std.ArrayList(Freed) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1005,9 +1026,23 @@ pub const TraceOps = struct {
     pub fn deinit(g: *TraceOps) void {
         g.nodes.deinit(g.gpa);
         g.waits.deinit(g.gpa);
+        g.freed.deinit(g.gpa);
     }
 
     pub fn reset(_: *TraceOps) void {}
+
+    /// Node ranges a `resetTo` released, `[from, to)`, in call order (the trace
+    /// keeps its nodes; tests read the ranges).
+    pub const Freed = struct { from: u32, to: u32 };
+
+    pub fn mark(g: *const TraceOps) Mark {
+        return .{ .n = g.nodes.items.len };
+    }
+
+    pub fn resetTo(g: *TraceOps, m: Mark) void {
+        std.debug.assert(m.n <= g.nodes.items.len);
+        g.freed.append(g.gpa, .{ .from = @intCast(m.n), .to = @intCast(g.nodes.items.len) }) catch @panic("trace: out of memory");
+    }
     pub fn evalAll(_: *TraceOps, _: []const T) !void {}
     pub fn keep(_: *TraceOps, x: T) T {
         return x;
@@ -1035,10 +1070,10 @@ pub const TraceOps = struct {
         return g.nodes.items[x];
     }
 
-    /// Ops recorded after `mark` (a node count), inputs excluded.
-    pub fn opsSince(g: *const TraceOps, gpa: std.mem.Allocator, mark: usize) ![]Op {
+    /// Ops recorded after node count `from`, inputs excluded.
+    pub fn opsSince(g: *const TraceOps, gpa: std.mem.Allocator, from: usize) ![]Op {
         var out: std.ArrayList(Op) = .empty;
-        for (g.nodes.items[mark..]) |n| if (n.op != .input) try out.append(gpa, n.op);
+        for (g.nodes.items[from..]) |n| if (n.op != .input) try out.append(gpa, n.op);
         return out.toOwnedSlice(gpa);
     }
 
@@ -1295,8 +1330,8 @@ pub const TraceOps = struct {
     }
 
     /// A pinned kernel launch: one kernel node per output the launch declares.
-    pub fn launch(g: *TraceOps, _: anytype, _: []const T, cfg: anytype, out: []T) !void {
-        for (out, 0..) |*o, i| o.* = try g.kernel(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i]);
+    pub fn launch(g: *TraceOps, _: xk.Kernel, _: []const T, cfg: *const xk.LaunchConfig, out: []T) !void {
+        for (out[0..cfg.n_out], 0..) |*o, i| o.* = try g.kernel(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i]);
     }
 
     /// The resident switch: x [..., 1, K] x w [E, N, K*bits/32] at rhs indices [...]
@@ -1637,19 +1672,105 @@ test "dsv41 ops: trace shapes for matmul, einsum, qmm, take, reductions" {
 }
 
 test "dsv41 ops: a pinned kernel launch records one node per declared output; the MLX launch analyses" {
-    const Cfg = struct { n_out: usize, out_ranks: [4]usize, out_shapes: [4][4]c_int, out_dtypes: [4]Dtype };
-    const K = enum(u16) { gemv, other };
+    const k0 = std.meta.tags(xk.Kernel)[0];
     var g = TraceOps.init(std.testing.allocator);
     defer g.deinit();
-    const cfg: Cfg = .{ .n_out = 2, .out_ranks = .{ 2, 1, 0, 0 }, .out_shapes = .{ .{ 3, 2304, 0, 0 }, .{ 7, 0, 0, 0 }, @splat(0), @splat(0) }, .out_dtypes = .{ .float32, .uint32, .float32, .float32 } };
-    var out: [2]u32 = undefined;
-    try g.launch(K.gemv, &.{}, &cfg, &out);
+    const cfg: xk.LaunchConfig = .{ .grid = .{ 1, 1, 1 }, .threadgroup = .{ 1, 1, 1 }, .template = &.{}, .n_out = 2, .out_ranks = .{ 2, 1, 0, 0 }, .out_shapes = .{ .{ 3, 2304, 0, 0 }, .{ 7, 0, 0, 0 }, @splat(0), @splat(0) }, .out_dtypes = .{ .float32, .uint32, .float32, .float32 } };
+    var out: [3]u32 = @splat(std.math.maxInt(u32));
+    try g.launch(k0, &.{}, &cfg, &out);
     try std.testing.expect(g.shapeOf(out[0]).eql(Shape.of(&.{ 3, 2304 })));
     try std.testing.expectEqual(Dtype.uint32, g.dtypeOf(out[1]));
+    try std.testing.expectEqual(std.math.maxInt(u32), out[2]); // only the declared outputs are written
     const smoke = struct {
-        fn f(m: *MlxOps, c: *const Cfg, o: []mlx.mlx_array) !void {
-            try m.launch(K.other, &.{}, c, o);
+        fn f(m: *MlxOps, c: *const xk.LaunchConfig, o: []mlx.mlx_array) !void {
+            try m.launch(std.meta.tags(xk.Kernel)[0], &.{}, c, o);
         }
     }.f;
     try std.testing.expect(@TypeOf(&smoke) != void);
+}
+
+/// `G.name` takes exactly `params` after `*G` (or `*const G`) and returns
+/// `Payload` (through an error union when `errors`): the kernels contract's
+/// method shapes, as the integration branch checks them.
+fn hasMethod(comptime G: type, comptime name: []const u8, comptime self_const: bool, comptime params: []const type, comptime Payload: type, comptime errors: bool) bool {
+    if (!@hasDecl(G, name)) return false;
+    const f = @typeInfo(@TypeOf(@field(G, name))).@"fn";
+    if (f.param_types.len != params.len + 1) return false;
+    const self_t = f.param_types[0] orelse return false;
+    if (self_t != (if (self_const) *const G else *G)) return false;
+    for (params, f.param_types[1..]) |want, got| if ((got orelse return false) != want) return false;
+    const ret = f.return_type orelse return false;
+    if (!errors) return ret == Payload;
+    const info = @typeInfo(ret);
+    return info == .error_union and info.error_union.payload == Payload;
+}
+
+test "dsv41 ops: both backends carry the kernels contract's launch, wave and scope methods with its exact types" {
+    inline for (.{ MlxOps, TraceOps }) |G| {
+        const T = G.T;
+        comptime std.debug.assert(hasMethod(G, "launch", false, &.{ xk.Kernel, []const T, *const xk.LaunchConfig, []T }, void, true));
+        comptime std.debug.assert(hasMethod(G, "evalAll", false, &.{[]const T}, void, true));
+        comptime std.debug.assert(hasMethod(G, "asyncEval", false, &.{[]const T}, void, true));
+        comptime std.debug.assert(hasMethod(G, "concat", false, &.{ []const T, c_int }, T, true));
+        comptime std.debug.assert(hasMethod(G, "take", false, &.{ T, T, c_int }, T, true));
+        comptime std.debug.assert(hasMethod(G, "mark", true, &.{}, Mark, false));
+        comptime std.debug.assert(hasMethod(G, "resetTo", false, &.{Mark}, void, false));
+    }
+}
+
+test "dsv41 ops: resetTo frees exactly what was tracked after its mark" {
+    const Counter = struct {
+        var freed: [16]u32 = undefined;
+        var n: usize = 0;
+        fn free(x: u32) void {
+            freed[n] = x;
+            n += 1;
+        }
+    };
+    var live: std.ArrayList(u32) = .empty;
+    defer live.deinit(testing.allocator);
+    try live.appendSlice(testing.allocator, &.{ 1, 2, 3 });
+    const m: Mark = .{ .n = live.items.len };
+    try live.appendSlice(testing.allocator, &.{ 4, 5 });
+    freeFrom(u32, &live, m.n, Counter.free);
+    try testing.expectEqualSlices(u32, &.{ 4, 5 }, Counter.freed[0..Counter.n]);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, live.items);
+    freeFrom(u32, &live, m.n, Counter.free); // an empty wave frees nothing
+    try testing.expectEqual(@as(usize, 2), Counter.n);
+    freeFrom(u32, &live, 0, Counter.free); // reset
+    try testing.expectEqualSlices(u32, &.{ 4, 5, 1, 2, 3 }, Counter.freed[0..Counter.n]);
+    try testing.expectEqual(@as(usize, 0), live.items.len);
+
+    // The trace backend records each released range for route tests.
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const x = try g.input(&.{ 2, 4 }, .float32);
+    const w0 = g.mark();
+    const y = try g.add(x, x);
+    _ = try g.mul(y, y);
+    g.resetTo(w0);
+    const w1 = g.mark();
+    g.resetTo(w1);
+    try testing.expectEqual(@as(usize, 2), g.freed.items.len);
+    try testing.expectEqual(TraceOps.Freed{ .from = 1, .to = 3 }, g.freed.items[0]);
+    try testing.expectEqual(TraceOps.Freed{ .from = 3, .to = 3 }, g.freed.items[1]);
+}
+
+// Guarded window only (_GPU_WINDOW_LOCKED=1): a wave's intermediates go back at
+// resetTo while its kept output still evaluates.
+test "dsv41 ops: an MLX wave scope frees its intermediates and keeps its output" {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    const vals = [_]f32{ 1, 2, 3, 4 };
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{4}, .float32);
+    const m = g.mark();
+    const out = g.keep(try g.mul(try g.add(x, x), x));
+    defer g.release(out);
+    try g.evalAll(&.{out});
+    g.resetTo(m);
+    try testing.expectEqual(@as(usize, 1), g.live.items.len);
+    try testing.expectEqualSlices(f32, &.{ 2, 8, 18, 32 }, (mlx.mlx_array_data_float32(out) orelse return error.MlxError)[0..4]);
 }
