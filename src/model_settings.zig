@@ -16,6 +16,8 @@ pub const Override = struct {
     mtp_greedy_tail: ?bool = null,
     /// Load the resident weights past the page cache (null: the arch's default).
     nocache_weights: ?bool = null,
+    /// A streamed-expert model's routed waves wait on the reads' events, not the host (null: the arch's default).
+    expert_event_gates: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -29,7 +31,8 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.nocache_weights == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and
+            o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -102,6 +105,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         .bool => |b| o.nocache_weights = b,
         else => {},
     };
+    if (obj.get("expert_event_gates")) |n| switch (n) {
+        .bool => |b| o.expert_event_gates = b,
+        else => {},
+    };
     if (obj.get("drafter")) |d| if (d == .string) {
         const name = d.string;
         if (std.mem.eql(u8, name, "off") or std.mem.eql(u8, name, "auto") or std.fs.path.isAbsolute(name))
@@ -157,7 +164,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} nocache_weights={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} nocache_weights={s} event_gates={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -165,6 +172,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         if (o.nocache_weights) |n| (if (n) "on" else "off") else "default",
+        if (o.expert_event_gates) |n| (if (n) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
     });
@@ -240,6 +248,17 @@ test "model_settings: nocache_weights is a bool, anything else is unset" {
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").nocache_weights);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").nocache_weights);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: expert_event_gates is a bool, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"expert_event_gates": true}, "/m/c": {"expert_event_gates": 1}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").expert_event_gates);
+    try std.testing.expect(!s.lookup(t, "/m/a").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }
 

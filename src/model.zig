@@ -415,6 +415,9 @@ pub const ModelConfig = struct {
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
+    /// A streamed-expert model's routed waves wait on the reads' events instead of the host (the
+    /// `expert_event_gates` model setting; null = the arch's default).
+    expert_event_gates: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

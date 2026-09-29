@@ -34,13 +34,27 @@ const dsp = @import("deepseek_v41_dspark_serve.zig");
 const log = std.log.scoped(.dsv41);
 
 const G = ops.MlxOps;
-/// The expert source: the exact tier's op chain around the kernels' EXL3 decode GEMV, the wide
-/// (prefill) routed calls on the kernels' DIG-X route, the next layer's reads started from the predictor
-/// (LOOKAHEAD3: the stream's lookahead class, host waits).
-pub const A = arm_mod.ArmWith(G, xp.EagerChain(G, xp.MlxGemv), .{ .prefill = xo.DigXPrefill(G), .lookahead = true });
+const expert_stream = @import("expert_stream.zig");
+const expert_event = @import("expert_event.zig");
+const Chain = xp.EagerChain(G, xp.MlxGemv);
+/// The expert source: the op chain around the kernels' EXL3 decode GEMV, the wide (prefill) routed calls on
+/// the kernels' DIG-X route, the next layer's reads started from the predictor. `A` waits on the host
+/// (LOOKAHEAD3, the exact tier); `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
+pub const A = arm_mod.ArmWith(G, Chain, .{ .prefill = xo.DigXPrefill(G), .lookahead = true });
+pub const AGated = arm_mod.ArmWith(G, Chain, .{ .prefill = xo.DigXPrefill(G), .lookahead = true, .gated = true });
 
-/// The exact tier's read-ahead (`DSV41_LOOKAHEAD3=8:inf:2`): top 8 by the predictor, no threshold, 2 records per call.
-pub const lookahead: @import("expert_stream.zig").Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2 };
+/// The chosen source and the router gates its predictor reads (borrowed from the residents).
+fn Tiered(comptime AT: type) type {
+    return struct { arm: *AT, gates: []AT.Hook.Gate };
+}
+/// Built once, by the `expert_event_gates` setting.
+pub const Arm = union(enum) { host_waits: Tiered(A), event_gates: Tiered(AGated) };
+
+/// The read-ahead of both tiers (`DSV41_LOOKAHEAD3` / `DSV41_LOOKAHEAD4` `=8:inf:2`): top 8 by the predictor,
+/// no threshold, 2 records per call.
+pub const lookahead: expert_stream.Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2 };
+/// A gate whose bytes have not landed by then fails the stream (the lane's watchdog).
+const event_watchdog_ms = 2000;
 const M = mdl.Model(G);
 const H = dh.Head(G);
 
@@ -54,7 +68,7 @@ pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
     kernels: *xo.Accepted(G),
-    arm: *A,
+    arm: Arm,
     weights: *model_io.Weights,
     engram: eng.RowSource,
     /// The input embedding's rows in its shard, read past the page cache once the prompt fence ran.
@@ -67,8 +81,6 @@ pub const Module = struct {
     fenced: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
-    /// Every routed layer's gate, borrowed from the residents: the predictor's inputs.
-    gates: []A.Hook.Gate = &.{},
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
@@ -86,24 +98,16 @@ pub const Module = struct {
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
         errdefer setCacheLimit(self.prev_cache_limit);
-        self.gates = try routerGates(gpa, weights, config.num_hidden_layers);
-        errdefer gpa.free(self.gates);
-        self.arm = A.initHooked(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
-            .model_dir = dir,
-            .envelope = envelope,
-            .baseline_bytes = config.memory_baseline_bytes,
-            .fixed_rows = config.expert_rows,
-            .slot_memory = .{ .mlx = s },
-            .prefill = .{ .reg = &self.kernels.reg },
-            .draft_pruned_bytes = 0,
-            .lookahead = lookahead,
-        }, .{ .gates = self.gates }, &diag) catch |e| return refused(e, &diag);
-        errdefer self.arm.deinit();
-        checkArmBanks(self.arm, &self.g, &self.kernels.reg, &diag) catch |e| return refused(e, &diag);
-        self.arm.grown_check = .{ .ctx = &self.kernels.reg, .check = GrownBanks.check };
+        self.arm = if (config.expert_event_gates orelse false)
+            .{ .event_gates = try self.buildArm(AGated, io, config, weights, s, try expert_event.createMetal(), &diag) }
+        else
+            .{ .host_waits = try self.buildArm(A, io, config, weights, s, null, &diag) };
+        errdefer self.dropArm();
         var vd: v41.Diag = .{};
         errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
-        const c = self.arm.config;
+        const c = switch (self.arm) {
+            inline else => |t| t.arm.config,
+        };
         if (c.engram.n_layers > 0) try loadEngramResidents(gpa, weights, dir);
         self.engram = try eng.RowSource.open(gpa, io, dir, map, &c, &vd);
         errdefer self.engram.deinit();
@@ -111,8 +115,42 @@ pub const Module = struct {
         errdefer self.embed_rows.close();
         self.model = try M.init(gpa, &self.g, c, try routes.parse(&.{}, &vd), weights, &self.engram);
         errdefer self.model.deinit(&self.g);
-        self.head = try H.initWith(gpa, &self.g, c, .{}, weights, .{ .subset = if (self.arm.draft_subset) |*x| x else null });
+        const subset = switch (self.arm) {
+            inline else => |t| if (t.arm.draft_subset) |*x| x else null,
+        };
+        self.head = try H.initWith(gpa, &self.g, c, .{}, weights, .{ .subset = subset });
         return self;
+    }
+
+    /// The expert source at the admitted rows, its banks checked against the kernels (again at the phase change).
+    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const model_io.ModelConfig, weights: *const model_io.Weights, s: mlx.mlx_stream, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
+        const gpa = self.gpa;
+        const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
+        errdefer gpa.free(gates);
+        const arm = AT.initHooked(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
+            .model_dir = config.expert_bank_dir.?,
+            .envelope = envelope,
+            .baseline_bytes = config.memory_baseline_bytes,
+            .fixed_rows = config.expert_rows,
+            .slot_memory = .{ .mlx = s },
+            .prefill = .{ .reg = &self.kernels.reg },
+            .draft_pruned_bytes = 0,
+            .lookahead = lookahead,
+            .event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null,
+        }, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
+        errdefer arm.deinit();
+        checkArmBanks(arm, &self.g, &self.kernels.reg, diag) catch |e| return refused(e, diag);
+        arm.grown_check = .{ .ctx = &self.kernels.reg, .check = GrownBanks(AT).check };
+        return .{ .arm = arm, .gates = gates };
+    }
+
+    fn dropArm(self: *Module) void {
+        switch (self.arm) {
+            inline else => |t| {
+                t.arm.deinit();
+                self.gpa.free(t.gates);
+            },
+        }
     }
 
     pub fn deinit(self: *Module) void {
@@ -122,8 +160,7 @@ pub const Module = struct {
         self.model.deinit(&self.g);
         self.embed_rows.close();
         self.engram.deinit();
-        self.arm.deinit();
-        gpa.free(self.gates);
+        self.dropArm();
         self.dropKernels();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
@@ -147,15 +184,17 @@ pub const Module = struct {
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
-        if (ids.len == 1 and !self.arm.grown) {
-            if (!self.fenced) {
-                try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
-                self.fenced = true;
-            }
-            // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
-            _ = mlx.mlx_clear_cache();
-            setCacheLimit(envelope.decode_cache_bytes);
-            try self.arm.grow(&self.g);
+        switch (self.arm) {
+            inline else => |t| if (ids.len == 1 and !t.arm.grown) {
+                if (!self.fenced) {
+                    try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
+                    self.fenced = true;
+                }
+                // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
+                _ = mlx.mlx_clear_cache();
+                setCacheLimit(envelope.decode_cache_bytes);
+                try t.arm.grow(&self.g);
+            },
         }
         return self.forward(ids);
     }
@@ -163,18 +202,22 @@ pub const Module = struct {
     fn forward(self: *Module, ids: []const u32) !mlx.mlx_array {
         const g = &self.g;
         const st = &(self.state orelse return error.Dsv41NoRequest);
-        const r = try self.model.forward(g, st, ids, .{ .logits = .last }, &self.arm.hook, graph.NoProbe{});
-        try M.fence(g, st, &.{r.logits.?});
-        try self.arm.hook.flush();
-        const out = g.keep(r.logits.?);
-        g.reset();
-        return out;
+        switch (self.arm) {
+            inline else => |t| {
+                const r = try self.model.forward(g, st, ids, .{ .logits = .last }, &t.arm.hook, graph.NoProbe{});
+                try M.fence(g, st, &.{r.logits.?});
+                try t.arm.hook.flush();
+                const out = g.keep(r.logits.?);
+                g.reset();
+                return out;
+            },
+        }
     }
 };
 
 /// `layers.<l>.ffn.gate.{weight,bias}` of every routed layer, refused by name when one is missing.
-fn routerGates(gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]A.Hook.Gate {
-    const gates = try gpa.alloc(A.Hook.Gate, n_layers);
+fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]Gate {
+    const gates = try gpa.alloc(Gate, n_layers);
     errdefer gpa.free(gates);
     var buf: [64]u8 = undefined;
     for (gates, 0..) |*gt, l| {
@@ -229,7 +272,7 @@ fn checkBank(g: *G, reg: *const xk.Registry, bank: xp.BankArraysOf(G.T), diag: *
 }
 
 /// Every bank the hook bound (base and transient; the grown ones after the phase change).
-fn checkArmBanks(arm: *A, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !void {
+fn checkArmBanks(arm: anytype, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !void {
     var kd: xk.Diag = .{};
     for (arm.hook.banks, 0..) |banks, l| for (banks, 0..) |maybe, kind| {
         const bank = maybe orelse continue;
@@ -239,16 +282,18 @@ fn checkArmBanks(arm: *A, g: *G, reg: *const xk.Registry, diag: *arm_mod.Diag) !
 }
 
 /// The phase change's banks, once (`Arm.grown_check`); a refusal is logged by name.
-const GrownBanks = struct {
-    fn check(ctx: *const anyopaque, arm: *A, g: *G) anyerror!void {
-        const reg: *const xk.Registry = @ptrCast(@alignCast(ctx));
-        var diag: arm_mod.Diag = .{};
-        checkArmBanks(arm, g, reg, &diag) catch |e| {
-            log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
-            return e;
-        };
-    }
-};
+fn GrownBanks(comptime AT: type) type {
+    return struct {
+        fn check(ctx: *const anyopaque, arm: *AT, g: *G) anyerror!void {
+            const reg: *const xk.Registry = @ptrCast(@alignCast(ctx));
+            var diag: arm_mod.Diag = .{};
+            checkArmBanks(arm, g, reg, &diag) catch |e| {
+                log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
+                return e;
+            };
+        }
+    };
+}
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
 // [DSV41_MODULE_ROWS=<--expert-rows>] [DSV41_MODULE_HEAD=ceiling: the record's pruned draft head]: the module's
@@ -355,9 +400,9 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     @memset(rows, 8);
     var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = rows });
     defer fsrc.deinit();
-    const Chain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
-    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, Chain, .{ .prefill = xo.DigXPrefill(ops.TraceOps) });
-    var ex = try Ex.initWith(a, &g, &fsrc, Chain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
+    const TChain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
+    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, TChain, .{ .prefill = xo.DigXPrefill(ops.TraceOps) });
+    var ex = try Ex.initWith(a, &g, &fsrc, TChain.init(.{}, &c), &c, .{ .prefill = .{ .reg = &reg } });
     defer ex.deinit();
     var rid: RandomIds = .{ .n_experts = @intCast(c.n_routed_experts) };
     g.host_values = rid.values();
