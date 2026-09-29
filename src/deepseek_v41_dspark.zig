@@ -171,8 +171,9 @@ pub const Lookup = struct {
     pub const key_len = 5;
     const max_context = 32;
 
+    /// Any prompt length (`LookupExtension`): positions are indexed from
+    /// `key_len` on, as the history grows past it.
     pub fn init(a: std.mem.Allocator, prompt: []const u32, minimum_context: u32, extra_tokens: u32) !Lookup {
-        if (prompt.len < key_len) return error.PromptTooShort;
         var l: Lookup = .{ .a = a, .minimum_context = minimum_context, .extra_tokens = extra_tokens };
         try l.history.appendSlice(a, prompt);
         return l;
@@ -308,7 +309,13 @@ test "dsv41 dspark: the lookup extends a full proposal from its earliest longest
     try testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5, 9 }, lk.extend(&.{ 2, 3, 4, 5, 9 }, &buf));
     // Below minimum_context: "3 4 5 70 71" occurs once, and the token before it (2) is not the tail's (8).
     try testing.expectEqualSlices(u32, &.{ 3, 4, 5, 70, 71 }, lk.extend(&.{ 3, 4, 5, 70, 71 }, &buf));
-    try testing.expectError(error.PromptTooShort, Lookup.init(a, &.{ 1, 2, 3, 4 }, 2, 2));
+    // A prompt shorter than the key (Python indexes from end 5 on as the history grows).
+    var short = try Lookup.init(a, &.{ 1, 2, 3 }, 2, 2);
+    defer short.deinit();
+    try short.appendCommitted(&.{ 4, 5, 6, 1, 2, 3, 4, 5 });
+    try testing.expectEqual(@as(usize, 6), short.ends.count()); // ends 5..10
+    // Its only earlier occurrence ends at 5 with no token before it: no context, no extension.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, short.extend(&.{ 1, 2, 3, 4, 5 }, &buf));
 }
 
 // DSV41_LOOKUP_FIXTURE=<json from R/exl3/runtime/dump_dsv41_lookup_fixture.py>
