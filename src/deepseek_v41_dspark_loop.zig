@@ -737,6 +737,38 @@ const Held = struct {
         return h;
     }
 
+    /// Peak live bytes of [from, to) for waves nested to any depth (K16: layer > chunk > score chain):
+    /// its own arrays (outside every child wave) stay live; a child wave's arrays are freed at its end
+    /// except its survivors (a leaf's output: a score chain's last array; a non-leaf's survivors are
+    /// the arrays it kept, not visible to the trace: 0 here, billed by construction); at any moment at
+    /// most one child is open. peak = own + sum(survivors) + max(child peak - child survivor).
+    const Nested = struct { all: u64, peak: u64, survivor: u64 };
+    fn nested(g: *const TraceOps, from: usize, to: usize, ranges: []const TraceOps.Freed, depth: u8) Nested {
+        const all = graph.heldBytes(g, from, to).sum;
+        var own = all;
+        var surv: u64 = 0;
+        var worst: u64 = 0;
+        var n_children: usize = 0;
+        for (ranges) |w| {
+            if (!(w.from >= from and w.to <= to and (w.from != from or w.to != to))) continue;
+            // a maximal child: no other range inside [from, to) strictly contains it
+            const maximal = for (ranges) |o| {
+                if (o.from >= from and o.to <= to and (o.from != from or o.to != to) and o.from <= w.from and w.to <= o.to and (o.from != w.from or o.to != w.to)) break false;
+            } else true;
+            if (!maximal) continue;
+            n_children += 1;
+            const ch = if (depth < 6) nested(g, w.from, w.to, ranges, depth + 1) else Nested{ .all = graph.heldBytes(g, w.from, w.to).sum, .peak = graph.heldBytes(g, w.from, w.to).sum, .survivor = 0 };
+            own -|= ch.all;
+            surv += ch.survivor;
+            worst = @max(worst, ch.peak -| ch.survivor);
+        }
+        if (n_children == 0) {
+            const c = chain(g, .{ .from = @intCast(from), .to = @intCast(to) });
+            return .{ .all = all, .peak = c.live + c.out, .survivor = c.out };
+        }
+        return .{ .all = all, .peak = own + surv + worst, .survivor = 0 };
+    }
+
     fn print(h: Held, what: []const u8) void {
         std.debug.print("dsv41 held: {s}: one reset per forward {d} B; layer waves {d} B; score chains released {d} B ({d} B outside the waves + the widest wave, #{d}, {d} B)\n", .{ what, h.reset, h.outside + h.layer, h.outside + h.wave, h.outside, h.widest_at, h.wave });
     }
@@ -872,7 +904,11 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
     for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
     const spans = try kvc.prefillSpans(aa, 16384, kvc.resolvePrefillChunk(&c, 16384, null, kvc.default_chunk_target_bytes));
     try testing.expectEqual(@as(usize, 18), spans.len);
-    for ([_]struct { name: []const u8, tier: routes.Tier }{ .{ .name = "stock", .tier = routes.stock }, .{ .name = "served", .tier = routes.served } }) |t| {
+    // K16 on the served tier (the construction switch the integration lane adds): every layer over all
+    // chunks before the next, one wave per layer, so a layer holds every chunk's arrays at once.
+    var served_k16 = routes.served;
+    served_k16.layer_major = true;
+    for ([_]struct { name: []const u8, tier: routes.Tier }{ .{ .name = "stock", .tier = routes.stock }, .{ .name = "served", .tier = routes.served }, .{ .name = "served-k16", .tier = served_k16 } }) |t| {
         var g = TraceOps.init(a);
         defer g.deinit();
         const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
@@ -886,16 +922,27 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
         var worst: Held = undefined;
         var worst_i: usize = 0;
-        for (spans, 0..) |sp, i| {
+        // Chunk-major: one forward per chunk, as the served prompt pass runs them. K16: ONE forward over the
+        // prompt (the model spans it into the same chunks and runs every layer over all of them).
+        const k16_spans = [_][2]u32{.{ 0, 16384 }};
+        const drive: []const [2]u32 = if (t.tier.layer_major) &k16_spans else spans;
+        for (drive, 0..) |sp, i| {
             const f0 = g.nodes.items.len;
             const w0 = g.freed.items.len;
-            _ = try model_.forward(&g, &st, prompt[sp[0]..sp[1]], .{ .logits = if (i + 1 == spans.len) .last else .none }, stand, graph.NoProbe{});
-            const h = Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
+            _ = try model_.forward(&g, &st, prompt[sp[0]..sp[1]], .{ .logits = if (i + 1 == drive.len) .last else .none }, stand, graph.NoProbe{});
+            if (t.tier.layer_major) {
+                // Three wave levels (layer > chunk > score chain): the nested peak, and the chunks' kept
+                // Halves (their survivors, invisible to the trace) by construction.
+                const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
+                const halves: u64 = 16384 * (@as(u64, c.hc_mult) * c.hidden_size * 4 + c.hidden_size * 4 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+                std.debug.print("dsv41 held: served-k16 tier, 16K one forward: nested peak {d} B + kept halves {d} B = {d} B (built {d} B)\n", .{ nst.peak, halves, nst.peak + halves, nst.all });
+            }
+            const h = if (t.tier.layer_major) Held{ .reset = 0, .outside = 0, .layer = 0, .wave = 0, .widest_at = 0 } else Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
             if (i == 0 or h.outside + h.layer > worst.outside + worst.layer) {
                 worst = h;
                 worst_i = i;
             }
-            if (i + 2 >= spans.len) {
+            if (i + 2 >= drive.len) {
                 var nb: [96]u8 = undefined;
                 h.print(try std.fmt.bufPrint(&nb, "{s} tier, 16K chunk {d} ({d} rows)", .{ t.name, i, sp[1] - sp[0] }));
             }
@@ -904,7 +951,8 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         worst.print(try std.fmt.bufPrint(&nb, "{s} tier, 16K widest chunk {d}", .{ t.name, worst_i }));
         // Released score chains: the stock tier's masked-full chunk keeps two 8 GB score blocks of its
         // five (plus the indexer's), under half its layer wave; K30's gathered chain under 3 / 5 of it.
-        if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else try testing.expect(5 * worst.wave < 3 * worst.layer);
+        // K16's forward is one call over every chunk: its held bytes are the reading here (no chain-share rule).
+        if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else if (!t.tier.layer_major) try testing.expect(5 * worst.wave < 3 * worst.layer);
         // A 5-row verify after the prompt: the served tier's head is C11's m1rows with the headpad
         // (a [6, dim] bf16 concat), the stock tier's the dense head.
         const n5 = g.nodes.items.len;

@@ -558,6 +558,8 @@ pub fn Model(comptime G: type) type {
             const shareds = try a.alloc(Tr.Share, nc);
             const mains = try a.alloc([8]T, nc);
             var n_main: usize = 0;
+            // The embedding's own wave: only each chunk's (kept) h, pre_mix and positions survive it.
+            const embed_wave = g.mark();
             for (spans, 0..) |sp, i| {
                 const e = try self.embedSpan(g, a, ids[sp[0]..sp[1]]);
                 hs[i] = g.keep(e.h);
@@ -566,6 +568,8 @@ pub fn Model(comptime G: type) type {
                 rows[i] = try self.engramRowsFor(st, a, ids[sp[0]..sp[1]]);
                 shareds[i] = .{};
             }
+            try g.evalAll(hs);
+            g.resetTo(embed_wave);
             // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
             const carries = try a.alloc(Tr.Carry, nc);
             @memset(carries, .{});
@@ -578,12 +582,23 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const lc = &st.layers[l];
+                // One wave per layer (freed at its end; hs, pms and the chunks' shared runtime carried).
+                const layer_wave = g.mark();
                 for (spans, 0..) |sp, i| {
+                    // One sub-wave per chunk: its attention side is freed before the next chunk's, only
+                    // its Half and its shared runtime kept to the layer's routed call (as chunk-major
+                    // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
+                    const wave = g.mark();
                     var h = hs[i];
                     if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
-                    try fence(g, st, &.{ halves[i].moe_in, halves[i].ffn_pre });
+                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
+                    const hf = halves[i];
+                    try fence(g, st, &.{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb });
+                    keepHalf(g, &halves[i]);
+                    carries[i].persistShared(g, &shareds[i]);
+                    g.resetTo(wave);
                 }
                 if (want_main and li.dspark_target) n_main += 1;
                 // Per chunk: the resident gate (M == the chunk, as chunk-major).
@@ -620,12 +635,13 @@ pub fn Model(comptime G: type) type {
                         hs[k] = g.keep(next);
                         g.release(pms[k]);
                         pms[k] = g.keep(halves[k].ffn_pre);
+                        releaseHalf(g, &halves[k]);
                     }
                     i = j;
                 }
                 try g.evalAll(hs);
                 for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
-                g.reset();
+                g.resetTo(layer_wave);
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));
             st.offset += @intCast(ids.len);
@@ -645,6 +661,15 @@ pub fn Model(comptime G: type) type {
                 for (mains[i][0..n_main]) |x| g.release(x);
             }
             return .{ .hidden = hidden, .main = main };
+        }
+
+        /// K16's per-chunk sub-wave keeps a chunk's Half past its reset (released after its HC post).
+        fn keepHalf(g: *G, hf: *Tr.Half) void {
+            inline for (@typeInfo(Tr.Half).@"struct".field_names) |name| @field(hf, name) = g.keep(@field(hf, name));
+        }
+
+        fn releaseHalf(g: *G, hf: *Tr.Half) void {
+            inline for (@typeInfo(Tr.Half).@"struct".field_names) |name| g.release(@field(hf, name));
         }
 
         /// Drop the last `n` tokens from every lane and the n-gram history, all or
