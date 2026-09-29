@@ -5,6 +5,7 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
 /// down span the last three.
@@ -291,8 +292,7 @@ pub const Bank = struct {
         if (st.mode & std.c.S.IFMT != std.c.S.IFREG) return refuse(diag, error.SidecarGeometry, "{s} is not a regular file", .{self.sidecar_path});
         const size: u64 = @intCast(st.size);
         if (size < self.sidecar_size) return refuse(diag, error.SidecarGeometry, "{s} is {d} B < {d}", .{ self.sidecar_path, size, self.sidecar_size });
-        if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0 or std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0)
-            return refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path});
+        io_util.noCache(fd, .{}) catch return refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path});
         self.sidecar_file_size = size;
     }
 
@@ -537,8 +537,7 @@ const ManifestSource = struct {
         };
         errdefer file.close(io);
         // A bank read like the records': streamed once, past the page cache.
-        if (std.c.fcntl(file.handle, std.c.F.NOCACHE, @as(c_int, 1)) != 0)
-            return refuse(diag, error.ManifestOpen, "{s}: F_NOCACHE refused", .{name});
+        io_util.noCache(file.handle, .{ .read_ahead = true }) catch return refuse(diag, error.ManifestOpen, "{s}: F_NOCACHE refused", .{name});
         const self = try a.create(ManifestSource);
         errdefer a.destroy(self);
         const buf = try a.alloc(u8, 1 << 16);

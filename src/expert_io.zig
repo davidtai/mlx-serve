@@ -16,8 +16,8 @@ const expert_bank = @import("expert_bank.zig");
 const n_components = expert_bank.n_components;
 const gu_components = expert_bank.gu_components;
 
-// 1:1 mirror of lib/expert_io/q3_lookahead4.h.
-const c = struct {
+// 1:1 mirror of lib/expert_io/q3_lookahead4.h (refusing stand-ins where the sources are not built).
+const c = if (@import("build_options").macos_engines) struct {
     extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     extern fn q3ld_spec_streams(idle_busy: i32) c_int;
     extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
@@ -47,7 +47,7 @@ const c = struct {
     extern fn q3ld_test_rules(n: i32, off: [*]const i64, code: [*]const i64, arg: [*]const i64) void;
     extern fn q3ld_test_delay(seed: u64, max_ns: i64) void;
     extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
-};
+} else @import("expert_io_stub.zig").q3ld;
 
 pub const abi_version = 2026092704;
 pub const max_workers = 8;
@@ -59,8 +59,8 @@ pub const max_pre = 32;
 pub const max_gates = 256;
 pub const max_gate_tickets = 256;
 const res_w = 8;
-const spec_state_w = 11;
-const pre_state_w = 5;
+pub const spec_state_w = 11;
+pub const pre_state_w = 5;
 /// `q3ld_submit` reads -1 as no deadline; 0 would expire every range at once.
 const no_deadline: i64 = -1;
 
