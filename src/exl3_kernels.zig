@@ -727,8 +727,23 @@ fn adoptArgs(a: Allocator, js: []const JArg, k: Kernel, diag: ?*Diag) (Refusal |
             .row_axis = j.row_axis,
         };
         if (arg.row_axis >= @max(arg.shape.len, 1)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: {s} row axis {d}", .{ k, j.name, arg.row_axis });
+        if (arg.role == .static and !staticHasValue(arg)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: static {s} carries no {t} value", .{ k, j.name, arg.dtype });
     }
     return out;
+}
+
+/// A `static` input is the lane's own constant (an eps, a flag): zeros, or a value list of its
+/// dtype's kind. One without a value would bind whatever the route's filler writes (eps 0).
+fn staticHasValue(arg: *const Arg) bool {
+    return switch (arg.domain.kind) {
+        .zeros => arg.domain.ints.len == 0 and arg.domain.floats.len == 0,
+        .values => switch (arg.dtype) {
+            .float32 => arg.domain.floats.len > 0 and arg.domain.ints.len == 0,
+            .int32, .uint32 => arg.domain.ints.len > 0 and arg.domain.floats.len == 0,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn checkThreadgroup(tg: [3]u32, k: Kernel, diag: ?*Diag) Refusal!void {
@@ -1225,6 +1240,38 @@ test "dsv41 kernels: every manifest refusal refuses, by name" {
         var diag: Diag = .{};
         try testing.expectError(c.want, Registry.init(a, &texts, &pin, &diag));
         try testing.expect(diag.len > 0);
+    }
+}
+
+test "dsv41 kernels: a static without its value is refused, by name (the K36 RMSNorm eps)" {
+    const a = testing.allocator;
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    // the registered eps: the lane config's rms_norm_eps, 1e-20 in f32
+    inline for (.{ Kernel.mtplx_dsv41_fp_rmsnorm_tg128_d1280, Kernel.mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64 }) |k| {
+        const eps = reg.get(k).inputs[2];
+        try testing.expectEqualStrings("eps", eps.name);
+        try testing.expectEqual(Role.static, eps.role);
+        try testing.expectEqual(@as(usize, 0), eps.shape.len);
+        try testing.expectEqualSlices(f64, &.{1e-20}, eps.domain.floats);
+    }
+    const eps_text = "\"floats\": [\n       1e-20\n      ],\n      \"kind\": \"values\"";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, embedded.manifest, eps_text));
+    const Case = struct { replacement: []const u8 };
+    for ([_]Case{
+        .{ .replacement = "\"floats\": [],\n      \"kind\": \"values\"" }, // no value
+        .{ .replacement = "\"kind\": \"values\"" }, // no list at all
+        .{ .replacement = "\"ints\": [\n       0\n      ],\n      \"kind\": \"values\"" }, // an int for an f32
+        .{ .replacement = "\"kind\": \"normal\"" }, // a drawn domain
+    }) |c| {
+        const m = try replaceFirst(a, embedded.manifest, eps_text, c.replacement);
+        defer a.free(m);
+        var texts = embedded;
+        texts.manifest = m;
+        const pin = shaHex(m);
+        var diag: Diag = .{};
+        try testing.expectError(error.SchemaInvalid, Registry.init(a, &texts, &pin, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "mtplx_dsv41_fp_rmsnorm_tg128_d1280: static eps") != null);
     }
 }
 

@@ -517,9 +517,15 @@ pub fn FusedProj(comptime G: type) type {
         inv_p: RowPlans(G, max_rows),
 
         /// `q_norm` / `kv_norm`: the layer's q_norm (bf16 [1280]) and kv_norm (bf16 [512]) weights.
-        pub fn init(g: *G, reg: *const xk.Registry, q_norm: G.T, kv_norm: G.T, diag: ?*xk.Diag) !Self {
+        /// `eps`: the model's rms_norm_eps. Both RMSNorm texts bind their registered eps static
+        /// (the lane's, 1e-20); another value is refused here, never run.
+        pub fn init(g: *G, reg: *const xk.Registry, q_norm: G.T, kv_norm: G.T, eps: f32, diag: ?*xk.Diag) !Self {
             const rms = reg.get(.mtplx_dsv41_fp_rmsnorm_tg128_d1280);
             const rms_rope = reg.get(.mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64);
+            inline for (.{ rms, rms_rope }) |e| {
+                const want: f32 = @floatCast(argOf(e, "eps").domain.floats[0]);
+                if (eps != want) return refuse(diag, error.RouteInput, "exl3 kernel ops: {t} is registered at eps {e}, the model's is {e}", .{ e.kernel, want, eps });
+            }
             try expectInput(G, g, rms, "weight", q_norm, &no_vars, diag);
             try expectInput(G, g, rms_rope, "weight", kv_norm, &no_vars, diag);
             const fwd = reg.get(.mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd);
@@ -1140,7 +1146,7 @@ test "dsv41 kernels ops: plan routes refuse rows outside their tables" {
     var r = try RcProj(Trace).init(&t, &reg, .wkv, w, sc, null);
     defer r.deinit(&t);
     try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .bfloat16, &.{})));
-    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), null);
+    var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), 1e-20, null);
     defer fp.deinit(&t);
     try testing.expectError(error.RowsOutOfPlan, fp.qNorm(&t, try t.node(&.{ 9, 1280 }, .bfloat16, &.{})));
     try testing.expectEqual(@as(usize, 0), t.launches.items.len);
