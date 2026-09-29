@@ -229,14 +229,32 @@ pub fn Model(comptime G: type) type {
 
         /// A fresh sequence: lanes per the tier's KV route, its own n-gram history.
         pub fn newState(self: *const Self) !State {
+            return self.newStateWith(self.tier.kv);
+        }
+
+        /// A fresh sequence whose KV lanes follow `kv`: the tier's route, or a
+        /// request's own bounded route (`boundedKv`).
+        pub fn newStateWith(self: *const Self, kv: kvc.Geometry) !State {
             const cs = try self.gpa.alloc(Cache, self.c.n_layers);
             errdefer self.gpa.free(cs);
             var max_len: ?u32 = null;
             for (cs, 0..) |*lc, l| {
-                lc.* = Cache.init(self.c.layers[l], self.c.window, self.tier.kv);
+                lc.* = Cache.init(self.c.layers[l], self.c.window, kv);
                 if (lc.admitLimit()) |m| max_len = if (max_len) |x| @min(x, m) else m;
             }
             return .{ .layers = cs, .hash = if (self.engram != null) .{} else null, .max_len = max_len, .scratch = try self.gpa.alloc(u8, self.scratchBytes(scratch_rows)) };
+        }
+
+        /// The bounded route (W107 lanes) for a request of at most `max_positions`
+        /// positions (its prompt, its tokens and one verify block): the window a
+        /// ring, the compress / index / frontier lanes sized once to it at their
+        /// first write and never grown; a forward past it is refused by name
+        /// (`BoundedLaneFull`) before any lane is written.
+        pub fn boundedKv(self: *const Self, max_positions: u32) kvc.Geometry {
+            var kv = self.tier.kv;
+            kv.route = .bounded;
+            kv.max_kv = max_positions;
+            return kv;
         }
 
         /// Host bytes a forward of `rows` rows allocates (the embed ids or, after

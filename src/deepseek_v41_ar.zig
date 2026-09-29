@@ -199,6 +199,7 @@ pub const DsparkReference = struct {
 
 // Guarded window only (loads the bank): DSV41_DSPARK_REF=<dump_dsv41_dspark_ref.py json> DSV41_BANK=<bank>
 // DSV41_ENGRAM_TOKEN_MAP=<converter map> _GPU_WINDOW_LOCKED=1 [DSV41_AR_ROWS=<decode rows per layer, default 16>]
+// [DSV41_KV_BOUNDED=1: the request's KV lanes bounded to its positions (M5BOUND), else the tier's route]
 test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions on the real model" {
     const ref_path = std.mem.span(std.c.getenv("DSV41_DSPARK_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
@@ -242,7 +243,9 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer res.deinit(&g);
     const m = res.model;
     const head = res.head;
-    var st = try m.newState();
+    // M5BOUND: every KV lane sized once to the run's positions (the prompt, its tokens, one verify block).
+    const kv_bound: ?u32 = if (std.c.getenv("DSV41_KV_BOUNDED") != null) @intCast(ref.prompt.len + ref.tokens.len + 8) else null;
+    var st = if (kv_bound) |n| try m.newStateWith(m.boundedKv(n)) else try m.newState();
     defer st.deinit(&g, gpa);
     var caches: [8]L.H.Cache = @splat(.{});
     defer for (caches[0..head.nStages()]) |*x| x.deinit(&g);
@@ -314,8 +317,9 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const sst = ex.source.stats();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    std.debug.print("dsv41 dspark: {s} arm, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
-        ref.arm,                                                   ref.cycles.len,
+    std.debug.print("dsv41 dspark: {s} arm, kv {s} {d}, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
+        ref.arm,                                                   if (kv_bound != null) "bounded" else "tier",
+        kv_bound orelse 0,                                         ref.cycles.len,
         if (ids_same) "IDENTICAL" else "DIFFER",                   n + 1,
         if (first_accept == null) "IDENTICAL" else "DIFFER",       if (first_decision == null) "IDENTICAL" else "DIFFER",
         lp.stats.accepted_drafts,                                  lp.stats.drafted_tokens,

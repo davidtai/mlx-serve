@@ -22,13 +22,18 @@ pub const Config = struct {
     /// `hybrid_install`'s causal lookup: a full native proposal extended from the history.
     lookup: ?struct { minimum_context: u32 = 2, extra_tokens: u32 = 2 } = .{},
     acceptance: ds.Acceptance = .greedy,
-    /// Rows per prompt forward.
+    /// Rows per prompt forward; `whole_prompt` runs it as one forward, chunked
+    /// by the model's own rule (every chunk wider than a route takes runs
+    /// through the wide lane: the served prompt pass).
     prompt_chunk: u32 = 8,
     max_tokens: u32,
     stop_ids: []const u32 = &.{},
 };
 
 pub const Finish = enum { length, stop };
+
+/// `Config.prompt_chunk`: the whole prompt in one forward.
+pub const whole_prompt: u32 = std.math.maxInt(u32);
 
 /// One cycle's decisions, as the Python oracle fixture records them.
 pub const CycleLog = struct {
@@ -620,6 +625,116 @@ test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every
             try testing.expectEqual(nf + n_st, nc);
         } else try testing.expectEqual(nf, nc);
     }
+}
+
+/// A wide route that records each call: its layer (routes are built in layer
+/// order), rows, act rows and slots, in the order the forward makes them.
+const WideLog = struct {
+    const xk = @import("exl3_kernels.zig");
+    const xko = @import("exl3_kernel_ops.zig");
+    var next_layer: u32 = 0;
+    var order: [512]u32 = undefined;
+    var n_order: usize = 0;
+    layer: u32,
+    calls: u32 = 0,
+    rows: u32 = 0,
+    finishes: u32 = 0,
+    ok: bool = true,
+
+    pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !WideLog {
+        next_layer += 1;
+        return .{ .layer = next_layer - 1 };
+    }
+    pub fn deinit(_: *WideLog, _: *TraceOps) void {}
+    pub fn call(self: *WideLog, g: *TraceOps, act: u32, r: xko.PrefillRows, bank: xko.BankArrays(u32)) !u32 {
+        self.calls += 1;
+        self.rows += @intCast(r.slot.len);
+        order[n_order] = self.layer;
+        n_order += 1;
+        const tokens: u32 = @intCast(g.shapeOf(act).d[0]);
+        const cap: u32 = @intCast(g.shapeOf(bank.gate.code).d[0]);
+        const act_row = r.act_row.?;
+        self.ok = self.ok and g.dtypeOf(act) == .bfloat16 and act_row.len == r.slot.len;
+        for (r.slot, act_row) |slot, row| self.ok = self.ok and slot < cap and row < tokens;
+        return g.input(&.{ @intCast(r.slot.len), g.shapeOf(act).d[1] }, .float32);
+    }
+    pub fn finish(self: *WideLog, _: *TraceOps) !void {
+        self.finishes += 1;
+    }
+};
+
+test "dsv41 dspark loop: the served prompt pass is one forward the model chunks; its wide chunks run through the wide lane, chunk-major" {
+    const a = testing.allocator;
+    const xk = @import("exl3_kernels.zig");
+    const m = try mdl.Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = m.spec };
+    // The model's own chunk rule, pinned small (30 rows) so a mini prompt spans several chunks.
+    const model = try Loop(TraceOps).M.init(a, &g, m.c, try routes.parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "30" }}, null), &lookup, &m.src);
+    defer model.deinit(&g);
+    const head = try Loop(TraceOps).H.init(a, &g, m.c, .{}, &lookup);
+    defer head.deinit(&g);
+    const nl = m.c.n_layers;
+    const k = m.c.n_experts_per_tok;
+    var rows0: [8]u32 = @splat(@intCast(m.c.n_routed_experts));
+    var src = try xp.FakeSource.init(a, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
+    defer src.deinit();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    WideLog.next_layer = 0;
+    WideLog.n_order = 0;
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = WideLog });
+    var ex = try Ex.initWith(a, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    var script: Script = .{ .n_experts = @intCast(m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    g.host_values = script.values();
+    // 70 prompt rows: spans 30 / 30 / 10. The first two are wider than a route takes (30 x k > 48), the last is not.
+    const n_prompt = 70;
+    try testing.expect(30 * k > xp.max_route_ids and 10 * k <= xp.max_route_ids);
+    var prompt: [n_prompt]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(1 + i % 50);
+    // The request's KV bounded to its positions: the prompt, 4 tokens and one verify block.
+    var st = try model.newStateWith(model.boundedKv(n_prompt + 4 + 8));
+    defer st.deinit(&g, a);
+    const max_len = st.max_len orelse return error.TestUnexpectedResult;
+    try testing.expect(max_len >= n_prompt + 4 + 8);
+    var caches: [4]Loop(TraceOps).H.Cache = @splat(.{});
+    defer for (caches[0..head.nStages()]) |*x| x.deinit(&g);
+    var lp = Loop(TraceOps).init(&g, model, head, &st, caches[0..head.nStages()], .{ .lookup = null, .max_tokens = 4, .prompt_chunk = whole_prompt });
+    defer lp.deinit();
+    try testing.expectEqual(@as(u32, 3), try lp.prefill(a, &ex, &prompt));
+    try testing.expectEqual(@as(u32, n_prompt), st.offset);
+    try testing.expectEqual(@as(u32, n_prompt), caches[0].offset);
+    // Every layer's wide route took the two wide chunks' rows (60 x k), act rows indexing the chunk,
+    // slots inside the bank, bf16 act; one finish per call.
+    for (ex.wide_routes) |r| {
+        try testing.expect(r.ok);
+        try testing.expectEqual(@as(u32, 60 * k), r.rows);
+        try testing.expectEqual(r.calls, r.finishes);
+    }
+    // Chunk-major: chunk 0 through layers 0 .. L-1, then chunk 1 (a layer's calls in a chunk adjacent).
+    var runs: [64]u32 = undefined;
+    var n_runs: usize = 0;
+    for (WideLog.order[0..WideLog.n_order]) |l| {
+        if (n_runs == 0 or runs[n_runs - 1] != l) {
+            runs[n_runs] = l;
+            n_runs += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2 * nl), n_runs);
+    for (runs[0..n_runs], 0..) |l, i| try testing.expectEqual(@as(u32, @intCast(i % nl)), l);
+    // The narrow last chunk takes the decode lane: one route per layer per chunk, wide or not.
+    try testing.expectEqual(@as(u64, 3 * nl), src.stats().route_calls);
+    // A forward past the request's positions is refused before any lane is written.
+    const room: usize = max_len - st.offset;
+    const too_many = try a.alloc(u32, room + 1);
+    defer a.free(too_many);
+    @memset(too_many, 1);
+    try testing.expectError(error.BoundedLaneFull, model.forward(&g, &st, too_many, .{ .logits = .none }, &ex, graph.NoProbe{}));
+    try testing.expectEqual(@as(u32, n_prompt), st.offset);
 }
 
 test "dsv41 dspark loop: typical flags accept what the argmax rejects; the correction stays the argmax" {

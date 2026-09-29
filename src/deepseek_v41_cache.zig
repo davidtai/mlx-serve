@@ -825,4 +825,9 @@ test "dsv41 cache: prefill chunks follow the Python shape-aware derivation" {
     try testing.expectEqual(@as(usize, 3), spans.len);
     try testing.expectEqual([2]u32{ 1906, 2000 }, spans[2]);
     try testing.expectEqual(@as(usize, 1), (try prefillSpans(arena.allocator(), 1, 953)).len);
+    // The 16K cell's prompt: the lane of record's 17 x 953 + 183 chunks.
+    const cell = try prefillSpans(arena.allocator(), 16384, resolvePrefillChunk(&c, 16384, null, default_chunk_target_bytes));
+    try testing.expectEqual(@as(usize, 18), cell.len);
+    for (cell[0..17]) |sp| try testing.expectEqual(@as(u32, 953), sp[1] - sp[0]);
+    try testing.expectEqual([2]u32{ 16201, 16384 }, cell[17]);
 }
