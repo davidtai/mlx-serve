@@ -57,6 +57,11 @@ pub const Envelope = struct {
     post_prefill_reserve_bytes: u64,
     projection_seed_fixed_bytes: u64,
     retirement_owners_proved: bool,
+    /// Resident draft-head bytes the envelope's measured stack did not hold:
+    /// the stack of record's compact DSpark head (run_full.py
+    /// `MTP_PRUNED_BYTES`, its `text_only_resident_discount`). A process whose
+    /// head leaves out fewer bytes is charged the difference on every phase.
+    draft_pruned_bytes: u64 = 0,
 
     pub const dsv41_pass2: Envelope = .{
         .predecessor_decode_rows = 112,
@@ -73,6 +78,8 @@ pub const Envelope = struct {
         .post_prefill_reserve_bytes = 1_301_547_008,
         .projection_seed_fixed_bytes = 17_536_326_524,
         .retirement_owners_proved = true,
+        // 201 of the head's 3 x 128 experts x 18,800,640 B (the 09-13 trace selection, 93 / 58 / 32 kept).
+        .draft_pruned_bytes = 3_778_928_640,
     };
 };
 
@@ -128,6 +135,11 @@ pub const Inputs = struct {
     prefill_charge_bytes: u64 = 0,
     peak_fill: ?PeakFill = .{},
     rowsx: ?Rowsx = null,
+    /// Resident draft-head bytes this process leaves out (0: the full head;
+    /// a subset head: its pruned experts' bytes). Null: the envelope's own
+    /// head. The admission charges `envelope.draft_pruned_bytes` minus this
+    /// on every phase, the prefill included.
+    draft_pruned_bytes: ?u64 = null,
 };
 
 pub const Phase = enum { growth, seed, prime, decode };
@@ -333,8 +345,10 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
     if (inherited < 0 or steady_fixed < 0 or transition_fixed < 0) return error.ProjectionEnvelopeTooSmall;
     const seed_fixed: i64 = @intCast(env.projection_seed_fixed_bytes);
     const group: i64 = projection_bytes;
+    // The draft head's residents beyond (or short of) the envelope's.
+    const head_extra: i64 = if (in.draft_pruned_bytes) |p| @as(i64, @intCast(env.draft_pruned_bytes)) - @as(i64, @intCast(p)) else 0;
     const charge: i64 = @as(i64, @intCast(in.phase_reserve_bytes - base_pipeline_bytes)) +
-        (if (in.rowsx == null) @as(i64, @intCast(in.lookahead_staging_bytes)) else 0) - @as(i64, @intCast(credit));
+        (if (in.rowsx == null) @as(i64, @intCast(in.lookahead_staging_bytes)) else 0) - @as(i64, @intCast(credit)) + head_extra;
     var ph = [4]i64{
         transition_fixed + group,
         seed_fixed + group,
@@ -361,8 +375,8 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
         }
     };
     const fit: Fit = .{ .box = @intCast(env.box_bytes), .base = base, .host = host, .wired = wired, .allocator_limit = allocator_limit };
-    const entry_fixed = transition_fixed + projection_bytes - retired_tail + post_reserve;
-    const prefill_base: i64 = @as(i64, @intCast(env.prefill_active_bytes)) + prefill_engine_remainder + transform_reserve;
+    const entry_fixed = transition_fixed + projection_bytes - retired_tail + post_reserve + head_extra;
+    const prefill_base: i64 = @as(i64, @intCast(env.prefill_active_bytes)) + prefill_engine_remainder + transform_reserve + head_extra;
     const raw_band: i64 = n_layers * raw_record;
 
     // The prefill: the largest predecessor-record row budget whose active and
@@ -597,6 +611,34 @@ test "dsv41 admission: a forced-147 fast receipt (host-fast-exact EXL3) admits i
     try testing.expectEqual(@as(u64, 3_310_789_376), pf.total_credit_bytes);
     try testing.expectEqual(@as(u64, 108_921_111_644), pf.modeled_peak_bytes);
     try testing.expect(p.rowsx == null);
+}
+
+test "dsv41 admission: the full DSpark head pays the record's pruned experts on every phase; the record's own subset pays nothing" {
+    const d = Envelope.dsv41_pass2.draft_pruned_bytes;
+    try testing.expectEqual(@as(u64, 201 * 18_800_640), d);
+    var rec_in = pass2Fast(7_755_397_656, 3_377_741_824, 130);
+    rec_in.peak_fill = null;
+    var full_in = rec_in;
+    full_in.draft_pruned_bytes = 0;
+    var same_in = rec_in;
+    same_in.draft_pruned_bytes = d;
+    const rec = (try Admission.plan(.dsv41_pass2, rec_in)).admission;
+    const full = (try Admission.plan(.dsv41_pass2, full_in)).admission;
+    const same = (try Admission.plan(.dsv41_pass2, same_in)).admission;
+    try testing.expectEqual(rec, same);
+    try expectPhaseValues(full.phases, rec.phases.growth + d, rec.phases.seed + d, rec.phases.prime + d, rec.phases.decode + d);
+    // The prefill holds the head too: its active is the record's + d at the same rows, so it can admit fewer.
+    try testing.expect(full.prefill_rows <= rec.prefill_rows);
+    try testing.expectEqual(rec.prefill_active_bytes + d - (rec.prefill_rows - full.prefill_rows) * n_layers * raw_record, full.prefill_active_bytes);
+    // Unforced, the full head admits the rows its 3.78 GB displaces (0.533 GB a row).
+    var auto_rec = rec_in;
+    auto_rec.fixed_rows = null;
+    var auto_full = auto_rec;
+    auto_full.draft_pruned_bytes = 0;
+    const r0 = (try Admission.plan(.dsv41_pass2, auto_rec)).admission.decode_rows;
+    const r1 = (try Admission.plan(.dsv41_pass2, auto_full)).admission.decode_rows;
+    // 3,778,928,640 B = 7.09 rows of 40 x 13,315,584 B: 7 or 8 fewer, by the slack at r0.
+    try testing.expect(r0 - r1 == d / (40 * exl3_record) or r0 - r1 == d / (40 * exl3_record) + 1);
 }
 
 test "dsv41 admission: an AUTO fast receipt (rowsx control) fills to its logged 156 rows" {
@@ -1050,7 +1092,9 @@ test "dsv41 admission: every pass-2 admission, synthetic cell and refusal equals
     const parsed = try std.json.parseFromSlice(Fixture, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const f = parsed.value;
-    const env = envelopeOf(f.envelope);
+    var env = envelopeOf(f.envelope);
+    // The fixture has no draft-head field: its cells all run the envelope's own head (null).
+    env.draft_pruned_bytes = Envelope.dsv41_pass2.draft_pruned_bytes;
     // The built-in calibration is the fixture's envelope.
     try testing.expectEqualDeep(Envelope.dsv41_pass2, env);
     var counts: [5][3]u32 = @splat(@splat(0));

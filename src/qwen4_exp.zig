@@ -203,12 +203,14 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
+    /// Rows come through `pread` on `fd`, opened past the page cache
+    /// (F_NOCACHE, read-ahead off), never through a mapping (`openTensor`).
+    nocache: bool = false,
     /// A record table's resident rows (`attachCache`); without it every row is read.
     cache: ?*RowCache = null,
 
     /// `bits` of a record table: raw fixed-width records, never dequantized here.
     pub const records_bits: u32 = 0;
-    const no_map: [0]u8 align(std.heap.page_size_min) = .{};
 
     /// `rows` records of `record_bytes` at `data_offset` of `path` (an Engram bank, an
     /// embedding tensor inside a safetensors shard), read past the page cache, not mapped.
@@ -219,7 +221,7 @@ pub const NgramTable = struct {
         const size = std.c.lseek(fd, 0, std.c.SEEK.END);
         const need = std.math.add(u64, data_offset, std.math.mul(u64, rows, record_bytes) catch return error.NgramTableRegion) catch return error.NgramTableRegion;
         if (size < 0 or @as(u64, @intCast(size)) < need) return error.NgramTableTruncated;
-        var t: NgramTable = .{ .map = &no_map, .rows = rows, .dim = record_bytes, .bits = records_bits, .group_size = 0, .w_off = @intCast(data_offset), .s_off = 0, .b_off = 0, .wcols = 0, .scols = 0, .fd = fd };
+        var t: NgramTable = .{ .map = &empty_map, .rows = rows, .dim = record_bytes, .bits = records_bits, .group_size = 0, .w_off = @intCast(data_offset), .s_off = 0, .b_off = 0, .wcols = 0, .scols = 0, .fd = fd, .nocache = true };
         if (record_bytes <= PrefetchPool.ROW_BUF) t.pool = try PrefetchPool.create();
         return t;
     }
@@ -283,6 +285,75 @@ pub const NgramTable = struct {
         t.fd = fd;
         if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
         return t;
+    }
+
+    /// A raw BF16 `[rows, dim]` tensor named `name` inside any safetensors file
+    /// (a checkpoint shard, no `mlx-serve-ngram` metadata), read past the page
+    /// cache: the descriptor is F_NOCACHE with read-ahead off, rows come
+    /// through `pread` (`gatherRaw`), nothing is mapped and no warm thread runs.
+    pub fn openTensor(path: [:0]const u8, name: []const u8) !NgramTable {
+        const fd = io_util.openNoCache(path.ptr, .{}) catch |e| return switch (e) {
+            error.NoCacheFcntl, error.NoCacheUnsupported => error.NgramTableNoCache,
+            else => error.FileNotFound,
+        };
+        errdefer _ = std.c.close(fd);
+        const size: usize = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+        if (size < 8) return error.NgramTableTruncated;
+        var len_bytes: [8]u8 = undefined;
+        try preadAll(fd, &len_bytes, 0);
+        const hlen: usize = @intCast(std.mem.readInt(u64, &len_bytes, .little));
+        if (hlen > size - 8) return error.NgramTableTruncated;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const header = try a.alloc(u8, hlen);
+        try preadAll(fd, header, 8);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, header, .{}) catch return error.NgramTableHeader;
+        if (parsed != .object) return error.NgramTableHeader;
+        const w = try headerRegion(parsed.object, name, "BF16", 2, size, 8 + hlen);
+        return .{
+            .map = &empty_map,
+            .rows = w.rows,
+            .dim = @intCast(w.cols),
+            .bits = 16,
+            .group_size = 0,
+            .w_off = 8 + hlen + @as(usize, @intCast(w.start)),
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = 0,
+            .scols = 0,
+            .fd = fd,
+            .nocache = true,
+        };
+    }
+
+    const empty_map: [0]u8 align(std.heap.page_size_min) = .{};
+
+    /// Raw BF16 rows `row_ids`, in order, into `out` (`row_ids.len * dim * 2`
+    /// bytes): the table's bytes, no conversion (a bits-16 table).
+    pub fn gatherRaw(self: *const NgramTable, row_ids: []const u32, out: []u8) !void {
+        std.debug.assert(self.bits == 16);
+        const rb: usize = @as(usize, self.dim) * 2;
+        if (out.len != row_ids.len * rb) return error.NgramTableRegion;
+        for (row_ids, 0..) |r, i| {
+            if (r >= self.rows) return error.NgramTableRegion;
+            const dst = out[i * rb ..][0..rb];
+            const off = self.w_off + @as(usize, r) * rb;
+            if (self.nocache) try preadAll(self.fd, dst, off) else @memcpy(dst, self.map[off..][0..rb]);
+        }
+    }
+
+    fn preadAll(fd: std.c.fd_t, dst: []u8, off: usize) !void {
+        var done: usize = 0;
+        while (done < dst.len) {
+            const r = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(off + done));
+            if (r < 0) {
+                if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                return error.NgramTableRead;
+            }
+            if (r == 0) return error.NgramTableTruncated;
+            done += @intCast(r);
+        }
     }
 
     /// Widths `mx.quantize` packs and `dequantRow` unpacks, plus 16 = raw
@@ -435,7 +506,7 @@ pub const NgramTable = struct {
             gpa.destroy(c);
             self.cache = null;
         }
-        if (!self.gpu_owns_map and self.map.len > 0) std.posix.munmap(self.map);
+        if (!self.gpu_owns_map and !self.nocache) std.posix.munmap(self.map);
     }
 
     const WARM_CHUNK: usize = 8 << 20;
@@ -445,7 +516,7 @@ pub const NgramTable = struct {
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
-        if (self.fd < 0 or self.warm_thread != null) return;
+        if (self.fd < 0 or self.warm_thread != null or self.nocache) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
             log.info("[qwen4] ngram table warm: disabled (MLX_SERVE_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
@@ -486,7 +557,7 @@ pub const NgramTable = struct {
     /// sits at bit offset i * bits of the little-endian u32 stream and may
     /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
-        std.debug.assert(r < self.rows and out.len >= self.dim);
+        std.debug.assert(r < self.rows and out.len >= self.dim and !self.nocache);
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
             const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
@@ -1090,6 +1161,39 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 2.0, 0.0 }, &out);
     t.row(1, &out);
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
+}
+
+test "dsv41 ngram table: a BF16 tensor inside a checkpoint shard gathers its raw rows past the page cache" {
+    // Two tensors, the second a BF16 [5, 3] table after a U8 one; no mlx-serve-ngram metadata.
+    const header = "{\"other\":{\"dtype\":\"U8\",\"shape\":[1,7],\"data_offsets\":[0,7]},\"embed.weight\":{\"dtype\":\"BF16\",\"shape\":[5,3],\"data_offsets\":[7,37]}}";
+    var image: [8 + header.len + 37 + 3]u8 = undefined;
+    std.mem.writeInt(u64, image[0..8], header.len, .little);
+    @memcpy(image[8..][0..header.len], header);
+    const data = image[8 + header.len ..];
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try td.dir.writeFile(testing.io, .{ .sub_path = "shard.safetensors", .data = &image });
+    var root: [512]u8 = undefined;
+    var pbuf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/shard.safetensors", .{root[0..try td.dir.realPath(testing.io, &root)]}, 0);
+    var t = try NgramTable.openTensor(path, "embed.weight");
+    defer t.close();
+    try testing.expect(t.nocache and t.map.len == 0 and t.warm_thread == null);
+    try testing.expectEqual(@as(u64, 5), t.rows);
+    try testing.expectEqual(@as(u32, 3), t.dim);
+    var out: [4 * 6]u8 = undefined;
+    const ids = [_]u32{ 4, 0, 4, 2 };
+    try t.gatherRaw(&ids, &out);
+    for (ids, 0..) |r, i| try testing.expectEqualSlices(u8, data[7 + r * 6 ..][0..6], out[i * 6 ..][0..6]);
+    t.startWarm(); // no warm thread on a no-cache table
+    try testing.expect(t.warm_thread == null);
+    try testing.expectError(error.NgramTableRegion, t.gatherRaw(&.{5}, out[0..6]));
+    try testing.expectError(error.NgramTableRegion, t.gatherRaw(&.{0}, out[0..5]));
+    // By name only: another dtype or a missing name is refused.
+    try testing.expectError(error.NgramTableHeader, NgramTable.openTensor(path, "other"));
+    try testing.expectError(error.NgramTableHeader, NgramTable.openTensor(path, "missing"));
+    try testing.expectError(error.FileNotFound, NgramTable.openTensor("/nonexistent/shard.safetensors", "embed.weight"));
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and

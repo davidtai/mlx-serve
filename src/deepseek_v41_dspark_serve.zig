@@ -25,6 +25,37 @@ const eng = @import("deepseek_v41_engram.zig");
 const model_io = @import("model.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
+const ops = @import("deepseek_v41_ops.zig");
+const mdl = @import("deepseek_v41_model.zig");
+const mlx = @import("mlx.zig");
+const qwen4 = @import("qwen4_exp.zig");
+const dh = @import("deepseek_v41_dspark_head.zig");
+
+/// How the residents load: past the page cache (`nocache_reader`), so a load
+/// keeps no file pages next to the array buffers (the guard counts cached
+/// pages as used).
+pub const resident_load_opts: model_io.LoadOpts = .{ .nocache = true };
+
+/// The Engram residents' sidecar (`wkv`, `q_weight`, `k_weight` of every
+/// Engram layer), beside the model's shards; the index names none of them.
+pub const engram_residents_file = "engram/engram-residents.safetensors";
+
+/// Every resident the model and the draft head bind, for the served arm and
+/// both window harnesses: the shards the index names (`loadWeightsNoCache`)
+/// and, when the config has Engram layers, the Engram sidecar, all past the
+/// page cache.
+pub fn loadResidents(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, c: *const v41.Config) !model_io.Weights {
+    var w = try model_io.loadWeightsNoCache(io, a, model_dir);
+    errdefer w.deinit();
+    if (c.engram.n_layers > 0) {
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/" ++ engram_residents_file, .{model_dir}, 0);
+        defer a.free(path);
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try model_io.loadSafetensorsFile(a, &w, path.ptr, s, resident_load_opts);
+    }
+    return w;
+}
 
 /// The loop's model and draft head over a bank's residents, owned: bound once
 /// (every refusal named, before any request), released by `deinit` after the
@@ -36,33 +67,91 @@ pub fn Resources(comptime G: type) type {
         a: std.mem.Allocator,
         weights: model_io.Weights,
         engram: eng.RowSource,
+        /// The input embedding's rows in its checkpoint shard, opened with the
+        /// residents (past the page cache); the model's lookups read them from
+        /// the first prompt pass's fence on.
+        embed_rows: qwen4.NgramTable,
         model: *L.M,
         head: *L.H,
 
-        /// The text trunk at the stock tier, the draft head's stages and the
-        /// Engram row source over `token_map` (the tokenizer's exported map).
-        pub fn open(a: std.mem.Allocator, io: std.Io, g: *G, model_dir: []const u8, c: v41.Config, token_map: []const u8, diag: *v41.Diag) !*Self {
+        /// The text trunk at the stock tier, the draft head's stages (every
+        /// expert, or only a pinned subset's) and the Engram row source over
+        /// `token_map` (the tokenizer's exported map).
+        pub fn open(a: std.mem.Allocator, io: std.Io, g: *G, model_dir: []const u8, c: v41.Config, token_map: []const u8, subset: ?*const dh.Subset, diag: *v41.Diag) !*Self {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.a = a;
-            self.weights = try model_io.loadWeights(io, a, model_dir);
+            self.weights = try loadResidents(io, a, model_dir, &c);
             errdefer self.weights.deinit();
             self.engram = try eng.RowSource.open(a, io, model_dir, token_map, &c, diag);
             errdefer self.engram.deinit();
+            self.embed_rows = try openEmbeddingRows(a, io, model_dir, &c, diag);
+            errdefer self.embed_rows.close();
             self.model = try L.M.init(a, g, c, try routes.parse(&.{}, diag), &self.weights, &self.engram);
             errdefer self.model.deinit(g);
-            self.head = try L.H.init(a, g, c, .{}, &self.weights);
+            self.head = try L.H.initWith(a, g, c, .{}, &self.weights, .{ .subset = subset });
             return self;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
             self.head.deinit(g);
             self.model.deinit(g);
+            self.embed_rows.close();
             self.engram.deinit();
             self.weights.deinit();
             self.a.destroy(self);
         }
+
+        pub fn retireEmbedding(self: *Self, g: *G) !void {
+            try embeddingFence(G, g, self.model, &self.embed_rows, &self.weights);
+        }
+
+        fn fenceRun(ctx: *anyopaque, g: *G) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try self.retireEmbedding(g);
+        }
     };
+}
+
+/// The prompt pass's fence (the stack of record's `embedding_install.retire`,
+/// before the phase change): the model's lookups move to `rows` and `owner`
+/// frees the table (`drop`). On MLX the active bytes must drop by at least
+/// the table's bytes (refused otherwise).
+pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *qwen4.NgramTable, owner: anytype) !void {
+    const before = activeBytes(G, g);
+    _ = try model.retireEmbedding(g, rows);
+    owner.drop("embed.weight");
+    if (G == ops.MlxOps) {
+        _ = mlx.mlx_clear_cache();
+        if (before -| activeBytes(G, g) < model.embeddingBytes()) return error.EmbeddingNotReleased;
+    }
+}
+
+fn activeBytes(comptime G: type, g: *G) u64 {
+    if (G != ops.MlxOps) return 0;
+    _ = mlx.mlx_synchronize(g.s);
+    var n: usize = 0;
+    _ = mlx.mlx_get_active_memory(&n);
+    return n;
+}
+
+fn refuse(diag: *v41.Diag, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
+    diag.len = if (std.fmt.bufPrint(&diag.buf, fmt, args)) |m| m.len else |_| diag.buf.len;
+    return err;
+}
+
+/// The input embedding's rows in its checkpoint shard (`embed.weight`, bf16
+/// `[vocab, dim]`), read past the page cache (`NgramTable.openTensor`).
+pub fn openEmbeddingRows(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, c: *const v41.Config, diag: *v41.Diag) !qwen4.NgramTable {
+    var ck = try v41.Checkpoint.openIndexed(a, io, model_dir, diag);
+    defer ck.deinit();
+    const t = ck.tensors.get("embed.weight") orelse return refuse(diag, error.MissingWeight, "embed.weight: not in the checkpoint", .{});
+    if (t.dtype != .BF16 or t.rank != 2 or t.shape[0] != c.vocab_size or t.shape[1] != c.hidden_size)
+        return refuse(diag, error.EmbeddingRowsMismatch, "embed.weight: {t} rank {d} [{d}, {d}], the host rows need bf16 [{d}, {d}]", .{ t.dtype, t.rank, t.shape[0], t.shape[1], c.vocab_size, c.hidden_size });
+    const path = try ck.shardPath(a, t.shard);
+    defer a.free(path);
+    return qwen4.NgramTable.openTensor(path, "embed.weight") catch |e|
+        refuse(diag, e, "{s}: the embedding rows cannot be read past the page cache", .{path});
 }
 
 /// The DSpark decode seam of arm `A` (`A.Backend` is the graph backend).
@@ -86,6 +175,12 @@ pub fn Dspark(comptime A: type) type {
         req: ?*Req = null,
         cfg: dsl.Config = .{ .max_tokens = std.math.maxInt(u32) },
         st: arm_mod.Stats = .{},
+        /// Run once, after the first prompt pass (set by `open`: the
+        /// embedding's retirement); later prompts read the host rows.
+        fence: ?Fence = null,
+        fenced: bool = false,
+
+        pub const Fence = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, g: *G) anyerror!void };
 
         const Req = struct {
             a: std.mem.Allocator,
@@ -111,10 +206,11 @@ pub fn Dspark(comptime A: type) type {
         /// Construction on the served backend: the residents of `arm`'s model
         /// directory under its config, then `attach`.
         pub fn open(self: *Self, a: std.mem.Allocator, io: std.Io, arm: *const A, g: *G, token_map: []const u8, diag: *v41.Diag) !void {
-            const res = try Res.open(a, io, g, arm.model_dir, arm.config, token_map, diag);
+            const res = try Res.open(a, io, g, arm.model_dir, arm.config, token_map, if (arm.draft_subset) |*s| s else null, diag);
             errdefer res.deinit(g);
             try self.attach(a, res.model, res.head);
             self.owned = res;
+            self.fence = .{ .ctx = res, .run = Res.fenceRun };
         }
 
         /// Construction over a model and head the caller owns (they outlive the seam).
@@ -158,6 +254,10 @@ pub fn Dspark(comptime A: type) type {
             r.loop = Loop.init(g, self.model, self.head, &r.state, r.caches, self.cfg);
             r.live = true;
             const primary = try r.loop.prefill(arm.a, &arm.hook, prompt);
+            if (!self.fenced) if (self.fence) |f| {
+                try f.run(f.ctx, g);
+                self.fenced = true;
+            };
             self.st.generated_tokens = 1;
             return primary;
         }
@@ -177,19 +277,74 @@ pub fn Dspark(comptime A: type) type {
         pub fn stats(self: *const Self) arm_mod.Stats {
             return self.st;
         }
+
+        /// The head the requests draft with (receipts): `full` or `compact:<subset sha256>`.
+        pub fn draftHead(self: *const Self, buf: *[72]u8) []const u8 {
+            return self.head.identity.text(buf);
+        }
     };
 }
 
 // ── Tests (host: the arm's synthetic bank, the mini model on the trace backend) ──
 
 const testing = std.testing;
-const ops = @import("deepseek_v41_ops.zig");
-const mdl = @import("deepseek_v41_model.zig");
 const serve = @import("deepseek_v41_serve.zig");
 const TraceOps = ops.TraceOps;
 const TraceArm = arm_mod.Arm(TraceOps, arm_mod.StandInMath(TraceOps));
 const D = Dspark(TraceArm);
 const TraceSession = serve.Session(TraceArm, D);
+
+test "dsv41 dspark serve: the residents load past the page cache, for the served arm and both harnesses" {
+    // Resources.open (the served arm and the DSpark harness) and the AR harness load through
+    // `loadResidents`: the shards through `loadWeightsNoCache`, the Engram sidecar with these options.
+    try testing.expect(resident_load_opts.nocache);
+    try testing.expect(!resident_load_opts.vision and !resident_load_opts.keep_f16);
+}
+
+// DSV41_BANK=<the 3.0 bank>: the files `loadResidents` reads (the index's shards, as `loadWeights` selects them,
+// and the Engram sidecar) declare every resident the model and the draft head bind; the shards alone do not
+// declare the Engram residents (the M3AR2 model-init refusal: MissingWeight at the first Engram lookup).
+test "dsv41 dspark serve: the residents' files declare every name the model and the draft head bind" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var diag: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank, &diag);
+    var shards = try v41.Checkpoint.openIndexed(a, testing.io, bank, &diag);
+    defer shards.deinit();
+    const side_path = try std.fmt.allocPrint(arena.allocator(), "{s}/" ++ engram_residents_file, .{bank});
+    var side = try v41.Checkpoint.openFile(a, side_path, &diag);
+    defer side.deinit();
+    const text = try v41.residentSpec(arena.allocator(), &c);
+    const eng_spec = try v41.engramSpec(arena.allocator(), &c);
+    var nb: [160]u8 = undefined;
+    var in_shards: usize = 0;
+    var in_side: usize = 0;
+    for ([_][]const v41.Param{ text, eng_spec }, 0..) |list, which| for (list) |p| {
+        var names: [2][]const u8 = undefined;
+        var n_names: usize = 1;
+        switch (p.kind) {
+            .dense => names[0] = p.name,
+            .quant => {
+                names[0] = try std.fmt.bufPrint(nb[0..80], "{s}.weight", .{p.name});
+                names[1] = try std.fmt.bufPrint(nb[80..], "{s}.scales", .{p.name});
+                n_names = 2;
+            },
+        }
+        for (names[0..n_names]) |name| {
+            const sh = shards.tensors.get(name) != null;
+            const sd = side.tensors.get(name) != null;
+            try testing.expect(sh or sd);
+            // The Engram residents are the sidecar's alone; everything else the shards'.
+            try testing.expectEqual(which == 1, sd and !sh);
+            in_shards += @intFromBool(sh);
+            in_side += @intFromBool(sd);
+        }
+    };
+    try testing.expectEqual(@as(usize, 8), in_side);
+    std.debug.print("dsv41 dspark serve: {d} residents in the index's shards, {d} in the Engram sidecar ({s})\n", .{ in_shards, in_side, engram_residents_file });
+}
 
 /// The host reads of a scripted run, in the loop's read order: each routing
 /// barrier's ids (k distinct experts per row), the prompt's pick, per cycle
@@ -420,4 +575,264 @@ test "dsv41 dspark serve: the request's depth and typical acceptance reach the l
     var run = try e.end();
     defer run.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 1), run.stats.cycles);
+}
+
+/// A checkpoint shard holding `embed.weight`, bf16 `[vocab, dim]`, after
+/// another tensor: row `r` begins with `r` (u32 LE), the rest
+/// `(r * 131 + j * 7 + 3) & 0xff`, so rows differ. Returns the image and the
+/// table's offset in it.
+fn writeEmbedShard(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, vocab: usize, dim: usize) !struct { image: []u8, table: usize } {
+    const row = dim * 2;
+    var hbuf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&hbuf, "{{\"norm.weight\":{{\"dtype\":\"BF16\",\"shape\":[20],\"data_offsets\":[0,40]}},\"embed.weight\":{{\"dtype\":\"BF16\",\"shape\":[{d},{d}],\"data_offsets\":[40,{d}]}}}}", .{ vocab, dim, 40 + vocab * row });
+    const table = 8 + header.len + 40;
+    const image = try a.alloc(u8, table + vocab * row);
+    std.mem.writeInt(u64, image[0..8], header.len, .little);
+    @memcpy(image[8..][0..header.len], header);
+    @memset(image[8 + header.len ..][0..40], 0x5a);
+    for (0..vocab) |r| {
+        const bytes = image[table + r * row ..][0..row];
+        for (bytes, 0..) |*b, j| b.* = @truncate(r * 131 + j * 7 + 3);
+        std.mem.writeInt(u32, bytes[0..4], @intCast(r), .little);
+    }
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = image });
+    return .{ .image = image, .table = table };
+}
+
+/// The fence as `Resources` runs it, over a recording owner of the table.
+const FenceProbe = struct {
+    model: *D.Loop.M,
+    rows: *qwen4.NgramTable,
+    dropped: std.ArrayList([]const u8) = .empty,
+    runs: u32 = 0,
+    /// The node count when the fence ran: later nodes belong to the cycles.
+    at_node: usize = 0,
+
+    pub fn drop(self: *FenceProbe, name: []const u8) void {
+        self.dropped.append(testing.allocator, name) catch @panic("oom");
+    }
+
+    fn run(ctx: *anyopaque, g: *TraceOps) anyerror!void {
+        const self: *FenceProbe = @ptrCast(@alignCast(ctx));
+        try embeddingFence(TraceOps, g, self.model, self.rows, self);
+        self.runs += 1;
+        self.at_node = g.nodes.items.len;
+    }
+};
+
+/// The ids of every embedding lookup built from host rows in nodes
+/// `[from, to)` (bf16 `[1, n, dim]` host arrays), each row matched to the table's row.
+fn hostRowIds(a: std.mem.Allocator, g: *const TraceOps, from: usize, to: usize, table: []const u8, dim: usize) !std.ArrayList([]u32) {
+    var out: std.ArrayList([]u32) = .empty;
+    errdefer {
+        for (out.items) |x| a.free(x);
+        out.deinit(a);
+    }
+    const row = dim * 2;
+    for (g.nodes.items[from..to], from..) |nd, x| {
+        if (nd.op != .host or nd.dtype != .bfloat16 or nd.shape.n != 3 or nd.shape.d[2] != @as(c_int, @intCast(dim))) continue;
+        const bytes = g.hostBytesOf(@intCast(x)).?;
+        const n: usize = @intCast(nd.shape.d[1]);
+        const ids = try a.alloc(u32, n);
+        errdefer a.free(ids);
+        for (ids, 0..) |*id, i| {
+            const r = bytes[i * row ..][0..row];
+            id.* = std.mem.readInt(u32, r[0..4], .little);
+            // Byte for byte the table's row.
+            try testing.expectEqualSlices(u8, table[id.* * row ..][0..row], r);
+        }
+        try out.append(a, ids);
+    }
+    return out;
+}
+
+test "dsv41 dspark serve: the first prompt pass's fence moves every later lookup to the host rows, byte for byte the table's" {
+    const rig = try Rig.create();
+    defer rig.destroy();
+    const a = testing.allocator;
+    const c = &rig.mini.c;
+    const dim: usize = c.hidden_size;
+    const shard = try writeEmbedShard(a, &rig.mini.tmp, "shard.safetensors", c.vocab_size, dim);
+    defer a.free(shard.image);
+    const table = shard.image[shard.table..];
+    var pbuf: [700]u8 = undefined;
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/shard.safetensors", .{root[0..try rig.mini.tmp.dir.realPath(testing.io, &root)]}, 0);
+    var rows = try qwen4.NgramTable.openTensor(path, "embed.weight");
+    defer rows.close();
+    var probe: FenceProbe = .{ .model = rig.model, .rows = &rows };
+    defer probe.dropped.deinit(a);
+    rig.session.decode.fence = .{ .ctx = &probe, .run = FenceProbe.run };
+    rig.g.record_host = true;
+    // The first engine test's request: 3 cycles (verify rows [3, 10, 11], [12, 20, 21], [22, 30]).
+    var s: Script = .{
+        .n_experts = 0,
+        .k = 0,
+        .pick = 3,
+        .u32s = &.{ &.{ 10, 11 }, &.{ 10, 11, 12 }, &.{ 20, 21 }, &.{ 20, 22, 23 }, &.{ 30, 31 }, &.{ 30, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.9 }, &.{ 0.9, 0.9 }, &.{ 0.9, 0.2 } },
+    };
+    rig.script(&s);
+    const e = rig.session.engine();
+    var out: Collect = .{};
+    defer out.tokens.deinit(a);
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const first_node = rig.g.nodes.items.len;
+    _ = try drive(e, .{ .prompt = &prompt, .max_tokens = 7, .stop_ids = &.{}, .acceptance = .greedy }, &out);
+    try testing.expectEqualSlices(u32, &.{ 3, 10, 11, 12, 20, 22, 30 }, out.tokens.items);
+    var run1 = try e.end();
+    run1.deinit(a);
+    // The fence ran once, after the prompt pass; the table's owner freed it.
+    try testing.expectEqual(@as(u32, 1), probe.runs);
+    try testing.expectEqual(@as(usize, 1), probe.dropped.items.len);
+    try testing.expectEqualStrings("embed.weight", probe.dropped.items[0]);
+    try testing.expect(rig.model.embed == .rows);
+    // Before the fence no lookup read host rows (the prompt gathered from the table).
+    try testing.expect(probe.at_node > first_node);
+    var before = try hostRowIds(a, &rig.g, first_node, probe.at_node, table, dim);
+    defer before.deinit(a);
+    try testing.expectEqual(@as(usize, 0), before.items.len);
+    var after = try hostRowIds(a, &rig.g, probe.at_node, rig.g.nodes.items.len, table, dim);
+    defer {
+        for (after.items) |x| a.free(x);
+        after.deinit(a);
+    }
+    // Per cycle: the draft block's input [primary, noise ...], then the verify rows.
+    const noise: u32 = c.dspark.noise_token_id;
+    const bs = c.dspark.block_size;
+    var want: std.ArrayList([]const u32) = .empty;
+    defer want.deinit(a);
+    var blocks: [3][8]u32 = undefined;
+    for ([_]u32{ 3, 12, 22 }, 0..) |p, i| {
+        blocks[i][0] = p;
+        for (blocks[i][1..bs]) |*d| d.* = noise;
+        try want.append(a, blocks[i][0..bs]);
+        try want.append(a, switch (i) {
+            0 => &.{ 3, 10, 11 },
+            1 => &.{ 12, 20, 21 },
+            else => &.{ 22, 30 },
+        });
+    }
+    try testing.expectEqual(want.items.len, after.items.len);
+    for (want.items, after.items) |w, got| try testing.expectEqualSlices(u32, w, got);
+    // A later request's prompt reads the host rows; the fence does not run again.
+    const mark = rig.g.nodes.items.len;
+    var second: Collect = .{};
+    defer second.tokens.deinit(a);
+    const short = [_]u32{ 7, 8, 9 };
+    _ = try drive(e, .{ .prompt = &short, .max_tokens = 1, .stop_ids = &.{}, .acceptance = .greedy }, &second);
+    var run2 = try e.end();
+    run2.deinit(a);
+    try testing.expectEqual(@as(u32, 1), probe.runs);
+    var later = try hostRowIds(a, &rig.g, mark, rig.g.nodes.items.len, table, dim);
+    defer {
+        for (later.items) |x| a.free(x);
+        later.deinit(a);
+    }
+    try testing.expectEqual(@as(usize, 1), later.items.len);
+    try testing.expectEqualSlices(u32, &short, later.items[0]);
+}
+
+// DSV41_BANK=<the 3.0 bank> DSV41_DSPARK_SUBSET=<R/mlx-serve-dsv41-model/dspark-head-subset-ceiling-trace-20260913.json>:
+// the stack of record's compact selection (a trace-derived CEILING, for like-for-like pairs with the Python
+// record cells only) loads under its pin, and what it leaves out is the admission's record credit, byte for byte.
+test "dsv41 dspark serve: the record's ceiling subset loads pinned and leaves out exactly the envelope's draft bytes" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const path = std.mem.span(std.c.getenv("DSV41_DSPARK_SUBSET") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const expert_admission = @import("expert_admission.zig");
+    var sub = try dh.Subset.load(a, testing.io, .{ .path = path, .sha256 = "90ee3df10e449a7dce1fbcd6cd1aef691ed4d2b55bb68a737578fd1d554a4a56" }, null);
+    defer sub.deinit();
+    try testing.expectEqualStrings("trace-derived-ceiling", sub.kind);
+    try testing.expectEqual(@as(usize, 3), sub.selected.len);
+    try testing.expectEqual(@as(usize, 93), sub.selected[0].len);
+    try testing.expectEqual(@as(usize, 58), sub.selected[1].len);
+    try testing.expectEqual(@as(usize, 32), sub.selected[2].len);
+    var diag: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank, &diag);
+    try testing.expectEqual(expert_admission.Envelope.dsv41_pass2.draft_pruned_bytes, dh.prunedBytes(&c, &sub));
+    // The left-out experts' arrays in the checkpoint, summed.
+    var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank, &diag);
+    defer ck.deinit();
+    var left_out: u64 = 0;
+    var nb: [96]u8 = undefined;
+    for (sub.selected, 0..) |kept, s| for (0..sub.n_experts) |e| {
+        if (std.mem.indexOfScalar(u16, kept, @intCast(e)) != null) continue;
+        inline for (.{ "w1", "w3", "w2" }) |w| inline for (.{ "weight", "scales" }) |part| {
+            const t = ck.tensors.get(try std.fmt.bufPrint(&nb, "mtp.{d}.ffn.experts.{d}." ++ w ++ "." ++ part, .{ s, e })).?;
+            left_out += t.end - t.begin;
+        };
+    };
+    try testing.expectEqual(expert_admission.Envelope.dsv41_pass2.draft_pruned_bytes, left_out);
+    // The host rows of the input embedding: the table the admission credits after the prompt.
+    var rows = try openEmbeddingRows(a, testing.io, bank, &c, &diag);
+    defer rows.close();
+    try testing.expectEqual(expert_admission.Envelope.dsv41_pass2.embedding_credit_bytes, rows.rows * rows.dim * 2);
+    try testing.expect(rows.nocache and rows.map.len == 0);
+    // Two rows through the table equal the checkpoint's bytes.
+    var got: [2 * 5120 * 2]u8 = undefined;
+    try rows.gatherRaw(&.{ 0, 129279 }, got[0 .. 2 * @as(usize, rows.dim) * 2]);
+    // The same rows by a plain read of the shard at the index's offsets (two rows, not the table).
+    const t = ck.tensors.get("embed.weight").?;
+    const spath = try ck.shardPath(a, t.shard);
+    defer a.free(spath);
+    const fd = std.c.open(spath.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    const rb: usize = @as(usize, rows.dim) * 2;
+    var want: [5120 * 2]u8 = undefined;
+    for ([_]u64{ 0, 129279 }, 0..) |r, i| {
+        try testing.expectEqual(@as(isize, @intCast(rb)), std.c.pread(fd, &want, rb, @intCast(t.begin + r * rb)));
+        try testing.expectEqualSlices(u8, want[0..rb], got[i * rb ..][0..rb]);
+    }
+    std.debug.print("dsv41 dspark serve: ceiling subset {s} leaves out {d} experts, {d} B; embedding rows {d} x {d} bf16 read past the page cache\n", .{ &sub.shaHex(), sub.pruned(), left_out, rows.rows, rows.dim });
+}
+
+test "dsv41 dspark serve: the arm pins the draft subset by sha, charges the admission what it leaves out, and refuses another file" {
+    const a = testing.allocator;
+    const tm = try arm_mod.TestModel.create(true);
+    defer tm.destroy();
+    var cdiag: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, tm.root, &cdiag);
+    // The mini head: one stage of 2 experts; the subset keeps expert 1.
+    try testing.expectEqual(@as(u32, 1), c.dspark.n_stages);
+    const n = c.dspark.n_routed_experts;
+    var text_buf: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "{{\"format\": \"mlx-serve-expert-subset-v1\", \"n_experts\": {d}, \"selected\": [[{d}]]}}", .{ n, n - 1 });
+    try tm.tmp.dir.writeFile(testing.io, .{ .sub_path = "subset.json", .data = text });
+    var pbuf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/subset.json", .{tm.root});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var opt = tm.options();
+    var diag: arm_mod.Diag = .{};
+    // No subset: the options' own charge (null: the envelope's head; the binding sets 0 for a full DSpark head).
+    {
+        const arm = try TraceArm.init(a, testing.io, &g, {}, opt, &diag);
+        defer arm.deinit();
+        try testing.expect(arm.draft_subset == null);
+        try testing.expectEqual(@as(?u64, null), arm.inputs.draft_pruned_bytes);
+    }
+    opt.draft_subset = .{ .path = path, .sha256 = &hex };
+    {
+        const arm = try TraceArm.init(a, testing.io, &g, {}, opt, &diag);
+        defer arm.deinit();
+        try testing.expectEqual(@as(u64, n - 1), arm.draft_subset.?.pruned());
+        try testing.expectEqual(@as(?u64, (n - 1) * dh.expertBytes(&c)), arm.inputs.draft_pruned_bytes);
+    }
+    const zero: [64]u8 = @splat('0');
+    opt.draft_subset = .{ .path = path, .sha256 = &zero };
+    try testing.expectError(error.SubsetNotPinned, TraceArm.init(a, testing.io, &g, {}, opt, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "draft subset") != null);
+    // A subset of another head's geometry is refused before the admission.
+    const other = "{\"format\": \"mlx-serve-expert-subset-v1\", \"n_experts\": 128, \"selected\": [[5]]}";
+    try tm.tmp.dir.writeFile(testing.io, .{ .sub_path = "other.json", .data = other });
+    var pbuf2: [700]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(other, &digest, .{});
+    const hex2 = std.fmt.bytesToHex(digest, .lower);
+    opt.draft_subset = .{ .path = try std.fmt.bufPrint(&pbuf2, "{s}/other.json", .{tm.root}), .sha256 = &hex2 };
+    try testing.expectError(error.SubsetGeometry, TraceArm.init(a, testing.io, &g, {}, opt, &diag));
 }

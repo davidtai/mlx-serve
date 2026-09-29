@@ -136,6 +136,9 @@ pub const Receipt = struct {
     engine: []const u8 = "mlx-serve",
     arch: []const u8 = "deepseek_v41",
     decode_binding: []const u8,
+    /// The draft head the run drafted with: `none` (no head), `full`, or
+    /// `compact:<subset sha256>` (a pinned subset, e.g. the trace-derived ceiling).
+    draft_head: []const u8 = "none",
     /// A stand-in cycle has no model math: its speed is the construction's and
     /// the streamer's, never the model's.
     measurement_valid: bool,

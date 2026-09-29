@@ -117,7 +117,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const kernels = try acceptKernels(gpa, &g);
     defer kernels.deinit(&g);
 
-    var weights = try model.loadWeights(io, gpa, bank_dir);
+    var weights = try dss.loadResidents(io, gpa, bank_dir, &c);
     defer weights.deinit();
     var src = try engram.RowSource.open(gpa, io, bank_dir, map_path, &c, &diag);
     defer src.deinit();
@@ -199,6 +199,7 @@ pub const DsparkReference = struct {
 
 // Guarded window only (loads the bank): DSV41_DSPARK_REF=<dump_dsv41_dspark_ref.py json> DSV41_BANK=<bank>
 // DSV41_ENGRAM_TOKEN_MAP=<converter map> _GPU_WINDOW_LOCKED=1 [DSV41_AR_ROWS=<decode rows per layer, default 16>]
+// [DSV41_KV_BOUNDED=1: the request's KV lanes bounded to its positions (M5BOUND), else the tier's route]
 test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions on the real model" {
     const ref_path = std.mem.span(std.c.getenv("DSV41_DSPARK_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
@@ -238,11 +239,13 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer kernels.deinit(&g);
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
-    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, &diag);
+    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, map_path, null, &diag);
     defer res.deinit(&g);
     const m = res.model;
     const head = res.head;
-    var st = try m.newState();
+    // M5BOUND: every KV lane sized once to the run's positions (the prompt, its tokens, one verify block).
+    const kv_bound: ?u32 = if (std.c.getenv("DSV41_KV_BOUNDED") != null) @intCast(ref.prompt.len + ref.tokens.len + 8) else null;
+    var st = if (kv_bound) |n| try m.newStateWith(m.boundedKv(n)) else try m.newState();
     defer st.deinit(&g, gpa);
     var caches: [8]L.H.Cache = @splat(.{});
     defer for (caches[0..head.nStages()]) |*x| x.deinit(&g);
@@ -271,6 +274,8 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     defer lp.deinit();
     const primary = try lp.prefill(gpa, &ex, ref.prompt);
     try testing.expectEqual(ref.tokens[0], primary);
+    // The served adapter's fence: the embedding table retires to its host rows before the cycles.
+    try res.retireEmbedding(&g);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     // The gate: the generated ids and each cycle's acceptance (drafts proposed,
@@ -279,8 +284,9 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     var first_accept: ?usize = null;
     var first_decision: ?usize = null;
     const t0 = std.Io.Timestamp.now(io, .boot);
+    var classified = false;
     for (ref.cycles, 0..) |rc, i| {
-        var lg: dsl.CycleLog = .{ .primary = 0 };
+        var lg: dsl.CycleLog = .{ .primary = 0, .want_top = true };
         _ = try lp.cycle(&ex, &out, gpa, &lg);
         const accept_same = lg.accepted + 1 == rc.kept and lg.verified == rc.verified and lg.k_eff == rc.drafts.len;
         var same = accept_same and lg.primary == rc.primary and lg.k_native == rc.k_eff_native;
@@ -289,7 +295,19 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
         for (rc.conf_sigmoid_bits, 0..) |bits, j| same = same and @as(u32, @bitCast(lg.conf[j])) == bits;
         var t: usize = 0;
         for (rc.targets) |chunk| for (chunk) |v| {
-            same = same and t < lg.n_targets and lg.targets[t] == v;
+            const eq = t < lg.n_targets and lg.targets[t] == v;
+            same = same and eq;
+            // The first verify row that picks another token, by the tie-flip rule: the reference's token
+            // is our second and the top two logits lie within 2^-5 of the row's rms.
+            if (!eq and !classified and t < lg.n_targets) {
+                classified = true;
+                const margin = (lg.top_logits[t][0] - lg.top_logits[t][1]) / lg.rms[t];
+                const flip = lg.top_ids[t][1] == v and margin <= 1.0 / 32.0;
+                std.debug.print("dsv41 dspark: first divergence cycle {d} verify row {d}: ours {d} (logit {d:.6}), second {d} (logit {d:.6}), reference {d}; margin / rms {d:.6}: {s}\n", .{
+                    i, t, lg.top_ids[t][0], lg.top_logits[t][0], lg.top_ids[t][1], lg.top_logits[t][1], v, margin,
+                    if (flip) "TIE FLIP (within 2^-5 of the row rms)" else if (lg.top_ids[t][1] == v) "NOT a tie flip (margin above 2^-5)" else "NOT a tie flip (the reference token is not our second)",
+                });
+            }
             t += 1;
         };
         var fl: usize = 0;
@@ -312,8 +330,9 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const sst = ex.source.stats();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    std.debug.print("dsv41 dspark: {s} arm, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
-        ref.arm,                                                   ref.cycles.len,
+    std.debug.print("dsv41 dspark: {s} arm, kv {s} {d}, {d} cycles; ids {s} ({d}); per-cycle acceptance {s}; decisions {s}; accepted {d}/{d}; {d} rows/layer; routes {d}, {d} B read; {d} ms; MLX peak {d} B\n", .{
+        ref.arm,                                                   if (kv_bound != null) "bounded" else "tier",
+        kv_bound orelse 0,                                         ref.cycles.len,
         if (ids_same) "IDENTICAL" else "DIFFER",                   n + 1,
         if (first_accept == null) "IDENTICAL" else "DIFFER",       if (first_decision == null) "IDENTICAL" else "DIFFER",
         lp.stats.accepted_drafts,                                  lp.stats.drafted_tokens,

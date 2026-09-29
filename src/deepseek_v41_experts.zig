@@ -583,6 +583,53 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
     };
 }
 
+/// The lane of record's decode chain around the EXL3 GEMV (PREP=rin, the
+/// kernels' `RinPrep` route): gate and up `in_rin` in one dispatch, the two
+/// GEMVs, `gu_epi` (the clamped SwiGLU), `din_rin`, the down GEMV, `dpost`
+/// (4 prepared launches + 3 GEMVs per bank group, where `EagerChain` builds
+/// about 11 graph ops per projection). Bit-identical to `EagerChain` on bf16
+/// activations (check_q3_exl3_rinprep.py "real"); `in_rin` reads bf16 rows, so
+/// it serves a tier whose MoE input is bf16 (the lane of record's).
+pub fn RinChain(comptime G: type, comptime Gemv: type) type {
+    return struct {
+        const Self = @This();
+        const T = G.T;
+
+        prep: *const xko.RinPrep(G),
+        gemv: Gemv,
+        hidden: u32,
+        inter: u32,
+        /// Trellis bits per weight (3 on every layer of the bank of record).
+        k: u32 = 3,
+
+        /// The route (built after the kernels' startup acceptance, owned by the caller) and the GEMV.
+        pub const Arg = struct { prep: *const xko.RinPrep(G), gemv: Gemv };
+
+        pub fn init(arg: Arg, c: *const v41.Config) Self {
+            return .{ .prep = arg.prep, .gemv = arg.gemv, .hidden = c.hidden_size, .inter = c.moe_intermediate_size };
+        }
+
+        /// Gate and up of rows `x` [rows, hidden] bf16 at slot rows `ids`: the
+        /// clamped SwiGLU f32 [rows, inter]. The rows are already taken, so
+        /// `in_rin` reads them in order.
+        pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: ProjOf(T), up: ProjOf(T)) !T {
+            std.debug.assert(g.dtypeOf(x) == .bfloat16);
+            const tok = try g.arange(0, @floatFromInt(g.shapeOf(x).dim(0)), 1, .int32);
+            const xs = try self.prep.inRin(g, x, tok, gate.rin, up.rin, ids);
+            const zg = try self.gemv.project(g, self.k, self.inter, xs[0], ids, gate.code);
+            const zu = try self.gemv.project(g, self.k, self.inter, xs[1], ids, up.code);
+            return self.prep.guEpi(g, zg, zu, gate.rout, up.rout, ids);
+        }
+
+        /// Down of the SwiGLU rows `h` [rows, inter]: f32 [rows, hidden].
+        pub fn down(self: *const Self, g: *G, h: T, ids: T, d: ProjOf(T)) !T {
+            const hd = try self.prep.dinRin(g, h, d.rin, ids);
+            const zd = try self.gemv.project(g, self.k, self.hidden, hd, ids, d.code);
+            return self.prep.dpost(g, zd, d.rout, ids);
+        }
+    };
+}
+
 /// The EXL3 decode GEMV on MLX, bound by the kernels lane (phase-3 ops): an
 /// output the backend owns (`g.adopt`), f32 [rows, out_dim]. Construction-time
 /// binding; nothing is looked up per call.
@@ -1399,6 +1446,55 @@ fn sampleRows(a: std.mem.Allocator, seed: u64, slots: []const u32, counts: []con
     return rows;
 }
 
+test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the model's backend at construction" {
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    {
+        var gemv = try xko.Gemv(TraceOps).init(&g, &reg);
+        defer gemv.deinit(&g);
+        try testing.expect(g.prepared_live > 0);
+        // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
+        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16));
+        try testing.expect(g.shapeOf(z).eql(ops.Shape.of(&.{ 6, 2304 })));
+        try testing.expectEqual(@as(usize, 1), g.prepared_launches);
+    }
+    try testing.expectEqual(@as(usize, 0), g.prepared_live);
+}
+
+test "dsv41 experts: the PREP=rin chain runs a group as in_rin, two GEMVs, gu_epi, din_rin, the down GEMV and dpost" {
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var prep = try xko.RinPrep(TraceOps).init(&g, &reg);
+    defer prep.deinit(&g);
+    var c = testConfig(5120, 2304, 1);
+    c.n_routed_experts = 64;
+    const Chain = RinChain(TraceOps, TraceGemv);
+    const chain = Chain.init(.{ .prep = &prep, .gemv = .{} }, &c);
+    const cap = 64;
+    const proj = struct {
+        fn f(gg: *TraceOps, in: c_int, out: c_int) !ProjOf(u32) {
+            return .{ .code = try gg.input(&.{ cap, @divExact(in, 16), @divExact(out, 16), 48 }, .int16), .rout = try gg.input(&.{ cap, out }, .float16), .rin = try gg.input(&.{ cap, in }, .float16) };
+        }
+    }.f;
+    const ids = try g.input(&.{6}, .uint32);
+    const first = g.nodes.items.len;
+    const h = try chain.gateUp(&g, try g.input(&.{ 6, 5120 }, .bfloat16), ids, try proj(&g, 5120, 2304), try proj(&g, 5120, 2304));
+    try testing.expect(g.shapeOf(h).eql(ops.Shape.of(&.{ 6, 2304 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(h));
+    const y = try chain.down(&g, h, ids, try proj(&g, 2304, 5120));
+    try testing.expect(g.shapeOf(y).eql(ops.Shape.of(&.{ 6, 5120 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(y));
+    // The four PREP kernels from configs prepared at construction; the three GEMVs (TraceGemv) aside.
+    try testing.expectEqual(@as(usize, 4), g.prepared_launches);
+    var kernels: usize = 0;
+    for (g.nodes.items[first..]) |nd| kernels += @intFromBool(nd.op == .kernel);
+    try testing.expectEqual(@as(usize, 2 + 1 + 1 + 1 + 3), kernels); // in_rin 2 outputs, gu_epi, din_rin, dpost, 3 GEMVs
+}
+
 test "dsv41 experts: the joined outputs are put back in routed order" {
     // Outputs joined as positions 3, 0, 4, 1, 2: routed position p reads joined row inv[p].
     var inv: [5]u32 = undefined;
@@ -1462,6 +1558,8 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
         for (g.nodes.items[first_node..]) |nd| kernels += @intFromBool(nd.op == .kernel);
         try testing.expectEqual(7 * waves, kernels);
         try testing.expectEqual(waves + 1, g.freed.items.len - resets_before);
+        // A prefill route builds each launch per call (its rows vary up to 2^20).
+        try testing.expectEqual(@as(usize, 0), g.prepared_launches);
         checked += 1;
         src.flush() catch {};
     }

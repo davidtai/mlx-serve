@@ -122,6 +122,12 @@ fn freeFrom(comptime E: type, list: *std.ArrayList(E), from: usize, comptime fre
     list.shrinkRetainingCapacity(from);
 }
 
+/// The compiled regions a model builds at construction (`prepareTape`), one
+/// closure per region and context (the trunk's config, the draft head's).
+pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence };
+const n_regions = std.meta.fieldNames(Region).len;
+const contexts_per_region = 2;
+
 // ── MLX backend ──
 
 pub const MlxOps = struct {
@@ -138,11 +144,15 @@ pub const MlxOps = struct {
     stream_box: *mlx.mlx_stream,
     /// Compiled trunk regions, one per (region type, construction context).
     tapes: std.ArrayList(TapeEntry) = .empty,
+    /// Each region's closures by context, filled by `prepareTape`.
+    regions: [n_regions][contexts_per_region]RegionSlot = @splat(@splat(.{})),
     /// A region's tracing context: borrows the owner's stream and closures.
     is_child: bool = false,
     /// The kernels lane's pinned registry, bound on this stream (`launch`); set
     /// once, before any kernel route is built.
     launcher: ?*const xk.Bound = null,
+
+    const RegionSlot = struct { ctx: ?*const anyopaque = null, compiled: mlx.mlx_closure = .{} };
 
     const TapeEntry = struct {
         key: usize,
@@ -188,14 +198,40 @@ pub const MlxOps = struct {
         for (out[0..cfg.n_out]) |*o| o.* = try g.track(o.*);
     }
 
-    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`: traced
-    /// once per input signature, replayed after. `ctx` carries the region's
-    /// structural constants and must outlive the backend.
+    /// A launch's mlx config built once (the kernels' decode routes, at construction).
+    pub const Prepared = xk.Prepared;
+
+    pub fn prepareLaunch(g: *MlxOps, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        return g.launcher.?.prepare(k, cfg);
+    }
+
+    /// One launch of a prepared config; the outputs join this scope.
+    pub fn launchPrepared(g: *MlxOps, p: *const Prepared, inputs: []const T, out: []T) !void {
+        try g.launcher.?.applyPrepared(p, inputs, out);
+        for (out[0..p.n_out]) |*o| o.* = try g.track(o.*);
+    }
+
+    pub fn releasePrepared(_: *MlxOps, p: *Prepared) void {
+        p.deinit();
+    }
+
+    /// Compiles region `Body` for context `ctx` (at construction; idempotent).
+    /// `ctx` carries the region's structural constants and must outlive the backend.
+    pub fn prepareTape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx) !void {
+        const slots = &g.regions[@intFromEnum(Body.region)];
+        for (slots) |sl| if (sl.ctx == @as(*const anyopaque, ctx)) return;
+        const free = for (slots) |*sl| {
+            if (sl.ctx == null) break sl;
+        } else return error.RegionContextsFull;
+        free.* = .{ .ctx = ctx, .compiled = try g.buildTape(Body, ctx, @intFromPtr(@typeName(Body).ptr)) };
+    }
+
+    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`, prepared
+    /// at construction: traced once per input signature, replayed after.
     pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
-        const key = @intFromPtr(@typeName(Body).ptr);
-        const compiled = for (g.tapes.items) |t| {
-            if (t.key == key and t.ctx == @as(*const anyopaque, ctx)) break t.compiled;
-        } else try g.buildTape(Body, ctx, key);
+        const compiled = for (g.regions[@intFromEnum(Body.region)]) |sl| {
+            if (sl.ctx == @as(*const anyopaque, ctx)) break sl.compiled;
+        } else return error.RegionNotPrepared;
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
@@ -775,6 +811,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostIdsSize;
+        // Two producers: the router (int32) and the arm's stand-in decode (uint32).
         switch (mlx.mlx_array_dtype(flat)) {
             .int32 => {
                 const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
@@ -819,13 +856,8 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        switch (mlx.mlx_array_dtype(flat)) {
-            .uint32 => @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]),
-            .int32 => for (out, (mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData)[0..n]) |*o, v| {
-                o.* = @intCast(v);
-            },
-            else => return error.HostReadDtype,
-        }
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .uint32); // argmax outputs and draft ids
+        @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
 
@@ -834,7 +866,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        if (mlx.mlx_array_dtype(flat) != .float32) return error.HostReadDtype;
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .float32);
         @memcpy(out, (mlx.mlx_array_data_float32(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
@@ -844,7 +876,7 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_array_eval(flat));
         const n = mlx.mlx_array_size(flat);
         if (n != out.len) return error.HostReadSize;
-        if (mlx.mlx_array_dtype(flat) != .bool_) return error.HostReadDtype;
+        std.debug.assert(mlx.mlx_array_dtype(flat) == .bool_);
         @memcpy(out, (mlx.mlx_array_data_bool(flat) orelse return error.MlxNoData)[0..n]);
         return out;
     }
@@ -1019,6 +1051,15 @@ pub const TraceOps = struct {
     freed: std.ArrayList(Freed) = .empty,
     /// The node count at each `evalAll` (where a host sync fell in the build).
     evals: std.ArrayList(usize) = .empty,
+    /// Launches of prepared configs, and the prepared configs not yet released.
+    prepared_launches: usize = 0,
+    prepared_live: usize = 0,
+    /// The regions `prepareTape` compiled, by context.
+    regions: [n_regions][contexts_per_region]?*const anyopaque = @splat(@splat(null)),
+    /// When set, `hostArray` keeps a copy of its bytes (`hostBytesOf`), so a
+    /// test can compare what a graph was fed.
+    record_host: bool = false,
+    host_data: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1030,6 +1071,14 @@ pub const TraceOps = struct {
         g.waits.deinit(g.gpa);
         g.freed.deinit(g.gpa);
         g.evals.deinit(g.gpa);
+        var it = g.host_data.valueIterator();
+        while (it.next()) |v| g.gpa.free(v.*);
+        g.host_data.deinit(g.gpa);
+    }
+
+    /// The bytes host array `x` was made from (`record_host` set before it was made).
+    pub fn hostBytesOf(g: *const TraceOps, x: T) ?[]const u8 {
+        return g.host_data.get(x);
     }
 
     pub fn reset(_: *TraceOps) void {}
@@ -1068,7 +1117,13 @@ pub const TraceOps = struct {
     pub fn hostArray(g: *TraceOps, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
         const s = Shape.of(shape);
         if (@as(i64, @intCast(bytes.len)) != s.numel() * @as(i64, @intCast(dtypeSize(dt)))) return error.HostBytes;
-        return g.push(.host, dt, s);
+        const x = try g.push(.host, dt, s);
+        if (g.record_host) {
+            const copy = try g.gpa.dupe(u8, bytes);
+            errdefer g.gpa.free(copy);
+            try g.host_data.put(g.gpa, x, copy);
+        }
+        return x;
     }
 
     pub fn node(g: *const TraceOps, x: T) Node {
@@ -1184,7 +1239,21 @@ pub const TraceOps = struct {
     }
 
     /// The region runs inline between two markers (a test pins its boundary).
+    /// Records that region `Body` is compiled for `ctx` (the MLX backend's construction step).
+    pub fn prepareTape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx) !void {
+        const slots = &g.regions[@intFromEnum(Body.region)];
+        for (slots) |sl| if (sl == @as(?*const anyopaque, ctx)) return;
+        for (slots) |*sl| if (sl.* == null) {
+            sl.* = ctx;
+            return;
+        };
+        return error.RegionContextsFull;
+    }
+
     pub fn tape(g: *TraceOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
+        for (g.regions[@intFromEnum(Body.region)]) |sl| {
+            if (sl == @as(?*const anyopaque, ctx)) break;
+        } else return error.RegionNotPrepared;
         _ = try g.push(.tape_begin, .bool_, .{});
         try Body.run(g, ctx, inputs, out);
         _ = try g.push(.tape_end, .bool_, .{});
@@ -1339,6 +1408,24 @@ pub const TraceOps = struct {
         for (out[0..cfg.n_out], 0..) |*o, i| o.* = try g.kernel(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i]);
     }
 
+    /// A prepared launch on the trace backend: the kernel and its config, kept by value.
+    pub const Prepared = struct { k: xk.Kernel, cfg: xk.LaunchConfig };
+
+    pub fn prepareLaunch(g: *TraceOps, k: xk.Kernel, cfg: *const xk.LaunchConfig) !Prepared {
+        g.prepared_live += 1;
+        return .{ .k = k, .cfg = cfg.* };
+    }
+
+    /// Launches `p` (counted apart from per-call launches).
+    pub fn launchPrepared(g: *TraceOps, p: *const Prepared, inputs: []const T, out: []T) !void {
+        g.prepared_launches += 1;
+        return g.launch(p.k, inputs, &p.cfg, out);
+    }
+
+    pub fn releasePrepared(g: *TraceOps, _: *Prepared) void {
+        g.prepared_live -= 1;
+    }
+
     /// The resident switch: x [..., 1, K] x w [E, N, K*bits/32] at rhs indices [...]
     /// -> [indices..., 1, N] at x's dtype.
     pub fn gatherQmm(g: *TraceOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
@@ -1384,18 +1471,21 @@ pub const TraceOps = struct {
     }
 
     pub fn hostU32(g: *TraceOps, x: T, out: []u32) ![]const u32 {
+        if (g.dtypeOf(x) != .uint32) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.u32s orelse return error.NoHostValues)(hv.ctx, out);
         return out;
     }
 
     pub fn hostF32(g: *TraceOps, x: T, out: []f32) ![]const f32 {
+        if (g.dtypeOf(x) != .float32) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.f32s orelse return error.NoHostValues)(hv.ctx, out);
         return out;
     }
 
     pub fn hostBool(g: *TraceOps, x: T, out: []bool) ![]const bool {
+        if (g.dtypeOf(x) != .bool_) return error.HostReadDtype;
         const hv = try g.scripted(x, out.len);
         try (hv.bools orelse return error.NoHostValues)(hv.ctx, out);
         return out;
@@ -1720,6 +1810,9 @@ test "dsv41 ops: both backends carry the kernels contract's launch, wave and sco
         comptime std.debug.assert(hasMethod(G, "take", false, &.{ T, T, c_int }, T, true));
         comptime std.debug.assert(hasMethod(G, "mark", true, &.{}, Mark, false));
         comptime std.debug.assert(hasMethod(G, "resetTo", false, &.{Mark}, void, false));
+        comptime std.debug.assert(hasMethod(G, "prepareLaunch", false, &.{ xk.Kernel, *const xk.LaunchConfig }, G.Prepared, true));
+        comptime std.debug.assert(hasMethod(G, "launchPrepared", false, &.{ *const G.Prepared, []const T, []T }, void, true));
+        comptime std.debug.assert(hasMethod(G, "releasePrepared", false, &.{*G.Prepared}, void, false));
     }
 }
 

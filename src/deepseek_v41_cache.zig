@@ -434,6 +434,21 @@ pub fn LayerState(comptime G: type) type {
             }
         }
 
+        /// The longest sequence `canAdmit` lets through (null: unbounded). A
+        /// constant of the layer's geometry: a state checks its minimum once.
+        pub fn admitLimit(self: *const Self) ?u32 {
+            const m = self.bounded_max_kv orelse return null;
+            var lim: ?u32 = null;
+            if (self.frontier != null) if (boundedLatentCap(m)) |cap| {
+                lim = cap;
+            };
+            if (self.kv_source and self.ratio >= 1) if (boundedCompCap(m, self.ratio)) |cap| {
+                const l = (cap + 1) * self.ratio - 1; // new_len / ratio <= cap
+                lim = if (lim) |x| @min(x, l) else l;
+            };
+            return lim;
+        }
+
         /// `assert_can_admit`: an over-cap forward fails before any lane is written.
         pub fn canAdmit(self: *const Self, n: u32) Error!void {
             const m = self.bounded_max_kv orelse return;
@@ -754,6 +769,20 @@ test "dsv41 cache: grow and bounded lanes read like the concatenated store, trim
     st.offset = 700;
     try testing.expectError(error.BoundedLaneFull, st.canAdmit(9));
     try st.canAdmit(8);
+    // The per-state limit agrees with the per-forward check at every length around it,
+    // for every compression ratio the model has (with and without the frontier).
+    for ([_]u8{ 1, 2, 4, 128 }) |ratio| for ([_]u32{ 1, 7, 700, 4096 }) |max_kv| {
+        const lr: v41.LayerInfo = .{ .ratio = ratio, .kv_source = true, .index_source = true, .mode = .full };
+        var s2 = RS.init(lr, 128, .{ .route = .bounded, .max_kv = max_kv });
+        const lim = s2.admitLimit().?;
+        for (lim -| 40..lim + 40) |len| {
+            s2.offset = 0;
+            const ok = if (s2.canAdmit(@intCast(len))) |_| true else |_| false;
+            try testing.expectEqual(len <= lim, ok);
+        }
+    };
+    const unbounded = RS.init(li, 128, .{ .route = .full_history });
+    try testing.expectEqual(@as(?u32, null), unbounded.admitLimit());
 }
 
 test "dsv41 cache: the compressor frontier pools each group once, across chunks and a trim" {
@@ -796,4 +825,9 @@ test "dsv41 cache: prefill chunks follow the Python shape-aware derivation" {
     try testing.expectEqual(@as(usize, 3), spans.len);
     try testing.expectEqual([2]u32{ 1906, 2000 }, spans[2]);
     try testing.expectEqual(@as(usize, 1), (try prefillSpans(arena.allocator(), 1, 953)).len);
+    // The 16K cell's prompt: the lane of record's 17 x 953 + 183 chunks.
+    const cell = try prefillSpans(arena.allocator(), 16384, resolvePrefillChunk(&c, 16384, null, default_chunk_target_bytes));
+    try testing.expectEqual(@as(usize, 18), cell.len);
+    for (cell[0..17]) |sp| try testing.expectEqual(@as(u32, 953), sp[1] - sp[0]);
+    try testing.expectEqual([2]u32{ 16201, 16384 }, cell[17]);
 }

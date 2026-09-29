@@ -84,7 +84,7 @@ const levers = [_]Lever{
     .{ .name = "ATTN_WO_A_DIRECT", .kind = .kernel },
     .{ .name = "DSPARK_VERIFY_K29", .kind = .kernel },
     .{ .name = "DSPARK_DECODE_KERNELS", .kind = .kernel },
-    .{ .name = "DRAFT_COMPILE", .kind = .deferred },
+    .{ .name = "DRAFT_COMPILE", .kind = .route },
     .{ .name = "DRAFT_HEAD_BF16", .kind = .deferred },
     .{ .name = "MTP", .kind = .deferred },
     .{ .name = "DSPARK_CONF_THRESHOLD", .kind = .deferred },
@@ -175,13 +175,15 @@ pub fn parse(pairs: []const [2][]const u8, diag: ?*v41.Diag) Refusal!Tier {
                 if (std.mem.eql(u8, name, "SELECTED_KEYS")) {
                     r.selected_keys = try truthy(name, val, diag);
                 } else if (std.mem.eql(u8, name, "ATTN_CORE_COMPILE")) {
-                    r.attn_core_compile = try truthy(name, val, diag);
+                    r.core_rows = if (try truthy(name, val, diag)) graph.core_compile_max_rows else 0;
                 } else if (std.mem.eql(u8, name, "ATTN_COMPILE")) {
-                    r.attn_compile = try truthy(name, val, diag);
+                    r.attn_rows = if (try truthy(name, val, diag)) graph.attn_compile_max_rows else 0;
                 } else if (std.mem.eql(u8, name, "HC_COMPILE")) {
-                    r.hc_compile = try truthy(name, val, diag);
+                    r.hc_rows = if (try truthy(name, val, diag)) graph.hc_compile_max_rows else 0;
                 } else if (std.mem.eql(u8, name, "SMALL_STAGES_FUSED")) {
-                    r.small_stages = try truthy(name, val, diag);
+                    r.small_rows = if (try truthy(name, val, diag)) graph.small_stages_max_rows else 0;
+                } else if (std.mem.eql(u8, name, "DRAFT_COMPILE")) {
+                    r.draft_rows = if (try truthy(name, val, diag)) graph.draft_compile_max_rows else 0;
                 } else if (std.mem.eql(u8, name, "ATTN_WO_A_CACHE")) {
                     r.wo_a_f32 = try truthy(name, val, diag);
                 } else if (std.mem.eql(u8, name, "PREFILL_SCORE_PATH")) {
@@ -296,13 +298,15 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     }
     const t = try parse(pairs.items, &diag);
     const r = t.routes;
-    try testing.expect(r.selected_keys and r.lean_prefill_score and r.attn_compile and r.wo_a_f32);
-    try testing.expect(!r.hc_compile and !r.small_stages and !r.attn_core_compile);
+    try testing.expect(r.selected_keys and r.lean_prefill_score and r.attn_rows == graph.attn_compile_max_rows and r.wo_a_f32);
+    try testing.expect(r.hc_rows == 0 and r.small_rows == 0 and r.core_rows == 0);
     try testing.expectEqual(graph.Routes.Head.bf16, r.head);
     try testing.expectEqual(kvc.Route.window_ring, t.kv.route);
     try testing.expectEqual(@as(?u32, null), t.kv.max_kv);
     try testing.expect(t.layer_major);
-    try testing.expectEqual(@as(usize, 9), t.deferredLevers().len);
+    // K33 draft compile is a route now (the draft head applies it); the other draft levers stay deferred.
+    try testing.expectEqual(graph.draft_compile_max_rows, r.draft_rows);
+    try testing.expectEqual(@as(usize, 8), t.deferredLevers().len);
 }
 
 test "dsv41 routes: every lever the build cannot run the same way refuses, by name" {

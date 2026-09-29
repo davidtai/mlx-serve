@@ -229,6 +229,8 @@ pub fn Construction(comptime b: Binding, comptime G: type) type {
             errdefer if (b.math == .kernels) self.dropKernels();
             var o = arm_opt;
             if (b.math == .kernels) o.prefill = .{ .reg = &self.kernels.reg };
+            // A DSpark decode holds its head resident: the full head unless a subset is pinned.
+            if (D != arm_mod.StandIn(A) and o.draft_subset == null) o.draft_pruned_bytes = 0;
             const arm = try A.init(a, io, &self.g, self.mathArg(), o, diag);
             errdefer arm.deinit();
             if (b.math == .kernels) {

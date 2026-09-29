@@ -22,13 +22,18 @@ pub const Config = struct {
     /// `hybrid_install`'s causal lookup: a full native proposal extended from the history.
     lookup: ?struct { minimum_context: u32 = 2, extra_tokens: u32 = 2 } = .{},
     acceptance: ds.Acceptance = .greedy,
-    /// Rows per prompt forward.
+    /// Rows per prompt forward; `whole_prompt` runs it as one forward, chunked
+    /// by the model's own rule (every chunk wider than a route takes runs
+    /// through the wide lane: the served prompt pass).
     prompt_chunk: u32 = 8,
     max_tokens: u32,
     stop_ids: []const u32 = &.{},
 };
 
 pub const Finish = enum { length, stop };
+
+/// `Config.prompt_chunk`: the whole prompt in one forward.
+pub const whole_prompt: u32 = std.math.maxInt(u32);
 
 /// One cycle's decisions, as the Python oracle fixture records them.
 pub const CycleLog = struct {
@@ -50,6 +55,12 @@ pub const CycleLog = struct {
     correction: u32 = 0,
     verified: u32 = 0,
     trimmed: u32 = 0,
+    /// Set by a caller that classifies divergences (the window harness): each
+    /// verify row's top two ids and f32 logits and its rms, indexed like `targets`.
+    want_top: bool = false,
+    top_ids: [ds.max_block + 1][2]u32 = undefined,
+    top_logits: [ds.max_block + 1][2]f32 = undefined,
+    rms: [ds.max_block + 1]f32 = undefined,
 };
 
 pub fn Loop(comptime G: type) type {
@@ -182,6 +193,37 @@ pub fn Loop(comptime G: type) type {
             return try g.hostBool(typical, flags[0..drafted]);
         }
 
+        /// A logged verify chunk's rows, for the tie-flip rule: the top two ids
+        /// and f32 logits of each row and the row's rms (one extra sync, only
+        /// when the caller asks: `CycleLog.want_top`).
+        fn topTwo(self: *Self, logits: T, width: u32, ids: [][2]u32, vals: [][2]f32, rms: []f32) !void {
+            const g = self.g;
+            const vocab = g.shapeOf(logits).dim(-1);
+            const w: c_int = @intCast(width);
+            const rows = try g.astype(try g.reshape(logits, &.{ w, vocab }), .float32);
+            const first_id = try g.argmax(rows, -1);
+            const m1 = try g.max(rows, -1, false);
+            const col = try g.reshape(try g.arange(0, @floatFromInt(vocab), 1, .uint32), &.{ 1, vocab });
+            const masked = try g.where(try g.equal(col, try g.reshape(first_id, &.{ w, 1 })), try g.scalar(-std.math.inf(f64), .float32), rows);
+            const second_id = try g.argmax(masked, -1);
+            const m2 = try g.max(masked, -1, false);
+            const r = try g.sqrt(try g.mean(try g.square(rows), -1, false));
+            try g.evalAll(&.{ first_id, m1, second_id, m2, r });
+            var a1: [ds.max_block + 1]u32 = undefined;
+            var a2: [ds.max_block + 1]u32 = undefined;
+            var v1: [ds.max_block + 1]f32 = undefined;
+            var v2: [ds.max_block + 1]f32 = undefined;
+            _ = try g.hostU32(first_id, a1[0..width]);
+            _ = try g.hostU32(second_id, a2[0..width]);
+            _ = try g.hostF32(m1, v1[0..width]);
+            _ = try g.hostF32(m2, v2[0..width]);
+            _ = try g.hostF32(r, rms[0..width]);
+            for (ids[0..width], vals[0..width], 0..) |*id, *v, i| {
+                id.* = .{ a1[i], a2[i] };
+                v.* = .{ v1[i], v2[i] };
+            }
+        }
+
         /// One cycle; returns null to continue, or how the run finished.
         pub fn cycle(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog) !?Finish {
             const g = self.g;
@@ -191,7 +233,7 @@ pub fn Loop(comptime G: type) type {
             var k_eff: u32 = 0;
             var native: [ds.max_block]u32 = undefined;
             if (self.k_cap > 0) {
-                const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed_w, self.model.head);
+                const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
                 try g.evalAll(&.{ d.ids, d.conf });
                 _ = try g.hostU32(d.ids, native[0..bs]);
@@ -232,6 +274,7 @@ pub fn Loop(comptime G: type) type {
                 var flags: [ds.max_block + 1]bool = undefined;
                 const typ = try self.decide(r.logits.?, drafts, .{ start, end }, k_eff, &target, &flags);
                 if (log) |lg| {
+                    if (lg.want_top) try self.topTwo(r.logits.?, end - start, lg.top_ids[lg.n_targets..], lg.top_logits[lg.n_targets..], lg.rms[lg.n_targets..]);
                     @memcpy(lg.targets[lg.n_targets..][0 .. end - start], target[0 .. end - start]);
                     lg.n_targets += end - start;
                     if (typ) |ty| {
@@ -243,7 +286,7 @@ pub fn Loop(comptime G: type) type {
                 start = end;
                 if (done) break;
             }
-            const correction = o.correction orelse return error.VerifyNoTarget;
+            const correction = o.correction.?; // acceptChunk sets it on the chunk that ends the verify
             st.endCycle(o, k_eff);
             const verify_hidden = if (n_hidden == 1) hiddens[0] else try g.concat(hiddens[0..n_hidden], 1);
             // Commit: keep [primary, d1 .. d_accepted] in the target, seed the draft windows.
@@ -443,6 +486,333 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(script.f32s.len, script.nf);
     // Every verify forward routed through the source: 3 prompt forwards + 4 verifies per layer.
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
+}
+
+test "dsv41 dspark loop: the K33 draft block replays the eager one from regions built at construction" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    const n_st = rig.head.nStages();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..n_st], .{ .lookup = null, .max_tokens = 8 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    // A K33 head over the same residents (its regions are built here, at construction).
+    const k33 = try Loop(TraceOps).H.init(a, &rig.g, rig.m.c, .{ .draft_rows = graph.draft_compile_max_rows }, &rig.lookup);
+    defer k33.deinit(&rig.g);
+    const e0 = rig.g.nodes.items.len;
+    const de = try rig.head.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed, rig.model.head);
+    const e1 = rig.g.nodes.items.len;
+    const dk = try k33.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed, rig.model.head);
+    const e2 = rig.g.nodes.items.len;
+    inline for (.{ "ids", "logits", "conf" }) |f| {
+        try testing.expect(rig.g.shapeOf(@field(de, f)).eql(rig.g.shapeOf(@field(dk, f))));
+        try testing.expectEqual(rig.g.dtypeOf(@field(de, f)), rig.g.dtypeOf(@field(dk, f)));
+    }
+    const count = struct {
+        fn f(g: *const TraceOps, from: usize, to: usize, op: ops.Op) usize {
+            var n: usize = 0;
+            for (g.nodes.items[from..to]) |nd| n += @intFromBool(nd.op == op);
+            return n;
+        }
+    }.f;
+    // Eager: no region. K33: per stage the HC attention prep, the main KV, the QKV and
+    // output prep, the HC ffn prep, the gate prefix, the MoE combine and the HC post;
+    // then a markov step per draft and the confidence.
+    try testing.expectEqual(@as(usize, 0), count(&rig.g, e0, e1, .tape_begin));
+    try testing.expectEqual(8 * n_st + rig.head.blockSize() + 1, count(&rig.g, e1, e2, .tape_begin));
+    // The regions hold the eager body's heavy ops.
+    inline for (.{ ops.Op.qmm, ops.Op.gather_qmm, ops.Op.softmax, ops.Op.argmax, ops.Op.matmul }) |op| {
+        try testing.expectEqual(count(&rig.g, e0, e1, op), count(&rig.g, e1, e2, op));
+    }
+}
+
+/// A lookup that records every name asked for and every name dropped.
+const DropLookup = struct {
+    inner: *const mdl.SpecLookup,
+    got: std.ArrayList([]u8) = .empty,
+    dropped: std.ArrayList([]u8) = .empty,
+
+    pub fn get(self: *DropLookup, name: []const u8) ?u32 {
+        self.got.append(testing.allocator, testing.allocator.dupe(u8, name) catch @panic("oom")) catch @panic("oom");
+        return self.inner.get(name);
+    }
+
+    pub fn drop(self: *DropLookup, name: []const u8) void {
+        self.dropped.append(testing.allocator, testing.allocator.dupe(u8, name) catch @panic("oom")) catch @panic("oom");
+    }
+
+    fn has(list: []const []u8, name: []const u8) bool {
+        for (list) |x| if (std.mem.eql(u8, x, name)) return true;
+        return false;
+    }
+
+    fn deinit(self: *DropLookup) void {
+        for (self.got.items) |x| testing.allocator.free(x);
+        for (self.dropped.items) |x| testing.allocator.free(x);
+        self.got.deinit(testing.allocator);
+        self.dropped.deinit(testing.allocator);
+    }
+};
+
+test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every routed id through its lut and otherwise drafts as the full head" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // The mini head (one stage) at 4 experts, so a subset can keep some, leave some out and
+    // move a kept expert to another slot: the full and the compact head over the same residents.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var c4 = rig.m.c;
+    c4.dspark.n_routed_experts = 4;
+    const c = &c4;
+    const lookup4: mdl.SpecLookup = .{ .g = &rig.g, .spec = try v41.residentSpec(arena.allocator(), c) };
+    const full = try Loop(TraceOps).H.init(a, &rig.g, c4, .{}, &lookup4);
+    defer full.deinit(&rig.g);
+    const n_st = full.nStages();
+    try testing.expectEqual(@as(usize, 1), n_st);
+    const n: u16 = 4;
+    // Stage 0 keeps {1, 3}: 1 -> slot 0, 3 -> slot 1, the left-out 0 and 2 -> slot 0.
+    const text = "{\"format\": \"mlx-serve-expert-subset-v1\", \"kind\": \"test\", \"n_experts\": 4, \"selected\": [[1, 3]]}";
+    try rig.m.tmp.dir.writeFile(testing.io, .{ .sub_path = "subset.json", .data = text });
+    var root: [512]u8 = undefined;
+    var pbuf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/subset.json", .{root[0..try rig.m.tmp.dir.realPath(testing.io, &root)]});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var sub = try dh.Subset.load(a, testing.io, .{ .path = path, .sha256 = &hex }, null);
+    defer sub.deinit();
+    var dl: DropLookup = .{ .inner = &lookup4 };
+    defer dl.deinit();
+    rig.g.record_host = true;
+    const compact = try Loop(TraceOps).H.initWith(a, &rig.g, c4, .{}, &dl, .{ .subset = &sub });
+    defer compact.deinit(&rig.g);
+    // Only the kept experts' arrays are asked for (in ascending order: slot i is kept
+    // expert i); every per-expert array is dropped, a left-out one before anything read it.
+    var nb: [96]u8 = undefined;
+    for (sub.selected, 0..) |kept, st| {
+        var slot: usize = 0;
+        for (0..n) |e| inline for (.{ "w1", "w3", "w2" }) |w| inline for (.{ "weight", "scales" }) |part| {
+            const name = try std.fmt.bufPrint(&nb, "mtp.{d}.ffn.experts.{d}." ++ w ++ "." ++ part, .{ st, e });
+            const is_kept = std.mem.indexOfScalar(u16, kept, @intCast(e)) != null;
+            try testing.expectEqual(is_kept, DropLookup.has(dl.got.items, name));
+            try testing.expect(DropLookup.has(dl.dropped.items, name));
+        };
+        for (dl.got.items) |name| {
+            var buf2: [96]u8 = undefined;
+            const want = try std.fmt.bufPrint(&buf2, "mtp.{d}.ffn.experts.", .{st});
+            if (!std.mem.startsWith(u8, name, want) or !std.mem.endsWith(u8, name, ".w1.weight")) continue;
+            const e = try std.fmt.parseInt(u16, name[want.len .. std.mem.indexOfScalarPos(u8, name, want.len, '.').?], 10);
+            try testing.expectEqual(kept[slot], e);
+            slot += 1;
+        }
+        try testing.expectEqual(kept.len, slot);
+        // The compact banks and the lut (`positions.get(expert, 0)`, run_full.py:92).
+        const stg = compact.stages[st];
+        inline for (.{ "w1", "w3", "w2" }) |w| try testing.expectEqual(@as(c_int, @intCast(kept.len)), rig.g.shapeOf(@field(stg.experts, w).w).dim(0));
+        const lut = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, rig.g.hostBytesOf(stg.lut.?).?));
+        try testing.expectEqual(@as(usize, n), lut.len);
+        for (0..n) |e| {
+            const want: i32 = if (std.mem.indexOfScalar(u16, kept, @intCast(e))) |i| @intCast(i) else 0;
+            try testing.expectEqual(want, lut[e]);
+        }
+    }
+    try testing.expect(compact.identity == .compact);
+    try testing.expectEqualSlices(u8, &sub.sha256, &compact.identity.compact);
+    var lut4: [4]i32 = undefined;
+    @memcpy(std.mem.sliceAsBytes(&lut4), rig.g.hostBytesOf(compact.stages[0].lut.?).?);
+    try testing.expectEqualSlices(i32, &.{ 0, 0, 0, 1 }, &lut4);
+    try testing.expect(full.identity == .full and full.pruned_bytes == 0 and full.stages[0].lut == null);
+    // The credit: the left-out experts' bytes (2 of them) at the head's per-expert bytes.
+    try testing.expectEqual(@as(u64, 2), sub.pruned());
+    try testing.expectEqual(sub.pruned() * dh.expertBytes(c), compact.pruned_bytes);
+    // One expert's six arrays, as bound, are `expertBytes`.
+    var per_expert: u64 = 0;
+    inline for (.{ "w1", "w3", "w2" }) |w| inline for (.{ "weight", "scales" }) |part| {
+        const x = lookup4.get("mtp.0.ffn.experts.0." ++ w ++ "." ++ part).?;
+        per_expert += @intCast(rig.g.shapeOf(x).numel() * @as(i64, @intCast(ops.dtypeSize(rig.g.dtypeOf(x)))));
+    };
+    try testing.expectEqual(per_expert, dh.expertBytes(c));
+    // A draft block: the same graph as the full head's, plus each stage MoE's lut gather.
+    var script: Script = .{ .n_experts = @intCast(c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..n_st], .{ .lookup = null, .max_tokens = 8 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    const e0 = rig.g.nodes.items.len;
+    _ = try full.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed, rig.model.head);
+    const e1 = rig.g.nodes.items.len;
+    _ = try compact.draftBlock(&rig.g, lp.main_h.?, 3, rig.caches[0..n_st], rig.model.embed, rig.model.head);
+    const e2 = rig.g.nodes.items.len;
+    try testing.expectEqual(e1 - e0 + n_st, e2 - e1);
+    inline for (@typeInfo(ops.Op).@"enum".field_names) |name| {
+        const op = @field(ops.Op, name);
+        var nf: usize = 0;
+        var nc: usize = 0;
+        for (rig.g.nodes.items[e0..e1]) |nd| nf += @intFromBool(nd.op == op);
+        for (rig.g.nodes.items[e1..e2]) |nd| nc += @intFromBool(nd.op == op);
+        if (op == .take) {
+            try testing.expectEqual(nf + n_st, nc);
+        } else try testing.expectEqual(nf, nc);
+    }
+}
+
+test "dsv41 dspark loop: a logged cycle that wants the tie-flip rule reads each verify row's top two and rms" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // One cycle (block 2, greedy): drafts 5, 6; verify rows [3, 5, 6] -> targets 5, 9, 7 (accepts 1).
+    // Then the logged top two: ids [5, 9, 7] / [8, 2, 4], logits [2, 1, 3] / [1.5, 0.5, 2.5], rms [4, 4, 4].
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 5, 9, 7 }, &.{ 8, 2, 4 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 2, 1, 3 }, &.{ 1.5, 0.5, 2.5 }, &.{ 4, 4, 4 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [9]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(i + 1);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var lg: CycleLog = .{ .primary = 0, .want_top = true };
+    const e0 = rig.g.nodes.items.len;
+    _ = try lp.cycle(&rig.ex, &out, a, &lg);
+    try testing.expectEqual(@as(usize, 4), script.nu);
+    try testing.expectEqual(@as(usize, 4), script.nf);
+    try testing.expectEqualSlices(u32, &.{ 5, 9 }, out.items);
+    try testing.expectEqual([2]u32{ 9, 2 }, lg.top_ids[1]);
+    try testing.expectEqual([2]f32{ 1, 0.5 }, lg.top_logits[1]);
+    try testing.expectEqual(@as(f32, 4), lg.rms[2]);
+    // The verify's own argmax, plus the logged first and second (masked) argmax.
+    var n_argmax: usize = 0;
+    var n_where: usize = 0;
+    for (rig.g.nodes.items[e0..]) |nd| {
+        n_argmax += @intFromBool(nd.op == .argmax);
+        n_where += @intFromBool(nd.op == .where);
+    }
+    try testing.expect(n_argmax >= 3 and n_where >= 1);
+}
+
+/// A wide route that records each call: its layer (routes are built in layer
+/// order), rows, act rows and slots, in the order the forward makes them.
+const WideLog = struct {
+    const xk = @import("exl3_kernels.zig");
+    const xko = @import("exl3_kernel_ops.zig");
+    var next_layer: u32 = 0;
+    var order: [512]u32 = undefined;
+    var n_order: usize = 0;
+    layer: u32,
+    calls: u32 = 0,
+    rows: u32 = 0,
+    finishes: u32 = 0,
+    ok: bool = true,
+
+    pub fn init(_: std.mem.Allocator, _: *const xk.Registry, _: xko.PrefillShape, _: ?*xk.Diag) !WideLog {
+        next_layer += 1;
+        return .{ .layer = next_layer - 1 };
+    }
+    pub fn deinit(_: *WideLog, _: *TraceOps) void {}
+    pub fn call(self: *WideLog, g: *TraceOps, act: u32, r: xko.PrefillRows, bank: xko.BankArrays(u32)) !u32 {
+        self.calls += 1;
+        self.rows += @intCast(r.slot.len);
+        order[n_order] = self.layer;
+        n_order += 1;
+        const tokens: u32 = @intCast(g.shapeOf(act).d[0]);
+        const cap: u32 = @intCast(g.shapeOf(bank.gate.code).d[0]);
+        const act_row = r.act_row.?;
+        self.ok = self.ok and g.dtypeOf(act) == .bfloat16 and act_row.len == r.slot.len;
+        for (r.slot, act_row) |slot, row| self.ok = self.ok and slot < cap and row < tokens;
+        return g.input(&.{ @intCast(r.slot.len), g.shapeOf(act).d[1] }, .float32);
+    }
+    pub fn finish(self: *WideLog, _: *TraceOps) !void {
+        self.finishes += 1;
+    }
+};
+
+test "dsv41 dspark loop: the served prompt pass is one forward the model chunks; its wide chunks run through the wide lane, chunk-major" {
+    const a = testing.allocator;
+    const xk = @import("exl3_kernels.zig");
+    const m = try mdl.Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = m.spec };
+    // The model's own chunk rule, pinned small (30 rows) so a mini prompt spans several chunks.
+    const model = try Loop(TraceOps).M.init(a, &g, m.c, try routes.parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "30" }}, null), &lookup, &m.src);
+    defer model.deinit(&g);
+    const head = try Loop(TraceOps).H.init(a, &g, m.c, .{}, &lookup);
+    defer head.deinit(&g);
+    const nl = m.c.n_layers;
+    const k = m.c.n_experts_per_tok;
+    var rows0: [8]u32 = @splat(@intCast(m.c.n_routed_experts));
+    var src = try xp.FakeSource.init(a, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
+    defer src.deinit();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    WideLog.next_layer = 0;
+    WideLog.n_order = 0;
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, xp.TraceMath, .{ .prefill = WideLog });
+    var ex = try Ex.initWith(a, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c, .{ .prefill = .{ .reg = &reg } });
+    defer ex.deinit();
+    var script: Script = .{ .n_experts = @intCast(m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    g.host_values = script.values();
+    // 70 prompt rows: spans 30 / 30 / 10. The first two are wider than a route takes (30 x k > 48), the last is not.
+    const n_prompt = 70;
+    try testing.expect(30 * k > xp.max_route_ids and 10 * k <= xp.max_route_ids);
+    var prompt: [n_prompt]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast(1 + i % 50);
+    // The request's KV bounded to its positions: the prompt, 4 tokens and one verify block.
+    var st = try model.newStateWith(model.boundedKv(n_prompt + 4 + 8));
+    defer st.deinit(&g, a);
+    const max_len = st.max_len orelse return error.TestUnexpectedResult;
+    try testing.expect(max_len >= n_prompt + 4 + 8);
+    var caches: [4]Loop(TraceOps).H.Cache = @splat(.{});
+    defer for (caches[0..head.nStages()]) |*x| x.deinit(&g);
+    var lp = Loop(TraceOps).init(&g, model, head, &st, caches[0..head.nStages()], .{ .lookup = null, .max_tokens = 4, .prompt_chunk = whole_prompt });
+    defer lp.deinit();
+    try testing.expectEqual(@as(u32, 3), try lp.prefill(a, &ex, &prompt));
+    try testing.expectEqual(@as(u32, n_prompt), st.offset);
+    try testing.expectEqual(@as(u32, n_prompt), caches[0].offset);
+    // Every layer's wide route took the two wide chunks' rows (60 x k), act rows indexing the chunk,
+    // slots inside the bank, bf16 act; one finish per call.
+    for (ex.wide_routes) |r| {
+        try testing.expect(r.ok);
+        try testing.expectEqual(@as(u32, 60 * k), r.rows);
+        try testing.expectEqual(r.calls, r.finishes);
+    }
+    // Chunk-major: chunk 0 through layers 0 .. L-1, then chunk 1 (a layer's calls in a chunk adjacent).
+    var runs: [64]u32 = undefined;
+    var n_runs: usize = 0;
+    for (WideLog.order[0..WideLog.n_order]) |l| {
+        if (n_runs == 0 or runs[n_runs - 1] != l) {
+            runs[n_runs] = l;
+            n_runs += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2 * nl), n_runs);
+    for (runs[0..n_runs], 0..) |l, i| try testing.expectEqual(@as(u32, @intCast(i % nl)), l);
+    // The narrow last chunk takes the decode lane: one route per layer per chunk, wide or not.
+    try testing.expectEqual(@as(u64, 3 * nl), src.stats().route_calls);
+    // A forward past the request's positions is refused before any lane is written.
+    const room: usize = max_len - st.offset;
+    const too_many = try a.alloc(u32, room + 1);
+    defer a.free(too_many);
+    @memset(too_many, 1);
+    try testing.expectError(error.BoundedLaneFull, model.forward(&g, &st, too_many, .{ .logits = .none }, &ex, graph.NoProbe{}));
+    try testing.expectEqual(@as(u32, n_prompt), st.offset);
 }
 
 test "dsv41 dspark loop: typical flags accept what the argmax rejects; the correction stays the argmax" {

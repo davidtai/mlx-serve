@@ -631,6 +631,7 @@ pub const Runner = struct {
         var g = try ops.MlxOps.init(gpa, s);
         defer g.deinit();
         const Tr = graph.Trunk(ops.MlxOps);
+        try Tr.prepareRegions(&g, &c, &rt, tier.layer_major);
 
         var weights = model.Weights.init(gpa);
         defer weights.deinit();

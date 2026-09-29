@@ -249,7 +249,9 @@ pub fn Session(comptime A: type, comptime D: type) type {
             const prompt_sha = try cell.idsSha256(a, run.prompt);
             const ids_sha = try cell.idsSha256(a, run.generated);
             const binding: arm_mod.DecodeBinding = if (D == arm_mod.StandIn(A)) .stand_in else .dspark;
-            const r = cell.receiptOf(run, spec, binding, self.arm.admissionRecord(), .{ .DSV41_EXL3_BANK = self.arm.model_dir }, &prompt_sha, &ids_sha);
+            var r = cell.receiptOf(run, spec, binding, self.arm.admissionRecord(), .{ .DSV41_EXL3_BANK = self.arm.model_dir }, &prompt_sha, &ids_sha);
+            var head_buf: [72]u8 = undefined;
+            if (@hasDecl(D, "draftHead")) r.draft_head = self.decode.draftHead(&head_buf);
             try cell.publish(a, self.io, &r, path, log);
         }
 

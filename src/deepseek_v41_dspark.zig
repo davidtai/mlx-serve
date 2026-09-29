@@ -161,6 +161,8 @@ pub fn acceptChunk(o: *Outcome, st: *Stats, drafts: []const u32, k_eff: u32, row
 /// earliest on ties.
 pub const Lookup = struct {
     a: std.mem.Allocator,
+    /// The key map and its position lists: bump-allocated, freed with the lookup.
+    arena: std.heap.ArenaAllocator,
     history: std.ArrayList(u32) = .empty,
     /// 5-token key -> the positions that followed it, chronological.
     ends: std.AutoHashMapUnmanaged([key_len]u32, std.ArrayList(u32)) = .empty,
@@ -174,15 +176,13 @@ pub const Lookup = struct {
     /// Any prompt length (`LookupExtension`): positions are indexed from
     /// `key_len` on, as the history grows past it.
     pub fn init(a: std.mem.Allocator, prompt: []const u32, minimum_context: u32, extra_tokens: u32) !Lookup {
-        var l: Lookup = .{ .a = a, .minimum_context = minimum_context, .extra_tokens = extra_tokens };
+        var l: Lookup = .{ .a = a, .arena = .init(a), .minimum_context = minimum_context, .extra_tokens = extra_tokens };
         try l.history.appendSlice(a, prompt);
         return l;
     }
 
     pub fn deinit(self: *Lookup) void {
-        var it = self.ends.valueIterator();
-        while (it.next()) |v| v.deinit(self.a);
-        self.ends.deinit(self.a);
+        self.arena.deinit();
         self.history.deinit(self.a);
         self.* = undefined;
     }
@@ -191,11 +191,12 @@ pub const Lookup = struct {
     pub fn appendCommitted(self: *Lookup, tokens: []const u32) !void {
         try self.history.appendSlice(self.a, tokens);
         const h = self.history.items;
+        const ka = self.arena.allocator();
         var end = self.indexed_end;
         while (end < h.len) : (end += 1) {
-            const gop = try self.ends.getOrPut(self.a, h[end - key_len ..][0..key_len].*);
+            const gop = try self.ends.getOrPut(ka, h[end - key_len ..][0..key_len].*);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(self.a, @intCast(end));
+            try gop.value_ptr.append(ka, @intCast(end));
         }
         self.indexed_end = h.len;
     }

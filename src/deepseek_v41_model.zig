@@ -16,6 +16,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const routes = @import("deepseek_v41_routes.zig");
+const qwen4 = @import("qwen4_exp.zig");
 
 pub const Want = struct {
     /// Head rows: none, the last position (a prefill), or every row (decode, verify).
@@ -25,7 +26,7 @@ pub const Want = struct {
     main_hidden: bool = false,
 };
 
-pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameTooLong };
+pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameTooLong, EmbeddingRetired, EmbeddingRowsMismatch };
 
 /// `_derive_moe_row_cap`: rows one K16 routed call may carry.
 pub fn moeRowCap(c: *const v41.Config, target_bytes: f64) u64 {
@@ -46,7 +47,9 @@ pub fn Model(comptime G: type) type {
         layers: []graph.LayerW(T),
         inv_swa: T,
         inv_yarn: T,
-        embed_w: T,
+        /// The input embedding: the resident table until `retireEmbedding`
+        /// (the prompt pass's fence), then its rows on the host.
+        embed: Embed,
         norm_w: T,
         head: Tr.HeadW,
         engram: ?EngramBind = null,
@@ -55,17 +58,51 @@ pub fn Model(comptime G: type) type {
 
         const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
 
+        /// The input embedding's source. Either way a lookup of `ids` is the
+        /// table's rows, byte for byte, `[1, n, dim]` in the table's dtype:
+        /// the resident table, or its rows read from the checkpoint shard
+        /// (`qwen4_exp.NgramTable.openTensor`, past the page cache).
+        pub const Embed = union(enum) {
+            table: T,
+            rows: *qwen4.NgramTable,
+
+            /// `ids` embedded `[1, n, dim]`; host buffers come from `a`.
+            pub fn of(self: Embed, g: *G, a: std.mem.Allocator, ids: []const u32, dim: u32) !T {
+                const n: c_int = @intCast(ids.len);
+                switch (self) {
+                    .table => |w| {
+                        const v = try a.alloc(i32, ids.len);
+                        for (v, ids) |*d, s| d.* = @intCast(s);
+                        return Tr.embed(g, w, try g.hostArray(std.mem.sliceAsBytes(v), &.{ 1, n }, .int32));
+                    },
+                    .rows => |r| {
+                        const buf = try a.alloc(u8, ids.len * @as(usize, r.dim) * 2);
+                        try r.gatherRaw(ids, buf);
+                        return g.hostArray(buf, &.{ 1, n, @intCast(dim) }, .bfloat16);
+                    },
+                }
+            }
+        };
         pub const State = struct {
             offset: u32 = 0,
             layers: []Cache,
             hash: ?eng.HashState = null,
+            /// The longest sequence every lane admits (null: unbounded), from the layers' geometry.
+            max_len: ?u32 = null,
+            /// Host scratch of a forward of at most `scratch_rows` rows (the decode / verify lane).
+            scratch: []u8 = &.{},
 
             pub fn deinit(self: *State, g: *G, gpa: std.mem.Allocator) void {
                 for (self.layers) |*l| l.deinit(g);
                 gpa.free(self.layers);
+                gpa.free(self.scratch);
                 if (self.hash) |*h| h.deinit(gpa);
             }
         };
+
+        /// Rows a forward may run on the state's scratch (the decode lane's
+        /// widest call: a verify block of 8 rows).
+        pub const scratch_rows = 8;
 
         pub const Mark = struct { offset: u32, layers: []Cache.Mark };
 
@@ -82,7 +119,7 @@ pub fn Model(comptime G: type) type {
         /// regions key on `&self.c`).
         pub fn init(gpa: std.mem.Allocator, g: *G, c: v41.Config, tier: routes.Tier, lookup: anytype, engram_src: ?*const eng.RowSource) !*Self {
             const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed_w = undefined, .norm_w = undefined, .head = undefined };
+            self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed = undefined, .norm_w = undefined, .head = undefined };
             errdefer self.deinit(g);
             const cp = &self.c;
             self.layers = try gpa.alloc(graph.LayerW(T), cp.n_layers);
@@ -92,7 +129,7 @@ pub fn Model(comptime G: type) type {
             }
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, cp));
             self.inv_yarn = try self.own(g, try Tr.yarnInvFreq(g, cp));
-            self.embed_w = try req(lookup, "embed.weight");
+            self.embed = .{ .table = try req(lookup, "embed.weight") };
             self.norm_w = try req(lookup, "norm.weight");
             const head_w = try req(lookup, "head.weight");
             self.head = switch (tier.routes.head) {
@@ -115,6 +152,7 @@ pub fn Model(comptime G: type) type {
                 }
                 self.engram = bind;
             }
+            try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
             return self;
         }
@@ -191,9 +229,47 @@ pub fn Model(comptime G: type) type {
 
         /// A fresh sequence: lanes per the tier's KV route, its own n-gram history.
         pub fn newState(self: *const Self) !State {
+            return self.newStateWith(self.tier.kv);
+        }
+
+        /// A fresh sequence whose KV lanes follow `kv`: the tier's route, or a
+        /// request's own bounded route (`boundedKv`).
+        pub fn newStateWith(self: *const Self, kv: kvc.Geometry) !State {
             const cs = try self.gpa.alloc(Cache, self.c.n_layers);
-            for (cs, 0..) |*lc, l| lc.* = Cache.init(self.c.layers[l], self.c.window, self.tier.kv);
-            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null };
+            errdefer self.gpa.free(cs);
+            var max_len: ?u32 = null;
+            for (cs, 0..) |*lc, l| {
+                lc.* = Cache.init(self.c.layers[l], self.c.window, kv);
+                if (lc.admitLimit()) |m| max_len = if (max_len) |x| @min(x, m) else m;
+            }
+            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null, .max_len = max_len, .scratch = try self.gpa.alloc(u8, self.scratchBytes(scratch_rows)) };
+        }
+
+        /// The bounded route (W107 lanes) for a request of at most `max_positions`
+        /// positions (its prompt, its tokens and one verify block): the window a
+        /// ring, the compress / index / frontier lanes sized once to it at their
+        /// first write and never grown; a forward past it is refused by name
+        /// (`BoundedLaneFull`) before any lane is written.
+        pub fn boundedKv(self: *const Self, max_positions: u32) kvc.Geometry {
+            var kv = self.tier.kv;
+            kv.route = .bounded;
+            kv.max_kv = max_positions;
+            return kv;
+        }
+
+        /// Host bytes a forward of `rows` rows allocates (the embed ids or, after
+        /// the fence, the embedding rows; the Engram rows, per Engram layer its
+        /// ids / codes / scales), each rounded up to the allocator's worst alignment.
+        fn scratchBytes(self: *const Self, rows: usize) usize {
+            const pad = 16;
+            var n: usize = @max(rows * @sizeOf(i32), rows * @as(usize, self.c.hidden_size) * 2) + pad;
+            if (self.engram) |en| {
+                const cols = en.src.hashing.cols();
+                const hd: usize = en.src.bank.head_dim;
+                n += rows * en.src.perToken() * @sizeOf(i64) + pad;
+                n += self.c.engram.n_layers * (rows * cols * @sizeOf(i64) + rows * cols * hd + rows * cols * (hd / 32) + 3 * pad);
+            }
+            return n;
         }
 
         fn invFor(self: *const Self, li: v41.LayerInfo) T {
@@ -222,10 +298,30 @@ pub fn Model(comptime G: type) type {
         }
 
         fn embedSpan(self: *const Self, g: *G, a: std.mem.Allocator, ids: []const u32) !Tr.Out {
-            const v = try a.alloc(i32, ids.len);
-            for (v, ids) |*d, s| d.* = @intCast(s);
-            const arr = try g.hostArray(std.mem.sliceAsBytes(v), &.{ 1, @intCast(ids.len) }, .int32);
-            return Tr.expandEmbedding(g, &self.c, try Tr.embed(g, self.embed_w, arr));
+            return Tr.expandEmbedding(g, &self.c, try self.embed.of(g, a, ids, self.c.hidden_size));
+        }
+
+        /// The input table's bytes (bf16 `[vocab, dim]`): what retiring it frees,
+        /// the admission's post-prefill embedding credit.
+        pub fn embeddingBytes(self: *const Self) u64 {
+            return @as(u64, self.c.vocab_size) * self.c.hidden_size * 2;
+        }
+
+        /// The prompt pass's fence (`embedding_install.retire`): later lookups
+        /// read `rows` (the table's rows on the host) and the table is handed
+        /// back for its owner to free. Once per model; `rows` must be the
+        /// table's layout (bf16 `[vocab, dim]`) and outlive the model.
+        pub fn retireEmbedding(self: *Self, g: *G, rows: *qwen4.NgramTable) !T {
+            const w = switch (self.embed) {
+                .table => |w| w,
+                .rows => return error.EmbeddingRetired,
+            };
+            const s = g.shapeOf(w);
+            if (g.dtypeOf(w) != .bfloat16 or !s.eql(ops.Shape.of(&.{ @intCast(self.c.vocab_size), @intCast(self.c.hidden_size) })) or
+                rows.bits != 16 or rows.rows != self.c.vocab_size or rows.dim != self.c.hidden_size)
+                return error.EmbeddingRowsMismatch;
+            self.embed = .{ .rows = rows };
+            return w;
         }
 
         fn engramRowsFor(self: *const Self, st: *State, a: std.mem.Allocator, ids: []const u32) ![]const i64 {
@@ -294,11 +390,13 @@ pub fn Model(comptime G: type) type {
         /// chunked by `_resolve_prefill_chunk` (K16 layer-major when the tier
         /// asks). The result's arrays live until the backend's next reset.
         pub fn forward(self: *Self, g: *G, st: *State, ids: []const u32, want: Want, routed: anytype, probe: anytype) !Result {
-            var arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena.deinit();
-            const a = arena.allocator();
             const n: u32 = @intCast(ids.len);
-            for (st.layers) |*lc| try lc.canAdmit(n);
+            if (st.max_len) |m| if (st.offset + n > m) return error.BoundedLaneFull;
+            // A decode / verify forward runs on the state's scratch; a prefill span on an arena.
+            var fba: std.heap.FixedBufferAllocator = .init(st.scratch);
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const a = if (n <= scratch_rows) fba.allocator() else arena.allocator();
             const chunk = kvc.resolvePrefillChunk(&self.c, n, self.tier.prefill_chunk, self.tier.chunk_target_bytes);
             var hidden: T = undefined;
             var main: ?T = null;
