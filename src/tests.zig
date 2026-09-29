@@ -62,6 +62,10 @@ test {
     _ = @import("deepseek_v41_serve.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
+    _ = @import("exl3_kernels.zig");
+    _ = @import("exl3_selfcheck.zig");
+    _ = @import("exl3_kernel_ops.zig");
+    _ = @import("exl3_kernel_ops_gate.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
