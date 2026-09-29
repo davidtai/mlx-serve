@@ -356,7 +356,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 1;
     }
     if (eq(u8, f, "index_topk")) {
-        var r = try tr.IndexTopk(MlxG).init(g, reg);
+        var r = try tr.IndexTopk(MlxG).init(g, reg, &.derived, null);
         defer r.deinit(g);
         outs[0..2].* = try r.select(g, in(ins, "score"), in(ins, "clen"));
         return 2;
@@ -392,14 +392,14 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     // prefill batch 2 (dump_kernel_prefill2_fixture.py): the P line's prefill-rows texts; the
     // prefill-rows index top-k replays through the index_topk branch above
     if (eq(u8, f, "idxscore")) {
-        const r = tr.IdxScore(MlxG).init(reg);
+        const r = try tr.IdxScore(MlxG).init(reg, &.derived, null);
         outs[0] = try r.call(g, in(ins, "q"), in(ins, "k"), in(ins, "w"), in(ins, "clen"));
         return 1;
     }
     if (eq(u8, f, "core_vec") or eq(u8, f, "core_rope")) {
         const kind: tr.CoreKind = if (eq(u8, f, "core_vec")) .vec else .rope;
         const ckv = ins.get("ckv");
-        var r = try tr.PrefillAttn(MlxG).init(g, reg, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
+        var r = try tr.PrefillAttn(MlxG).init(g, reg, &.derived, kind, g.dtypeOf(in(ins, "q")), g.dtypeOf(in(ins, "win")), ckv != null, null);
         defer r.deinit(g);
         const cmp: ?[2]mlx.mlx_array = if (ckv) |store| .{ store, in(ins, "cidx") } else null;
         const rope: ?[2]mlx.mlx_array = if (kind == .rope) .{ in(ins, "qcos"), in(ins, "qsin") } else null;
@@ -415,7 +415,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 2;
     }
     if (eq(u8, f, "smallk")) {
-        const r = tr.SmallKCombine(MlxG).init(reg);
+        const r = try tr.SmallKCombine(MlxG).init(reg, &.derived, null);
         outs[0] = try r.call(g, in(ins, "routed"), in(ins, "weights"), in(ins, "shared"));
         return 1;
     }

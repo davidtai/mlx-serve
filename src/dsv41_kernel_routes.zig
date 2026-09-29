@@ -664,6 +664,32 @@ pub fn WoaRingTranspose(comptime G: type) type {
 /// tier). k = min(512, N) and the output width = k on the tier (ATTN_CORE_COMPILE / K29 off); the
 /// flag is k >= N. N (the compressed count) grows during decode, so each call builds its launch
 /// config and its N / k scalars (the lane's own per-call ints); the 0 / 1 flags are built once.
+/// The model geometry the prefill-attention, indexer and combine texts were derived for (the lane's
+/// DeepSeek-V4.1 shapes, baked into their texts and launch rules). A route is built only for a model
+/// whose config matches, field by field; any other is refused at construction, by name, never run.
+pub const PrefillGeometry = struct {
+    n_heads: u32,
+    head_dim: u32,
+    rope_head_dim: u32,
+    window: u32,
+    index_topk: u32,
+    index_n_heads: u32,
+    index_head_dim: u32,
+    n_experts_per_tok: u32,
+    hidden: u32,
+
+    pub const derived: PrefillGeometry = .{ .n_heads = 64, .head_dim = 512, .rope_head_dim = 64, .window = 128, .index_topk = 512, .index_n_heads = 32, .index_head_dim = 128, .n_experts_per_tok = 6, .hidden = 5120 };
+
+    /// `what` names the route; every field is compared (a subset would let a shape through).
+    pub fn admit(got: *const PrefillGeometry, what: []const u8, diag: ?*xk.Diag) Refusal!void {
+        inline for (comptime std.meta.fieldNames(PrefillGeometry)) |name| {
+            const want = @field(derived, name);
+            const have = @field(got.*, name);
+            if (have != want) return refuse(diag, error.RouteInput, "exl3 kernel ops: {s} is derived for {s} {d}, the model's is {d}", .{ what, name, want, have });
+        }
+    }
+};
+
 pub fn IndexTopk(comptime G: type) type {
     return struct {
         const Self = @This();
@@ -671,7 +697,8 @@ pub fn IndexTopk(comptime G: type) type {
         e: *const Entry,
         flag: [2]G.T,
 
-        pub fn init(g: *G, reg: *const xk.Registry) !Self {
+        pub fn init(g: *G, reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) !Self {
+            try geo.admit("mtplx_dsv41_index_topk_select", diag);
             var s: Self = .{ .e = reg.get(.mtplx_dsv41_index_topk_select), .flag = undefined };
             var built: usize = 0;
             errdefer for (s.flag[0..built]) |x| g.release(x);
@@ -913,7 +940,8 @@ pub fn IdxScore(comptime G: type) type {
         const Self = @This();
         e: *const Entry,
 
-        pub fn init(reg: *const xk.Registry) Self {
+        pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
+            try geo.admit("q3_ph_index_score", diag);
             return .{ .e = reg.get(.q3_ph_index_score) };
         }
 
@@ -975,7 +1003,8 @@ pub fn PrefillAttn(comptime G: type) type {
         /// `q` the query dtype (bf16 on the tier), `ring` the window store's dtype, `cmp` a
         /// compressed layer (its store f32). A dtype set the lane does not warm is refused
         /// (TemplateNotRegistered).
-        pub fn init(g: *G, reg: *const xk.Registry, kind: CoreKind, q: Dtype, ring: Dtype, cmp: bool, diag: ?*xk.Diag) !Self {
+        pub fn init(g: *G, reg: *const xk.Registry, geo: *const PrefillGeometry, kind: CoreKind, q: Dtype, ring: Dtype, cmp: bool, diag: ?*xk.Diag) !Self {
+            try geo.admit(if (kind == .rope) "the ropefuse prefill core" else "the corevec prefill core", diag);
             const Stage = struct { vec: Kernel, rope: Kernel };
             const qk_base: Stage = if (cmp) .{ .vec = .q3_ph_qkvec_cmp, .rope = .q3_ph_qkrope_cmp } else .{ .vec = .q3_ph_qkvec_win, .rope = .q3_ph_qkrope_win };
             const pv_base: Stage = if (cmp) .{ .vec = .q3_ph_pvvec_cmp, .rope = .q3_ph_pvrope_cmp } else .{ .vec = .q3_ph_pvvec_win, .rope = .q3_ph_pvrope_win };
@@ -1107,7 +1136,8 @@ pub fn SmallKCombine(comptime G: type) type {
         const Self = @This();
         e: *const Entry,
 
-        pub fn init(reg: *const xk.Registry) Self {
+        pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
+            try geo.admit("q3sk_combine", diag);
             return .{ .e = reg.get(.q3sk_combine) };
         }
 
@@ -1289,7 +1319,7 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
     // index top-k: N grows during decode, so a per-call launch; N / k scalars per call, the flag prebuilt
     {
         const e = reg.get(.mtplx_dsv41_index_topk_select);
-        var r = try IndexTopk(Trace).init(&t, &reg);
+        var r = try IndexTopk(Trace).init(&t, &reg, &.derived, null);
         defer r.deinit(&t);
         for (e.samples) |*s| {
             const m: c_int = @intCast(s.vars.get(.rows));
@@ -1407,7 +1437,7 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     // idxscore: q / index_k cast to f32 first (the lane's astype), one launch per call at (S, N)
     {
         const e = reg.get(.q3_ph_index_score);
-        const r = IdxScore(Trace).init(&reg);
+        const r = try IdxScore(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n_s: c_int = @intCast(s.vars.get(.rows));
             const n_c: c_int = @intCast(s.vars.get(.ncomp));
@@ -1429,7 +1459,7 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     const sink = try t.node(&.{ 1, 1, 64, 1 }, .float32, &.{});
     const Layer = struct { ring: Dtype, cmp: bool };
     for ([_]CoreKind{ .vec, .rope }) |kind| for ([_]Dtype{ .bfloat16, .float32 }) |qdt| for ([_]Layer{ .{ .ring = .bfloat16, .cmp = false }, .{ .ring = .float32, .cmp = false }, .{ .ring = .float32, .cmp = true } }) |lay| {
-        var r = try PrefillAttn(Trace).init(&t, &reg, kind, qdt, lay.ring, lay.cmp, null);
+        var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, kind, qdt, lay.ring, lay.cmp, null);
         defer r.deinit(&t);
         try testing.expect(r.qk.samples.len > 0);
         for (r.qk.samples) |*s| {
@@ -1478,10 +1508,10 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         }
     };
     // a dtype set the lane never warms, a mismatched call and a selection wider than index_topk
-    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, .vec, .bfloat16, .bfloat16, true, null));
-    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, .rope, .float16, .float32, false, null));
+    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .vec, .bfloat16, .bfloat16, true, null));
+    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .float16, .float32, false, null));
     {
-        var r = try PrefillAttn(Trace).init(&t, &reg, .rope, .bfloat16, .float32, true, null);
+        var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .float32, true, null);
         defer r.deinit(&t);
         const n_launch = t.launches.items.len;
         const q = try t.node(&.{ 1, 40, 64, 512 }, .bfloat16, &.{});
@@ -1519,7 +1549,7 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     // the MoE combine
     {
         const e = reg.get(.q3sk_combine);
-        const r = SmallKCombine(Trace).init(&reg);
+        const r = try SmallKCombine(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n: c_int = @intCast(s.vars.get(.rows));
             const routed, const w, const sh = .{ try t.node(&.{ n, 6, 5120 }, .float32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
@@ -1529,13 +1559,40 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     }
     // INDEX_TOPK's select at a prefill chunk's rows (the same entry, per call)
     {
-        var r = try IndexTopk(Trace).init(&t, &reg);
+        var r = try IndexTopk(Trace).init(&t, &reg, &.derived, null);
         defer r.deinit(&t);
         _ = try r.select(&t, try t.node(&.{ 183, 4096 }, .float32, &.{}), try t.node(&.{183}, .int32, &.{}));
         const l = t.back(1);
         try testing.expect(!l.prepared);
         try testing.expectEqual([3]u32{ 256 * 183, 1, 1 }, l.cfg.grid);
         try testing.expectEqual(@as(c_int, 512), l.cfg.out_shapes[0][1]);
+    }
+    // construction: every route is built only for the geometry its texts were derived for; a model
+    // off by one field is refused by name before anything is kept (the native prompt pass passes
+    // its config's values: n_heads, head_dim, rope_head_dim, window, index_topk, index heads / dim,
+    // experts per token, hidden)
+    {
+        const kept = t.keeps;
+        inline for (comptime std.meta.fieldNames(PrefillGeometry)) |name| {
+            var geo = PrefillGeometry.derived;
+            @field(geo, name) *= 2;
+            var d: xk.Diag = .{};
+            try testing.expectError(error.RouteInput, PrefillAttn(Trace).init(&t, &reg, &geo, .rope, .float32, .float32, true, &d));
+            try testing.expect(std.mem.indexOf(u8, d.message(), "ropefuse prefill core is derived for " ++ name) != null);
+            try testing.expectError(error.RouteInput, IdxScore(Trace).init(&reg, &geo, &d));
+            try testing.expect(std.mem.indexOf(u8, d.message(), "q3_ph_index_score is derived for " ++ name) != null);
+            try testing.expectError(error.RouteInput, IndexTopk(Trace).init(&t, &reg, &geo, &d));
+            try testing.expectError(error.RouteInput, SmallKCombine(Trace).init(&reg, &geo, &d));
+        }
+        try testing.expectEqual(kept, t.keeps);
+        // the native prompt pass's three layer kinds (the model lane, 09-29): layer 0 on the bf16
+        // embedding stream (q, window bf16, window-only), layer 1 on the f32 stream (window-only),
+        // the compressed layers f32 with the f32 compressed store
+        const Kind = struct { q: Dtype, ring: Dtype, cmp: bool };
+        for ([_]Kind{ .{ .q = .bfloat16, .ring = .bfloat16, .cmp = false }, .{ .q = .float32, .ring = .float32, .cmp = false }, .{ .q = .float32, .ring = .float32, .cmp = true } }) |k| {
+            var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, k.q, k.ring, k.cmp, null);
+            r.deinit(&t);
+        }
     }
     // every prefill batch 2 entry was launched through its route; nothing kept past its route
     var hit: std.EnumSet(Kernel) = .empty;
