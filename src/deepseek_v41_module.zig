@@ -204,8 +204,8 @@ const GrownBanks = struct {
 };
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
-// [DSV41_MODULE_ROWS=<--expert-rows>]: the module's expert-source plan on the real bank at a box baseline
-// (CPU: config, bank, admission; no slot memory), the numbers the served gate's line carries.
+// [DSV41_MODULE_ROWS=<--expert-rows>] [DSV41_MODULE_HEAD=ceiling: the record's pruned draft head]: the module's
+// expert-source plan on the real bank at a box baseline (CPU: config, bank, admission; no slot memory).
 test "dsv41 module: the served plan on the real bank at a box baseline" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const gb = struct {
@@ -222,7 +222,7 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         .wired_bytes = try gb("DSV41_MODULE_WIRED_GB", 3.377741824),
         .fixed_rows = if (std.c.getenv("DSV41_MODULE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else null,
         .slot_memory = .host,
-        .draft_pruned_bytes = 0,
+        .draft_pruned_bytes = if (std.c.getenv("DSV41_MODULE_HEAD") != null) null else 0,
     }, &diag) catch |e| {
         std.debug.print("refused: {s}\n", .{diag.message()});
         return e;
