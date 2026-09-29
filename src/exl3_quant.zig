@@ -1280,29 +1280,16 @@ fn namedBank(t: *Trace, cap: c_int) !BankArrays(Trace.T) {
     return testBank(t, cap);
 }
 
-const old = @import("exl3_kernel_ops.zig");
+/// What today's EXL3 entries (exl3_kernel_ops.zig at e777dc5: RinChain's composition over its Gemv
+/// and RinPrep, DigXPrefill call / finish) launched over the cases below, rendered by `renderLog`:
+/// compared with the C2 entries byte for byte at the move commit aad8e67, then pinned here when the
+/// old file was deleted.
+const moved_log_lines = 1021;
+const moved_log_sha256 = "e1f27114d1cbda8b71a4c9e990754c151bdabf1b9bf3075bc8aa61747578657d";
 
-test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill / checkBank / accept == today's EXL3 entries" {
+test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill launch what today's EXL3 entries launched (pinned at the move)" {
     const a = testing.allocator;
     var diag: Diag = .{};
-    // today's entries on trace A: RinChain's composition (m1 deepseek_v41_experts.zig RinChain.gateUp /
-    // down) over exl3_kernel_ops' Gemv and RinPrep, its per-call arange replaced by the same
-    // int32 0..m-1 row maps the quant builds once; DigXPrefill call / finish at the tier shape
-    var ta: Trace = .{ .a = a };
-    defer ta.deinit();
-    var reg = try testRegistry();
-    defer reg.deinit();
-    var ogemv = try old.Gemv(Trace).init(&ta, &reg);
-    defer ogemv.deinit(&ta);
-    var oprep = try old.RinPrep(Trace).init(&ta, &reg);
-    defer oprep.deinit(&ta);
-    var otok: [48]Trace.T = undefined;
-    var idx: [48]i32 = undefined;
-    for (&idx, 0..) |*v, i| v.* = @intCast(i);
-    for (1..49) |m| otok[m - 1] = try ta.hostArray(std.mem.sliceAsBytes(idx[0..m]), &.{@intCast(m)}, .int32);
-    var owave = try old.DigXPrefill(Trace).init(a, &reg, .tier, null);
-    defer owave.deinit(&ta);
-    // the C2 entries on trace B
     var tb: Trace = .{ .a = a };
     defer tb.deinit();
     const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
@@ -1310,86 +1297,44 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     set.install(Trace, &tb);
     const acc = try accept(Trace, a, &tb, .{ .kernels = set }, v41_spec, &diag);
     defer acc.deinit(&tb);
-    var la: std.ArrayList(u8) = .empty;
-    defer la.deinit(a);
     var lb: std.ArrayList(u8) = .empty;
     defer lb.deinit(a);
-    const ba = try namedBank(&ta, 64);
     const bb = try namedBank(&tb, 64);
-    const oba: old.BankArrays(Trace.T) = .{ .gate = .{ .code = ba.gate.code, .rout = ba.gate.rout, .rin = ba.gate.rin }, .up = .{ .code = ba.up.code, .rout = ba.up.rout, .rin = ba.up.rin }, .down = .{ .code = ba.down.code, .rout = ba.down.rout, .rin = ba.down.rin } };
-    const a0 = ta.log.items.len;
     const b0 = tb.log.items.len;
     // decode, every M
     for (1..49) |m| {
         const mc: c_int = @intCast(m);
-        const xa, const ia = .{ try ta.ext("x", &.{ mc, 5120 }, .bfloat16), try ta.ext("ids", &.{mc}, .uint32) };
         const xb, const ib = .{ try tb.ext("x", &.{ mc, 5120 }, .bfloat16), try tb.ext("ids", &.{mc}, .uint32) };
-        const og = .{ .code = ba.gate.code, .rout = ba.gate.rout, .rin = ba.gate.rin };
-        const xs = try oprep.inRin(&ta, xa, otok[m - 1], og.rin, ba.up.rin, ia);
-        const zg = try ogemv.project(&ta, .gate, xs[0], ia, og.code);
-        const zu = try ogemv.project(&ta, .gate, xs[1], ia, ba.up.code);
-        const ha = try oprep.guEpi(&ta, zg, zu, og.rout, ba.up.rout, ia);
-        const hd = try oprep.dinRin(&ta, ha, ba.down.rin, ia);
-        const zd = try ogemv.project(&ta, .down, hd, ia, ba.down.code);
-        _ = try oprep.dpost(&ta, zd, ba.down.rout, ia);
         const hb = try acc.gateUp(&tb, xb, ib, bb.gate, bb.up);
         _ = try acc.down(&tb, hb, ib, bb.down);
     }
     // prefill: the lane samples' calls at the tier shape, then the boundary
     const parsed = try std.json.parseFromSlice(JSamples, a, prefill_samples, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    var n_calls: usize = 0;
     for (parsed.value.cases) |*cs| for (cs.calls) |*cl| {
         const slots = try routeRows(a, cl.route.seed, cl.route.slots, cl.route.counts);
         defer a.free(slots);
         for (slots) |*s| s.* %= 64;
         const n: c_int = @intCast(slots.len);
-        const ya = try owave.call(&ta, try ta.ext("act", &.{ n, 5120 }, .bfloat16), .{ .slot = slots }, oba);
         const yb = try acc.prefill(&tb, 3, try tb.ext("act", &.{ n, 5120 }, .bfloat16), .{ .slot = slots }, bb);
-        ta.release(ya);
         tb.release(yb);
-        n_calls += 1;
     };
-    try owave.finish(&ta);
     try acc.finishPrefill(&tb);
-    try renderLog(&ta, a0, &la);
     try renderLog(&tb, b0, &lb);
-    try testing.expect(n_calls >= 10);
-    try testing.expect(std.mem.count(u8, la.items, "\n") > 48 * 7);
-    if (!std.mem.eql(u8, la.items, lb.items)) {
-        var i: usize = 0;
-        while (i < @min(la.items.len, lb.items.len) and la.items[i] == lb.items[i]) i += 1;
-        std.debug.print("move invariance: the logs differ at byte {d}:\n  today: {s}\n  C2:    {s}\n", .{ i, la.items[i..@min(la.items.len, i + 200)], lb.items[i..@min(lb.items.len, i + 200)] });
-        return error.TestExpectedEqual;
-    }
-    std.debug.print("[c2 move invariance] {d} log lines, sha256 {s}\n", .{ std.mem.count(u8, la.items, "\n"), digestOf(la.items) });
-    // checkBank: the same verdict and message on every refusal of the table
-    const Bad = struct { proj: Proj, cap: c_int, gate_rin_dt: Dtype };
-    for ([_]Bad{ .{ .proj = .gate, .cap = 0, .gate_rin_dt = .float16 }, .{ .proj = .gate, .cap = 64, .gate_rin_dt = .float32 }, .{ .proj = .gate, .cap = 5000, .gate_rin_dt = .float16 } }) |c| {
-        const cap = if (c.cap == 0) 1 else c.cap;
-        var arr = ProjArrays(Trace.T){ .code = try tb.ext("code", &.{ cap, 320, 144, 48 }, .int16), .rout = try tb.ext("rout", &.{ cap, 2304 }, .float16), .rin = try tb.ext("rin", &.{ cap, 5120 }, c.gate_rin_dt) };
-        if (c.cap == 0) arr.code = try tb.ext("code", &.{ cap, 320, 144, 32 }, .int16);
-        var d_old: Diag = .{};
-        var d_new: Diag = .{};
-        const e_old = old.checkBank(Trace, &tb, &reg, .gate, .{ .code = arr.code, .rout = arr.rout, .rin = arr.rin }, &d_old);
-        const e_new = acc.checkBank(&tb, .{ .gate = arr, .up = bb.up, .down = bb.down }, &d_new);
-        try testing.expectError(error.RouteInput, e_old);
-        try testing.expectError(error.RouteInput, e_new);
-        try testing.expectEqualStrings(d_old.message(), d_new.message());
+    try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lb.items, "\n"));
+    try testing.expectEqualStrings(moved_log_sha256, &digestOf(lb.items));
+    // checkBank: the moved per-projection check's refusals, through the quant's entry
+    for ([_]struct { cap: c_int, last: c_int, rin_dt: Dtype, what: []const u8 }{
+        .{ .cap = 1, .last = 32, .rin_dt = .float16, .what = "input code" },
+        .{ .cap = 64, .last = 48, .rin_dt = .float32, .what = "input rg" },
+        .{ .cap = 5000, .last = 48, .rin_dt = .float16, .what = "a bank of 5000 slots" },
+    }) |c| {
+        const arr = ProjArrays(Trace.T){ .code = try tb.ext("code", &.{ c.cap, 320, 144, c.last }, .int16), .rout = try tb.ext("rout", &.{ c.cap, 2304 }, .float16), .rin = try tb.ext("rin", &.{ c.cap, 5120 }, c.rin_dt) };
+        try testing.expectError(error.RouteInput, acc.checkBank(&tb, .{ .gate = arr, .up = bb.up, .down = bb.down }, &diag));
+        if (std.mem.indexOf(u8, diag.message(), c.what) == null) {
+            std.debug.print("checkBank refused with: {s}\n", .{diag.message()});
+            return error.TestUnexpectedResult;
+        }
     }
     try acc.checkBank(&tb, bb, &diag);
-    // accept: today's stub plan, its EXL3 lines, == the quant's plan
-    var tc: Trace = .{ .a = a };
-    defer tc.deinit();
-    const oacc = try old.acceptAtStartup(Trace, a, &tc, .{ .device = .{ .stub = .{} } }, &diag);
-    defer oacc.deinit(&tc);
-    var j: usize = 0;
-    const ex = ks.subsetOf(&kernels);
-    for (oacc.report.results.items) |r| {
-        if (!ex.contains(r.kernel)) continue;
-        const n = acc.report.results.items[j];
-        try testing.expect(n.kernel == r.kernel and n.check == r.check and n.ok == r.ok);
-        j += 1;
-    }
-    try testing.expectEqual(acc.report.results.items.len, j);
 }

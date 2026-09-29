@@ -46,7 +46,6 @@ test {
     _ = @import("expert_stream.zig");
     _ = @import("exl3_kernels.zig");
     _ = @import("exl3_selfcheck.zig");
-    _ = @import("exl3_kernel_ops.zig");
     _ = @import("exl3_kernel_ops_gate.zig");
     _ = @import("kernel_routes.zig");
     _ = @import("kernel_set.zig");
