@@ -696,6 +696,55 @@ pub fn cellPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, case_id: ?
 /// per-cycle acceptance and the generated ids.
 pub const served_cell_format = "mlx-serve-dsv41-served-cell-v1";
 const CellCycle = struct { k_eff: u32, accepted: u32, verified: u32 };
+
+/// The expert stream's counters over a phase of the request (two reads of its existing Stats, taken
+/// outside the timed ranges: free for the measured cell).
+const StreamPhase = struct {
+    route_calls: u64,
+    hits: u64,
+    misses: u64,
+    bytes_read: u64,
+    preadv_calls: u64,
+    read_busy_s: f64,
+    read_seconds: f64,
+
+    fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
+        return .{
+            .route_calls = b.route_calls -| a.route_calls,
+            .hits = b.expert_cache_hits -| a.expert_cache_hits,
+            .misses = b.expert_cache_misses -| a.expert_cache_misses,
+            .bytes_read = b.expert_bytes_read -| a.expert_bytes_read,
+            .preadv_calls = b.preadv_calls -| a.preadv_calls,
+            .read_busy_s = @as(f64, @floatFromInt(b.read_wall_ns -| a.read_wall_ns)) / 1e9,
+            .read_seconds = b.expert_read_seconds - a.expert_read_seconds,
+        };
+    }
+};
+
+/// A decode-profile run's cycle (DSV41_CELL_DECODE_PROFILE): the host time of each phase
+/// (`dsl.Phase`, exclusive, from the loop's stamps) and the stream's counters over the cycle.
+const ProfCycle = struct { k_eff: u32, accepted: u32, draft_ms: f64, verify_ms: f64, decide_ms: f64, commit_ms: f64, tail_ms: f64, misses: u64, bytes_read: u64, read_busy_ms: f64 };
+
+/// The decode profile's stamper: `mark(p)` charges the host time since the previous mark to `p`.
+const Stamper = struct {
+    io: std.Io,
+    last: std.Io.Timestamp,
+    ns: [std.meta.fields(dsl.Phase).len]u64 = @splat(0),
+
+    fn begin(self: *Stamper) void {
+        self.ns = @splat(0);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+    }
+
+    pub fn mark(self: *Stamper, p: dsl.Phase) void {
+        self.ns[@intFromEnum(p)] += @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+    }
+
+    fn ms(self: *const Stamper, p: dsl.Phase) f64 {
+        return @as(f64, @floatFromInt(self.ns[@intFromEnum(p)])) / 1e6;
+    }
+};
 const CellReceipt = struct {
     format: []const u8 = served_cell_format,
     tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
@@ -726,6 +775,11 @@ const CellReceipt = struct {
     drafted_tokens: u32,
     accept_rate: f64,
     tokens_per_cycle: f64,
+    /// The stream over the prompt pass and over the decode (the phase change's grow between them).
+    prompt_stream: ?StreamPhase = null,
+    decode_stream: ?StreamPhase = null,
+    /// Set by a decode-profile run only (not a timed cell: its stamps sit in the loop).
+    decode_profile: ?[]const ProfCycle = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -798,10 +852,13 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     });
     defer lp.deinit();
 
+    const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
+    const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
+    const s_prompt = arm.hook.source.stats();
     // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
     var mlx_peak: usize = memProbePeak("dsv41 served cell", "prompt (one pass)");
     const t1 = std.Io.Timestamp.now(io, .boot);
@@ -813,7 +870,10 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     var cycles: std.ArrayList(CellCycle) = .empty;
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
-    if (std.mem.indexOfScalar(u32, stops[0..n_stop], primary) == null) while (true) {
+    var prof: std.ArrayList(ProfCycle) = .empty;
+    const primary_stops = std.mem.indexOfScalar(u32, stops[0..n_stop], primary) != null;
+    if (!primary_stops and !profile) while (true) {
+        // The timed cell: no stamps in the loop.
         var lg: dsl.CycleLog = .{ .primary = 0 };
         const f = try lp.cycle(&arm.hook, &out, gpa, &lg);
         try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
@@ -822,7 +882,24 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
             break;
         }
     };
+    if (!primary_stops and profile) while (true) {
+        // The decode profile: the loop's phase stamps and the stream's counters per cycle.
+        var lg: dsl.CycleLog = .{ .primary = 0 };
+        var sp: Stamper = .{ .io = io, .last = undefined };
+        const c0 = arm.hook.source.stats();
+        sp.begin();
+        const f = try lp.cycleStamped(&arm.hook, &out, gpa, &lg, &sp);
+        const c1 = arm.hook.source.stats();
+        try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
+        const sph = StreamPhase.of(c0, c1);
+        try prof.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .draft_ms = sp.ms(.draft), .verify_ms = sp.ms(.verify), .decide_ms = sp.ms(.decide), .commit_ms = sp.ms(.commit), .tail_ms = sp.ms(.tail), .misses = sph.misses, .bytes_read = sph.bytes_read, .read_busy_ms = sph.read_busy_s * 1e3 });
+        if (f) |x| {
+            finish = x;
+            break;
+        }
+    };
     const decode_s = secondsSince(io, t2);
+    const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
     mlx_peak = @max(mlx_peak, memProbePeak("dsv41 served cell", "cycles"));
 
@@ -861,7 +938,12 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
         .drafted_tokens = stt.drafted_tokens,
         .accept_rate = stt.acceptRate(),
         .tokens_per_cycle = if (cycles.items.len == 0) 0 else @as(f64, @floatFromInt(out.items.len)) / @as(f64, @floatFromInt(cycles.items.len)),
+        .prompt_stream = StreamPhase.of(s_start, s_prompt),
+        // The decode window starts at the prompt's end: it includes the phase change's grow.
+        .decode_stream = StreamPhase.of(s_prompt, s_end),
+        .decode_profile = if (profile) prof.items else null,
     };
+    if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
     std.debug.print("\ndsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
@@ -1156,6 +1238,31 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+}
+
+/// DECODE_PROFILE lines: the per-phase means over the cycles (ms per cycle) and the stream's.
+fn printDecodeProfile(p: []const ProfCycle) void {
+    if (p.len == 0) return;
+    var sum: ProfCycle = .{ .k_eff = 0, .accepted = 0, .draft_ms = 0, .verify_ms = 0, .decide_ms = 0, .commit_ms = 0, .tail_ms = 0, .misses = 0, .bytes_read = 0, .read_busy_ms = 0 };
+    for (p) |c| {
+        sum.k_eff += c.k_eff;
+        sum.accepted += c.accepted;
+        sum.draft_ms += c.draft_ms;
+        sum.verify_ms += c.verify_ms;
+        sum.decide_ms += c.decide_ms;
+        sum.commit_ms += c.commit_ms;
+        sum.tail_ms += c.tail_ms;
+        sum.misses += c.misses;
+        sum.bytes_read += c.bytes_read;
+        sum.read_busy_ms += c.read_busy_ms;
+    }
+    const n: f64 = @floatFromInt(p.len);
+    std.debug.print("\nDECODE_PROFILE {{\"cycles\": {d}, \"draft_ms\": {d:.2}, \"verify_ms\": {d:.2}, \"decide_ms\": {d:.2}, \"commit_ms\": {d:.2}, \"tail_ms\": {d:.2}, \"cycle_ms\": {d:.2}, \"misses_per_cycle\": {d:.1}, \"mb_read_per_cycle\": {d:.1}, \"read_busy_ms\": {d:.2}, \"k_eff\": {d:.2}, \"accepted\": {d:.2}}}\n", .{
+        p.len,                     sum.draft_ms / n,       sum.verify_ms / n,  sum.decide_ms / n,
+        sum.commit_ms / n,         sum.tail_ms / n,        (sum.draft_ms + sum.verify_ms + sum.decide_ms + sum.commit_ms + sum.tail_ms) / n,
+        @as(f64, @floatFromInt(sum.misses)) / n, @as(f64, @floatFromInt(sum.bytes_read)) / n / 1e6, sum.read_busy_ms / n,
+        @as(f64, @floatFromInt(sum.k_eff)) / n, @as(f64, @floatFromInt(sum.accepted)) / n,
+    });
 }
 
 fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {

@@ -63,6 +63,14 @@ pub const CycleLog = struct {
     rms: [ds.max_block + 1]f32 = undefined,
 };
 
+/// A cycle's phases for a decode-profile run's host stamps (`Loop.cycleStamped`): a stamper's
+/// `mark(p)` charges the host time since its previous mark to `p`.
+pub const Phase = enum { draft, verify, decide, commit, tail };
+
+inline fn mark(stamp: anytype, p: Phase) void {
+    if (@TypeOf(stamp) != void) stamp.mark(p);
+}
+
 pub fn Loop(comptime G: type) type {
     return struct {
         const Self = @This();
@@ -305,6 +313,12 @@ pub fn Loop(comptime G: type) type {
 
         /// One cycle; returns null to continue, or how the run finished.
         pub fn cycle(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog) !?Finish {
+            return self.cycleStamped(ex, out, a, log, {});
+        }
+
+        /// `cycle` with a stamper's marks at its phase ends (a decode-profile run only; `{}` compiles
+        /// them out, as `cycle` passes).
+        pub fn cycleStamped(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog, stamp: anytype) !?Finish {
             const g = self.g;
             const st = &self.stats;
             var drafts_buf: [ds.max_block]u32 = undefined;
@@ -333,6 +347,7 @@ pub fn Loop(comptime G: type) type {
                 }
                 k_eff = @intCast(drafts.len);
             }
+            mark(stamp, .draft);
             // Verify [primary, drafts] in chunks of max_rows, stopping at the correction.
             var block: [ds.max_block + 1]u32 = undefined;
             block[0] = self.primary;
@@ -346,6 +361,7 @@ pub fn Loop(comptime G: type) type {
                 const end = @min(start + self.max_rows, n_block);
                 const r = try self.model.forward(g, self.st, block[start..end], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
                 try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
+                mark(stamp, .verify);
                 st.verify_calls += 1;
                 hiddens[n_hidden] = r.main_hidden.?;
                 n_hidden += 1;
@@ -362,6 +378,7 @@ pub fn Loop(comptime G: type) type {
                     }
                 }
                 const done = ds.acceptChunk(&o, st, drafts, k_eff, .{ start, end }, target[0 .. end - start], typ);
+                mark(stamp, .decide);
                 start = end;
                 if (done) break;
             }
@@ -372,6 +389,7 @@ pub fn Loop(comptime G: type) type {
             try self.model.trim(g, self.st, o.trimRows());
             try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(o.accepted + 1)), self.caches);
             try self.evalWindows();
+            mark(stamp, .commit);
             if (log) |lg| {
                 lg.primary = self.primary;
                 lg.k_eff = k_eff;
@@ -405,6 +423,7 @@ pub fn Loop(comptime G: type) type {
             }
             try ex.flush();
             g.reset();
+            mark(stamp, .tail);
             return finish;
         }
 
