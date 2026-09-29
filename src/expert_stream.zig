@@ -1003,7 +1003,8 @@ test "dsv41 slots: layer 13, 8 rows through the pool == pread == v2 sha == Pytho
     defer rows.deinit();
     const calls = try checkSet("layer_set", &env.bank, set, &rows);
     try testing.expect(calls >= 2 * set.len);
-    try testing.expect(!metalDriverLoaded());
+    // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
 }
 
 test "dsv41 slots: cross-layer PICK set" {
@@ -1014,7 +1015,8 @@ test "dsv41 slots: cross-layer PICK set" {
     var rows = try HostSlotRows.init(&env.bank.layers[set[0].layer], @intCast(set.len));
     defer rows.deinit();
     _ = try checkSet("pick_set", &env.bank, set, &rows);
-    try testing.expect(!metalDriverLoaded());
+    // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
 }
 
 // Phase 0b, inside a guarded window (GPU lock held): DSV41_PHASE0B_MLX=1.
