@@ -73,6 +73,7 @@ pub const Module = struct {
         self.arm = A.init(gpa, io, &self.g, self.kernels.gemvRoute(xp.MlxGemv), .{
             .model_dir = dir,
             .baseline_bytes = config.memory_baseline_bytes,
+            .fixed_rows = config.expert_rows,
             .slot_memory = .{ .mlx = s },
             .prefill = .{ .reg = &self.kernels.reg },
             .draft_pruned_bytes = 0,
@@ -202,9 +203,9 @@ const GrownBanks = struct {
     }
 };
 
-// DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]: the
-// module's expert-source plan on the real bank at a box baseline (CPU: config, bank, admission; no slot
-// memory), the numbers the served gate's line carries.
+// DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
+// [DSV41_MODULE_ROWS=<--expert-rows>]: the module's expert-source plan on the real bank at a box baseline
+// (CPU: config, bank, admission; no slot memory), the numbers the served gate's line carries.
 test "dsv41 module: the served plan on the real bank at a box baseline" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const gb = struct {
@@ -219,6 +220,7 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         .model_dir = bank,
         .baseline_bytes = try gb("DSV41_MODULE_BASELINE_GB", 7.755397656),
         .wired_bytes = try gb("DSV41_MODULE_WIRED_GB", 3.377741824),
+        .fixed_rows = if (std.c.getenv("DSV41_MODULE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else null,
         .slot_memory = .host,
         .draft_pruned_bytes = 0,
     }, &diag) catch |e| {

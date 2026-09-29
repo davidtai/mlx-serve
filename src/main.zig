@@ -155,6 +155,8 @@ fn printUsage(io: std.Io) void {
         \\  --memory-baseline-gb <gb>  The non-model box baseline in decimal GB (memory
         \\                        in use before the model loads): the only override of
         \\                        mlx-serve's memory model, for streamed-expert models.
+        \\  --expert-rows <n>     Decode slot rows per layer for a streamed-expert model
+        \\                        (default: as many as its memory admission fits).
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -893,6 +895,12 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             model_mod.memory_baseline_override = @intFromFloat(@round(gb * 1e9));
+        } else if (std.mem.eql(u8, args[i], "--expert-rows") and i + 1 < args.len) {
+            i += 1;
+            model_mod.expert_rows_override = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--expert-rows: expected a row count, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {

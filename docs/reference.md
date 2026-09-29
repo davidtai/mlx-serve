@@ -439,7 +439,7 @@ Every memory plan (load preflight, auto-context, prefill admission) subtracts a 
 
 ### Streamed-expert models: memory baseline and page-cache bypass
 
-A model whose routed experts stream from disk (deepseek_v41) plans its slot banks against the box: `--memory-baseline-gb <gb>` gives the non-model baseline in decimal GB (the memory in use before the model loads) and is the only override of the memory model. Its resident weights load past the page cache (F_NOCACHE: cached pages would count twice against a box the residents nearly fill); the per-model setting `"nocache_weights": false` in `model-settings.json` turns that off, and `true` turns it on for any other model.
+A model whose routed experts stream from disk (deepseek_v41) plans its slot banks against the box: `--memory-baseline-gb <gb>` gives the non-model baseline in decimal GB (the memory in use before the model loads) and is the only override of the memory model; `--expert-rows <n>` pins the decode slot rows per layer below the admission's own fill. Its resident weights load past the page cache (F_NOCACHE: cached pages would count twice against a box the residents nearly fill); the per-model setting `"nocache_weights": false` in `model-settings.json` turns that off, and `true` turns it on for any other model.
 
 ### Workload-fair hot-cache eviction (#378)
 

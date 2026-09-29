@@ -408,6 +408,8 @@ pub const ModelConfig = struct {
     engram_token_map_path: ?[]const u8 = null,
     /// The non-model box baseline (`--memory-baseline-gb`): the only override of the memory model.
     memory_baseline_bytes: ?u64 = null,
+    /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
+    expert_rows: ?u32 = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
@@ -1837,8 +1839,9 @@ fn yarnMscale(factor: f32) f32 {
 /// therefore the way to A/B a scaling experiment on identical weights.
 var config_overrides: ?[]const u8 = null;
 
-/// `--memory-baseline-gb`, in bytes: stamped on every parsed config.
+/// `--memory-baseline-gb`, in bytes, and `--expert-rows`: stamped on every parsed config.
 pub var memory_baseline_override: ?u64 = null;
+pub var expert_rows_override: ?u32 = null;
 
 pub fn setConfigOverrides(raw: ?[]const u8) void {
     config_overrides = raw;
@@ -1903,6 +1906,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     const root = parsed.value.object;
     var config = ModelConfig{};
     config.memory_baseline_bytes = memory_baseline_override;
+    config.expert_rows = expert_rows_override;
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
