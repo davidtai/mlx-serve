@@ -769,13 +769,18 @@ test "dsv41 cache: grow and bounded lanes read like the concatenated store, trim
     st.offset = 700;
     try testing.expectError(error.BoundedLaneFull, st.canAdmit(9));
     try st.canAdmit(8);
-    // The per-state limit agrees with the per-forward check at every length around it.
-    const lim = st.admitLimit().?;
-    for (690..730) |len| {
-        st.offset = 0;
-        const ok = if (st.canAdmit(@intCast(len))) |_| true else |_| false;
-        try testing.expectEqual(len <= lim, ok);
-    }
+    // The per-state limit agrees with the per-forward check at every length around it,
+    // for every compression ratio the model has (with and without the frontier).
+    for ([_]u8{ 1, 2, 4, 128 }) |ratio| for ([_]u32{ 1, 7, 700, 4096 }) |max_kv| {
+        const lr: v41.LayerInfo = .{ .ratio = ratio, .kv_source = true, .index_source = true, .mode = .full };
+        var s2 = RS.init(lr, 128, .{ .route = .bounded, .max_kv = max_kv });
+        const lim = s2.admitLimit().?;
+        for (lim -| 40..lim + 40) |len| {
+            s2.offset = 0;
+            const ok = if (s2.canAdmit(@intCast(len))) |_| true else |_| false;
+            try testing.expectEqual(len <= lim, ok);
+        }
+    };
     const unbounded = RS.init(li, 128, .{ .route = .full_history });
     try testing.expectEqual(@as(?u32, null), unbounded.admitLimit());
 }
