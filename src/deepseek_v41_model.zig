@@ -1,0 +1,766 @@
+//! The DeepSeek-V4.1 text model over the trunk graphs: residents bound once
+//! (every layer, embedding, final norm, head, Engram), per-sequence state, the
+//! forward over a span (one shot, chunk-major, or K16 layer-major prefill; a
+//! decode token; a DSpark verify block) and its trim / mark / rollback.
+//! Generic over the op backend; the routed experts are the caller's source
+//! (`routed(g, xf, indices) -> [n, k, dim]`, the expert streamer when served).
+//!
+//! DSpark seam (M2): a verify forward runs `[t, d1 .. dK]` with
+//! `.{ .logits = .all, .main_hidden = true }`; the decode loop accepts `a`
+//! drafts and calls `trim(K - a)`; the draft reads `main_hidden`'s committed rows.
+
+const std = @import("std");
+const v41 = @import("deepseek_v41.zig");
+const ops = @import("deepseek_v41_ops.zig");
+const graph = @import("deepseek_v41_graph.zig");
+const kvc = @import("deepseek_v41_cache.zig");
+const eng = @import("deepseek_v41_engram.zig");
+const routes = @import("deepseek_v41_routes.zig");
+
+pub const Want = struct {
+    /// Head rows: none, the last position (a prefill), or every row (decode, verify).
+    logits: enum { none, last, all } = .all,
+    /// DSpark `main_hidden`: the target layers' attention inputs (mean over the
+    /// hc copies), concatenated.
+    main_hidden: bool = false,
+};
+
+pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameTooLong };
+
+/// `_derive_moe_row_cap`: rows one K16 routed call may carry.
+pub fn moeRowCap(c: *const v41.Config, target_bytes: f64) u64 {
+    const per_row: u64 = @as(u64, c.n_experts_per_tok) * c.hidden_size * 4;
+    return @max(1, @as(u64, @intFromFloat(@floor(@max(target_bytes, 1e9) / @as(f64, @floatFromInt(per_row))))));
+}
+
+pub fn Model(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const T = G.T;
+        pub const Tr = graph.Trunk(G);
+        pub const Cache = Tr.Cache;
+
+        gpa: std.mem.Allocator,
+        c: v41.Config,
+        tier: routes.Tier,
+        layers: []graph.LayerW(T),
+        inv_swa: T,
+        inv_yarn: T,
+        embed_w: T,
+        norm_w: T,
+        head: Tr.HeadW,
+        engram: ?EngramBind = null,
+        /// Arrays the model made (inverse frequencies, the quantized head, f32 wo_a).
+        owned: std.ArrayList(T) = .empty,
+
+        const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
+
+        pub const State = struct {
+            offset: u32 = 0,
+            layers: []Cache,
+            hash: ?eng.HashState = null,
+
+            pub fn deinit(self: *State, g: *G, gpa: std.mem.Allocator) void {
+                for (self.layers) |*l| l.deinit(g);
+                gpa.free(self.layers);
+                if (self.hash) |*h| h.deinit(gpa);
+            }
+        };
+
+        pub const Mark = struct { offset: u32, layers: []Cache.Mark };
+
+        pub const Result = struct {
+            /// The final-normed hidden `[1, s, dim]`.
+            hidden: T,
+            logits: ?T = null,
+            main_hidden: ?T = null,
+        };
+
+        /// Bind every resident once. `lookup.get(name) ?T` resolves checkpoint
+        /// (and Engram sidecar) names; `engram_src` is required when the config
+        /// has Engram layers. The model must not move afterwards (compiled
+        /// regions key on `&self.c`).
+        pub fn init(gpa: std.mem.Allocator, g: *G, c: v41.Config, tier: routes.Tier, lookup: anytype, engram_src: ?*const eng.RowSource) !*Self {
+            const self = try gpa.create(Self);
+            self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed_w = undefined, .norm_w = undefined, .head = undefined };
+            errdefer self.deinit(g);
+            const cp = &self.c;
+            self.layers = try gpa.alloc(graph.LayerW(T), cp.n_layers);
+            for (self.layers, 0..) |*lw, l| {
+                lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
+                if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
+            }
+            self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, cp));
+            self.inv_yarn = try self.own(g, try Tr.yarnInvFreq(g, cp));
+            self.embed_w = try req(lookup, "embed.weight");
+            self.norm_w = try req(lookup, "norm.weight");
+            const head_w = try req(lookup, "head.weight");
+            self.head = switch (tier.routes.head) {
+                .f32, .bf16 => .{ .dense = head_w },
+                .mxfp8 => blk: {
+                    const q = try Tr.quantizeHead(g, head_w);
+                    break :blk .{ .mxfp8 = .{ .w = try self.own(g, q.w), .s = try self.own(g, q.s), .mode = .mxfp8 } };
+                },
+            };
+            if (cp.engram.n_layers > 0) {
+                const src = engram_src orelse return error.EngramSourceRequired;
+                var bind: EngramBind = .{ .src = src, .w = undefined };
+                var b: [96]u8 = undefined;
+                for (cp.engram.layer_ids[0..cp.engram.n_layers], 0..) |l, i| {
+                    bind.w[i] = .{
+                        .wkv = .{ .w = try reqf(lookup, &b, "layers.{d}.engram.wkv.weight", .{l}), .s = try reqf(lookup, &b, "layers.{d}.engram.wkv.scales", .{l}), .mode = .mxfp8 },
+                        .q_weight = try reqf(lookup, &b, "layers.{d}.engram.q_weight", .{l}),
+                        .k_weight = try reqf(lookup, &b, "layers.{d}.engram.k_weight", .{l}),
+                    };
+                }
+                self.engram = bind;
+            }
+            try g.evalAll(self.owned.items);
+            return self;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            for (self.owned.items) |x| g.release(x);
+            self.owned.deinit(self.gpa);
+            self.gpa.free(self.layers);
+            self.gpa.destroy(self);
+        }
+
+        fn own(self: *Self, g: *G, x: T) !T {
+            const k = g.keep(x);
+            try self.owned.append(self.gpa, k);
+            return k;
+        }
+
+        fn req(lookup: anytype, name: []const u8) !T {
+            return lookup.get(name) orelse error.MissingWeight;
+        }
+
+        fn reqf(lookup: anytype, buf: []u8, comptime fmt: []const u8, args: anytype) !T {
+            return req(lookup, std.fmt.bufPrint(buf, fmt, args) catch return error.NameTooLong);
+        }
+
+        fn reqQ(lookup: anytype, buf: []u8, comptime base: []const u8, args: anytype) !graph.Q(T) {
+            return .{ .w = try reqf(lookup, buf, base ++ ".weight", args), .s = try reqf(lookup, buf, base ++ ".scales", args), .mode = .mxfp8 };
+        }
+
+        /// One trunk layer's residents by checkpoint name.
+        pub fn bindLayer(lookup: anytype, li: v41.LayerInfo, l: u32) !graph.LayerW(T) {
+            var b: [192]u8 = undefined;
+            var lw: graph.LayerW(T) = .{
+                .attn_norm = try reqf(lookup, &b, "layers.{d}.attn_norm.weight", .{l}),
+                .ffn_norm = try reqf(lookup, &b, "layers.{d}.ffn_norm.weight", .{l}),
+                .hc_attn_fn = try reqf(lookup, &b, "layers.{d}.hc_attn_fn", .{l}),
+                .hc_attn_base = try reqf(lookup, &b, "layers.{d}.hc_attn_base", .{l}),
+                .hc_attn_scale = try reqf(lookup, &b, "layers.{d}.hc_attn_scale", .{l}),
+                .hc_ffn_fn = try reqf(lookup, &b, "layers.{d}.hc_ffn_fn", .{l}),
+                .hc_ffn_base = try reqf(lookup, &b, "layers.{d}.hc_ffn_base", .{l}),
+                .hc_ffn_scale = try reqf(lookup, &b, "layers.{d}.hc_ffn_scale", .{l}),
+                .attn_sink = try reqf(lookup, &b, "layers.{d}.attn.attn_sink", .{l}),
+                .q_norm = try reqf(lookup, &b, "layers.{d}.attn.q_norm.weight", .{l}),
+                .kv_norm = try reqf(lookup, &b, "layers.{d}.attn.kv_norm.weight", .{l}),
+                .wq_a = try reqQ(lookup, &b, "layers.{d}.attn.wq_a", .{l}),
+                .wq_b = try reqQ(lookup, &b, "layers.{d}.attn.wq_b", .{l}),
+                .wkv = try reqQ(lookup, &b, "layers.{d}.attn.wkv", .{l}),
+                .wo_a = try reqQ(lookup, &b, "layers.{d}.attn.wo_a", .{l}),
+                .wo_b = try reqQ(lookup, &b, "layers.{d}.attn.wo_b", .{l}),
+                .gate_w = try reqf(lookup, &b, "layers.{d}.ffn.gate.weight", .{l}),
+                .gate_bias = try reqf(lookup, &b, "layers.{d}.ffn.gate.bias", .{l}),
+                .sh_w1 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w1", .{l}),
+                .sh_w2 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w2", .{l}),
+                .sh_w3 = try reqQ(lookup, &b, "layers.{d}.ffn.shared_experts.w3", .{l}),
+            };
+            if (li.kv_source) {
+                lw.comp = .{
+                    .wkv = try reqf(lookup, &b, "layers.{d}.attn.compressor.wkv.weight", .{l}),
+                    .wgate = if (li.ratio > 1) try reqf(lookup, &b, "layers.{d}.attn.compressor.wgate.weight", .{l}) else null,
+                    .norm = try reqf(lookup, &b, "layers.{d}.attn.compressor.norm.weight", .{l}),
+                };
+                lw.idx_k = .{ .wk = try reqf(lookup, &b, "layers.{d}.attn.indexer.wk.weight", .{l}), .k_norm = try reqf(lookup, &b, "layers.{d}.attn.indexer.k_norm.weight", .{l}) };
+            }
+            if (li.index_source) {
+                lw.idx_q = .{ .wq_b = try reqQ(lookup, &b, "layers.{d}.attn.indexer.wq_b", .{l}), .weights_proj = try reqf(lookup, &b, "layers.{d}.attn.indexer.weights_proj.weight", .{l}) };
+            }
+            return lw;
+        }
+
+        /// A fresh sequence: lanes per the tier's KV route, its own n-gram history.
+        pub fn newState(self: *const Self) !State {
+            const cs = try self.gpa.alloc(Cache, self.c.n_layers);
+            for (cs, 0..) |*lc, l| lc.* = Cache.init(self.c.layers[l], self.c.window, self.tier.kv);
+            return .{ .layers = cs, .hash = if (self.engram != null) .{} else null };
+        }
+
+        fn invFor(self: *const Self, li: v41.LayerInfo) T {
+            return if (li.ratio > 0) self.inv_yarn else self.inv_swa;
+        }
+
+        /// The Engram add of layer slot `slot` for `n` positions (`rows` from the span's hash).
+        fn engramLayer(self: *const Self, g: *G, a: std.mem.Allocator, slot: usize, h: T, rows: []const i64, n: usize) !T {
+            const en = &self.engram.?;
+            const cols = en.src.hashing.cols();
+            const hd: usize = en.src.bank.head_dim;
+            const ids = try a.alloc(i64, n * cols);
+            const codes = try a.alloc(u8, n * cols * hd);
+            const scales = try a.alloc(u8, n * cols * (hd / 32));
+            try en.src.read(slot, rows, n, ids, codes, scales);
+            const nr: c_int = @intCast(n * cols);
+            const ca = try g.hostArray(codes, &.{ nr, @intCast(hd / 4) }, .uint32);
+            const sa = try g.hostArray(scales, &.{ nr, @intCast(hd / 32) }, .uint8);
+            const er = try Tr.engramRows(g, ca, sa, 1, @intCast(n), @intCast(cols));
+            return Tr.engramApply(g, &self.c, en.w[slot], h, er);
+        }
+
+        /// `mean(h.astype(f32), axis=2).astype(h.dtype)`.
+        fn mainOf(g: *G, h: T) !T {
+            return g.astype(try g.mean(try g.astype(h, .float32), 2, false), g.dtypeOf(h));
+        }
+
+        fn embedSpan(self: *const Self, g: *G, a: std.mem.Allocator, ids: []const u32) !Tr.Out {
+            const v = try a.alloc(i32, ids.len);
+            for (v, ids) |*d, s| d.* = @intCast(s);
+            const arr = try g.hostArray(std.mem.sliceAsBytes(v), &.{ 1, @intCast(ids.len) }, .int32);
+            return Tr.expandEmbedding(g, &self.c, try Tr.embed(g, self.embed_w, arr));
+        }
+
+        fn engramRowsFor(self: *const Self, st: *State, a: std.mem.Allocator, ids: []const u32) ![]const i64 {
+            const en = &(self.engram orelse return &.{});
+            const rows = try a.alloc(i64, ids.len * en.src.perToken());
+            try en.src.advance(self.gpa, &st.hash.?, ids, rows);
+            return rows;
+        }
+
+        /// `_forward_span`: every layer over one span; returns the final-normed hidden.
+        fn forwardSpan(self: *const Self, g: *G, a: std.mem.Allocator, st: *State, ids: []const u32, want_main: bool, routed: anytype, probe: anytype, main_out: *?T) !T {
+            const c = &self.c;
+            const rt = &self.tier.routes;
+            const n: u32 = @intCast(ids.len);
+            const positions = try g.arange(@floatFromInt(st.offset), @floatFromInt(st.offset + n), 1, .int32);
+            const e = try self.embedSpan(g, a, ids);
+            const rows = try self.engramRowsFor(st, a, ids);
+            var h = e.h;
+            var pm = e.pre_mix;
+            var shared: Tr.Share = .{};
+            var mains: [8]T = undefined;
+            var n_main: usize = 0;
+            for (self.layers, 0..) |*lw, l| {
+                const li = c.layers[l];
+                if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows, n);
+                if (want_main and li.dspark_target) {
+                    mains[n_main] = try mainOf(g, h);
+                    n_main += 1;
+                }
+                const out = try Tr.layer(g, probe, c, rt, li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
+                h = out.h;
+                pm = out.pre_mix;
+            }
+            for (st.layers) |*lc| lc.advance(n);
+            st.offset += n;
+            main_out.* = if (n_main > 0) try g.concat(mains[0..n_main], -1) else null;
+            return Tr.finalNorm(g, c, h, pm, self.norm_w);
+        }
+
+        /// The arrays a span fence settles: every lane's backing plus `extra`.
+        pub fn fence(g: *G, st: *State, extra: []const T) !void {
+            var list: [512]T = undefined;
+            var k: usize = 0;
+            for (extra) |x| {
+                list[k] = x;
+                k += 1;
+            }
+            for (st.layers) |*lc| {
+                if (try lc.window.view(g)) |x| {
+                    list[k] = x;
+                    k += 1;
+                }
+                if (try lc.compress.view(g)) |x| {
+                    list[k] = x;
+                    k += 1;
+                }
+                if (try lc.index.view(g)) |x| {
+                    list[k] = x;
+                    k += 1;
+                }
+            }
+            try g.evalAll(list[0..k]);
+        }
+
+        /// The target forward over `ids` from the state's offset: one shot, or
+        /// chunked by `_resolve_prefill_chunk` (K16 layer-major when the tier
+        /// asks). The result's arrays live until the backend's next reset.
+        pub fn forward(self: *Self, g: *G, st: *State, ids: []const u32, want: Want, routed: anytype, probe: anytype) !Result {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const n: u32 = @intCast(ids.len);
+            for (st.layers) |*lc| try lc.canAdmit(n);
+            const chunk = kvc.resolvePrefillChunk(&self.c, n, self.tier.prefill_chunk, self.tier.chunk_target_bytes);
+            var hidden: T = undefined;
+            var main: ?T = null;
+            if (chunk <= 0 or chunk >= n) {
+                hidden = try self.forwardSpan(g, a, st, ids, want.main_hidden, routed, probe, &main);
+            } else if (self.tier.layer_major) {
+                const r = try self.forwardLayerMajor(g, a, st, ids, try kvc.prefillSpans(a, n, chunk), want.main_hidden, routed, probe);
+                hidden = r.hidden;
+                main = r.main;
+            } else {
+                // Chunk-major: each span through every layer, settled before the next.
+                const spans = try kvc.prefillSpans(a, n, chunk);
+                const outs = try a.alloc(T, spans.len);
+                const mains = try a.alloc(?T, spans.len);
+                for (spans, outs, mains) |sp, *o, *m| {
+                    var mh: ?T = null;
+                    const h = try self.forwardSpan(g, a, st, ids[sp[0]..sp[1]], want.main_hidden, routed, probe, &mh);
+                    try fence(g, st, if (mh) |x| &.{ h, x } else &.{h});
+                    o.* = g.keep(h);
+                    m.* = if (mh) |x| g.keep(x) else null;
+                    g.reset();
+                }
+                hidden = try g.concat(outs, 1);
+                if (want.main_hidden) {
+                    const ms = try a.alloc(T, spans.len);
+                    for (mains, ms) |m, *x| x.* = m.?;
+                    main = try g.concat(ms, 1);
+                }
+                for (outs) |x| g.release(x);
+                for (mains) |m| if (m) |x| g.release(x);
+            }
+            var res: Result = .{ .hidden = hidden, .main_hidden = main };
+            switch (want.logits) {
+                .none => {},
+                .all => res.logits = try Tr.head(g, &self.tier.routes, hidden, self.head),
+                .last => {
+                    const s = g.shapeOf(hidden);
+                    const last = try g.slice(hidden, &.{ 0, s.d[1] - 1, 0 }, s.slice(), &.{ 1, 1, 1 });
+                    res.logits = try Tr.head(g, &self.tier.routes, last, self.head);
+                },
+            }
+            return res;
+        }
+
+        /// Greedy AR (the M3 token-parity run): the prompt in forwards of at
+        /// most `chunk` rows, then one token per forward; `out[0]` is the
+        /// prompt's pick. `ex` is the routed-experts executor (`at`, `flush`),
+        /// flushed after each forward's eval; `observer` (or `{}`) gets each
+        /// evaluated logits row (`step(g, logits)`).
+        pub fn greedy(self: *Self, g: *G, st: *State, prompt: []const u32, chunk: u32, ex: anytype, out: []u32, observer: anytype) !void {
+            std.debug.assert(prompt.len > 0 and chunk > 0 and out.len > 0);
+            var i: usize = 0;
+            var next: u32 = 0;
+            while (i < prompt.len) {
+                const end = @min(i + chunk, prompt.len);
+                const last = end == prompt.len;
+                const r = try self.forward(g, st, prompt[i..end], .{ .logits = if (last) .last else .none }, ex, graph.NoProbe{});
+                try fence(g, st, &.{if (last) r.logits.? else r.hidden});
+                try ex.flush();
+                if (last) {
+                    if (@TypeOf(observer) != void) try observer.step(g, r.logits.?);
+                    next = try g.hostArgmax(r.logits.?);
+                }
+                g.reset();
+                i = end;
+            }
+            for (out, 0..) |*o, t| {
+                o.* = next;
+                if (t + 1 == out.len) break;
+                const r = try self.forward(g, st, &.{next}, .{ .logits = .last }, ex, graph.NoProbe{});
+                try fence(g, st, &.{r.logits.?});
+                try ex.flush();
+                if (@TypeOf(observer) != void) try observer.step(g, r.logits.?);
+                next = try g.hostArgmax(r.logits.?);
+                g.reset();
+            }
+        }
+
+        /// K16 `_forward_layer_major`: every layer over all chunks before the next;
+        /// the gate and shared expert per chunk, the routed call batched across
+        /// chunks (row-capped), the ffn combine the compiled `_PREFILL_HC_POST`.
+        fn forwardLayerMajor(self: *const Self, g: *G, a: std.mem.Allocator, st: *State, ids: []const u32, spans: []const [2]u32, want_main: bool, routed: anytype, probe: anytype) !struct { hidden: T, main: ?T } {
+            const c = &self.c;
+            const rt = &self.tier.routes;
+            const nc = spans.len;
+            const offset0 = st.offset;
+            const hs = try a.alloc(T, nc);
+            const pms = try a.alloc(T, nc);
+            const poss = try a.alloc(T, nc);
+            const rows = try a.alloc([]const i64, nc);
+            const shareds = try a.alloc(Tr.Share, nc);
+            const mains = try a.alloc([8]T, nc);
+            var n_main: usize = 0;
+            for (spans, 0..) |sp, i| {
+                const e = try self.embedSpan(g, a, ids[sp[0]..sp[1]]);
+                hs[i] = g.keep(e.h);
+                pms[i] = g.keep(e.pre_mix);
+                poss[i] = g.keep(try g.arange(@floatFromInt(offset0 + sp[0]), @floatFromInt(offset0 + sp[1]), 1, .int32));
+                rows[i] = try self.engramRowsFor(st, a, ids[sp[0]..sp[1]]);
+                shareds[i] = .{};
+            }
+            const cap = moeRowCap(c, self.tier.chunk_target_bytes);
+            const halves = try a.alloc(Tr.Half, nc);
+            const xfs = try a.alloc(T, nc);
+            const routes_ = try a.alloc(Tr.Route, nc);
+            const dim: c_int = @intCast(c.hidden_size);
+            for (self.layers, 0..) |*lw, l| {
+                const li = c.layers[l];
+                const lc = &st.layers[l];
+                for (spans, 0..) |sp, i| {
+                    var h = hs[i];
+                    if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                    if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
+                    halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
+                    try fence(g, st, &.{ halves[i].moe_in, halves[i].ffn_pre });
+                }
+                if (want_main and li.dspark_target) n_main += 1;
+                // Per chunk: the resident gate (M == the chunk, as chunk-major).
+                for (halves, xfs, routes_) |hf, *xf, *r| {
+                    xf.* = try g.reshape(hf.moe_in, &.{ -1, dim });
+                    r.* = try Tr.router(g, probe, c, rt, lw, xf.*);
+                }
+                // The routed call over consecutive chunks up to the row cap.
+                var i: usize = 0;
+                while (i < nc) {
+                    var j = i;
+                    var n_rows: u64 = 0;
+                    while (j < nc) : (j += 1) {
+                        const r_: u64 = @intCast(g.shapeOf(xfs[j]).dim(0));
+                        if (j > i and n_rows + r_ > cap) break;
+                        n_rows += r_;
+                    }
+                    const cat_xf = if (j - i == 1) xfs[i] else try g.concat(xfs[i..j], 0);
+                    const idxs = try a.alloc(T, j - i);
+                    for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
+                    const cat_idx = if (j - i == 1) routes_[i].indices else try g.concat(idxs, 0);
+                    const ro = try routed.at(@intCast(l)).routed(g, cat_xf, cat_idx);
+                    var pos: c_int = 0;
+                    for (i..j) |k| {
+                        const nk = g.shapeOf(xfs[k]).dim(0);
+                        const rs = g.shapeOf(ro);
+                        const part = if (j - i == 1) ro else try g.slice(ro, &.{ pos, 0, 0 }, &.{ pos + nk, rs.d[1], rs.d[2] }, &.{ 1, 1, 1 });
+                        pos += nk;
+                        const y = try Tr.combineRouted(g, probe, c, rt, lw, part, routes_[k].weights, xfs[k]);
+                        const sh = g.shapeOf(halves[k].moe_in);
+                        const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
+                        const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
+                        g.release(hs[k]);
+                        hs[k] = g.keep(next);
+                        g.release(pms[k]);
+                        pms[k] = g.keep(halves[k].ffn_pre);
+                    }
+                    i = j;
+                }
+                try g.evalAll(hs);
+                g.reset();
+            }
+            for (st.layers) |*lc| lc.advance(@intCast(ids.len));
+            st.offset += @intCast(ids.len);
+            const outs = try a.alloc(T, nc);
+            for (outs, 0..) |*o, i| o.* = try Tr.finalNorm(g, c, hs[i], pms[i], self.norm_w);
+            const hidden = try g.concat(outs, 1);
+            var main: ?T = null;
+            if (n_main > 0) {
+                const parts = try a.alloc(T, nc);
+                for (parts, 0..) |*p, i| p.* = try g.concat(mains[i][0..n_main], -1);
+                main = try g.concat(parts, 1);
+            }
+            for (0..nc) |i| {
+                g.release(hs[i]);
+                g.release(pms[i]);
+                g.release(poss[i]);
+                for (mains[i][0..n_main]) |x| g.release(x);
+            }
+            return .{ .hidden = hidden, .main = main };
+        }
+
+        /// Drop the last `n` tokens from every lane and the n-gram history, all or
+        /// nothing (a ring that cannot recover that far refuses before any change).
+        pub fn trim(self: *const Self, g: *G, st: *State, n: u32) !void {
+            _ = self;
+            if (n == 0) return;
+            for (st.layers) |*lc| if (!lc.canTrim(n)) return error.TrimTooDeep;
+            for (st.layers) |*lc| _ = try lc.trim(g, n);
+            if (st.hash) |*h| h.trim(n);
+            st.offset -= n;
+        }
+
+        pub fn mark(self: *const Self, a: std.mem.Allocator, st: *const State) !Mark {
+            _ = self;
+            const ms = try a.alloc(Cache.Mark, st.layers.len);
+            for (ms, st.layers) |*m, *lc| m.* = lc.mark();
+            return .{ .offset = st.offset, .layers = ms };
+        }
+
+        pub fn rollback(self: *const Self, g: *G, st: *State, m: Mark) !void {
+            _ = self;
+            if (m.offset > st.offset) return error.TrimTooDeep;
+            for (st.layers) |*lc| if (m.offset != lc.offset and !lc.canTrim(lc.offset - m.offset)) return error.TrimTooDeep;
+            for (st.layers, m.layers) |*lc, lm| try lc.rollback(g, lm);
+            if (st.hash) |*h| h.trim(st.offset - m.offset);
+            st.offset = m.offset;
+        }
+    };
+}
+
+// ── tests: the whole mini model through the trace backend ──
+
+const testing = std.testing;
+const TraceOps = ops.TraceOps;
+const TM = Model(TraceOps);
+
+/// Resident names -> trace inputs of the spec's dtype and shape.
+const SpecLookup = struct {
+    g: *TraceOps,
+    spec: []const v41.Param,
+
+    fn find(self: *const SpecLookup, name: []const u8) ?struct { p: v41.Param, scales: bool } {
+        for (self.spec) |p| switch (p.kind) {
+            .dense => if (std.mem.eql(u8, p.name, name)) return .{ .p = p, .scales = false },
+            .quant => {
+                if (std.mem.startsWith(u8, name, p.name) and name.len > p.name.len and name[p.name.len] == '.') {
+                    const rest = name[p.name.len + 1 ..];
+                    if (std.mem.eql(u8, rest, "weight")) return .{ .p = p, .scales = false };
+                    if (std.mem.eql(u8, rest, "scales")) return .{ .p = p, .scales = true };
+                }
+            },
+        };
+        return null;
+    }
+
+    pub fn get(self: *const SpecLookup, name: []const u8) ?u32 {
+        const f = self.find(name) orelse return null;
+        return switch (f.p.kind) {
+            .dense => |d| blk: {
+                var sh: [2]c_int = undefined;
+                for (0..d.rank) |i| sh[i] = @intCast(d.shape[i]);
+                break :blk self.g.input(sh[0..d.rank], stToDtype(d.dtype)) catch null;
+            },
+            .quant => |q| if (f.scales)
+                self.g.input(&.{ @intCast(q.out), @intCast(q.in / 32) }, .uint8) catch null
+            else
+                self.g.input(&.{ @intCast(q.out), @intCast(q.in * v41.quantBits(q.mode) / 32) }, .uint32) catch null,
+        };
+    }
+};
+
+fn stToDtype(d: v41.StDtype) ops.Dtype {
+    return switch (d) {
+        .BF16 => .bfloat16,
+        .F32 => .float32,
+        .U8 => .uint8,
+        .U32 => .uint32,
+        else => .float16,
+    };
+}
+
+/// The routed stand-in's shape: unweighted `[n, k, dim]` f32.
+const TraceRouted = struct {
+    pub fn at(self: TraceRouted, _: u32) TraceRouted {
+        return self;
+    }
+
+    pub fn routed(_: TraceRouted, g: *TraceOps, xf: u32, indices: u32) !u32 {
+        return g.input(&.{ g.shapeOf(xf).dim(0), g.shapeOf(indices).dim(1), g.shapeOf(xf).dim(1) }, .float32);
+    }
+};
+
+const Mini = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp: std.testing.TmpDir,
+    c: v41.Config,
+    src: eng.RowSource,
+    spec: []v41.Param,
+
+    fn init() !*Mini {
+        const m = try testing.allocator.create(Mini);
+        errdefer testing.allocator.destroy(m);
+        m.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        const a = m.arena.allocator();
+        m.tmp = std.testing.tmpDir(.{});
+        var rbuf: [512]u8 = undefined;
+        const root = try a.dupe(u8, rbuf[0..try m.tmp.dir.realPath(testing.io, &rbuf)]);
+        const map_path = try eng.writeMiniBank(a, &m.tmp, root, .{});
+        const json = try v41.testConfigJson(testing.allocator, .mini);
+        defer testing.allocator.free(json);
+        m.c = try v41.Config.parse(testing.allocator, json, null);
+        m.src = try eng.RowSource.open(testing.allocator, testing.io, root, map_path, &m.c, null);
+        const spec = try v41.residentSpec(a, &m.c);
+        const espec = try v41.engramSpec(a, &m.c);
+        m.spec = try std.mem.concat(a, v41.Param, &.{ spec, espec });
+        return m;
+    }
+
+    fn deinit(m: *Mini) void {
+        m.src.deinit();
+        m.tmp.cleanup();
+        m.arena.deinit();
+        testing.allocator.destroy(m);
+    }
+};
+
+test "dsv41 model: the mini model binds every resident and runs prefill, decode and a verify block" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_WINDOW_RING", "1" }, .{ "MTPLX_DSV41_SELECTED_KEYS", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    tier.routes.head = .mxfp8;
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    // Prefill 20 tokens in chunks of 8 (3 spans); only the last row gets logits.
+    const pre = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+    try testing.expect(g.shapeOf(pre.hidden).eql(ops.Shape.of(&.{ 1, 20, 64 })));
+    try testing.expect(g.shapeOf(pre.logits.?).eql(ops.Shape.of(&.{ 1, 1, 64 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(pre.logits.?));
+    // One DSpark target layer (4) of width 64.
+    try testing.expect(g.shapeOf(pre.main_hidden.?).eql(ops.Shape.of(&.{ 1, 20, 64 })));
+    try testing.expectEqual(@as(u32, 20), st.offset);
+    try testing.expectEqual(@as(u32, 20), st.layers[3].compress.rows()); // ratio 1: one row per token
+    try testing.expectEqual(@as(u32, 10), st.layers[1].compress.rows()); // ratio 2
+    try testing.expectEqual(@as(usize, 20), st.hash.?.hist.items.len);
+    // A verify block of K + 1 = 6 rows: every row's logits, then accept 2 of 5 drafts.
+    const ver = try model_.forward(&g, &st, ids[0..6], .{ .logits = .all, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+    try testing.expect(g.shapeOf(ver.logits.?).eql(ops.Shape.of(&.{ 1, 6, 64 })));
+    try model_.trim(&g, &st, 5 - 2);
+    try testing.expectEqual(@as(u32, 23), st.offset);
+    for (st.layers) |lc| try testing.expectEqual(@as(u32, 23), lc.offset);
+    try testing.expectEqual(@as(u32, 11), st.layers[1].compress.rows());
+    try testing.expectEqual(@as(usize, 23), st.hash.?.hist.items.len);
+    try testing.expectEqual(@as(u32, 11), st.layers[1].nFed() / 2);
+    // Mark, decode two tokens, roll back: every lane and the history return.
+    const mk = try model_.mark(testing.allocator, &st);
+    defer testing.allocator.free(mk.layers);
+    _ = try model_.forward(&g, &st, ids[0..1], .{}, TraceRouted{}, graph.NoProbe{});
+    _ = try model_.forward(&g, &st, ids[1..2], .{}, TraceRouted{}, graph.NoProbe{});
+    try model_.rollback(&g, &st, mk);
+    try testing.expectEqual(@as(u32, 23), st.offset);
+    try testing.expectEqual(@as(u32, 23), st.layers[3].compress.rows());
+    try testing.expectEqual(@as(usize, 23), st.hash.?.hist.items.len);
+}
+
+test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one compiled combine per chunk" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    const mark = g.nodes.items.len;
+    const r = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+    try testing.expect(g.shapeOf(r.hidden).eql(ops.Shape.of(&.{ 1, 20, 64 })));
+    try testing.expect(g.shapeOf(r.main_hidden.?).eql(ops.Shape.of(&.{ 1, 20, 64 })));
+    const seq = try g.opsSince(testing.allocator, mark);
+    defer testing.allocator.free(seq);
+    // 5 layers x 3 chunks of `_PREFILL_HC_POST`; nothing else compiled at 8-row chunks.
+    try testing.expectEqual(@as(usize, 5 * 3), std.mem.count(ops.Op, seq, &.{.tape_begin}));
+    try testing.expectEqual(@as(u32, 20), st.offset);
+    try testing.expectEqual(@as(u32, 10), st.layers[1].compress.rows());
+    // The engram needs its row source; a model without it refuses at construction.
+    try testing.expectError(error.EngramSourceRequired, TM.init(testing.allocator, &g, m.c, tier, &lookup, null));
+}
+
+test "dsv41 model: the AR dry path routes every layer call of every forward through the expert source" {
+    const xp = @import("deepseek_v41_experts.zig");
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{}, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    // The harness's source: no prefill rows, grown before the first forward
+    // (every call a decode route), all four experts resident after growth.
+    const nl = m.c.n_layers;
+    var rows0: [8]u32 = @splat(0);
+    var rows1: [8]u32 = @splat(4);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
+    defer src.deinit();
+    const Ex = xp.Experts(TraceOps, xp.FakeSource, xp.TraceMath);
+    var ex = try Ex.init(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c);
+    defer ex.deinit();
+    try ex.grow(&g, rows1[0..nl]);
+    const Host = struct {
+        rng: std.Random.DefaultPrng,
+        n: u16,
+        picks: u32 = 0,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out) |*o| o.* = h.rng.random().uintLessThan(u16, h.n);
+        }
+        fn argmax(ctx: *anyopaque) anyerror!u32 {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.picks += 1;
+            return (h.picks * 5 + 1) % 64;
+        }
+    };
+    var host: Host = .{ .rng = std.Random.DefaultPrng.init(20260928), .n = @intCast(m.c.n_routed_experts) };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    var out: [4]u32 = undefined;
+    // 20 prompt tokens in forwards of 8, 8, 4 rows; then 3 one-token forwards.
+    try model_.greedy(&g, &st, &prompt, 8, &ex, &out, {});
+    try testing.expectEqualSlices(u32, &.{ 6, 11, 16, 21 }, &out);
+    try testing.expectEqual(@as(u32, 23), st.offset);
+    const forwards = 3 + 3;
+    try testing.expectEqual(@as(u64, forwards * nl), src.stats().route_calls);
+    try testing.expectEqual(@as(usize, 0), src.liveCalls());
+    // Per forward: every layer routes and releases its call once, in layer order.
+    var n_route: usize = 0;
+    var n_release: usize = 0;
+    var layer_next: u32 = 0;
+    for (src.log.items) |e| switch (e.kind) {
+        .route => {
+            try testing.expectEqual(layer_next, e.layer);
+            layer_next = (layer_next + 1) % nl;
+            n_route += 1;
+        },
+        .release => n_release += 1,
+        .wait_gu, .wait_down => try testing.expectEqual((layer_next + nl - 1) % nl, e.layer),
+        .flush, .grow => {},
+    };
+    try testing.expectEqual(n_route, n_release);
+    try testing.expectEqual(@as(u32, 4), host.picks);
+    // A prompt forward wider than the decode lane (top-2 x 25 rows > 48 ids) is refused by route.
+    try testing.expectError(error.PrefillLaneNotPorted, model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {}));
+}
+
+test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    // 8e9 // (6 x 5120 x 4): the whole 16,384-token prompt is one routed call.
+    try testing.expectEqual(@as(u64, 65104), moeRowCap(&c, kvc.default_chunk_target_bytes));
+}
+
+/// The model over MLX with the checkpoint's weights map and the routed
+/// stand-in: referenced (never called) by the test below so the MLX
+/// instantiation is analysed on the host.
+fn mlxSmoke(gpa: std.mem.Allocator, g: *ops.MlxOps, c: v41.Config, tier: routes.Tier, w: *const @import("model.zig").Weights, src: ?*const eng.RowSource, routed: graph.StandIn(ops.MlxOps)) !void {
+    const M = Model(ops.MlxOps);
+    const m = try M.init(gpa, g, c, tier, w, src);
+    defer m.deinit(g);
+    var st = try m.newState();
+    defer st.deinit(g, gpa);
+    _ = try m.forward(g, &st, &.{ 1, 2, 3 }, .{ .logits = .last, .main_hidden = true }, routed, graph.NoProbe{});
+    try m.trim(g, &st, 1);
+    const mk = try m.mark(gpa, &st);
+    defer gpa.free(mk.layers);
+    try m.rollback(g, &st, mk);
+}
+
+test "dsv41 model: the MLX instantiation of the model analyses (host, nothing runs)" {
+    try testing.expect(@TypeOf(&mlxSmoke) != void);
+}

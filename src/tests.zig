@@ -41,6 +41,17 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    _ = @import("deepseek_v41.zig");
+    _ = @import("deepseek_v41_ops.zig");
+    _ = @import("deepseek_v41_graph.zig");
+    _ = @import("deepseek_v41_engram.zig");
+    _ = @import("deepseek_v41_cache.zig");
+    _ = @import("deepseek_v41_routes.zig");
+    _ = @import("deepseek_v41_model.zig");
+    _ = @import("deepseek_v41_dspark.zig");
+    _ = @import("deepseek_v41_parity.zig");
+    _ = @import("deepseek_v41_experts.zig");
+    _ = @import("deepseek_v41_ar.zig");
     _ = @import("expert_bank.zig");
     _ = @import("expert_io.zig");
     _ = @import("expert_lookahead.zig");

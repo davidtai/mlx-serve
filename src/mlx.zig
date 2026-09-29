@@ -209,6 +209,7 @@ pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: ml
 pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
 pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_einsum(res: *mlx_array, subscripts: [*:0]const u8, operands: mlx_vector_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -265,6 +266,7 @@ pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: us
 
 pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update_dynamic(res: *mlx_array, src: mlx_array, update: mlx_array, start: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
