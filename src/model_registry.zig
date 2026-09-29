@@ -32,6 +32,7 @@ const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
+const dsv41_serve = @import("deepseek_v41_serve.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
 
@@ -234,6 +235,9 @@ pub const LoadedModel = struct {
     /// on first prefill, driven by one slot at a time (`session_busy`), freed
     /// with the engine.
     ds4_session: ?*arch_ds4.Ds4Session = null,
+    /// The native deepseek_v41 arm's request engine (module-owned state: slot
+    /// banks, stream, decode loop); one request at a time (`session_busy`).
+    dsv41_engine: ?dsv41_serve.Engine = null,
 
     /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
     /// when non-null the MLX fields stay null and request handlers route through
@@ -385,6 +389,10 @@ pub const LoadedModel = struct {
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.dsv41_engine) |engine| {
+            engine.deinit();
+            self.dsv41_engine = null;
         }
         if (self.llama_engine) |engine| {
             engine.close();
@@ -555,6 +563,10 @@ pub const LoadedModel = struct {
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.dsv41_engine) |engine| {
+            engine.deinit();
+            self.dsv41_engine = null;
         }
         if (self.llama_engine) |engine| {
             engine.close();
