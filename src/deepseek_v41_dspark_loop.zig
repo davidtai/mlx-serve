@@ -935,7 +935,10 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
                 // Halves (their survivors, invisible to the trace) by construction.
                 const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
                 const halves: u64 = 16384 * (@as(u64, c.hc_mult) * c.hidden_size * 4 + c.hidden_size * 4 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
-                std.debug.print("dsv41 held: served-k16 tier, 16K one forward: nested peak {d} B + kept halves {d} B = {d} B (built {d} B)\n", .{ nst.peak, halves, nst.peak + halves, nst.all });
+                const billed = v41.PrefillBill.of(&c).layerMajorWaveBytes(16384, .served);
+                std.debug.print("dsv41 held: served-k16 tier, 16K one forward: nested peak {d} B + kept halves {d} B = {d} B (built {d} B); billed layer-major wave {d} B\n", .{ nst.peak, halves, nst.peak + halves, nst.all, billed });
+                // The bill covers the trace, within a margin that keeps the rows it costs honest.
+                try testing.expect(nst.peak + halves <= billed and billed <= nst.peak + halves + (nst.peak + halves) / 2);
             }
             const h = if (t.tier.layer_major) Held{ .reset = 0, .outside = 0, .layer = 0, .wave = 0, .widest_at = 0 } else Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
             if (i == 0 or h.outside + h.layer > worst.outside + worst.layer) {
