@@ -428,6 +428,8 @@ pub const ModelConfig = struct {
     /// A streamed-expert model's wide prefill read schedule (`expert_wide_feed` / `expert_wide_depth`; null = off / 1).
     expert_wide_feed: ?bool = null,
     expert_wide_depth: ?u8 = null,
+    /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
+    expert_wide_cold_rows: ?u8 = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

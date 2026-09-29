@@ -146,7 +146,7 @@ pub const Module = struct {
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
         tier.layer_major = layer_major;
-        log.info("numeric tier: {t}; prefill layer-major {}, wide feed {}, wide depth {d}", .{ config.numeric_tier orelse .served, tier.layer_major, config.expert_wide_feed orelse false, config.expert_wide_depth orelse 1 });
+        log.info("numeric tier: {t}; prefill layer-major {}, wide feed {}, wide depth {d}, cold rows {d}", .{ config.numeric_tier orelse .served, tier.layer_major, config.expert_wide_feed orelse false, config.expert_wide_depth orelse 1, config.expert_wide_cold_rows orelse 0 });
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         const subset = switch (self.arm) {
@@ -318,7 +318,7 @@ pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockT
 
 /// The wide prefill calls' read schedule from the model settings (off by default).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .feed = config.expert_wide_feed orelse false, .depth = config.expert_wide_depth orelse 1 };
+    return .{ .feed = config.expert_wide_feed orelse false, .depth = config.expert_wide_depth orelse 1, .cold_rows = config.expert_wide_cold_rows orelse 0 };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -454,6 +454,7 @@ test "dsv41 module: the prefill routes are off by default; layer-major is refuse
     c.numeric_tier = null;
     c.expert_wide_feed = null;
     c.expert_wide_depth = null;
+    c.expert_wide_cold_rows = null;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));
     c.layer_major_prefill = true;
@@ -463,7 +464,8 @@ test "dsv41 module: the prefill routes are off by default; layer-major is refuse
     if (layer_major_billed) try std.testing.expect(try layerMajor(&c)) else try std.testing.expectError(error.LayerMajorNotBilled, layerMajor(&c));
     c.expert_wide_feed = true;
     c.expert_wide_depth = 2;
-    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2 }, wideRoute(&c));
+    c.expert_wide_cold_rows = 2;
+    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2, .cold_rows = 2 }, wideRoute(&c));
 }
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {

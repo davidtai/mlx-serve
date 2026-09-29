@@ -2711,6 +2711,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     if (o.layer_major_prefill) |n| config.layer_major_prefill = n;
     if (o.expert_wide_feed) |n| config.expert_wide_feed = n;
     if (o.expert_wide_depth) |n| config.expert_wide_depth = n;
+    if (o.expert_wide_cold_rows) |n| config.expert_wide_cold_rows = n;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
