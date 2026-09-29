@@ -157,6 +157,9 @@ fn printUsage(io: std.Io) void {
         \\                        mlx-serve's memory model, for streamed-expert models.
         \\  --expert-rows <n>     Decode slot rows per layer for a streamed-expert model
         \\                        (default: as many as its memory admission fits).
+        \\  --memory-ceiling-gb <gb>  The memory a streamed-expert model's admission fits
+        \\                        under, decimal GB (default: the GPU's working set, the
+        \\                        wired limit); the admitted peak lands 2 GB below it.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -895,6 +898,14 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             model_mod.memory_baseline_override = @intFromFloat(@round(gb * 1e9));
+        } else if (std.mem.eql(u8, args[i], "--memory-ceiling-gb") and i + 1 < args.len) {
+            i += 1;
+            const gb = std.fmt.parseFloat(f64, args[i]) catch -1;
+            if (!(gb > 4 and gb < 1024)) {
+                log.err("--memory-ceiling-gb: expected decimal GB above 4, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            model_mod.memory_ceiling_override = @intFromFloat(@round(gb * 1e9));
         } else if (std.mem.eql(u8, args[i], "--expert-rows") and i + 1 < args.len) {
             i += 1;
             model_mod.expert_rows_override = std.fmt.parseInt(u32, args[i], 10) catch {

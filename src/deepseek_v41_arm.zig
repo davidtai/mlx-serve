@@ -74,6 +74,8 @@ pub const Options = struct {
     host_reserve_bytes: u64 = pass2_host_reserve_bytes,
     prefill_charge_bytes: u64 = pass2_prefill_charge_bytes,
     peak_fill: ?expert_admission.PeakFill = .{},
+    /// The box the admission fits (null: the envelope's own).
+    ceiling: ?expert_admission.Ceiling = null,
     rowsx: ?expert_admission.Rowsx = null,
     slot_memory: expert_stream.SlotMemory,
     lookahead: ?expert_stream.Lookahead = null,
@@ -137,6 +139,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         .host_reserve_bytes = opt.host_reserve_bytes,
         .prefill_charge_bytes = opt.prefill_charge_bytes,
         .peak_fill = opt.peak_fill,
+        .ceiling = opt.ceiling,
         .rowsx = opt.rowsx,
         .draft_pruned_bytes = draft_pruned,
     };
@@ -413,7 +416,7 @@ pub const AdmissionRecord = struct {
             .tcq3_embedding_rows = in.embedding_rows,
             .tcq3_tail_rows = in.tail_rows,
             .tcq3_peak_fill = if (plan.peak_fill) |pf| .{
-                .target_physical_bytes = in.peak_fill.?.target_bytes,
+                .target_physical_bytes = pf.target_bytes,
                 .total_phase_credit_bytes = pf.total_credit_bytes,
                 .modeled_peak_physical_bytes = pf.modeled_peak_bytes,
                 .control = summary(pf.control),

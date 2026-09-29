@@ -118,15 +118,17 @@ pub const Module = struct {
             return e;
         };
         try self.acceptKernels(gpa, &c0, s, &diag);
+        // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
+        const ceiling = boxCeiling(config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet(), c0.n_routed_experts);
         errdefer self.dropKernels();
         _ = mlx.mlx_clear_cache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, envelope.prefill_cache_bytes);
         errdefer setCacheLimit(self.prev_cache_limit);
         self.arm = if (config.expert_event_gates orelse false)
-            .{ .event_gates = try self.buildArm(AGated, io, config, weights, s, try expert_event.createMetal(), &diag) }
+            .{ .event_gates = try self.buildArm(AGated, io, config, weights, s, ceiling, try expert_event.createMetal(), &diag) }
         else
-            .{ .host_waits = try self.buildArm(A, io, config, weights, s, null, &diag) };
+            .{ .host_waits = try self.buildArm(A, io, config, weights, s, ceiling, null, &diag) };
         errdefer self.dropArm();
         var vd: v41.Diag = .{};
         errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
@@ -160,7 +162,7 @@ pub const Module = struct {
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
-    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const model_io.ModelConfig, weights: *const model_io.Weights, s: mlx.mlx_stream, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
+    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const model_io.ModelConfig, weights: *const model_io.Weights, s: mlx.mlx_stream, ceiling: expert_admission.Ceiling, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
@@ -172,6 +174,7 @@ pub const Module = struct {
             .slot_memory = .{ .mlx = s },
             .draft_pruned_bytes = 0,
             .lookahead = lookahead,
+            .ceiling = ceiling,
             .event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null,
         }, .{ .gates = gates, .event = event }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
@@ -297,6 +300,15 @@ pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
     };
 }
 
+/// The admitted modeled peak lands this far under the box's ceiling.
+pub const ceiling_stop_bytes: u64 = 2_000_000_000;
+
+/// The box a streamed-expert admission fits under a memory ceiling (the GPU's working set by default):
+/// the peak `ceiling_stop_bytes` under it, every layer up to its expert count.
+pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
+    return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
+}
+
 /// The phase change runs before the first decode-width forward of a prompt, once.
 pub fn phaseChangeDue(rows: usize, grown: bool) bool {
     return rows == 1 and !grown;
@@ -392,7 +404,8 @@ test "dsv41 module: the module's construction and forwards analyse (host, nothin
 }
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
-// [DSV41_MODULE_ROWS=<--expert-rows>] [DSV41_MODULE_HEAD=ceiling: the record's pruned draft head]: the module's
+// [DSV41_MODULE_ROWS=<--expert-rows>] [DSV41_MODULE_HEAD=ceiling: the record's pruned draft head]
+// [DSV41_MODULE_CEILING_GB=<--memory-ceiling-gb>: the box at that ceiling; unset: the envelope's own]: the module's
 // expert-source plan on the real bank at a box baseline (CPU: config, bank, admission; no slot memory).
 test "dsv41 module: the served plan on the real bank at a box baseline" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
@@ -412,6 +425,7 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         .slot_memory = .host,
         .draft_pruned_bytes = if (std.c.getenv("DSV41_MODULE_HEAD") != null) null else 0,
         .lookahead = lookahead,
+        .ceiling = if (std.c.getenv("DSV41_MODULE_CEILING_GB") != null) boxCeiling(try gb("DSV41_MODULE_CEILING_GB", 0), 384) else null,
     }, &diag) catch |e| {
         std.debug.print("refused: {s}\n", .{diag.message()});
         return e;
@@ -422,7 +436,10 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
     std.debug.print("\nDSV41_MODULE_PLAN {{\"prefill_rows\": {d}, \"decode_rows\": {d}, \"slot_bank_prefill_bytes\": {d}, \"slot_bank_decode_bytes\": {d}, \"active_bound_bytes\": {d}, \"physical_bound_bytes\": {d}, \"host_reserve_bytes\": {d}, \"baseline_bytes\": {d}}}\n", .{
         p.prefill_rows, p.decode_rows, (40 * @as(u64, p.prefill_rows) + 48) * rec, (40 * @as(u64, p.decode_rows) + 48) * rec, ad.active_bound_bytes, ad.physical_bound_bytes, ad.host_reserve_bytes, p.inputs.baseline_bytes,
     });
-    try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= 110_000_000_000);
+    const box: u64 = if (p.inputs.ceiling) |cl| cl.box_bytes else expert_admission.box_ceiling_bytes;
+    const modeled = if (p.plan.peak_fill) |pf| pf.modeled_peak_bytes else ad.physical_bound_bytes;
+    std.debug.print("DSV41_MODULE_BOX {{\"box_bytes\": {d}, \"modeled_peak_bytes\": {d}}}\n", .{ box, modeled });
+    try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= box);
 }
 
 /// The bytes one traced forward `[from, to)` holds, as MlxOps frees its waves (the model lane's bank accounting):

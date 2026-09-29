@@ -87,9 +87,26 @@ pub const Allocation = enum { uniform, prefill_excess };
 /// Aligned I/O staging of the read pool: 36 MiB for gate/up-first reads, else 32 MiB.
 pub const IoLayout = enum { segments, record, gate_up };
 
+/// The box an admission fits: the physical ceiling of the process's box, the GPU's wired ceiling, the
+/// modeled-peak target's upper end and the rows a layer may hold. Null in `Inputs`: the envelope's own box (the
+/// 110 GB / 100 GiB calibration, fills to 109.5 GB, 160 rows).
+pub const Ceiling = struct {
+    box_bytes: u64,
+    wired_bytes: u64,
+    max_target_bytes: u64,
+    max_rows: u32,
+
+    /// A box whose ceiling is the GPU's working set (the wired limit): the admitted modeled peak lands within
+    /// `stop_bytes` of it; the fill's window ends 0.5 GB under the box, as the envelope's does.
+    pub fn ofWorkingSet(working_set_bytes: u64, stop_bytes: u64, max_rows: u32) Ceiling {
+        const target = working_set_bytes - stop_bytes;
+        return .{ .box_bytes = target + (box_ceiling_bytes - max_target_bytes), .wired_bytes = working_set_bytes, .max_target_bytes = target, .max_rows = max_rows };
+    }
+};
+
 pub const PeakFill = struct {
-    /// Decimal-GB modeled-peak target, in [box - 1 GiB, max_target_bytes].
-    target_bytes: u64 = max_target_bytes,
+    /// Decimal-GB modeled-peak target, in [box - 1 GiB, the ceiling's max target]; null: that max.
+    target_bytes: ?u64 = null,
     /// The named evidence credit (wide allowance + compiler reserve + tensor margin).
     evidence_credit_bytes: u64 = 2_737_047_552,
 };
@@ -112,10 +129,12 @@ pub const Inputs = struct {
     wired_bytes: u64,
     /// One expert record = one slot (EXL3 3.0: 13,315,584).
     record_bytes: u64,
-    /// Forced decode rows (84..160), or null for the largest that fits.
+    /// Forced decode rows (84..the ceiling's rows), or null for the largest that fits.
     fixed_rows: ?u32 = null,
-    /// The largest decode rows searched; an oracle launch searches up to the oracle's rows.
-    search_ceiling: u32 = 160,
+    /// The largest decode rows searched (null: the ceiling's rows); an oracle launch searches up to its rows.
+    search_ceiling: ?u32 = null,
+    /// The box (null: the envelope's own).
+    ceiling: ?Ceiling = null,
     /// The oracle's prefill capacity, which the admitted prefill must equal.
     matched_prefill_rows: ?u32 = null,
     allocation: Allocation = .prefill_excess,
@@ -234,6 +253,7 @@ pub const Summary = struct {
 };
 
 pub const PeakFillRecord = struct {
+    target_bytes: u64,
     control: Summary,
     filled: Summary,
     total_credit_bytes: u64,
@@ -320,16 +340,17 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
     if ((in.embedding_rows or in.tail_rows != null) and !env.retirement_owners_proved) return error.RetirementProofMissing;
     const retired_embedding: i64 = if (in.embedding_rows) embedding_bytes else 0;
     const retired_tail: i64 = if (in.tail_rows != null) tail_credit_bytes else 0;
-    if (in.matched_prefill_rows) |m| if (m < 16 or m > 160) return error.InvalidMatchedRows;
-    var ceiling = in.search_ceiling;
+    const box = boxOf(env, in);
+    if (in.matched_prefill_rows) |m| if (m < 16 or m > box.max_rows) return error.InvalidMatchedRows;
+    var ceiling = in.search_ceiling orelse box.max_rows;
     if (fixed) |f| {
-        if (f < 84 or f > 160) return error.InvalidFixedRows;
+        if (f < 84 or f > box.max_rows) return error.InvalidFixedRows;
         if (f > ceiling) return error.FixedRowsAboveCeiling;
         ceiling = f;
     }
     const post_reserve: i64 = @intCast(env.post_prefill_reserve_bytes);
     const cache: i64 = @intCast(env.decode_cache_bytes);
-    const allocator_limit: i64 = @as(i64, @intCast(env.allocator_limit_at_base0)) - base;
+    const allocator_limit: i64 = @as(i64, @intCast(env.allocator_limit_at_base0 + box.box_bytes)) - @as(i64, @intCast(env.box_bytes)) - base;
     const host: i64 = @intCast(env.host_reserve_bytes + io_host + in.host_reserve_bytes);
     const restored: i64 = @intCast(env.embedding_credit_bytes + env.projection_credit_bytes);
     const pred_prefill: i64 = env.predecessor_prefill_rows;
@@ -367,14 +388,15 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
         base: i64,
         host: i64,
         wired: i64,
+        wired_ceiling: i64,
         allocator_limit: i64,
         fn ok(f: @This(), active: i64, cache_bytes: i64) bool {
             return f.base + f.host + active + cache_bytes + @as(i64, physical_headroom) <= f.box and
                 active + cache_bytes <= f.allocator_limit and
-                f.wired + active + cache_bytes + @as(i64, wired_headroom) <= @as(i64, wired_ceiling_bytes);
+                f.wired + active + cache_bytes + @as(i64, wired_headroom) <= f.wired_ceiling;
         }
     };
-    const fit: Fit = .{ .box = @intCast(env.box_bytes), .base = base, .host = host, .wired = wired, .allocator_limit = allocator_limit };
+    const fit: Fit = .{ .box = @intCast(box.box_bytes), .base = base, .host = host, .wired = wired, .wired_ceiling = @intCast(box.wired_bytes), .allocator_limit = allocator_limit };
     const entry_fixed = transition_fixed + projection_bytes - retired_tail + post_reserve + head_extra;
     const prefill_base: i64 = @as(i64, @intCast(env.prefill_active_bytes)) + prefill_engine_remainder + transform_reserve + head_extra;
     const raw_band: i64 = n_layers * raw_record;
@@ -480,9 +502,11 @@ fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) E
 /// with its credit off every post-prefill phase; the fill may move nothing
 /// but the decode rows and must stay under its target.
 fn peakFilled(env: Envelope, in: Inputs, pf: PeakFill, extra_credit: u64) Error!struct { admission: Admission, record: PeakFillRecord } {
-    const unfilled = env.box_bytes - physical_headroom;
-    if (pf.target_bytes < unfilled or pf.target_bytes > max_target_bytes) return error.InvalidTarget;
-    const spend = pf.target_bytes - unfilled;
+    const box = boxOf(env, in);
+    const target = pf.target_bytes orelse box.max_target_bytes;
+    const unfilled = box.box_bytes - physical_headroom;
+    if (target < unfilled or target > box.max_target_bytes) return error.InvalidTarget;
+    const spend = target - unfilled;
     const credit = pf.evidence_credit_bytes + spend;
     const control = try retarget(env, in, extra_credit, null, false);
     const filled = try retarget(env, in, extra_credit + credit, in.fixed_rows, true);
@@ -494,10 +518,15 @@ fn peakFilled(env: Envelope, in: Inputs, pf: PeakFill, extra_credit: u64) Error!
     } else if (filled.decode_rows < control.decode_rows) return error.PeakFillReducedRows;
     const active = filled.phases.max();
     const modeled = @max(filled.physical_bound_bytes, filled.baseline_bytes + filled.host_reserve_bytes + active + filled.decode_cache_bytes + spend);
-    if (modeled > pf.target_bytes) return error.PeakFillOverTarget;
+    if (modeled > target) return error.PeakFillOverTarget;
     if (active + filled.decode_cache_bytes > filled.allocator_limit_bytes) return error.PeakFillOverAllocator;
-    if (filled.wired_bytes + active + filled.decode_cache_bytes + gib > wired_ceiling_bytes) return error.PeakFillOverWired;
-    return .{ .admission = filled, .record = .{ .control = Summary.of(control), .filled = Summary.of(filled), .total_credit_bytes = credit, .modeled_peak_bytes = modeled } };
+    if (filled.wired_bytes + active + filled.decode_cache_bytes + gib > box.wired_bytes) return error.PeakFillOverWired;
+    return .{ .admission = filled, .record = .{ .target_bytes = target, .control = Summary.of(control), .filled = Summary.of(filled), .total_credit_bytes = credit, .modeled_peak_bytes = modeled } };
+}
+
+/// The box an admission fits: the caller's ceiling, else the envelope's own.
+fn boxOf(env: Envelope, in: Inputs) Ceiling {
+    return in.ceiling orelse .{ .box_bytes = env.box_bytes, .wired_bytes = wired_ceiling_bytes, .max_target_bytes = max_target_bytes, .max_rows = 160 };
 }
 
 fn planAdmission(env: Envelope, in: Inputs) Error!Plan {
@@ -516,9 +545,11 @@ fn planAdmission(env: Envelope, in: Inputs) Error!Plan {
     const ref = try peakFilled(env, in, pf, 0);
     if (in.fixed_rows != null) return error.CreditWithFixedRows;
     const r = ref.admission;
-    const spend = pf.target_bytes - (env.box_bytes - physical_headroom);
+    // The credit's evidence was measured in the envelope's own box.
+    if (in.ceiling != null) return error.CreditGeometry;
+    const spend = ref.record.target_bytes - (env.box_bytes - physical_headroom);
     if (r.phases.decode - r.final_bank_bytes != rx.decode_fixed_bytes or r.phases.prime - r.final_bank_bytes != rx.prime_fixed_bytes or
-        r.host_reserve_bytes + r.decode_cache_bytes != rx.non_mlx_bytes or pf.target_bytes != rx.target_bytes or env.box_bytes != box_ceiling_bytes)
+        r.host_reserve_bytes + r.decode_cache_bytes != rx.non_mlx_bytes or ref.record.target_bytes != rx.target_bytes or env.box_bytes != box_ceiling_bytes)
         return error.CreditGeometry;
     const cred = try peakFilled(env, in, pf, credit);
     const c = cred.admission;
