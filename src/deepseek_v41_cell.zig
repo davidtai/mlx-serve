@@ -425,6 +425,8 @@ test "dsv41 cell: the stand-in cell on the bank at the admitted rows (the arm's 
     const model_dir = std.mem.span(std.c.getenv("DSV41_CELL_MODEL") orelse return error.SkipZigTest);
     const out = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    // The key lines start at column 0 (the test runner's name line has no newline).
+    std.debug.print("\n", .{});
     const a = testing.allocator;
     const io = std.testing.io;
     const envOf = struct {
