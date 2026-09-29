@@ -91,6 +91,10 @@ pub const Routes = struct {
     /// C13: the RCTAIL HC premix (split-K f32 GEMV of the [24, 20480] HC fn) at rows <= 8,
     /// bound per layer for the attn and ffn mixes.
     rc_premix: bool = false,
+    /// C14: RCPROJ mxfp8 + woarc at rows <= 8: wq_a, wkv, wq_b, wo_b and the grouped wo_a on
+    /// the packed weights (the M-invariant FMA kernel, bf16 in / out), bound per layer; the
+    /// prefill widths keep the K22 / eager chain.
+    rc_proj: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -148,6 +152,40 @@ pub fn MixKernels(comptime G: type) type {
     };
 }
 
+/// C14: one layer's RCPROJ sites (`kr.RcSite` minus the head), over its packed mxfp8 pairs.
+pub fn RcProjs(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        wq_a: kr.RcProj(G),
+        wkv: kr.RcProj(G),
+        wq_b: kr.RcProj(G),
+        wo_b: kr.RcProj(G),
+        woa: kr.RcProj(G),
+
+        const names = @typeInfo(Self).@"struct".field_names;
+
+        /// A pair off the site's pinned geometry (or not mxfp8) is refused by name.
+        pub fn init(g: *G, reg: *const xk.Registry, w: *const LayerW(G.T)) !Self {
+            var s: Self = undefined;
+            var built: usize = 0;
+            errdefer inline for (names, 0..) |name, i| {
+                if (i < built) @field(s, name).deinit(g);
+            };
+            inline for (names) |name| {
+                const q: Q(G.T) = if (comptime std.mem.eql(u8, name, "woa")) w.wo_a else @field(w, name);
+                if (q.mode != .mxfp8) return error.RcProjGeometry;
+                @field(s, name) = kr.RcProj(G).init(g, reg, @field(kr.RcSite, name), q.w, q.s, null) catch |e| return if (e == error.RouteInput) error.RcProjGeometry else e;
+                built += 1;
+            }
+            return s;
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            inline for (names) |name| @field(self, name).deinit(g);
+        }
+    };
+}
+
 /// The rounding-class tier's kernel routes one layer calls (null: the stock op chain):
 /// a view of the model's `Trunk(G).Kernels`, bound once at construction.
 pub fn LayerKernels(comptime G: type) type {
@@ -157,6 +195,7 @@ pub fn LayerKernels(comptime G: type) type {
         router: ?*const kr.Router(G) = null,
         premix_attn: ?*const kr.Premix(G) = null,
         premix_ffn: ?*const kr.Premix(G) = null,
+        proj: ?*const RcProjs(G) = null,
 
         pub fn attnMix(self: Self) MixKernels(G) {
             return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn };
@@ -189,9 +228,11 @@ pub fn Trunk(comptime G: type) type {
             /// C13, per layer: the router over its gate, the attn / ffn premixes over its HC fns.
             router: std.ArrayList(kr.Router(G)) = .empty,
             premix: std.ArrayList([2]kr.Premix(G)) = .empty,
+            /// C14, per layer: the five RCPROJ sites.
+            proj: std.ArrayList(RcProjs(G)) = .empty,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -221,6 +262,10 @@ pub fn Trunk(comptime G: type) type {
                         k.premix.appendAssumeCapacity(.{ pa, try kr.Premix(G).init(g, reg, w.hc_ffn_fn, null) });
                     }
                 }
+                if (rt.rc_proj) {
+                    try k.proj.ensureTotalCapacity(gpa, layers.len);
+                    for (layers) |*w| k.proj.appendAssumeCapacity(try RcProjs(G).init(g, reg, w));
+                }
                 return k;
             }
 
@@ -228,9 +273,11 @@ pub fn Trunk(comptime G: type) type {
                 if (self.sinkhorn) |*x| x.deinit(g);
                 for (self.router.items) |*x| x.deinit(g);
                 for (self.premix.items) |*p| for (p) |*x| x.deinit(g);
+                for (self.proj.items) |*x| x.deinit(g);
                 if (self.gpa) |a| {
                     self.router.deinit(a);
                     self.premix.deinit(a);
+                    self.proj.deinit(a);
                 }
                 self.* = .{};
             }
@@ -241,6 +288,7 @@ pub fn Trunk(comptime G: type) type {
                     .router = if (self.router.items.len > 0) &self.router.items[l] else null,
                     .premix_attn = if (self.premix.items.len > 0) &self.premix.items[l][0] else null,
                     .premix_ffn = if (self.premix.items.len > 0) &self.premix.items[l][1] else null,
+                    .proj = if (self.proj.items.len > 0) &self.proj.items[l] else null,
                 };
             }
         };
@@ -895,18 +943,26 @@ pub fn Trunk(comptime G: type) type {
         /// `Attention._attend`: the projections (K22 tape at rows <= 32), the
         /// window append, masked-full (stock, W50 lean at prefill) or K30
         /// selected-key attention, the output projection.
-        pub fn attention(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, positions: T, cache: *Cache, shared: *Share) !T {
+        pub fn attention(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, positions: T, cache: *Cache, shared: *Share) !T {
             const sh = g.shapeOf(x);
             const b = sh.d[0];
             const s = sh.d[1];
             const H: c_int = @intCast(c.n_heads);
             const hd: c_int = @intCast(c.head_dim);
-            const compiled = b * s <= rt.attn_rows;
+            // C14 at <= 8 rows: the RCPROJ projections (the stream is bf16 there by construction:
+            // every attention and MoE output of the route is bf16); K22 / eager above.
+            const rc: ?*const RcProjs(G) = if (b * s <= rc_max_rows) lk.proj else null;
+            const compiled = rc == null and b * s <= rt.attn_rows;
             const cs = try cosSin(g, inv_freq, positions);
             var q: T = undefined;
             var qr: T = undefined;
             var kv_new: T = undefined;
-            if (compiled) {
+            if (rc) |pj| {
+                if (std.debug.runtime_safety) std.debug.assert(g.dtypeOf(x) == .bfloat16);
+                qr = try rmsnorm(g, try pj.wq_a.linear(g, x), w.q_norm, c.rms_norm_eps);
+                q = try ropeLast(g, try g.reshape(try pj.wq_b.linear(g, qr), &.{ b, s, H, hd }), cs, false);
+                kv_new = try ropeLast(g, try rmsnorm(g, try pj.wkv.linear(g, x), w.kv_norm, c.rms_norm_eps), cs, false);
+            } else if (compiled) {
                 var o: [3]T = undefined;
                 try g.tape(QkvPrep, c, &.{ x, cs.cos, cs.sin, w.q_norm, w.kv_norm, w.wq_a.w, w.wq_a.s, w.wq_b.w, w.wq_b.s, w.wkv.w, w.wkv.s }, &o);
                 q = o[0];
@@ -948,6 +1004,14 @@ pub fn Trunk(comptime G: type) type {
                 if (scores) |m| try closeScores(g, m, &.{&o0});
             }
             try p.put("attn.o", o0);
+            if (rc) |pj| {
+                // woarc: the query-RoPE removal to bf16, the grouped wo_a on its packed pair, wo_b.
+                const o1 = try g.astype(try ropeLast(g, o0, cs, true), .bfloat16);
+                const o2 = try pj.woa.call(g, try g.reshape(o1, &.{ b * s, -1 }));
+                const out = try pj.wo_b.linear(g, try g.reshape(o2, &.{ b, s, -1 }));
+                try p.put("attn.out", out);
+                return out;
+            }
             const w_ol = try woaDense(g, c, w);
             const out = if (compiled) blk: {
                 var o: [1]T = undefined;
@@ -1171,7 +1235,7 @@ pub fn Trunk(comptime G: type) type {
                 var s1: [4]T = undefined;
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &s1);
                 try p.put("attn.x", s1[0]);
-                const ao = try attention(g, p, c, rt, li, w, inv_freq, s1[0], positions, cache, shared);
+                const ao = try attention(g, p, c, rt, lk, li, w, inv_freq, s1[0], positions, cache, shared);
                 var s2: [8]T = undefined;
                 try g.tape(Seg2, c, &.{ ao, h, s1[1], s1[2], s1[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, w.gate_w, w.gate_bias, w.sh_w1.w, w.sh_w1.s, w.sh_w3.w, w.sh_w3.s, w.sh_w2.w, w.sh_w2.s }, &s2);
                 try p.put("gate.indices", s2[2]);
@@ -1216,7 +1280,7 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("attn.comb", a[3]);
             }
             try p.put("attn.x", a[0]);
-            const ao = try attention(g, p, c, rt, li, w, inv_freq, a[0], positions, cache, shared);
+            const ao = try attention(g, p, c, rt, lk, li, w, inv_freq, a[0], positions, cache, shared);
             var f: [5]T = undefined;
             if (hc_tape) {
                 try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
@@ -1432,6 +1496,12 @@ fn realConfig() !v41.Config {
     return v41.Config.parse(testing.allocator, json, null);
 }
 
+/// No `op` node in the trace since `from`.
+fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
+    for (g.nodes.items[from..]) |nd| if (nd.op == op) return false;
+    return true;
+}
+
 fn miniConfig() !v41.Config {
     const json = try v41.testConfigJson(testing.allocator, .mini);
     defer testing.allocator.free(json);
@@ -1526,12 +1596,6 @@ test "dsv41 graph: the RC router and HC premix bind per layer on the kernels' ge
     try testing.expectEqual(ws[1].gate_w, lk.router.?.w);
     try testing.expectEqual(ws[1].hc_ffn_fn, lk.premix_ffn.?.w);
     try testing.expect(lk.sinkhorn == null);
-    const noneOf = struct {
-        fn f(tg: *const TraceOps, from: usize, op: anytype) bool {
-            for (tg.nodes.items[from..]) |nd| if (nd.op == op) return false;
-            return true;
-        }
-    }.f;
     // Verify rows (5): the whole gate is the two router kernels; each HC mix's GEMM the two premix kernels.
     const l0 = g.prepared_launches;
     var n0 = g.nodes.items.len;
@@ -1559,6 +1623,52 @@ test "dsv41 graph: the RC router and HC premix bind per layer on the kernels' ge
     bad = c;
     bad.hc_mult = 2;
     try testing.expectError(error.PremixGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &.{ .rc_premix = true }, &ws));
+}
+
+test "dsv41 graph: the RCPROJ sites bind per layer on the packed pairs, take verify rows bf16 in and out, and leave prefill widths on the chain" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const li = c.layers[0];
+    const ws = [_]LayerW(u32){try traceLayerW(&g, &c, li)};
+    // K22 prepared: the RC route takes the verify rows before the compiled prep.
+    const rt: Routes = .{ .rc_proj = true, .selected_keys = true, .attn_rows = attn_compile_max_rows };
+    try Tr.prepareRegions(&g, &c, &rt, false);
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &ws);
+    defer k.deinit(&g);
+    const lk = k.at(0);
+    try testing.expectEqual(ws[0].wo_a.w, lk.proj.?.woa.w);
+    try testing.expectEqual(ws[0].wo_b.s, lk.proj.?.wo_b.scales);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
+    var shared: Tr.Share = .{};
+    // Verify rows (5): five FMA launches (wq_a, wq_b, wkv, the packed wo_a, wo_b), no quantized
+    // matmul and no wo_a dequantize; the output bf16 (the stream stays bf16).
+    const l0 = g.prepared_launches;
+    var n0 = g.nodes.items.len;
+    const out = try Tr.attention(&g, &p, &c, &rt, lk, li, &ws[0], inv, try g.input(&.{ 1, 5, 5120 }, .bfloat16), try g.arange(0, 5, 1, .int32), &cache, &shared);
+    try expectShape(&g, out, &.{ 1, 5, 5120 }, .bfloat16);
+    try expectStage(&g, &p, "attn.qr", &.{ 1, 5, @intCast(c.q_lora_rank) }, .bfloat16);
+    try testing.expectEqual(l0 + 5, g.prepared_launches);
+    try testing.expect(noneOf(&g, n0, .qmm) and noneOf(&g, n0, .dequantize));
+    // A prefill width (9 rows): no launch; K22's prep and the per-call wo_a dequantize (no W97).
+    n0 = g.nodes.items.len;
+    _ = try Tr.attention(&g, &p, &c, &rt, lk, li, &ws[0], inv, try g.input(&.{ 1, 9, 5120 }, .bfloat16), try g.arange(5, 14, 1, .int32), &cache, &shared);
+    try testing.expectEqual(l0 + 5, g.prepared_launches);
+    try testing.expect(!noneOf(&g, n0, .dequantize));
+    // A pair off a site's pinned geometry, or another codec, is refused by name.
+    var bad = ws;
+    bad[0].wo_b = try qIn(&g, 5120, 4096, .mxfp8);
+    try testing.expectError(error.RcProjGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &bad));
+    bad = ws;
+    bad[0].wq_a.mode = .mxfp4;
+    try testing.expectError(error.RcProjGeometry, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &bad));
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {
@@ -1657,7 +1767,7 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
         p.nodes.clearRetainingCapacity();
         const x = try g.input(&.{ 1, st.s, 5120 }, .float32);
         const pos = try g.arange(@floatFromInt(pos0), @floatFromInt(pos0 + st.s), 1, .int32);
-        const out = try Tr.attention(&g, &p, &c, &stock, li, &w, inv, x, pos, &cache, &shared);
+        const out = try Tr.attention(&g, &p, &c, &stock, .{}, li, &w, inv, x, pos, &cache, &shared);
         try expectShape(&g, out, &.{ 1, st.s, 5120 }, .float32);
         try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, st.rows, 512 }, .float32);
         try expectShape(&g, (try cache.compress.view(&g)).?, &.{ 1, st.comp, 512 }, .float32);
@@ -1698,7 +1808,7 @@ test "dsv41 graph: under the window ring the attention sees a bounded window, on
             const x = try g.input(&.{ 1, s, 5120 }, .bfloat16);
             p.names.clearRetainingCapacity();
             p.nodes.clearRetainingCapacity();
-            _ = try Tr.attention(&g, &p, &c, &stock, c.layers[l], &ws[l], inv, x, pos, &caches[l], &shared);
+            _ = try Tr.attention(&g, &p, &c, &stock, .{}, c.layers[l], &ws[l], inv, x, pos, &caches[l], &shared);
             masks[l] = shared.win_mask.?;
             caches[l].advance(@intCast(s));
         }
@@ -1734,7 +1844,7 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
         const x = try g.input(&.{ 1, s, ci(c.hidden_size) }, .float32);
         p.names.clearRetainingCapacity();
         p.nodes.clearRetainingCapacity();
-        _ = try Tr.attention(&g, &p, &c, &stock, li, &w, inv_c, x, pos, &caches[l], &shared);
+        _ = try Tr.attention(&g, &p, &c, &stock, .{}, li, &w, inv_c, x, pos, &caches[l], &shared);
         switch (l) {
             // Full, ratio 2: 4 groups from 9 tokens.
             1 => try expectStage(&g, &p, "attn.topk_mask", &.{ 1, 9, 4 }, .bool_),
@@ -1838,7 +1948,7 @@ test "dsv41 graph: K30 selected keys gather each query's window and selected row
         const x = try g.input(&.{ 1, 9, ci(c.hidden_size) }, .float32);
         p.names.clearRetainingCapacity();
         p.nodes.clearRetainingCapacity();
-        const out = try Tr.attention(&g, &p, &c, &rt, c.layers[l], &w, inv, x, pos, &caches[l], &shared);
+        const out = try Tr.attention(&g, &p, &c, &rt, .{}, c.layers[l], &w, inv, x, pos, &caches[l], &shared);
         try expectShape(&g, out, &.{ 1, 9, ci(c.hidden_size) }, .float32);
         try expectStage(&g, &p, "attn.o", &.{ 1, 9, 2, 32 }, .float32);
         published[l] = shared.selected_idx;
@@ -1857,13 +1967,13 @@ test "dsv41 graph: K30 selected keys gather each query's window and selected row
     var cache1 = Tr.Cache.init(c.layers[1], c.window, .{});
     defer cache1.deinit(&g);
     var sh1: Tr.Share = .{};
-    try testing.expectError(error.RegionNotPrepared, Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache1, &sh1));
+    try testing.expectError(error.RegionNotPrepared, Tr.attention(&g, &p, &c, &rtc, .{}, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache1, &sh1));
     try Tr.prepareRegions(&g, &c, &rtc, false);
     var cache2 = Tr.Cache.init(c.layers[1], c.window, .{});
     defer cache2.deinit(&g);
     var sh2: Tr.Share = .{};
     const mark = g.nodes.items.len;
-    _ = try Tr.attention(&g, &p, &c, &rtc, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache2, &sh2);
+    _ = try Tr.attention(&g, &p, &c, &rtc, .{}, c.layers[1], &w1, inv, try g.input(&.{ 1, 1, ci(c.hidden_size) }, .float32), try g.arange(0, 1, 1, .int32), &cache2, &sh2);
     const seq = try g.opsSince(testing.allocator, mark);
     defer testing.allocator.free(seq);
     try testing.expectEqual(@as(usize, 1), std.mem.count(ops.Op, seq, &.{.tape_begin}));
@@ -1961,7 +2071,7 @@ test "dsv41 graph: the W50 lean prefill score folds the sink instead of concaten
         defer cache.deinit(&g);
         var shared: Tr.Share = .{};
         const mark = g.nodes.items.len;
-        _ = try Tr.attention(&g, &p, &c, &.{ .lean_prefill_score = lean }, li, &w, inv, try g.input(&.{ 1, 5, 5120 }, .bfloat16), try g.arange(0, 5, 1, .int32), &cache, &shared);
+        _ = try Tr.attention(&g, &p, &c, &.{ .lean_prefill_score = lean }, .{}, li, &w, inv, try g.input(&.{ 1, 5, 5120 }, .bfloat16), try g.arange(0, 5, 1, .int32), &cache, &shared);
         try expectStage(&g, &p, "attn.o", &.{ 1, 5, 64, 512 }, .float32);
         const seq = try g.opsSince(testing.allocator, mark);
         defer testing.allocator.free(seq);
