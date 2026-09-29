@@ -65,7 +65,6 @@ test {
     _ = @import("deepseek_v41_dspark_serve.zig");
     _ = @import("deepseek_v41_bind.zig");
     _ = @import("nocache_reader.zig");
-    _ = @import("row_cache.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
     _ = @import("exl3_kernels.zig");

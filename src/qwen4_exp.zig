@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const io_util = @import("io_util.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -202,6 +203,64 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
+    /// A record table's resident rows (`attachCache`); without it every row is read.
+    cache: ?*RowCache = null,
+
+    /// `bits` of a record table: raw fixed-width records, never dequantized here.
+    pub const records_bits: u32 = 0;
+    const no_map: [0]u8 align(std.heap.page_size_min) = .{};
+
+    /// `rows` records of `record_bytes` at `data_offset` of `path` (an Engram bank, an
+    /// embedding tensor inside a safetensors shard), read past the page cache, not mapped.
+    pub fn openRecords(path: [:0]const u8, record_bytes: u32, rows: u64, data_offset: u64) !NgramTable {
+        if (record_bytes == 0) return error.NgramTableRegion;
+        const fd = try io_util.openNoCache(path.ptr, .{});
+        errdefer _ = std.c.close(fd);
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        const need = std.math.add(u64, data_offset, std.math.mul(u64, rows, record_bytes) catch return error.NgramTableRegion) catch return error.NgramTableRegion;
+        if (size < 0 or @as(u64, @intCast(size)) < need) return error.NgramTableTruncated;
+        var t: NgramTable = .{ .map = &no_map, .rows = rows, .dim = record_bytes, .bits = records_bits, .group_size = 0, .w_off = @intCast(data_offset), .s_off = 0, .b_off = 0, .wcols = 0, .scols = 0, .fd = fd };
+        if (record_bytes <= PrefetchPool.ROW_BUF) t.pool = try PrefetchPool.create();
+        return t;
+    }
+
+    /// Keep up to `budget_bytes` of this record table's rows resident (`RowCache`).
+    pub fn attachCache(self: *NgramTable, gpa: std.mem.Allocator, budget_bytes: u64) !void {
+        std.debug.assert(self.bits == records_bits and self.cache == null);
+        const c = try gpa.create(RowCache);
+        errdefer gpa.destroy(c);
+        c.* = try RowCache.init(gpa, self.dim, budget_bytes);
+        self.cache = c;
+    }
+
+    /// Row reads per row: the three quantized regions, or the one record.
+    fn regions(self: *const NgramTable) usize {
+        return if (self.bits == records_bits) 1 else 3;
+    }
+
+    /// The records of `row_ids`, in order, into `out` (`row_ids.len * record_bytes`),
+    /// through the cache when one is attached; reads ride the pool.
+    pub fn gatherRecords(self: *const NgramTable, row_ids: []const i64, out: []u8) !void {
+        std.debug.assert(self.bits == records_bits and out.len == row_ids.len * self.dim);
+        for (row_ids) |r| if (r < 0 or @as(u64, @intCast(r)) >= self.rows) return error.RowOutOfRange;
+        if (self.cache) |c| return c.gather(self, row_ids, out);
+        return self.readRecords(row_ids, out);
+    }
+
+    /// Read `rows`' records into `out`, the pool's rounds when it has one.
+    fn readRecords(self: *const NgramTable, rows: []const i64, out: []u8) !void {
+        const rb: usize = self.dim;
+        if (self.pool) |p| {
+            var start: usize = 0;
+            while (start < rows.len) : (start += PrefetchPool.MAX_ROWS) {
+                const end = @min(start + PrefetchPool.MAX_ROWS, rows.len);
+                if (!p.run(self, rows[start..end])) return error.RecordRead;
+                for (start..end) |i| @memcpy(out[i * rb ..][0..rb], p.bufs[i - start][0..rb]);
+            }
+            return;
+        }
+        for (rows, 0..) |r, i| if (!self.preadSite(@intCast(r), 0, out[i * rb ..][0..rb])) return error.RecordRead;
+    }
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -370,7 +429,13 @@ pub const NgramTable = struct {
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
-        if (!self.gpu_owns_map) std.posix.munmap(self.map);
+        if (self.cache) |c| {
+            const gpa = c.gpa;
+            c.deinit();
+            gpa.destroy(c);
+            self.cache = null;
+        }
+        if (!self.gpu_owns_map and self.map.len > 0) std.posix.munmap(self.map);
     }
 
     const WARM_CHUNK: usize = 8 << 20;
@@ -491,7 +556,7 @@ pub const NgramTable = struct {
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
-        const wl: usize = self.wcols * 4;
+        const wl: usize = if (self.bits == records_bits) self.dim else self.wcols * 4;
         const sl: usize = self.scols * 2;
         const off: usize, const dst: []u8 = switch (region) {
             0 => .{ self.w_off + r * wl, buf[0..wl] },
@@ -501,6 +566,203 @@ pub const NgramTable = struct {
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
+};
+
+/// A byte-budgeted LRU of a record table's rows, Python's `NGramRowCache` rule for rule: a
+/// gather's distinct rows in first-appearance order, a hit made newest, the misses read and
+/// entered sorted (sub-runs capped at the slot count), each taking the highest free slot or the oldest row's.
+pub const RowCache = struct {
+    pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, evictions: u64 = 0, reads: u64 = 0, rows_read: u64 = 0, gathers: u64 = 0 };
+    const nil: u32 = std.math.maxInt(u32);
+    const Miss = struct { row: u64, d: u32 };
+
+    gpa: std.mem.Allocator,
+    record_bytes: u32,
+    slot_count: u32,
+    arena: []u8,
+    slot_row: []u64,
+    prev: []u32,
+    next: []u32,
+    free: []u32,
+    n_free: u32,
+    oldest: u32 = nil,
+    newest: u32 = nil,
+    index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Removals since the index was last rehashed (its tombstones).
+    removed: u32 = 0,
+    stats: Stats = .{},
+    // One gather's scratch, kept across gathers.
+    first: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    distinct: std.ArrayList(u64) = .empty,
+    chain_head: std.ArrayList(u32) = .empty,
+    chain_tail: std.ArrayList(u32) = .empty,
+    chain_next: std.ArrayList(u32) = .empty,
+    misses: std.ArrayList(Miss) = .empty,
+    miss_rows: std.ArrayList(i64) = .empty,
+    miss_recs: std.ArrayList(u8) = .empty,
+
+    /// Python's slot rule: `max(1, max(record_bytes, budget) // record_bytes)`.
+    pub fn slotCount(record_bytes: u32, budget_bytes: u64) u32 {
+        return @intCast(@max(1, @max(record_bytes, budget_bytes) / record_bytes));
+    }
+
+    /// The row index's capacity for `slots` rows (the std map's 80 % load rule, minimum 8).
+    pub fn indexCapacity(slots: u32) u32 {
+        return @max(8, std.math.ceilPowerOfTwo(u32, @intCast(@as(u64, slots) * 100 / 80 + 1)) catch unreachable);
+    }
+
+    /// Host bytes the cache holds for its whole life (a memory bill's term): the slot
+    /// arena, the per-slot links and the row index.
+    pub fn hostBytes(record_bytes: u32, budget_bytes: u64) u64 {
+        const slots = slotCount(record_bytes, budget_bytes);
+        return @as(u64, slots) * (record_bytes + @sizeOf(u64) + 3 * @sizeOf(u32)) + @as(u64, indexCapacity(slots)) * (@sizeOf(u64) + @sizeOf(u32) + 1);
+    }
+
+    pub fn init(gpa: std.mem.Allocator, record_bytes: u32, budget_bytes: u64) !RowCache {
+        const slots = slotCount(record_bytes, budget_bytes);
+        const arena = try gpa.alloc(u8, @as(usize, slots) * record_bytes);
+        errdefer gpa.free(arena);
+        const slot_row = try gpa.alloc(u64, slots);
+        errdefer gpa.free(slot_row);
+        const prev = try gpa.alloc(u32, slots);
+        errdefer gpa.free(prev);
+        const next = try gpa.alloc(u32, slots);
+        errdefer gpa.free(next);
+        const free = try gpa.alloc(u32, slots);
+        errdefer gpa.free(free);
+        for (free, 0..) |*f, i| f.* = @intCast(i);
+        var self: RowCache = .{ .gpa = gpa, .record_bytes = record_bytes, .slot_count = slots, .arena = arena, .slot_row = slot_row, .prev = prev, .next = next, .free = free, .n_free = slots };
+        try self.index.ensureTotalCapacity(gpa, slots);
+        return self;
+    }
+
+    pub fn deinit(self: *RowCache) void {
+        const a = self.gpa;
+        a.free(self.arena);
+        a.free(self.slot_row);
+        a.free(self.prev);
+        a.free(self.next);
+        a.free(self.free);
+        self.index.deinit(a);
+        self.first.deinit(a);
+        self.distinct.deinit(a);
+        self.chain_head.deinit(a);
+        self.chain_tail.deinit(a);
+        self.chain_next.deinit(a);
+        self.misses.deinit(a);
+        self.miss_rows.deinit(a);
+        self.miss_recs.deinit(a);
+    }
+
+    fn unlink(self: *RowCache, s: u32) void {
+        const p = self.prev[s];
+        const n = self.next[s];
+        if (p != nil) self.next[p] = n else self.oldest = n;
+        if (n != nil) self.prev[n] = p else self.newest = p;
+    }
+
+    fn linkNewest(self: *RowCache, s: u32) void {
+        self.prev[s] = self.newest;
+        self.next[s] = nil;
+        if (self.newest != nil) self.next[self.newest] = s else self.oldest = s;
+        self.newest = s;
+    }
+
+    /// Python `_alloc_slot`: `list.pop()` of the free list, else the oldest row is evicted.
+    fn allocSlot(self: *RowCache) u32 {
+        if (self.n_free > 0) {
+            self.n_free -= 1;
+            return self.free[self.n_free];
+        }
+        const s = self.oldest;
+        _ = self.index.remove(self.slot_row[s]);
+        self.removed += 1;
+        self.unlink(s);
+        self.stats.evictions += 1;
+        return s;
+    }
+
+    fn lessRow(_: void, x: Miss, y: Miss) bool {
+        return x.row < y.row;
+    }
+
+    /// `rec` into every position of distinct row `d` in `out`.
+    fn put(self: *const RowCache, out: []u8, d: u32, rec: []const u8) void {
+        const rb: usize = self.record_bytes;
+        var i = self.chain_head.items[d];
+        while (i != nil) : (i = self.chain_next.items[i]) @memcpy(out[@as(usize, i) * rb ..][0..rb], rec);
+    }
+
+    /// Python `gather_bytes` over `table` (rows already range-checked).
+    fn gather(self: *RowCache, table: *const NgramTable, rows: []const i64, out: []u8) !void {
+        const a = self.gpa;
+        const rb: usize = self.record_bytes;
+        self.first.clearRetainingCapacity();
+        self.distinct.clearRetainingCapacity();
+        self.chain_head.clearRetainingCapacity();
+        self.chain_tail.clearRetainingCapacity();
+        try self.chain_next.resize(a, rows.len);
+        for (rows, 0..) |r, i| {
+            const gop = try self.first.getOrPut(a, @intCast(r));
+            self.chain_next.items[i] = nil;
+            if (gop.found_existing) {
+                const d = gop.value_ptr.*;
+                self.chain_next.items[self.chain_tail.items[d]] = @intCast(i);
+                self.chain_tail.items[d] = @intCast(i);
+            } else {
+                gop.value_ptr.* = @intCast(self.distinct.items.len);
+                try self.distinct.append(a, @intCast(r));
+                try self.chain_head.append(a, @intCast(i));
+                try self.chain_tail.append(a, @intCast(i));
+            }
+        }
+        self.misses.clearRetainingCapacity();
+        for (self.distinct.items, 0..) |row, d| {
+            if (self.index.get(row)) |slot| {
+                self.unlink(slot);
+                self.linkNewest(slot);
+                self.stats.hits += 1;
+                self.put(out, @intCast(d), self.arena[@as(usize, slot) * rb ..][0..rb]);
+            } else try self.misses.append(a, .{ .row = row, .d = @intCast(d) });
+        }
+        const ms = self.misses.items;
+        if (ms.len > 0) {
+            std.mem.sort(Miss, ms, {}, lessRow);
+            try self.miss_rows.resize(a, ms.len);
+            for (ms, self.miss_rows.items) |m, *r| r.* = @intCast(m.row);
+            try self.miss_recs.resize(a, ms.len * rb);
+            try table.readRecords(self.miss_rows.items, self.miss_recs.items);
+        }
+        var i: usize = 0;
+        while (i < ms.len) {
+            var j = i + 1;
+            while (j < ms.len and ms[j].row == ms[j - 1].row + 1) j += 1;
+            var off = i;
+            while (off < j) {
+                const n: usize = @min(j - off, self.slot_count);
+                self.stats.reads += 1;
+                self.stats.rows_read += n;
+                self.stats.misses += n;
+                for (ms[off..][0..n], off..) |m, k| {
+                    const slot = self.allocSlot();
+                    const rec = self.miss_recs.items[k * rb ..][0..rb];
+                    @memcpy(self.arena[@as(usize, slot) * rb ..][0..rb], rec);
+                    self.slot_row[slot] = m.row;
+                    self.index.putAssumeCapacity(m.row, slot);
+                    self.linkNewest(slot);
+                    self.put(out, m.d, rec);
+                }
+                off += n;
+            }
+            i = j;
+        }
+        self.stats.gathers += 1;
+        // Evictions leave tombstones in the index: clear them once they reach half the slots.
+        if (self.removed >= self.slot_count / 2 + 1) {
+            self.index.rehash(std.hash_map.AutoContext(u64){});
+            self.removed = 0;
+        }
+    }
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -556,7 +818,7 @@ const PrefetchPool = struct {
         for (self.threads[0..started]) |t| t.join();
     }
 
-    /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
+    /// Fan the `regions * rows.len` preads over the workers; rows land in `bufs`.
     fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
         _ = self.runs.fetchAdd(1, .monotonic);
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -586,9 +848,10 @@ const PrefetchPool = struct {
             const table = self.table.?;
             const rows = self.rows;
             self.mu.unlock(io);
+            const k = table.regions();
             var i = idx;
-            while (i < rows.len * 3) : (i += N) {
-                if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
+            while (i < rows.len * k) : (i += N) {
+                if (!table.preadSite(@intCast(rows[i / k]), i % k, &self.bufs[i / k])) _ = self.failed.fetchAdd(1, .acq_rel);
             }
             _ = self.pending.fetchSub(1, .acq_rel);
         }
@@ -1187,4 +1450,106 @@ test "WarmProgress emits on the byte step, on the silence timeout, and never twi
     try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
     try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
     try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
+}
+
+/// A file of `rows` records of `rb` bytes at `path`, record r filled with byte r (mod 256).
+fn writeRecordFile(path: [:0]const u8, rows: usize, rb: usize) !void {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.TestOpen;
+    defer _ = std.c.close(fd);
+    const buf = try std.testing.allocator.alloc(u8, rows * rb);
+    defer std.testing.allocator.free(buf);
+    for (0..rows) |r| @memset(buf[r * rb ..][0..rb], @truncate(r));
+    if (std.c.write(fd, buf.ptr, buf.len) != @as(isize, @intCast(buf.len))) return error.TestWrite;
+}
+
+fn lruOrder(c: *const RowCache, out: []u64) usize {
+    var n: usize = 0;
+    var s = c.oldest;
+    while (s != RowCache.nil) : (s = c.next[s]) {
+        out[n] = c.slot_row[s];
+        n += 1;
+    }
+    return n;
+}
+
+test "ngram record table: Python's gather sequence gives Python's stats, residency and LRU order" {
+    // Python's NGramRowCache (mtplx/ngram_row_cache.py) gives these stats and this order for this
+    // sequence (32 rows of 33 B, 3 slots).
+    const rb = 33;
+    var pbuf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "/tmp/ngram-records-{d}.bin", .{std.c.getpid()}, 0);
+    try writeRecordFile(path, 32, rb);
+    defer _ = std.c.unlink(path.ptr);
+    var t = try NgramTable.openRecords(path, rb, 32, 0);
+    defer t.close();
+    try t.attachCache(std.testing.allocator, 3 * rb);
+    const seq = [_][]const i64{ &.{ 5, 6, 5, 9 }, &.{ 6, 10 }, &.{ 11, 12, 13, 14 }, &.{13}, &.{15}, &.{12} };
+    var out: [4 * rb]u8 = undefined;
+    for (seq) |rows| {
+        try t.gatherRecords(rows, out[0 .. rows.len * rb]);
+        for (rows, 0..) |r, i| try std.testing.expect(std.mem.allEqual(u8, out[i * rb ..][0..rb], @intCast(r)));
+    }
+    const c = t.cache.?;
+    try std.testing.expectEqual(RowCache.Stats{ .hits = 2, .misses = 10, .evictions = 7, .reads = 7, .rows_read = 10, .gathers = 6 }, c.stats);
+    var order: [3]u64 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), lruOrder(c, &order));
+    try std.testing.expectEqual([3]u64{ 13, 15, 12 }, order);
+    try std.testing.expectError(error.RowOutOfRange, t.gatherRecords(&.{ 3, 32 }, out[0 .. 2 * rb]));
+    try std.testing.expectEqual(@as(u64, 6), c.stats.gathers);
+}
+
+test "ngram record table: pooled and serial reads, and gathers past the arena, give the same records and stats" {
+    const rb = 20;
+    var pbuf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "/tmp/ngram-records-pool-{d}.bin", .{std.c.getpid()}, 0);
+    try writeRecordFile(path, 4096, rb);
+    defer _ = std.c.unlink(path.ptr);
+    var pooled = try NgramTable.openRecords(path, rb, 4096, 0);
+    defer pooled.close();
+    try std.testing.expect(pooled.pool != null);
+    try pooled.attachCache(std.testing.allocator, 97 * rb);
+    var serial = try NgramTable.openRecords(path, rb, 4096, 0);
+    defer serial.close();
+    serial.pool.?.destroy();
+    serial.pool = null;
+    try serial.attachCache(std.testing.allocator, 97 * rb);
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var rows: [300]i64 = undefined;
+    var a: [300 * rb]u8 = undefined;
+    var b: [300 * rb]u8 = undefined;
+    for (0..60) |step| {
+        const n: usize = if (step % 13 == 12) 300 else 1 + rnd.uintLessThan(usize, 60);
+        const band: u64 = if (step % 5 == 0) 4096 else 300;
+        for (rows[0..n]) |*r| r.* = @intCast(rnd.uintLessThan(u64, band));
+        try pooled.gatherRecords(rows[0..n], a[0 .. n * rb]);
+        try serial.gatherRecords(rows[0..n], b[0 .. n * rb]);
+        try std.testing.expectEqualSlices(u8, b[0 .. n * rb], a[0 .. n * rb]);
+        for (rows[0..n], 0..) |r, i| try std.testing.expect(std.mem.allEqual(u8, a[i * rb ..][0..rb], @truncate(@as(u64, @intCast(r)))));
+    }
+    try std.testing.expectEqual(serial.cache.?.stats, pooled.cache.?.stats);
+    try std.testing.expect(pooled.cache.?.stats.evictions > 0 and pooled.cache.?.stats.hits > 0);
+    // Without a cache every row is read, in order.
+    var plain = try NgramTable.openRecords(path, rb, 4096, 0);
+    defer plain.close();
+    try plain.gatherRecords(&.{ 4095, 0, 7, 7 }, a[0 .. 4 * rb]);
+    for ([_]u8{ 255, 0, 7, 7 }, 0..) |v, i| try std.testing.expect(std.mem.allEqual(u8, a[i * rb ..][0..rb], v));
+}
+
+test "ngram record table: the host charge is the cache's allocation; a short file refuses" {
+    try std.testing.expectEqual(@as(u32, 254_200), RowCache.slotCount(264, 64 << 20));
+    try std.testing.expectEqual(@as(u32, 524_288), RowCache.indexCapacity(254_200));
+    try std.testing.expectEqual(@as(u64, 254_200 * (264 + 20) + 524_288 * 13), RowCache.hostBytes(264, 64 << 20));
+    var c = try RowCache.init(std.testing.allocator, 264, 64 << 20);
+    defer c.deinit();
+    try std.testing.expectEqual(@as(usize, 254_200 * 264), c.arena.len);
+    try std.testing.expectEqual(RowCache.indexCapacity(c.slot_count), c.index.capacity());
+    var pbuf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "/tmp/ngram-records-short-{d}.bin", .{std.c.getpid()}, 0);
+    try writeRecordFile(path, 10, 8);
+    defer _ = std.c.unlink(path.ptr);
+    try std.testing.expectError(error.NgramTableTruncated, NgramTable.openRecords(path, 8, 11, 0));
+    try std.testing.expectError(error.NgramTableTruncated, NgramTable.openRecords(path, 8, 10, 8));
+    try std.testing.expectError(error.NgramTableRegion, NgramTable.openRecords(path, 0, 10, 0));
 }
