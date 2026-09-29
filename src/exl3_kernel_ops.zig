@@ -30,6 +30,8 @@ pub const Refusal = error{
     TemplateNotRegistered,
     /// A row count outside a plan kernel's table (the caller's phase route owns those rows).
     RowsOutOfPlan,
+    /// A routed row naming a slot outside its call's bank.
+    SlotOutOfBank,
 };
 
 fn refuse(diag: ?*xk.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
@@ -559,7 +561,10 @@ pub fn ProjArrays(comptime T: type) type {
 /// A layer bank's projection arrays are what the kernels read (bind time, once per bank).
 pub fn checkBank(comptime G: type, g: *G, reg: *const xk.Registry, proj: Proj, a: ProjArrays(G.T), diag: ?*xk.Diag) Refusal!void {
     var vars: Vars = .initFill(0);
-    vars.set(.cap, rowsOf(G, g, a.code, 0));
+    const cap = rowsOf(G, g, a.code, 0);
+    const bound = reg.get(.dsv41_exl3_mul1h_k3_2304).bounds.get(.cap).?;
+    if (cap < bound[0] or cap > bound[1]) return refuse(diag, error.RouteInput, "exl3 kernel ops: a bank of {d} slots (the kernels take {d}..{d})", .{ cap, bound[0], bound[1] });
+    vars.set(.cap, cap);
     switch (proj) {
         .gate, .up => {
             try expectInput(G, g, reg.get(.dsv41_exl3_mul1h_k3_2304), "code", a.code, &vars, diag);
@@ -840,26 +845,274 @@ pub fn DigTableArray(comptime G: type) type {
     return struct { tbl: G.T, tgs: u32 };
 }
 
+// ── Prefill: the routed wave dispatch (DIG-X, DIG2 onepass, SHAPE balance / rebuildahead / carry) ──
+
+/// The installed prefill wave shape: the fused point's wave / inflight / row budget
+/// (Q3_PREFILL_FUSED_INSTALL config) and SHAPE's carry rows (Q3_PREFILL_SHAPE_INSTALL).
+pub const PrefillShape = struct {
+    /// experts per wave (1..16, the wave table's expert rows)
+    wave: u32,
+    /// waves in flight (>= 2, SHAPE's overlap route): a wave first waits for all but `inflight - 1` older ones
+    inflight: u32,
+    /// assignment rows per wave; an expert above it forms a wave alone (solo: drained before, evaluated after)
+    row_budget: u32,
+    /// a call of at most `carry_rows` rows leaves its last waves in flight (to the next call or `finish`)
+    carry_rows: u32,
+
+    /// Record 3 (pass3r-record3-fast-typical-exl3-30-guard-20260928.log).
+    pub const tier: PrefillShape = .{ .wave = 4, .inflight = 2, .row_budget = 7168, .carry_rows = 8192 };
+};
+
+/// A layer bank's three projections (the streamer's `BankArrays`).
+pub fn BankArrays(comptime T: type) type {
+    return struct { gate: ProjArrays(T), up: ProjArrays(T), down: ProjArrays(T) };
+}
+
+/// One call's routed rows: `slot[i]` = assignment row i's bank slot (its binding's bank_index).
+/// Row i reads act row i (the switch's `selected`), or act row `act_row[i]` when given (the
+/// chunk's tokens and position / top_k: the same words without the switch's row take).
+pub const PrefillRows = struct { slot: []const u32, act_row: ?[]const u32 = null };
+
+/// The lane of record's `Tcq3FusedPrefillDispatch...__dig2_onepass_exl3.__call__` over one call's
+/// routed rows (one route per layer, as the lane has one dispatcher per layer): experts grouped
+/// by slot in first-appearance order, snake-ordered (largest, smallest, ...; stable), packed
+/// greedily into waves of <= `wave` experts and <= `row_budget` rows; per wave rot_take2 -> the
+/// gate|up GEMM (72-tile table) -> dig2 onepass -> the down GEMM (80-tile table) -> rot_widen1;
+/// then `take(concatenate(waves), argsort(positions))`, the permutation made on the host. The
+/// eval schedule is SHAPE's: a wave waits for all but `inflight - 1` older waves (a solo wave for
+/// all, and is evaluated at once); a call above `carry_rows` rows drains every wave and evaluates
+/// the join and the result, a carried call leaves its last waves in flight and async-evaluates
+/// the result; `finish` (the prefill boundary) drains them. The lane's rebuild-ahead is the next
+/// wave's two host tables (no GPU work) and has no counterpart here.
+pub fn DigXPrefill(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        const hidden = 5120;
+        dig: DigX(G),
+        shape: PrefillShape,
+        tiles_gu: u32,
+        tiles_dn: u32,
+        rows_hi: u64,
+        a: Allocator,
+        diag: ?*xk.Diag,
+        /// waves in flight, oldest first (kept handles; persist across carried calls)
+        flight: std.ArrayList(G.T) = .empty,
+        parts: std.ArrayList(G.T) = .empty,
+        // host scratch, reused across calls
+        group_of: std.ArrayList(i32) = .empty,
+        gslot: std.ArrayList(u32) = .empty,
+        gcount: std.ArrayList(u32) = .empty,
+        gnext: std.ArrayList(u32) = .empty,
+        snake: std.ArrayList(u32) = .empty,
+        sorted: std.ArrayList(u32) = .empty,
+        grows: std.ArrayList(u32) = .empty,
+        pos: std.ArrayList(u32) = .empty,
+        ridx: std.ArrayList(i32) = .empty,
+        rhs: std.ArrayList(u32) = .empty,
+        inv: std.ArrayList(u32) = .empty,
+
+        /// `diag` (optional) receives the refusal messages of `init` and of every call.
+        pub fn init(a: Allocator, reg: *const xk.Registry, shape: PrefillShape, diag: ?*xk.Diag) Refusal!Self {
+            if (shape.wave < 1 or shape.wave > wave_max or shape.inflight < 2 or shape.row_budget < 1)
+                return refuse(diag, error.RouteInput, "exl3 kernel ops: prefill shape wave {d} (1..{d}), inflight {d} (>= 2: SHAPE's overlap route), row budget {d} (>= 1)", .{ shape.wave, wave_max, shape.inflight, shape.row_budget });
+            const dig = DigX(G).init(reg);
+            return .{ .dig = dig, .shape = shape, .tiles_gu = dig.digTiles(.gate_up), .tiles_dn = dig.digTiles(.down), .rows_hi = dig.gemm_gu.bounds.get(.rows).?[1], .a = a, .diag = diag };
+        }
+
+        /// Releases the waves still in flight (without evaluating them) and the scratch.
+        pub fn deinit(self: *Self, g: *G) void {
+            for (self.flight.items) |x| g.release(x);
+            self.flight.deinit(self.a);
+            self.parts.deinit(self.a);
+            inline for (.{ &self.group_of, &self.gslot, &self.gcount, &self.gnext, &self.snake, &self.sorted, &self.grows, &self.pos, &self.ridx, &self.rhs, &self.inv }) |l| l.deinit(self.a);
+        }
+
+        /// The prefill boundary: every wave still in flight evaluated, oldest first.
+        pub fn finish(self: *Self, g: *G) !void {
+            while (self.flight.items.len > 0) try self.drainOne(g);
+        }
+
+        fn drainOne(self: *Self, g: *G) !void {
+            const x = self.flight.orderedRemove(0);
+            defer g.release(x);
+            try g.evalAll(&.{x});
+        }
+
+        /// act bf16 [a_rows, 5120], `rows` (A assignment rows), the call's bank -> f32 [A, 5120]
+        /// in assignment-row order (the lane's `result`). Refused: A outside 1..the kernels' row
+        /// bound (RowsOutOfPlan), a slot outside the bank (SlotOutOfBank), act rows that are not
+        /// A (no act_row) or an act_row outside act (RouteInput).
+        pub fn call(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !G.T {
+            const n_rows = rows.slot.len;
+            if (n_rows == 0 or n_rows > self.rows_hi) return refuse(self.diag, error.RowsOutOfPlan, "exl3 kernel ops: a prefill call of {d} rows (1..{d})", .{ n_rows, self.rows_hi });
+            const a_rows = rowsOf(G, g, act, 0);
+            if (rows.act_row == null and a_rows != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill act has {d} rows for {d} routed rows", .{ a_rows, n_rows });
+            if (rows.act_row) |ar| if (ar.len != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: {d} act rows for {d} routed rows", .{ ar.len, n_rows });
+            try self.group(rows, rowsOf(G, g, bank.gate.code, 0), a_rows);
+            const carried = n_rows <= self.shape.carry_rows;
+            const a = self.a;
+            const cnt = self.gcount.items;
+            const order = self.snake.items;
+            self.parts.clearRetainingCapacity();
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < order.len) {
+                const first = i;
+                var wave_rows: usize = cnt[order[i]];
+                i += 1;
+                while (i < order.len and i - first < self.shape.wave and wave_rows + cnt[order[i]] <= self.shape.row_budget) : (i += 1) wave_rows += cnt[order[i]];
+                const solo = wave_rows > self.shape.row_budget;
+                const keep: usize = if (solo) 0 else self.shape.inflight - 1;
+                while (self.flight.items.len > keep) try self.drainOne(g);
+                var ex: [wave_max]WaveExpert = undefined;
+                for (order[first..i], 0..) |gi, j| {
+                    ex[j] = .{ .slot = self.gslot.items[gi], .rows = cnt[gi] };
+                    @memset(self.rhs.items[off..][0..cnt[gi]], @intCast(j));
+                    off += cnt[gi];
+                }
+                const r0 = off - wave_rows;
+                const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off]);
+                try self.parts.append(a, y);
+                if (solo) {
+                    try g.evalAll(&.{y});
+                } else {
+                    try g.asyncEval(&.{y});
+                    try self.flight.ensureUnusedCapacity(a, 1);
+                    self.flight.appendAssumeCapacity(g.keep(y));
+                }
+            }
+            if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
+            const joined = try g.concat(self.parts.items, 0);
+            if (!carried) try g.evalAll(&.{joined});
+            for (self.pos.items, 0..) |p, j| self.inv.items[p] = @intCast(j);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(self.inv.items), &.{@intCast(n_rows)}, .uint32);
+            const result = try g.take(joined, ord, 0);
+            if (carried) try g.asyncEval(&.{result}) else try g.evalAll(&.{result});
+            return result;
+        }
+
+        /// One wave's five launches -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
+        fn submit(self: *Self, g: *G, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32) !G.T {
+            const n: c_int = @intCast(ridx.len);
+            const tg = digTable(ex, self.tiles_gu);
+            const td = digTable(ex, self.tiles_dn);
+            const tgu = try g.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32);
+            const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
+            const ridx_a = try g.hostArray(std.mem.sliceAsBytes(ridx), &.{n}, .int32);
+            const rhs_a = try g.hostArray(std.mem.sliceAsBytes(rhs), &.{n}, .uint32);
+            const hz = try self.dig.gateUpOnePass(g, act, ridx_a, rhs_a, .{ .tbl = tgu, .tgs = tg.tgs }, bank.gate, bank.up, bank.down.rin);
+            const zd = try self.dig.gemmDown(g, hz[0], bank.down.code, tdn, td.tgs);
+            const y = try self.dig.widen1(g, zd, rhs_a, tdn, bank.down.rout);
+            return g.reshape(y, &.{ n, hidden });
+        }
+
+        /// The host plan: groups (slot -> rows, first-appearance order, rows ascending), the snake
+        /// order, and per wave-ordered row its assignment row (`pos`) and act row (`ridx`).
+        fn group(self: *Self, rows: PrefillRows, cap: u64, a_rows: u64) !void {
+            const a = self.a;
+            const n = rows.slot.len;
+            try self.group_of.resize(a, @intCast(cap));
+            @memset(self.group_of.items, -1);
+            self.gslot.clearRetainingCapacity();
+            self.gcount.clearRetainingCapacity();
+            for (rows.slot, 0..) |s, i| {
+                if (s >= cap) return refuse(self.diag, error.SlotOutOfBank, "exl3 kernel ops: prefill row {d} names slot {d} of a {d}-slot bank", .{ i, s, cap });
+                if (rows.act_row) |ar| if (ar[i] >= a_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill row {d} reads act row {d} of {d}", .{ i, ar[i], a_rows });
+                var gi = self.group_of.items[s];
+                if (gi < 0) {
+                    gi = @intCast(self.gslot.items.len);
+                    self.group_of.items[s] = gi;
+                    try self.gslot.append(a, s);
+                    try self.gcount.append(a, 0);
+                }
+                self.gcount.items[@intCast(gi)] += 1;
+            }
+            const ng = self.gslot.items.len;
+            // each group's rows, ascending (the lane appends rows in order)
+            try self.gnext.resize(a, ng);
+            var start: u32 = 0;
+            for (self.gcount.items, self.gnext.items) |c, *nx| {
+                nx.* = start;
+                start += c;
+            }
+            try self.grows.resize(a, n);
+            for (rows.slot, 0..) |s, i| {
+                const gi: usize = @intCast(self.group_of.items[s]);
+                self.grows.items[self.gnext.items[gi]] = @intCast(i);
+                self.gnext.items[gi] += 1;
+            }
+            // snake over the rows-descending order (stable: ties keep first appearance)
+            try self.sorted.resize(a, ng);
+            for (self.sorted.items, 0..) |*v, i| v.* = @intCast(i);
+            std.mem.sort(u32, self.sorted.items, @as([]const u32, self.gcount.items), struct {
+                fn more(c: []const u32, x: u32, y: u32) bool {
+                    return c[x] > c[y];
+                }
+            }.more);
+            try self.snake.resize(a, ng);
+            var lo: usize = 0;
+            var hi: usize = ng;
+            var k: usize = 0;
+            while (lo < hi) {
+                self.snake.items[k] = self.sorted.items[lo];
+                k += 1;
+                lo += 1;
+                if (lo < hi) {
+                    hi -= 1;
+                    self.snake.items[k] = self.sorted.items[hi];
+                    k += 1;
+                }
+            }
+            // rows in wave order: the snake order's groups, each group's rows ascending
+            try self.pos.resize(a, n);
+            try self.ridx.resize(a, n);
+            try self.rhs.resize(a, n);
+            try self.inv.resize(a, n);
+            var off: usize = 0;
+            for (self.snake.items) |gi| {
+                const c = self.gcount.items[gi];
+                const first = self.gnext.items[gi] - c;
+                for (self.grows.items[first..][0..c]) |row| {
+                    self.pos.items[off] = row;
+                    self.ridx.items[off] = @intCast(if (rows.act_row) |ar| ar[row] else row);
+                    off += 1;
+                }
+            }
+        }
+    };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
 
 /// Host-only backend: nodes of shape + dtype (host arrays keep their bytes), every launch
-/// recorded with its inputs and outputs. Nothing reaches MLX.
+/// recorded with its inputs and outputs, every node with its origin, and the launches, evals
+/// and joins in one ordered log. Nothing reaches MLX.
 const Trace = struct {
     pub const T = u32;
-    const Node = struct { shape: Shape, dtype: Dtype, bytes: []u8 };
+    const Origin = union(enum) { none, host, ext: []const u8, out: [2]u32, view: T, cat: u32, take: u32 };
+    const Node = struct { shape: Shape, dtype: Dtype, bytes: []u8, origin: Origin = .none };
     const Launch = struct { k: Kernel, cfg: LaunchConfig, inputs: [16]T = undefined, n_in: usize, outs: [xk.max_outputs]T = undefined };
+    const Ev = union(enum) { launch: u32, eval: []T, async_eval: []T, concat: []T, take: [2]T };
 
     a: Allocator,
     nodes: std.ArrayList(Node) = .empty,
     launches: std.ArrayList(Launch) = .empty,
+    log: std.ArrayList(Ev) = .empty,
+    cats: u32 = 0,
+    takes: u32 = 0,
     keeps: isize = 0,
 
     fn deinit(t: *Trace) void {
         for (t.nodes.items) |n| t.a.free(n.bytes);
         t.nodes.deinit(t.a);
         t.launches.deinit(t.a);
+        for (t.log.items) |e| switch (e) {
+            .eval, .async_eval, .concat => |xs| t.a.free(xs),
+            else => {},
+        };
+        t.log.deinit(t.a);
     }
 
     fn node(t: *Trace, shape: []const c_int, dt: Dtype, bytes: []const u8) !T {
@@ -867,6 +1120,16 @@ const Trace = struct {
         errdefer t.a.free(copy);
         try t.nodes.append(t.a, .{ .shape = Shape.of(shape), .dtype = dt, .bytes = copy });
         return @intCast(t.nodes.items.len - 1);
+    }
+
+    fn with(t: *Trace, x: T, origin: Origin) T {
+        t.nodes.items[x].origin = origin;
+        return x;
+    }
+
+    /// A caller array named `name` (a lane's ext: reference).
+    fn ext(t: *Trace, name: []const u8, shape: []const c_int, dt: Dtype) !T {
+        return t.with(try t.node(shape, dt, &.{}), .{ .ext = name });
     }
 
     pub fn shapeOf(t: *Trace, x: T) Shape {
@@ -878,7 +1141,7 @@ const Trace = struct {
     }
 
     pub fn hostArray(t: *Trace, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
-        return t.node(shape, dt, bytes);
+        return t.with(try t.node(shape, dt, bytes), .host);
     }
 
     pub fn keep(t: *Trace, x: T) T {
@@ -891,7 +1154,7 @@ const Trace = struct {
     }
 
     pub fn reshape(t: *Trace, x: T, shape: []const c_int) !T {
-        return t.node(shape, t.nodes.items[x].dtype, &.{});
+        return t.with(try t.node(shape, t.nodes.items[x].dtype, &.{}), .{ .view = x });
     }
 
     pub fn astype(t: *Trace, x: T, dt: Dtype) !T {
@@ -901,11 +1164,46 @@ const Trace = struct {
     pub fn launch(t: *Trace, k: Kernel, inputs: []const T, cfg: *const LaunchConfig, out: []T) !void {
         var l: Launch = .{ .k = k, .cfg = cfg.*, .n_in = inputs.len };
         @memcpy(l.inputs[0..inputs.len], inputs);
+        const li: u32 = @intCast(t.launches.items.len);
         for (out, 0..) |*o, i| {
-            o.* = try t.node(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i], &.{});
+            o.* = t.with(try t.node(cfg.out_shapes[i][0..cfg.out_ranks[i]], cfg.out_dtypes[i], &.{}), .{ .out = .{ li, @intCast(i) } });
             l.outs[i] = o.*;
         }
         try t.launches.append(t.a, l);
+        try t.log.append(t.a, .{ .launch = li });
+    }
+
+    pub fn evalAll(t: *Trace, xs: []const T) !void {
+        const d = try t.a.dupe(T, xs);
+        errdefer t.a.free(d);
+        try t.log.append(t.a, .{ .eval = d });
+    }
+
+    pub fn asyncEval(t: *Trace, xs: []const T) !void {
+        const d = try t.a.dupe(T, xs);
+        errdefer t.a.free(d);
+        try t.log.append(t.a, .{ .async_eval = d });
+    }
+
+    pub fn concat(t: *Trace, xs: []const T, axis: c_int) !T {
+        std.debug.assert(axis == 0);
+        var s = t.nodes.items[xs[0]].shape;
+        s.d[0] = 0;
+        for (xs) |x| s.d[0] += t.nodes.items[x].shape.d[0];
+        const d = try t.a.dupe(T, xs);
+        errdefer t.a.free(d);
+        try t.log.append(t.a, .{ .concat = d });
+        t.cats += 1;
+        return t.with(try t.node(s.slice(), t.nodes.items[xs[0]].dtype, &.{}), .{ .cat = t.cats - 1 });
+    }
+
+    pub fn take(t: *Trace, x: T, idx: T, axis: c_int) !T {
+        std.debug.assert(axis == 0);
+        var s = t.nodes.items[x].shape;
+        s.d[0] = t.nodes.items[idx].shape.d[0];
+        try t.log.append(t.a, .{ .take = .{ x, idx } });
+        t.takes += 1;
+        return t.with(try t.node(s.slice(), t.nodes.items[x].dtype, &.{}), .{ .take = t.takes - 1 });
     }
 
     /// A caller array: `e`'s input `name` at `vars`.
@@ -1324,4 +1622,255 @@ test "dsv41 kernels ops: the seam calls cast and reshape as the lanes' seams do"
     try testing.expectEqualSlices(c_int, &.{ 7, 1280 }, t.shapeOf(t.back(1).inputs[2]).slice());
     try testing.expectEqualSlices(c_int, &.{ 1, 7, 32768 }, t.shapeOf(q).slice());
     try testing.expectEqual(@as(i32, 7), templateInt(t.back(1).cfg.template, "M"));
+}
+
+// ── The prefill wave route vs the lane of record's own dispatch (dump_prefill_waves.py --samples) ──
+
+const prefill_samples = @embedFile("fixtures/dsv41_prefill_wave_samples.json");
+const JRoute = struct { seed: u64, slots: []const u32, counts: []const u32 };
+const JCall = struct { name: []const u8, a_rows: u32, route: JRoute, events: []const []const u8, ret: []const u8, ret_shape: []const i64 };
+const JShapeCfg = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };
+const JSampleCase = struct { case: []const u8, shape: JShapeCfg, cap: u32, calls: []const JCall, finish: []const []const u8 };
+const JSamples = struct { format: []const u8, cases: []const JSampleCase };
+
+/// dump_prefill_waves.route_rows: slot j repeated counts[j] times, then Fisher-Yates from the end
+/// with j = splitmix64(seed) output k % (i + 1), k = 0, 1, ... as i runs A - 1 .. 1.
+fn routeRows(a: Allocator, seed: u64, slots: []const u32, counts: []const u32) ![]u32 {
+    var n: usize = 0;
+    for (counts) |c| n += c;
+    const rows = try a.alloc(u32, n);
+    var k: usize = 0;
+    for (slots, counts) |s, c| for (0..c) |_| {
+        rows[k] = s;
+        k += 1;
+    };
+    var st = seed;
+    var i = n;
+    while (i > 1) {
+        i -= 1;
+        const j: usize = @intCast(xk.splitmix64(&st) % (i + 1));
+        std.mem.swap(u32, &rows[i], &rows[j]);
+    }
+    return rows;
+}
+
+fn shapeStr(out: *std.ArrayList(u8), a: Allocator, s: []const c_int) !void {
+    try out.append(a, '[');
+    for (s, 0..) |d, i| try out.print(a, "{s}{d}", .{ if (i == 0) "" else ",", d });
+    try out.append(a, ']');
+}
+
+/// The lane samples' canonical reference of a node: ext:<name>, host:<dtype>:<shape>:<sha256[0..16]>,
+/// L<launch>.<output>, C<concat>, T<take>; a view appends @<its shape>.
+fn traceRef(t: *const Trace, x: Trace.T, out: *std.ArrayList(u8)) !void {
+    const a = t.a;
+    var n = x;
+    var view: ?Shape = null;
+    while (t.nodes.items[n].origin == .view) {
+        if (view == null) view = t.nodes.items[n].shape;
+        n = t.nodes.items[n].origin.view;
+    }
+    const nd = &t.nodes.items[n];
+    switch (nd.origin) {
+        .host => {
+            var d: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(nd.bytes, &d, .{});
+            const hex = std.fmt.bytesToHex(d, .lower);
+            try out.print(a, "host:{t}:", .{nd.dtype});
+            try shapeStr(out, a, nd.shape.slice());
+            try out.print(a, ":{s}", .{hex[0..16]});
+        },
+        .ext => |name| try out.print(a, "ext:{s}", .{name}),
+        .out => |o| try out.print(a, "L{d}.{d}", .{ o[0], o[1] }),
+        .cat => |i| try out.print(a, "C{d}", .{i}),
+        .take => |i| try out.print(a, "T{d}", .{i}),
+        .none, .view => return error.UntracedNode,
+    }
+    if (view) |s| {
+        try out.append(a, '@');
+        try shapeStr(out, a, s.slice());
+    }
+}
+
+fn traceRefs(t: *const Trace, xs: []const Trace.T, out: *std.ArrayList(u8)) !void {
+    for (xs, 0..) |x, i| {
+        if (i > 0) try out.append(t.a, ';');
+        try traceRef(t, x, out);
+    }
+}
+
+fn traceEvent(t: *const Trace, e: Trace.Ev, out: *std.ArrayList(u8)) !void {
+    const a = t.a;
+    switch (e) {
+        .launch => |li| {
+            const l = &t.launches.items[li];
+            const c = &l.cfg;
+            try out.print(a, "launch {t} g={d},{d},{d} t={d},{d},{d} in=", .{ l.k, c.grid[0], c.grid[1], c.grid[2], c.threadgroup[0], c.threadgroup[1], c.threadgroup[2] });
+            try traceRefs(t, l.inputs[0..l.n_in], out);
+            try out.appendSlice(a, " out=");
+            for (0..c.n_out) |i| {
+                if (i > 0) try out.append(a, ';');
+                try out.print(a, "{t}", .{c.out_dtypes[i]});
+                try shapeStr(out, a, c.out_shapes[i][0..c.out_ranks[i]]);
+            }
+            if (c.template.len > 0) return error.TemplateOnPrefillRoute;
+        },
+        .eval => |xs| {
+            try out.appendSlice(a, "eval ");
+            try traceRefs(t, xs, out);
+        },
+        .async_eval => |xs| {
+            try out.appendSlice(a, "async ");
+            try traceRefs(t, xs, out);
+        },
+        .concat => |xs| {
+            try out.appendSlice(a, "concat ");
+            try traceRefs(t, xs, out);
+        },
+        .take => |xi| {
+            try out.appendSlice(a, "take ");
+            try traceRef(t, xi[0], out);
+            try out.append(a, ' ');
+            try traceRef(t, xi[1], out);
+        },
+    }
+}
+
+/// The trace's log from `from` on is the lane's `want`, event for event.
+fn expectEvents(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8) !void {
+    const got = t.log.items[from..];
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(t.a);
+    for (got[0..@min(got.len, want.len)], want[0..@min(got.len, want.len)], 0..) |e, w, i| {
+        buf.clearRetainingCapacity();
+        try traceEvent(t, e, &buf);
+        if (!std.mem.eql(u8, buf.items, w)) {
+            std.debug.print("prefill {s} {s} event {d}:\n  route: {s}\n  lane:  {s}\n", .{ case, what, i, buf.items, w });
+            return error.TestExpectedEqual;
+        }
+    }
+    if (got.len != want.len) {
+        std.debug.print("prefill {s} {s}: {d} events, the lane {d}\n", .{ case, what, got.len, want.len });
+        return error.TestExpectedEqual;
+    }
+}
+
+fn testBank(t: *Trace, cap: c_int) !BankArrays(Trace.T) {
+    return .{
+        .gate = .{ .code = try t.ext("gate_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("gate_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("gate_proj.rin", &.{ cap, 5120 }, .float16) },
+        .up = .{ .code = try t.ext("up_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("up_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("up_proj.rin", &.{ cap, 5120 }, .float16) },
+        .down = .{ .code = try t.ext("down_proj.code", &.{ cap, 144, 320, 48 }, .int16), .rout = try t.ext("down_proj.rout", &.{ cap, 5120 }, .float16), .rin = try t.ext("down_proj.rin", &.{ cap, 2304 }, .float16) },
+    };
+}
+
+test "dsv41 kernels ops: the prefill wave route replays the lane's own launches, evals and joins (lane samples)" {
+    const a = testing.allocator;
+    var reg = try testRegistry();
+    defer reg.deinit();
+    const parsed = try std.json.parseFromSlice(JSamples, a, prefill_samples, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mlx-serve-exl3-prefill-wave-samples-v1", parsed.value.format);
+    var n_calls: usize = 0;
+    var n_waves: usize = 0;
+    for (parsed.value.cases) |*cs| {
+        var t: Trace = .{ .a = a };
+        defer t.deinit();
+        const shape: PrefillShape = .{ .wave = cs.shape.wave, .inflight = cs.shape.inflight, .row_budget = cs.shape.row_budget, .carry_rows = cs.shape.carry_rows };
+        var r = try DigXPrefill(Trace).init(a, &reg, shape, null);
+        defer r.deinit(&t);
+        const bank = try testBank(&t, @intCast(cs.cap));
+        var mark: usize = 0;
+        for (cs.calls) |*cl| {
+            const slots = try routeRows(a, cl.route.seed, cl.route.slots, cl.route.counts);
+            defer a.free(slots);
+            try testing.expectEqual(@as(usize, cl.a_rows), slots.len);
+            const act = try t.ext("act", &.{ @intCast(slots.len), 5120 }, .bfloat16);
+            const launches0 = t.launches.items.len;
+            const res = try r.call(&t, act, .{ .slot = slots }, bank);
+            try expectEvents(&t, mark, cl.events, cs.case, cl.name);
+            mark = t.log.items.len;
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(a);
+            try traceRef(&t, res, &buf);
+            try testing.expectEqualStrings(cl.ret, buf.items);
+            const rs = t.shapeOf(res);
+            for (cl.ret_shape, rs.slice()) |w, d| try testing.expectEqual(w, @as(i64, d));
+            n_calls += 1;
+            n_waves += (t.launches.items.len - launches0) / 5;
+        }
+        try r.finish(&t);
+        try expectEvents(&t, mark, cs.finish, cs.case, "finish");
+        try testing.expectEqual(@as(isize, 0), t.keeps);
+    }
+    try testing.expect(n_calls >= 10 and n_waves >= 60);
+}
+
+test "dsv41 kernels ops: the prefill wave route refuses by name, before any launch" {
+    const a = testing.allocator;
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var diag: xk.Diag = .{};
+    const tier = PrefillShape.tier;
+    var bads = [_]PrefillShape{ tier, tier, tier, tier };
+    bads[0].wave = 0;
+    bads[1].wave = 17;
+    bads[2].inflight = 1;
+    bads[3].row_budget = 0;
+    for (bads) |s| try testing.expectError(error.RouteInput, DigXPrefill(Trace).init(a, &reg, s, &diag));
+    var t: Trace = .{ .a = a };
+    defer t.deinit();
+    var r = try DigXPrefill(Trace).init(a, &reg, tier, &diag);
+    defer r.deinit(&t);
+    const bank = try testBank(&t, 8);
+    const act4 = try t.ext("act", &.{ 4, 5120 }, .bfloat16);
+    try testing.expectError(error.RowsOutOfPlan, r.call(&t, act4, .{ .slot = &.{} }, bank));
+    try testing.expectError(error.SlotOutOfBank, r.call(&t, act4, .{ .slot = &.{ 1, 2, 8, 3 } }, bank));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "slot 8 of a 8-slot bank") != null);
+    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 } }, bank));
+    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 4, 1 } }, bank));
+    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 1 } }, bank));
+    try testing.expectEqual(@as(usize, 0), t.launches.items.len);
+    try testing.expectEqual(@as(usize, 0), t.log.items.len);
+    // a bank above the kernels' slot bound is refused where the model binds it
+    const big: ProjArrays(Trace.T) = .{ .code = try t.ext("c", &.{ 4097, 320, 144, 48 }, .int16), .rout = try t.ext("r", &.{ 4097, 2304 }, .float16), .rin = try t.ext("i", &.{ 4097, 5120 }, .float16) };
+    try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .gate, big, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "a bank of 4097 slots") != null);
+    try checkBank(Trace, &t, &reg, .gate, bank.gate, &diag);
+    try checkBank(Trace, &t, &reg, .down, bank.down, &diag);
+}
+
+test "dsv41 kernels ops: prefill rows read by act_row take the same act words (tokens, position / top_k)" {
+    const a = testing.allocator;
+    var reg = try testRegistry();
+    defer reg.deinit();
+    const counts = [_]u32{ 900, 700, 300, 297, 40, 1 };
+    const slots = try routeRows(a, 77, &.{ 5, 0, 2, 7, 3, 6 }, &counts);
+    defer a.free(slots);
+    const n = slots.len;
+    try testing.expectEqual(@as(usize, 2238), n);
+    const act_row = try a.alloc(u32, n);
+    defer a.free(act_row);
+    for (act_row, 0..) |*v, i| v.* = @intCast(i / 6);
+    var ta: Trace = .{ .a = a };
+    defer ta.deinit();
+    var tb: Trace = .{ .a = a };
+    defer tb.deinit();
+    var ra = try DigXPrefill(Trace).init(a, &reg, .tier, null);
+    defer ra.deinit(&ta);
+    var rb = try DigXPrefill(Trace).init(a, &reg, .tier, null);
+    defer rb.deinit(&tb);
+    _ = try ra.call(&ta, try ta.ext("act", &.{ @intCast(n), 5120 }, .bfloat16), .{ .slot = slots }, try testBank(&ta, 8));
+    _ = try rb.call(&tb, try tb.ext("tokens", &.{ @intCast(n / 6), 5120 }, .bfloat16), .{ .slot = slots, .act_row = act_row }, try testBank(&tb, 8));
+    try testing.expectEqual(ta.launches.items.len, tb.launches.items.len);
+    try testing.expectEqual(ta.log.items.len, tb.log.items.len);
+    for (ta.launches.items, tb.launches.items) |la, lb| {
+        try testing.expectEqual(la.k, lb.k);
+        try testing.expectEqual(la.cfg.grid, lb.cfg.grid);
+        if (la.k != .q3_prefill_dig_rot_take2_5120) continue;
+        // ridx: assignment row p in A reads act row p; in B, act_row[p] = p / 6
+        const ba, const bb = .{ ta.nodes.items[la.inputs[1]].bytes, tb.nodes.items[lb.inputs[1]].bytes };
+        try testing.expectEqual(ba.len, bb.len);
+        var k: usize = 0;
+        while (k < ba.len) : (k += 4) try testing.expectEqual(@divTrunc(std.mem.readInt(i32, ba[k..][0..4], .little), 6), std.mem.readInt(i32, bb[k..][0..4], .little));
+    }
 }

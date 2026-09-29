@@ -87,6 +87,38 @@ pub const MlxG = struct {
         for (out) |o| _ = try g.track(o);
     }
 
+    pub fn evalAll(_: *MlxG, xs: []const T) !void {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_eval(v));
+    }
+
+    pub fn asyncEval(_: *MlxG, xs: []const T) !void {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
+    }
+
+    pub fn concat(g: *MlxG, xs: []const T, axis: c_int) !T {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_concatenate_axis(&r, v, axis, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    pub fn take(g: *MlxG, x: T, idx: T, axis: c_int) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_take_axis(&r, x, idx, axis, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
     /// Row-contiguous host bytes of `x` (caller frees).
     fn hostBytes(g: *MlxG, x: T) ![]u8 {
         var c = mlx.mlx_array_new();
@@ -378,6 +410,85 @@ fn wanted(filter: ?[]const u8, family: []const u8) bool {
     return false;
 }
 
+// ── The prefill wave fixture (dump_prefill_waves.py spec.json, window PF) ──
+
+const PShape = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };
+const PCall = struct { name: []const u8, a_rows: u32, slots: []const u32, act: JArray, output: JArray };
+const PCase = struct { family: []const u8, case: []const u8, shape: PShape, cap: u32, inputs: []const JArray, calls: []const PCall };
+const PSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const PCase };
+const prefill_format = "mlx-serve-exl3-prefill-waves-fixture-v1";
+
+/// An input regenerated from its generator; null when its bytes are not the dump's (sha256).
+fn regen(a: Allocator, g: *MlxG, i: *const JArray) !?mlx.mlx_array {
+    const dt = dtypeOf(i.dtype);
+    var shape: [8]c_int = undefined;
+    var n: usize = 1;
+    for (i.shape, 0..) |d, k| {
+        shape[k] = @intCast(d);
+        n *= @intCast(d);
+    }
+    const bytes = try generate(a, i.gen.?, dt, n);
+    defer a.free(bytes);
+    if (!hexEql(i.sha256, bytes)) return null;
+    return try g.hostArray(bytes, shape[0..i.shape.len], dt);
+}
+
+/// One case: the bank and each call's act regenerated and checked, the route's calls in order on
+/// one route (then its prefill boundary), every call's result compared with the lane's, word for word.
+fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u8, c: *const PCase, lines: *std.ArrayList(Line), diag: *xk.Diag) !void {
+    var ins: std.StringHashMapUnmanaged(mlx.mlx_array) = .empty;
+    defer ins.deinit(a);
+    for (c.inputs) |*i| {
+        const x = try regen(a, g, i) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input generator differs from the dump's" });
+            return;
+        };
+        try ins.put(a, i.name, x);
+    }
+    const P = ops.ProjArrays(mlx.mlx_array);
+    const bank: ops.BankArrays(mlx.mlx_array) = .{
+        .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin") },
+        .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin") },
+        .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin") },
+    };
+    try ops.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
+    try ops.checkBank(MlxG, g, reg, .up, bank.up, diag);
+    try ops.checkBank(MlxG, g, reg, .down, bank.down, diag);
+    const shape: ops.PrefillShape = .{ .wave = c.shape.wave, .inflight = c.shape.inflight, .row_budget = c.shape.row_budget, .carry_rows = c.shape.carry_rows };
+    var r = try ops.DigXPrefill(MlxG).init(a, reg, shape, diag);
+    defer r.deinit(g);
+    var results: std.ArrayList(mlx.mlx_array) = .empty;
+    defer results.deinit(a);
+    for (c.calls) |*cl| {
+        const act = try regen(a, g, &cl.act) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = cl.name, .err = "act generator differs from the dump's" });
+            return;
+        };
+        try results.append(a, try r.call(g, act, .{ .slot = cl.slots }, bank));
+    }
+    try r.finish(g);
+    try g.evalAll(results.items);
+    for (c.calls, results.items) |*cl, got_arr| {
+        const o = &cl.output;
+        var line: Line = .{ .family = c.family, .case = c.case, .output = cl.name };
+        const got = try g.hostBytes(got_arr);
+        defer a.free(got);
+        const path = try std.fs.path.join(a, &.{ dir, o.file.? });
+        defer a.free(path);
+        const want = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 31));
+        defer a.free(want);
+        if (g.dtypeOf(got_arr) != dtypeOf(o.dtype) or got.len != want.len) {
+            line.err = "dtype or size differs";
+        } else {
+            line.words = got.len / 4;
+            var k: usize = 0;
+            while (k < got.len) : (k += 4) line.bad += @intFromBool(!std.mem.eql(u8, got[k..][0..4], want[k..][0..4]));
+            line.ok = line.bad == 0 and hexEql(o.sha256, want);
+        }
+        try lines.append(a, line);
+    }
+}
+
 const testing = std.testing;
 
 // The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1,
@@ -435,6 +546,59 @@ test "dsv41 kernels ops gpu: every route reproduces its lane's own device output
     if (std.c.getenv("DSV41_KERNEL_OPS_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
     std.debug.print("[kernel ops gate] {d} cases, {d} outputs, {d} failed\n", .{ cases, lines.items.len, failed });
     try testing.expect(cases > 0);
+    try testing.expectEqual(@as(usize, 0), failed);
+}
+
+// The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
+// DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
+test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
+    _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_KERNEL_PREFILL_FIXTURE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    const spec_path = try std.fs.path.join(a, &.{ dir, "spec.json" });
+    defer a.free(spec_path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, spec_path, a, .limited(16 << 20));
+    defer a.free(text);
+    const parsed = try std.json.parseFromSlice(PSpec, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const spec = parsed.value;
+    try testing.expectEqualStrings(prefill_format, spec.format);
+    try testing.expectEqualStrings(xk.manifest_sha256, spec.manifest_sha256);
+    var diag: xk.Diag = .{};
+    var reg = xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag) catch |e| {
+        std.debug.print("exl3 kernels refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    var lines: std.ArrayList(Line) = .empty;
+    defer lines.deinit(a);
+    for (spec.cases) |*c| {
+        replayPrefill(a, &g, &reg, dir, c, &lines, &diag) catch |e| {
+            var buf: [256]u8 = undefined;
+            const msg = mlx.takeError(&buf) orelse "";
+            std.debug.print("[kernel prefill gate] {s}: {t} {s} {s}\n", .{ c.case, e, msg, diag.message() });
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = "", .err = @errorName(e) });
+        };
+        g.reset();
+    }
+    var failed: usize = 0;
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(a);
+    for (lines.items) |l| {
+        failed += @intFromBool(!l.ok);
+        try j.print(a, "{{\"family\":\"{s}\",\"case\":\"{s}\",\"call\":\"{s}\",\"words\":{d},\"bad\":{d},\"ok\":{},\"err\":\"{s}\"}}\n", .{ l.family, l.case, l.output, l.words, l.bad, l.ok, l.err });
+    }
+    std.debug.print("{s}", .{j.items});
+    if (std.c.getenv("DSV41_KERNEL_PREFILL_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = j.items });
+    std.debug.print("[kernel prefill gate] {d} cases, {d} calls, {d} failed\n", .{ spec.cases.len, lines.items.len, failed });
+    try testing.expect(spec.cases.len > 0);
     try testing.expectEqual(@as(usize, 0), failed);
 }
 
