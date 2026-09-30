@@ -1600,7 +1600,8 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
 /// read counters. The syncs serialize the pass: the profile's wall exceeds the unprobed TTFT; the
 /// split, not the sum, is the reading.
 const PrefillProbe = struct {
-    const n_max = 40;
+    /// Distinct stage names (37 in the trunk, the K16 pass and the experts today); a 65th refuses by name.
+    const n_max = 64;
     g: *ops.MlxOps,
     io: std.Io,
     stats_of: *const fn (*anyopaque) expert_stream.Stats,
@@ -1624,8 +1625,9 @@ const PrefillProbe = struct {
         self.cur_chunk = i;
     }
 
-    fn slot(self: *PrefillProbe, name: []const u8) usize {
+    fn slot(self: *PrefillProbe, name: []const u8) !usize {
         for (self.names[0..self.n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return i;
+        if (self.n == n_max) return error.ProbeStagesFull;
         self.names[self.n] = name;
         self.n += 1;
         return self.n - 1;
@@ -1638,7 +1640,7 @@ const PrefillProbe = struct {
         try self.g.evalAll(&.{x});
         const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
-        self.ns[self.slot(name)] += d;
+        self.ns[try self.slot(name)] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
         if (is_routed) {
