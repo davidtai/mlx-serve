@@ -12,7 +12,6 @@ const mdl = @import("deepseek_v41_model.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
-const graph = @import("deepseek_v41_graph.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
@@ -318,11 +317,9 @@ pub fn engramPostedBytes(e: v41.Engram, prompt_tokens: u64) u64 {
 }
 
 /// Whether `config`'s prompt pass posts its Engram gathers: the K16 pass over a bank with Engram layers, the
-/// route set (the harness's override, else the served tier's). The route's declarations land with dsv41-engram-prefetch:
-/// a tree without them posts nothing, and the term comes on with the route, no bill change.
+/// route set (the harness's override, else the served tier's).
 fn engramPostedRoute(config: *const model.ModelConfig, ov: module.RouteOverrides, c: *const v41.Config) bool {
     if (!config.dsv41LayerMajor() or c.engram.n_layers == 0) return false;
-    if (comptime !@hasField(graph.Routes, "engram_posted")) return false;
     return ov.engram_posted orelse module.numericTier(.served).routes.engram_posted;
 }
 
@@ -545,10 +542,11 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
 }
 
-// DSV41_BANK=<bank> (host): the rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB stop;
-// baselines 9.2 GB and pass3an's 9.55 GB), the Engram posted gathers off (SERVED9b) and on (SERVED10, the served
-// tier's route with dsv41-engram-prefetch): the posted slot costs the 9.2 GB box one prompt row, no decode row.
-test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's posted gathers off and on (bank)" {
+// DSV41_BANK=<bank> (host): this tree's rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB
+// stop; baselines 9.2 GB and pass3an's 9.55 GB), with the seed's copies as the retained prompt state (ac2121c:
+// 847,872 B, +2 decode rows over the views) and the Engram posted gathers off and on (the served tier's route):
+// the posted slot costs the 9.2 GB box one prompt row, no decode row.
+test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetch's posted gathers off and on (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
