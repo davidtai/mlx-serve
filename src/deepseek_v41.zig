@@ -55,6 +55,17 @@ pub const PrefillBill = struct {
     /// The served prefill indexer route (idxscore + INDEX_TOPK): an index source's score chain is one
     /// [rows, positions] f32 score (and the select's mask), not the per-head [rows, heads, positions].
     index_launch: bool = false,
+    /// The served JOINLESS route: the routed group's joined input is the minimal copy's bound
+    /// (`joinless_outputs`), not every routed row.
+    joinless: bool = false,
+
+    /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
+    /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
+    /// (into the last source) and reads the others in place, so it copies at most (n - 23) / n of the routed rows.
+    pub const joinless_sources: u64 = 24;
+    /// The outputs a layer's wide call makes at L1 (16,384 tokens, modeled in 58d9fb1: the deferred base call's 17
+    /// waves and six transient calls' 34): the bill's bound is (51 - 23) / 51 = 28 / 51 of the routed rows.
+    pub const joinless_outputs: u64 = 51;
 
     /// The tier's prefill allocator cache: what the module holds MLX's cache to through the prompt pass.
     pub fn cacheBytes(b: PrefillBill, tier: Tier) u64 {
@@ -68,6 +79,19 @@ pub const PrefillBill = struct {
         var x = b;
         x.index_launch = on;
         return x;
+    }
+
+    pub fn withJoinless(b: PrefillBill, on: bool) PrefillBill {
+        var x = b;
+        x.joinless = on;
+        return x;
+    }
+
+    /// The routed group's joined input for `routed` bytes of routed outputs: all of them joined, or under JOINLESS
+    /// the minimal copy's bound, (n - 23) / n of them at L1's n (rounded up).
+    pub fn joinedBytes(b: PrefillBill, routed: u64) u64 {
+        if (!b.joinless) return routed;
+        return std.math.divCeil(u64, routed * (joinless_outputs - (joinless_sources - 1)), joinless_outputs) catch unreachable;
     }
 
     /// The trunk's attention: the stock tier scores every position (masked full), the served tier the selected keys.
@@ -159,8 +183,9 @@ pub const PrefillBill = struct {
     ///   index selection: a top-k mask row over the compressed positions, the selected ids);
     ///   plus the larger of the two sub-waves that open inside a layer, one at a time: a chunk's
     ///   attention side (`waveBytes` without the chunk-major kept positions, which the kept state
-    ///   above replaces) or a routed group (moeRowCap rows: the routed outputs, the joined input,
-    ///   the combine and the HC post to the next stream, with the group's new stream held beside the old).
+    ///   above replaces) or a routed group (moeRowCap rows: the routed outputs, the joined input (under
+    ///   JOINLESS the minimal copy's bound, `joinedBytes`), the combine and the HC post to the next stream,
+    ///   with the group's new stream held beside the old).
     pub fn layerMajorWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
         const d = b.hidden;
         const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
@@ -171,7 +196,9 @@ pub const PrefillBill = struct {
         const attn = b.waveBytes(b.chunkRows(seq), seq, tier) - seq * kept_pos_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
-        const group = g_rows * (2 * b.top_k * d * 4 + 2 * d * 4 + 4 * b.hc * d * 4);
+        // The group's routed outputs, their joined input (`joinedBytes`), the combine and the HC post.
+        const routed = g_rows * b.top_k * d * 4;
+        const group = routed + b.joinedBytes(routed) + g_rows * (2 * d * 4 + 4 * b.hc * d * 4);
         return kept_stream + halves + selection + @max(attn, group);
     }
 
@@ -280,6 +307,16 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expectEqual(@as(u64, 1_588_543_488), wave / 4 * 5 - billed);
     // The per-request bill (the server's admission) carries the same transient.
     try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
+    // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of
+    // the 2.01 GB join, so the routed group's outputs and joined input fall from 4.03 to 3.12 GB. SERVED14 measured
+    // the prompt's transient at 12.40 GB with the merge (13.46 GB before it).
+    // On the served indexer route (one score launch) the routed group is the layer's wider sub-wave, so the whole
+    // saving reaches the wave; on the per-head score chain the attention side (9.26 GB) binds first.
+    const served = b.withIndexLaunch(true);
+    const j = served.withJoinless(true);
+    try std.testing.expectEqual(@as(u64, 2_013_265_920), j.joinedBytes(0) + b.joinedBytes(2_013_265_920));
+    try std.testing.expectEqual(@as(u64, 1_105_322_466), j.joinedBytes(2_013_265_920));
+    try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_105_322_466), j.layerMajorWaveBytes(16384, .served));
 }
 
 /// Per-layer attention mode (Python `_derive_layer_modes`): ratio 0 is a pure

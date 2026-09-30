@@ -1642,20 +1642,20 @@ pub const Sentinel = struct {
                 break;
             }
         }
-        self.logLine("start", self.base, null);
+        self.logLine("start", 0, self.base, null);
         self.thread = try std.Thread.spawn(.{ .stack_size = sentinel_stack_bytes }, run, .{self});
         return self;
     }
 
-    pub const Summary = struct { ticks: u32, unstable: u32, errors: u32, peak_rise: i64 };
+    pub const Summary = struct { ticks: u32, unstable: u32, errors: u32, peak_tick: u32, peak_rise: i64 };
 
     /// Joins the thread (at most a period and one reading), then the summary lines: the peak reading and its rise.
     pub fn stop(self: *Sentinel, gpa: std.mem.Allocator) Summary {
         self.stopping.store(true, .release);
         self.thread.join();
         const pk = self.peak orelse self.base;
-        const sum: Summary = .{ .ticks = self.ticks, .unstable = self.unstable, .errors = self.errors, .peak_rise = sentinelRise(self.base, pk) };
-        self.logLine("peak", pk, sum.peak_rise);
+        const sum: Summary = .{ .ticks = self.ticks, .unstable = self.unstable, .errors = self.errors, .peak_tick = self.peak_tick, .peak_rise = sentinelRise(self.base, pk) };
+        self.logLine("peak", self.peak_tick, pk, sum.peak_rise);
         std.debug.print("NATIVE DSV41_SENTINEL {{\"step\": \"{s}\", \"ticks\": {d}, \"unstable_ticks\": {d}, \"errors\": {d}, \"peak_tick\": {d}, \"peak_rise_bytes\": {d}, \"period_ms\": {d}, \"rise_limit_bytes\": {d}}}\n", .{ self.step, self.ticks, self.unstable, self.errors, self.peak_tick, sum.peak_rise, sentinel_period_ms, sentinel_rise_bytes });
         gpa.destroy(self);
         return sum;
@@ -1686,16 +1686,16 @@ pub const Sentinel = struct {
                 self.peak_tick = self.ticks;
             }
             if (sentinelTrips(self.base, r)) {
-                self.logLine("OutsideFootprintGrew", r, sentinelRise(self.base, r));
+                self.logLine("OutsideFootprintGrew", self.ticks, r, sentinelRise(self.base, r));
                 std.debug.print("NATIVE DSV41_SENTINEL {s}: OutsideFootprintGrew (the box's pages outside this footprint rose past {d} B over construction); stopping the process, exit {d}\n", .{ self.step, sentinel_rise_bytes, sentinel_exit_code });
                 std.c._exit(sentinel_exit_code);
             }
         }
     }
 
-    /// One `NATIVE DSV41_SENTINEL <what> {json}` line: the reading, its change from the base by page type (bytes),
-    /// and this task's ledgers now.
-    fn logLine(self: *const Sentinel, what: []const u8, r: SentinelReading, rise: ?i64) void {
+    /// One `NATIVE DSV41_SENTINEL <what> {json}` line: the reading (taken at `tick`), its change from the base by
+    /// page type (bytes), and this task's ledgers now.
+    fn logLine(self: *const Sentinel, what: []const u8, tick: u32, r: SentinelReading, rise: ?i64) void {
         const d = struct {
             fn f(a: u64, b: u64) i64 {
                 return @as(i64, @intCast(a)) - @as(i64, @intCast(b));
@@ -1705,7 +1705,7 @@ pub const Sentinel = struct {
         const p = r.pages;
         const line = .{
             .step = self.step,
-            .tick = self.ticks,
+            .tick = tick,
             .physical = p.physical(),
             .footprint = .{ r.f0, r.f1 },
             .outside = r.outside(),
@@ -1915,6 +1915,8 @@ test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and s
     sleepMs(2 * sentinel_period_ms + 150);
     const sum = s.stop(testing.allocator);
     try testing.expect(sum.ticks >= 1 and sum.errors == 0);
+    // The peak line names the peak's own tick (SERVED14's printed the final count).
+    try testing.expect(sum.peak_tick >= 1 and sum.peak_tick <= sum.ticks);
     try testing.expect(sum.peak_rise <= @as(i64, @intCast(sentinel_rise_bytes)));
 }
 

@@ -273,7 +273,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     var eck = try v41.Checkpoint.openFile(a, epath, &vd);
     defer eck.deinit();
     const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov));
+    // JOINLESS (the served default): the routed group's joined input is the minimal copy's bound (`joinedBytes`).
+    const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(joinless);
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
@@ -294,11 +296,12 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes(),
         // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
-        // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no joined copy, and
-        // the wave alone covers the pass (v6b: 13.54 GB measured incl. KV against 14.40 + 0.16 billed);
+        // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no wide-lane copy, and
+        // the wave alone covers the pass, its routed group's joined input at the minimal copy's bound (28 / 51
+        // of the routed rows; SERVED14: 12.40 GB measured against 13.49 + 0.50 KV billed);
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
         .prefill_wave = if (config.dsv41LayerMajor())
-            (if (ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
+            (if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
         else
             bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
@@ -572,8 +575,12 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 136, .decode = 166 }, .on = .{ .prefill = 135, .decode = 166 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 135, .decode = 165 }, .on = .{ .prefill = 135, .decode = 165 } },
+        // JOINLESS's minimal-copy merge billed at its bound (28 / 51 of the routed rows; the wave -0.908 GB) returns
+        // prompt rows (this tree before it: 9.20 GB 136 / 166 off, 135 / 166 on; 9.55 GB 135 / 165 both; SERVED14's
+        // cell filled 136 / 166 at 8.985 GB).
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 138, .decode = 166 }, .on = .{ .prefill = 138, .decode = 166 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 137, .decode = 166 }, .on = .{ .prefill = 137, .decode = 166 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 137, .decode = 165 }, .on = .{ .prefill = 136, .decode = 165 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
