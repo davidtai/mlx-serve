@@ -624,6 +624,8 @@ pub fn Model(comptime G: type) type {
                     for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
                     const cat_idx = if (j - i == 1) routes_[i].indices else try g.concat(idxs, 0);
                     const ro = try routed.at(@intCast(l)).routed(g, cat_xf, cat_idx);
+                    // The profile's own stage for the group's routed compute (else it lands in moe.shared).
+                    try probe.put("moe.routed", ro);
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         const nk = g.shapeOf(xfs[k]).dim(0);

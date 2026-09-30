@@ -91,6 +91,7 @@ pub const served: Tier = blk: {
     t.routes.prefill_index = true; // ATTNHALF idxscore + INDEX_TOPK: the prefill indexer (rows > 32)
     t.routes.prefill_hc = true; // ATTN hcnorm: the prefill HC norms (rows >= 32)
     t.routes.prefill_combine = true; // SMALLK: the prefill MoE combine (rows > 32)
+    t.routes.prefill_oproj = true; // DENSE16 oproj after the prefill core (rows > 32)
     break :blk t;
 };
 
@@ -392,6 +393,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.prefill_index = false;
     rc_off.prefill_hc = false;
     rc_off.prefill_combine = false;
+    rc_off.prefill_oproj = false;
     // C14 drops W97 (the dense f32 wo_a, 5.37 GB over 40 layers): the tier's arm keeps it.
     rc_off.wo_a_f32 = true;
     try testing.expectEqual(trunk.routes, rc_off);

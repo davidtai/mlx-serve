@@ -1484,10 +1484,13 @@ pub const TraceOps = struct {
         const sw = g.shapeOf(w);
         const si = g.shapeOf(idx);
         const in_dim = @divExact(sw.dim(-1) * 32, @as(c_int, @intCast(quantBits(mode))));
-        if (sw.n != 3 or sx.dim(-2) != 1 or sx.dim(-1) != in_dim or g.shapeOf(sc).dim(-1) * @as(c_int, @intCast(quantGroup(mode))) != in_dim) return error.GatherQmmShape;
+        // One row per index, or the batched form (x's batch dims == idx's, M rows each).
+        const m_rows = sx.dim(-2);
+        const batched = m_rows != 1 and sx.n == si.n + 2 and std.mem.eql(c_int, sx.d[0..si.n], si.d[0..si.n]);
+        if (sw.n != 3 or (m_rows != 1 and !batched) or sx.dim(-1) != in_dim or g.shapeOf(sc).dim(-1) * @as(c_int, @intCast(quantGroup(mode))) != in_dim) return error.GatherQmmShape;
         if (!isInteger(g.dtypeOf(idx))) return error.GatherQmmIndices;
         var out = si;
-        out.d[out.n] = 1;
+        out.d[out.n] = m_rows;
         out.d[out.n + 1] = sw.dim(1);
         out.n += 2;
         return g.push(.gather_qmm, g.dtypeOf(x), out);

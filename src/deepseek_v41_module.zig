@@ -178,7 +178,7 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
             inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index },
         };
@@ -284,7 +284,7 @@ pub const Module = struct {
         const m = self.g.mark();
         defer self.g.resetTo(m);
         var checks: [16]Tr.RouteCheck = undefined;
-        const n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, &checks);
+        const n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
         for (checks[0..n]) |ck| {
             var b: [1]bool = undefined;
             _ = try self.g.hostBool(ck.ok, &b);

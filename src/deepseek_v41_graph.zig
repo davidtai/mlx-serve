@@ -126,6 +126,10 @@ pub const Routes = struct {
     /// The prefill MoE combine (SMALLK): routed x weights summed over the experts + shared, one f32
     /// kernel at rows above `attn_compile_max_rows`.
     prefill_combine: bool = false,
+    /// DENSE16 o-projection after the prefill core: the grouped o-LoRA as one bf16 gather_qmm over
+    /// the packed mxfp8 wo_a (one expert per group) and wo_b as a bf16 qmm, widened to f32 (no f32
+    /// einsum over the dense f32 wo_a).
+    prefill_oproj: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -1177,7 +1181,7 @@ pub fn Trunk(comptime G: type) type {
         /// on deterministic host data at prompt widths; one RouteCheck per installed route into `out`.
         /// Tolerances: the score and the f32 norms / combine 1e-3 x (1 + |stock|) (reduction order),
         /// bf16 norm outputs 2e-2; the select's indices equal the stock top-k on the stock score.
-        pub fn prefillRoutesCheck(g: *G, c: *const v41.Config, kx: *const Kernels, layers: []const W, scratch: []f32, out: []RouteCheck) !usize {
+        pub fn prefillRoutesCheck(g: *G, c: *const v41.Config, rt: *const Routes, kx: *const Kernels, layers: []const W, scratch: []f32, out: []RouteCheck) !usize {
             var n: usize = 0;
             const attn = try prefillAttnCheck(g, c, kx, layers, scratch);
             const attn_names = [_][]const u8{ "attention core, layer 0 kind", "attention core, f32 window kind", "attention core, compressed kind" };
@@ -1227,6 +1231,14 @@ pub fn Trunk(comptime G: type) type {
                 out[n] = .{ .name = if (di == 0) "HC pre-norm, bf16 stream" else "HC pre-norm, f32 stream", .ok = try checkClose(g, try hn.preNorm(g, h, pre, w), want, if (di == 0) 2e-2 else 1e-3) };
                 n += 1;
             };
+            if (rt.prefill_oproj) {
+                // DENSE16 against the f32 grouped o-LoRA on layer 1's weights (bf16 rounding: 3e-2).
+                const in_: c_int = @intCast(c.n_heads * c.head_dim / c.o_groups);
+                const og = try checkFill(g, r, scratch, &.{ @intCast(c.o_groups), S, in_ }, 1.0, .float32);
+                const w = &layers[1];
+                out[n] = .{ .name = "o-projection DENSE16", .ok = try checkClose(g, try outProjDense16(g, c, og, w, 1, S), try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, 1, S), 3e-2) };
+                n += 1;
+            }
             if (kx.combine) |*cb| {
                 const top: c_int = @intCast(c.n_experts_per_tok);
                 const ro = try checkFill(g, r, scratch, &.{ S, top, dim }, 1.0, .float32);
@@ -1304,6 +1316,22 @@ pub fn Trunk(comptime G: type) type {
         /// The model's prefill geometry, as the kernel lane's routes compare it.
         fn prefillGeometry(c: *const v41.Config) kr.PrefillGeometry {
             return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size, .hc_mult = c.hc_mult };
+        }
+
+        /// DENSE16 `outProj` after the prefill core: og f32 [g, S, in] -> bf16, the grouped o-LoRA as
+        /// gather_qmm over wo_a's packed [g, rank, in] view (rhs = arange(g)), [S, g x rank], then
+        /// wo_b's qmm, widened to f32.
+        pub fn outProjDense16(g: *G, c: *const v41.Config, og: T, w: *const W, b: c_int, s: c_int) !T {
+            const G_: c_int = @intCast(c.o_groups);
+            const R: c_int = @intCast(c.o_lora_rank);
+            const ws = g.shapeOf(w.wo_a.w);
+            const ss = g.shapeOf(w.wo_a.s);
+            const wa = try g.reshape(w.wo_a.w, &.{ G_, R, ws.dim(-1) });
+            const sa = try g.reshape(w.wo_a.s, &.{ G_, R, ss.dim(-1) });
+            const idx = try g.astype(try g.arange(0, @floatFromInt(G_), 1, .int32), .uint32);
+            const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, idx, w.wo_a.mode);
+            const flat = try g.reshape(try g.transposeAxes(o2, &.{ 1, 0, 2 }), &.{ b, s, G_ * R });
+            return g.astype(try qlinear(g, flat, w.wo_b), .float32);
         }
 
         /// `outProj` after the prefill core: o already inverse-roped as [g, S, in] f32 -> the grouped
@@ -1400,7 +1428,7 @@ pub fn Trunk(comptime G: type) type {
                     var og = try core.attend(g, q, window, sel.idx, sel.valid, cmp, sink, .{ cs.cos, cs.sin });
                     if (scores) |m| try closeScores(g, m, &.{&og});
                     try p.put("attn.o_grouped", og);
-                    const out = try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, b, s);
+                    const out = if (rt.prefill_oproj) try outProjDense16(g, c, og, w, b, s) else try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, b, s);
                     try p.put("attn.out", out);
                     return out;
                 }
@@ -2339,8 +2367,9 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
     var ka = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &all, &.{});
     defer ka.deinit(&g);
     var checks: [16]Tr.RouteCheck = undefined;
-    const n = try Tr.prefillRoutesCheck(&g, &c, &ka, ws[0..c.n_layers], scratch, &checks);
-    try testing.expectEqual(@as(usize, 10), n);
+    const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .selected_keys = true };
+    const n = try Tr.prefillRoutesCheck(&g, &c, &all_o, &ka, ws[0..c.n_layers], scratch, &checks);
+    try testing.expectEqual(@as(usize, 11), n);
     for (checks[0..n]) |ck| {
         try testing.expectEqual(Dtype.bool_, g.dtypeOf(ck.ok));
         try testing.expectEqual(@as(u8, 0), g.shapeOf(ck.ok).n);
