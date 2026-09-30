@@ -3234,6 +3234,16 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
 /// "unknown" by the caller, which then skips the check). Symlinked weights
 /// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
+/// The load preflight's weights figure for a pack, as the MLX load bills it: a module-owned arch's own load bill
+/// (streamed experts: `transformer.archLoadRequirementBytes`), else the shards on disk. `mlx-serve --print-load-bytes`
+/// prints it, so the bench's model lookup (tests/_lib_models.sh) sizes a streamed pack by the bill it is admitted on.
+pub const PackLoadBill = struct { arch: bool, bytes: u64 };
+
+pub fn packLoadBill(io: std.Io, allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, model_dir: []const u8) PackLoadBill {
+    if (transformer_mod.archLoadRequirementBytes(io, allocator, config)) |b| return .{ .arch = true, .bytes = b };
+    return .{ .arch = false, .bytes = modelDiskBytes(io, model_dir) };
+}
+
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
@@ -3279,6 +3289,24 @@ test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     defer std.testing.allocator.free(snap);
 
     try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
+}
+
+test "packLoadBill: an arch without its own load bill is billed its shards, as the preflight bills it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors", .data = "0123456789abcdef0123" });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/m", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(dir);
+    const cfg: model_mod.ModelConfig = .{};
+    const bill = packLoadBill(io, std.testing.allocator, &cfg, dir);
+    try std.testing.expect(!bill.arch);
+    try std.testing.expectEqual(@as(u64, 20), bill.bytes);
+    try std.testing.expectEqual(modelDiskBytes(io, dir), bill.bytes);
 }
 
 test "modelDiskBytes bills only the shards the index names (issue #274)" {

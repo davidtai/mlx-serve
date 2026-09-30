@@ -13,6 +13,8 @@ ok() { # name  actual  expected
 }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# Never the tree's real server: a pack past the budget asks MLX_SERVE_BIN for its load bill (model_load_gb).
+export MLX_SERVE_BIN="$TMP/no-binary"
 mkdir -p "$TMP/a/org/small" "$TMP/b/org/small" "$TMP/b/org/big" "$TMP/b/gguf-dir"
 head -c 2048 /dev/zero > "$TMP/a/org/small/model.safetensors"
 touch "$TMP/b/gguf-dir/m.gguf"
@@ -45,6 +47,18 @@ gpu_budget_gb() { echo 14; }
 ok "14 GB budget: an 11 GB pack is the largest" "$(max_model_gb)"                "11"
 ok "96 GB budget: headroom caps at 7 GB"         "$(gpu_budget_gb() { echo 96; }; max_model_gb)" "89"
 ok "extra headroom for a big prompt's KV"        "$(MODEL_HEADROOM_GB=6 max_model_gb)" "6"
+
+echo "── model_load_gb (a streamed pack's own load bill) ──"
+# Stub servers: one answers with an arch bill, one bills shards, one fails; none loads anything.
+printf '#!/bin/bash\necho "arch 0"\n' > "$TMP/bin-arch"; printf '#!/bin/bash\necho "shards 2048"\n' > "$TMP/bin-shards"
+printf '#!/bin/bash\nexit 1\n' > "$TMP/bin-fail"; chmod +x "$TMP/bin-arch" "$TMP/bin-shards" "$TMP/bin-fail"
+ok "a pack within budget is its shards (the binary is not asked)" "$(MAX_MODEL_GB=1 MLX_SERVE_BIN="$TMP/bin-fail" model_load_gb "$TMP/a/org/small")" "1"
+ok "past the budget: the arch's own bill"      "$(MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/bin-arch" model_load_gb "$TMP/a/org/small")" "0"
+ok "past the budget, a shard-billed arch"      "$(MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/bin-shards" model_load_gb "$TMP/a/org/small")" "1"
+ok "past the budget, the binary fails: shards" "$(MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/bin-fail" model_load_gb "$TMP/a/org/small")" "1"
+ok "past the budget, no binary: shards"        "$(MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/none" model_load_gb "$TMP/a/org/small")" "1"
+MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/bin-arch" model_fits "$TMP/a/org/small"; ok "a streamed pack fits by its bill" "$?" "0"
+MAX_MODEL_GB=0 MLX_SERVE_BIN="$TMP/bin-shards" model_fits "$TMP/a/org/small"; ok "a shard-billed pack past the budget" "$?" "1"
 
 echo "── find_fitting_model ──"
 head -c 2048 /dev/zero > "$TMP/b/org/big/model.safetensors"

@@ -161,6 +161,9 @@ fn printUsage(io: std.Io) void {
         \\                        decimal GB (default: Metal's working set); a
         \\                        streamed-expert model's fill lands the wired margin
         \\                        (--wired-margin-gib / --wired-margin) below it.
+        \\  --print-load-bytes  Print the load pre-flight's weights figure for --model and
+        \\                        exit (nothing loads): "arch <bytes>" for an arch that bills
+        \\                        its own load (streamed experts), else "shards <bytes>".
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -575,6 +578,7 @@ pub fn main(init: std.process.Init) !void {
     // ships a sidecar is otherwise unreachable from clients that never send
     // `enable_mtp:true` (llmprobe, Claude Code, curl).
     var force_mtp = false;
+    var print_load_bytes = false;
     var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
@@ -698,6 +702,8 @@ pub fn main(init: std.process.Init) !void {
             scheduler_mod.no_vision_global = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
+        } else if (std.mem.eql(u8, args[i], "--print-load-bytes")) {
+            print_load_bytes = true;
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
@@ -1054,6 +1060,22 @@ pub fn main(init: std.process.Init) !void {
             log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
             std.process.exit(1);
         }
+    }
+
+    // `--print-load-bytes`: the load pre-flight's weights figure for `--model`'s pack, then exit (nothing loads).
+    // The bench's model lookup (tests/_lib_models.sh) sizes a streamed-expert pack by it.
+    if (print_load_bytes) {
+        var cfg = model_mod.parseConfig(io, allocator, model_dir) catch |e| {
+            log.err("--print-load-bytes: no model config at '{s}' ({s})\n", .{ model_dir, @errorName(e) });
+            std.process.exit(1);
+        };
+        defer cfg.deinit(allocator);
+        const bill = scheduler_mod.packLoadBill(io, allocator, &cfg, model_dir);
+        var out_buf: [64]u8 = undefined;
+        var out_w = std.Io.File.stdout().writer(io, &out_buf);
+        out_w.interface.print("{s} {d}\n", .{ if (bill.arch) "arch" else "shards", bill.bytes }) catch {};
+        out_w.interface.flush() catch {};
+        return;
     }
 
     // One value for the three media seams (they run under gen.zig with no

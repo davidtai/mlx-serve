@@ -9,6 +9,7 @@
 #   ./tests/bench.sh --only qwen38-27b              # one row
 #   ./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
 #   ./tests/bench.sh --full                         # median of 3 per rung, to 64k
+#   BENCH_EXTRA_FLAGS="--wired-margin 2000000000" ./tests/bench.sh --only dsv41   # flags appended to every boot
 #
 # Each cell is mlx-serve at its FASTEST: speculation is forced on where the
 # checkpoint carries an MTP head (it is default-off on MoE targets). The mode
@@ -37,7 +38,7 @@ BINARY="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
 LLMPROBE="${LLMPROBE:-npx -y llmprobe@latest}"
 PORT=11250
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,7 +72,14 @@ TARGETS=(
     "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
     "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
     "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    # DeepSeek-V4.1 over a streamed EXL3 expert bank: sized by the load bill it is admitted on (model_load_gb), one
+    # request per server start. On the dev box it only runs as a chain step inside a guarded window
+    # (MLX_SERVE_MODEL_ROOTS=~/models ./tests/bench.sh --only dsv41); anywhere else it runs as any row.
+    "dsv41-flash-exl3|DeepSeek-V4.1-Flash-MTPLX-streaming-exl3-3.0bpw"
 )
+# Rows whose server serves one request per start (its phase change is per start): one timed request, not the ladder.
+ONE_REQUEST_ROWS=" dsv41-flash-exl3 "
+ONE_REQUEST_PROMPT_LEN="${ONE_REQUEST_PROMPT_LEN:-16384}"
 
 # Only ever called on the path that STARTED a server: --url may be pointed at
 # a local mlx-serve someone else is using, and a bench must not kill it.
@@ -90,6 +98,32 @@ probe() { # logical host model_id
     # shellcheck disable=SC2086
     $LLMPROBE "$2" -m "$3" "${depth[@]}" --save "$OUT/$1.json" \
         || echo "  llmprobe failed for $1" >&2
+}
+
+# one_request logical port log: a prompt of ONE_REQUEST_PROMPT_LEN ids (the server's own tokenizer), 128 greedy ids,
+# the numbers from the server's own timing line; saved in llmprobe's bench shape so the table below reads it.
+one_request() {
+    printf '── %s (localhost:%s, one request, a %s-id prompt) ──\n' "$1" "$2" "$ONE_REQUEST_PROMPT_LEN"
+    python3 - "$2" "$ONE_REQUEST_PROMPT_LEN" "$3" "$OUT/$1.json" <<'PY' || echo "  the request failed for $1" >&2
+import json, re, sys, urllib.request
+port, n, log, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+def post(path, body, timeout=3600):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+unit = "The quick brown fox jumps over the lazy dog while the bench counts every id it reads. "
+ids = post("/tokenize", {"content": unit * (n // 8 + 64)})["tokens"][:n]
+text = post("/detokenize", {"tokens": ids})["content"]
+post("/v1/completions", {"model": "mlx-serve", "prompt": text, "max_tokens": 128, "temperature": 0, "ignore_eos": True})
+lines = open(log, errors="replace").read()
+t = re.findall(r"<- (\d+)\+(\d+) tokens \((\d+)ms\) \[prefill: ([\d.]+) tok/s, decode: ([\d.]+) tok/s\]", lines)
+if not t: sys.exit("no timing line in the server log")
+prefill, decode = t[-1][3], t[-1][4]
+stats = re.findall(r"\[spec-stats\] mode=\w+ attempts=\d+ accepts=\d+ avg_per_round=([\d.]+)", lines)
+bench = {"decodeTokPerSec": {"median": float(decode)}, "prefillTokPerSec": {"median": float(prefill)}}
+if stats: bench["speculative"] = {"tokensPerStep": float(stats[-1])}
+json.dump({"bench": bench, "oneRequest": {"promptIds": len(ids), "maxNew": 128}}, open(out, "w"))
+PY
 }
 
 # --mtp is forced wherever the checkpoint ships a head: it is default-OFF on
@@ -123,16 +157,18 @@ else
         flags="$(spec_flags "$path")"
         echo; echo ">> $logical$flags"
         # shellcheck disable=SC2086
-        "$BINARY" --serve --model "$path" --port "$PORT" $flags >"$OUT/$logical.log" 2>&1 &
+        "$BINARY" --serve --model "$path" --port "$PORT" $flags ${BENCH_EXTRA_FLAGS:-} >"$OUT/$logical.log" 2>&1 &
         pid=$!
         for _ in $(seq 1 300); do
             curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
             sleep 1
         done
-        if curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-            probe "$logical" "localhost:$PORT" "$(basename "$path")"
-        else
+        if ! curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
             echo "  mlx-serve never came up for $logical" >&2
+        elif [[ "$ONE_REQUEST_ROWS" == *" $logical "* ]]; then
+            one_request "$logical" "$PORT" "$OUT/$logical.log"
+        else
+            probe "$logical" "localhost:$PORT" "$(basename "$path")"
         fi
         kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
         stop_server

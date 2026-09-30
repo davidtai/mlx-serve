@@ -10,7 +10,8 @@
 #
 # Roots: MLX_SERVE_MODEL_ROOTS (colon-separated) replaces the defaults, which are
 # ~/.mlx-serve/models, ~/.lmstudio/models and models|models-dl|Models|gguf on
-# every mounted volume. Budget: MAX_MODEL_GB overrides the derived one.
+# every mounted volume. Budget: MAX_MODEL_GB overrides the derived one. A pack that streams its experts is sized by
+# the load bill the server admits it on (model_load_gb), not its shards.
 
 model_roots() {
     if [[ -n "${MLX_SERVE_MODEL_ROOTS:-}" ]]; then
@@ -63,8 +64,24 @@ max_model_gb() {
     if (( room >= 54 )); then echo $(( room - 6 )); else echo $(( room * 8 / 9 )); fi
 }
 
+# The GB the server's load pre-flight bills a pack: its shards, unless they are past the budget and the arch bills its
+# own load (streamed experts: the resident set, not the expert bank), which the server binary states without loading
+# anything (`mlx-serve --model <dir> --print-load-bytes` -> "arch <bytes>"). MLX_SERVE_BIN, else BINARY, else the
+# tree's build names the binary; without one the shards stand.
+model_load_gb() {
+    local gb bin out
+    gb=$(model_gb "$1")
+    if [[ "$gb" -gt "$(max_model_gb)" ]]; then
+        bin="${MLX_SERVE_BIN:-${BINARY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/zig-out/bin/mlx-serve}}"
+        if [[ -x "$bin" ]] && out=$("$bin" --model "$1" --print-load-bytes 2>/dev/null | tail -1) && [[ "$out" =~ ^arch\ ([0-9]+)$ ]]; then
+            gb=$(( (${BASH_REMATCH[1]} + 1073741823) / 1073741824 ))
+        fi
+    fi
+    echo "$gb"
+}
+
 model_fits() {
-    [[ "$(model_gb "$1")" -le "$(max_model_gb)" ]]
+    [[ "$(model_load_gb "$1")" -le "$(max_model_gb)" ]]
 }
 
 # Like find_model, but a candidate past the budget is passed over for the next
