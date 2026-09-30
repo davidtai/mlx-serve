@@ -34,6 +34,7 @@ const PhaseTerms = bill_mod.PhaseTerms;
 const PhaseMemory = bill_mod.PhaseMemory;
 const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
+const dt = @import("dsv41_decode_timers.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -1027,6 +1028,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     var cycles: std.ArrayList(CellCycle) = .empty;
+    // A profile build's decode timers count the cycles only (not the warm-up, not the prompt).
+    if (comptime dt.enabled) dt.reset();
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
     var prof: std.ArrayList(ProfCycle) = .empty;
@@ -1076,6 +1079,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         }
     }
     const decode_s = secondsSince(io, t2);
+    if (comptime dt.enabled) {
+        var lb: [2048]u8 = undefined;
+        std.debug.print("\nNATIVE {s}\n", .{dt.line(&lb)});
+    }
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
     phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), 0, cx.file_backed_start);
@@ -1124,7 +1131,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_profile = if (profile) prof.items else null,
         // The routes the module installed (read back from it, not from the settings).
         .layer_major = md.installed.layer_major,
-        .event_gates = config.expert_event_gates,
+        .event_gates = md.arm == .event_gates,
         .wide_feed = md.installed.wide.seed and md.installed.wide.hot_first,
         .wide_seed = md.installed.wide.seed,
         .wide_hot_first = md.installed.wide.hot_first,
@@ -1653,6 +1660,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     const args = try cellConfig(&config);
+    // The prompt pass reads through no gate: the profile keeps the host-waits arm unless the line sets one.
+    if (config.expert_event_gates == null) config.expert_event_gates = false;
     const stop = WindowStop.set(args.stop, args.ceiling);
     defer stop.restore();
     try cellFill(a, io, &config, args, inputs.prompt.len, 1024);

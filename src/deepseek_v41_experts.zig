@@ -34,6 +34,7 @@ const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
 const xk = @import("exl3_kernels.zig");
 const quant = @import("quant.zig");
+const dt = @import("dsv41_decode_timers.zig");
 const xq = @import("exl3_quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
@@ -793,6 +794,14 @@ pub const Wide = struct {
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
 /// bound once at `init` (base, transient) and at `grow` (the grown rows).
 /// `at(layer)` is the per-layer hook the trunk calls.
+/// The MLX event wait (the gated arm's): aliases of `xs` into `outs`, which may hold anything (a caller's
+/// `undefined`): the shim assigns each alias into its handle, so every handle is made fresh first.
+fn mlxEventWait(g: *ops.MlxOps, event: expert_event.Event, xs: []const mlx.mlx_array, value: u64, deps: []const mlx.mlx_array, outs: []mlx.mlx_array) !void {
+    for (outs) |*o| o.* = mlx.mlx_array_new();
+    try expert_event.wait(xs, event, value, deps, false, g.s, outs);
+    for (outs) |*o| o.* = try g.adopt(o.*);
+}
+
 pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
     return ExpertsWith(G, S, M, .{});
 }
@@ -905,11 +914,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
         }
 
-        /// An event wait's aliases of `xs` (the GPU reads them after `value`).
+        /// An event wait's aliases of `xs` (the GPU reads them after `value`), into `outs` (any contents).
         fn eventWait(self: *Self, g: *G, xs: []const T, value: u64, deps: []const T, outs: []T) !void {
             if (G == ops.MlxOps) {
-                try expert_event.wait(xs, self.event, value, deps, false, g.s, outs);
-                for (outs) |*o| o.* = try g.adopt(o.*);
+                try mlxEventWait(g, self.event, xs, value, deps, outs);
             } else {
                 for (xs, outs) |x, *o| o.* = try g.eventAlias(x, value, deps.len);
             }
@@ -950,7 +958,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             layer: u32,
 
             pub fn routed(h: Hook, g: *G, xf: T, indices: T) !T {
-                return h.ex.run(g, h.layer, xf, indices);
+                return h.ex.run(g, h.layer, xf, indices, &.{});
+            }
+
+            /// `routed`, with the caller's arrays that do not wait on this call (`hoist`: the layer's
+            /// shared expert and HC tail) committed once its reads are issued and its hit wave
+            /// started: they run during the read wait, not in the next routing barrier.
+            pub fn routedHoist(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !T {
+                return h.ex.run(g, h.layer, xf, indices, hoist);
             }
 
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs and
@@ -1076,7 +1091,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// barrier, the residents' wave, then per miss part gate/up after
         /// `waitGu` and down after `waitDown`, each wave started on the GPU;
         /// release; the outputs in the router's order, `[n, k, hidden]` f32.
-        pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T) !T {
+        pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             const n_ids = n * k;
@@ -1084,6 +1099,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // and verify, <= 8 rows of top-6) are the decode lane; wider calls
             // are the wide lane (the DIG kernels), when it is installed.
             if (n_ids > max_route_ids) {
+                // Only a decode-width layer hoists (the trunk's small-rows segments).
+                std.debug.assert(hoist.len == 0);
                 if (comptime !routes.prefill) {
                     return error.PrefillLaneNotPorted;
                 } else {
@@ -1093,6 +1110,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [expert_lookahead.max_rows * 512]f32 = undefined;
             var scores: []const f32 = &.{};
+            var tt = dt.now();
             if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| {
                 // The predictor joins the routing barrier's eval (the last layer predicts nothing).
                 const sc = try nextScores(g, xf, gate);
@@ -1100,7 +1118,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 scores = try g.hostF32(sc, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+            tt = dt.charge(.barrier, tt);
             const call = try self.source.route(layer, ids, scores);
+            _ = dt.charge(.route, tt);
+            dt.countCall();
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
@@ -1108,25 +1129,89 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // Residents: gate/up and down at once.
             const hits = try self.gateUpWave(g, layer, xf, k, sv, 0, null);
             if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc, null));
+            // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave.
+            if (hoist.len > 0) try g.asyncEval(hoist);
             if (routes.gated) {
                 if (try self.source.gate(call)) |gates| try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
             } else for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
+                tt = dt.now();
                 try self.source.waitGu(call, part);
+                _ = dt.charge(.read_wait, tt);
                 const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
                 try g.asyncEval(wave.h[0..wave.n]);
+                tt = dt.now();
                 try self.source.waitDown(call, part);
+                _ = dt.charge(.read_wait, tt);
                 try g.asyncEval(try self.downWave(g, layer, &wave, &acc, null));
             }
             self.source.release(call);
             released = true;
-            // `take(concatenate(outputs), argsort(positions))`: the inverse
-            // permutation of the (unique) positions, made on the host.
+            return self.join(g, &acc, n, k);
+        }
+
+        /// `take(concatenate(outputs), argsort(positions))`: the inverse permutation of the (unique)
+        /// positions, made on the host; `[n, k, hidden]`.
+        fn join(self: *const Self, g: *G, acc: *const Acc, n: u32, k: u32) !T {
             const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
             var order: [max_route_ids]u32 = undefined;
             for (acc.pos[0..acc.n_pos], 0..) |pos, j| order[pos] = @intCast(j);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..acc.n_pos]), &.{@intCast(acc.n_pos)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// `checkGated` on layer 0's first `top_k` experts (cold at construction: every one a miss)
+        /// and one fixed bf16 row.
+        pub fn checkGates(self: *Self, g: *G, a: std.mem.Allocator, top_k: u32) !void {
+            const hidden: usize = @intCast(self.hidden);
+            var ids: [max_route_ids]u16 = undefined;
+            for (ids[0..top_k], 0..) |*d, i| d.* = @intCast(i);
+            const row = try a.alloc(u16, hidden);
+            defer a.free(row);
+            for (row, 0..) |*v, i| v.* = ops.bf16Bits(@as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) / 64.0);
+            const kh = @as(usize, top_k) * hidden;
+            const outs = try a.alloc(f32, 2 * kh);
+            defer a.free(outs);
+            const m = g.mark();
+            defer g.resetTo(m);
+            const xf = try g.hostArray(std.mem.sliceAsBytes(row), &.{ 1, self.hidden }, .bfloat16);
+            try self.checkGated(g, 0, xf, ids[0..top_k], outs[0..kh], outs[kh..]);
+        }
+
+        /// LOOKAHEAD4's construction check, once on the real stream before any request: one call of
+        /// `ids` (one row `xf`) over `layer`, whose misses' waves wait on event gates and are
+        /// evaluated (the GPU held until the pool publishes their bytes), then the same slots' waves
+        /// with no gate after the bytes landed (the host-waits arm's). The two outputs must match bit
+        /// for bit (`gated` / `waited`: `k * hidden` f32 each) and the pool must have forced no gate.
+        pub fn checkGated(self: *Self, g: *G, layer: u32, xf: T, ids: []const u16, gated: []f32, waited: []f32) !void {
+            if (comptime !routes.gated) @compileError("checkGated needs the gated route");
+            const k: u32 = @intCast(ids.len);
+            const m = g.mark();
+            defer g.resetTo(m);
+            const call = try self.source.route(layer, ids, &.{});
+            var released = false;
+            errdefer if (!released) self.source.release(call);
+            const sv = self.source.served(call);
+            const gates = (try self.source.gate(call)) orelse return error.GateCheckNoMiss;
+            var acc: Acc = .{};
+            const hits = try self.gateUpWave(g, layer, xf, k, sv, 0, null);
+            if (hits.n > 0) _ = try self.downWave(g, layer, &hits, &acc, null);
+            try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
+            _ = try g.hostF32(try self.join(g, &acc, 1, k), gated);
+            var ref: Acc = .{};
+            if (hits.n > 0) _ = try self.downWave(g, layer, &hits, &ref, null);
+            for (0..sv.n_parts) |p| {
+                const part: u32 = @intCast(p);
+                try self.source.waitGu(call, part);
+                const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
+                try self.source.waitDown(call, part);
+                _ = try self.downWave(g, layer, &wave, &ref, null);
+            }
+            _ = try g.hostF32(try self.join(g, &ref, 1, k), waited);
+            self.source.release(call);
+            released = true;
+            try self.source.flush();
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(gated), std.mem.sliceAsBytes(waited))) return error.GateCheckMismatch;
         }
 
         /// The wide lane: the routing barrier; the call's distinct experts (first
@@ -2156,6 +2241,158 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
     try ex.flush();
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
     std.debug.print("dsv41 experts: {d} recorded decode calls through the hook, {d} parts, {d} bank groups; plans, parts and waves equal the Python bank's\n", .{ f.routes.len, n_parts, n_groups });
+}
+
+test "dsv41 experts: VERIFY_ENCODE hoist: the caller's tail is committed behind the hit wave, before any read wait or gate" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    // Host waits: call 1 (six misses, two parts), call 2 (three hits, one part), as the decode-call test.
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var ex = try Experts(TraceOps, FakeSource, Chain).init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try ex.grow(&g, &.{ 8, 8 });
+    src.log.clearRetainingCapacity();
+    src.trace = &g;
+    var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 7, 1, 7, 9, 3 } } };
+    g.host_values = script.values();
+    const xf = try g.input(&.{ 2, 256 }, .bfloat16);
+    const idx = try g.input(&.{ 2, 3 }, .int32);
+    const tail = [_]u32{ try g.input(&.{ 2, 256 }, .float32), try g.input(&.{ 2, 3 }, .float32) };
+    const first = g.nodes.items.len;
+    _ = try ex.at(0).routedHoist(&g, xf, idx, &tail);
+    var kb: [64]u8 = undefined;
+    try testing.expectEqualStrings("Rgdgdr", kindsOf(src.log.items, &kb));
+    // [<R, R..g0, g0..d0, d0..g1, g1..d1, d1..r, >r]: the tail between the route and the first wait.
+    var ae: [7]usize = undefined;
+    opsBetween(&g, src.log.items, first, .async_eval, &ae);
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 1, 1, 1, 1, 0 }, &ae);
+    const mark = src.log.items.len;
+    const second = g.nodes.items.len;
+    _ = try ex.at(0).routedHoist(&g, xf, idx, &tail);
+    try testing.expectEqualStrings("fRgdr", kindsOf(src.log.items[mark..], &kb));
+    // [<f, f..R, R..g0, g0..d0, d0..r, >r]: the hit wave's commit, then the tail's, then the reads.
+    var ae2: [6]usize = undefined;
+    opsBetween(&g, src.log.items[mark..], second, .async_eval, &ae2);
+    try testing.expectEqualSlices(usize, &.{ 0, 0, 2, 1, 1, 0 }, &ae2);
+    var last_kernel: usize = 0;
+    var commits: [2]usize = undefined;
+    var n_commits: usize = 0;
+    const r_at = src.log.items[mark + 1].at;
+    const g_at = src.log.items[mark + 2].at;
+    for (g.nodes.items[r_at..g_at], r_at..) |nd, i| switch (nd.op) {
+        .kernel => last_kernel = i,
+        .async_eval => {
+            commits[n_commits] = i;
+            n_commits += 1;
+        },
+        else => {},
+    };
+    // Every hit-wave kernel is built before the first commit (the hit wave's); the tail's is second.
+    try testing.expect(last_kernel < commits[0] and commits[0] < commits[1]);
+    try ex.flush();
+
+    // Gated: the tail is committed before the gate is registered (and before any wave is waited).
+    var gsrc = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer gsrc.deinit();
+    var gg = TraceOps.init(a);
+    defer gg.deinit();
+    var gex = try ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true }).init(a, &gg, &gsrc, Chain.init(.{}, &c), &c);
+    defer gex.deinit();
+    try gex.grow(&gg, &.{ 8, 8 });
+    gsrc.log.clearRetainingCapacity();
+    gsrc.trace = &gg;
+    var gscript: Script = .{ .calls = &.{&.{ 1, 2, 3, 4, 5, 6 }} };
+    gg.host_values = gscript.values();
+    const gtail = [_]u32{try gg.input(&.{ 2, 256 }, .float32)};
+    const gfirst = gg.nodes.items.len;
+    _ = try gex.at(0).routedHoist(&gg, try gg.input(&.{ 2, 256 }, .bfloat16), try gg.input(&.{ 2, 3 }, .int32), &gtail);
+    try testing.expectEqualStrings("REr", kindsOf(gsrc.log.items, &kb));
+    var gae: [4]usize = undefined;
+    opsBetween(&gg, gsrc.log.items, gfirst, .async_eval, &gae);
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 0, 0 }, &gae);
+    try gex.flush();
+}
+
+test "dsv41 experts: LOOKAHEAD4's construction check: the gated waves against the same slots waited, a mismatch or no miss refused" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var ex = try ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true }).init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try ex.grow(&g, &.{ 8, 8 });
+    src.log.clearRetainingCapacity();
+    src.trace = &g;
+    // The two outputs each check reads (gated, then waited), scripted.
+    const Reads = struct {
+        same: [2 * 6 * 256]f32 = @splat(0.25),
+        n: usize = 0,
+        differ: bool = false,
+        fn values(self: *@This()) TraceOps.HostValues {
+            return .{ .ctx = self, .ids = ids, .argmax = argmax, .f32s = f32s };
+        }
+        fn ids(_: *anyopaque, _: []u16) anyerror!void {
+            return error.NoIds;
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return error.NoPicks;
+        }
+        fn f32s(ctx: *anyopaque, out: []f32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(out, self.same[0..out.len]);
+            if (self.differ and self.n % 2 == 1) out[out.len - 1] = -1;
+            self.n += 1;
+        }
+    };
+    var reads: Reads = .{};
+    g.host_values = reads.values();
+    const xf = try g.input(&.{ 1, 256 }, .bfloat16);
+    var gated: [6 * 256]f32 = undefined;
+    var waited: [6 * 256]f32 = undefined;
+    // Six cold experts: the gate, then each part's waits for the reference waves, release, flush.
+    const w0 = g.waits.items.len;
+    try ex.checkGated(&g, 0, xf, &.{ 1, 2, 3, 4, 5, 6 }, &gated, &waited);
+    var kb: [32]u8 = undefined;
+    try testing.expectEqualStrings("REgdgdrf", kindsOf(src.log.items, &kb));
+    try testing.expect(g.waits.items.len > w0);
+    try testing.expectEqual(@as(usize, 2), reads.n);
+    // Six other cold experts whose waited output differs in one float: refused by name.
+    reads.differ = true;
+    try testing.expectError(error.GateCheckMismatch, ex.checkGated(&g, 0, xf, &.{ 7, 8, 9, 10, 11, 12 }, &gated, &waited));
+    // Resident experts only: nothing is gated, nothing checked.
+    try testing.expectError(error.GateCheckNoMiss, ex.checkGated(&g, 0, xf, &.{ 7, 8, 9, 10, 11, 12 }, &gated, &waited));
+    try testing.expectEqual(@as(usize, 0), src.liveCalls());
+}
+
+// DSV41_PHASE0B_MLX=1, inside a guarded window only (any MLX array allocates through Metal, on a CPU stream too).
+test "dsv41 experts 0b: a gated wait over handles left as garbage (waitProj's undefined outs) aliases its inputs" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try ops.MlxOps.init(testing.allocator, stream);
+    defer g.deinit();
+    // A host event already past the gate's value: the CPU consumer runs the WaitEvent without blocking.
+    const word = try testing.allocator.create(i64);
+    defer testing.allocator.destroy(word);
+    word.* = 7;
+    const ev = try expert_event.createHost(word, std.time.ns_per_s);
+    const vals = [_]f32{ 1, 2, 3, 4 };
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{4}, .float32);
+    const y = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{ 2, 2 }, .float32);
+    var outs: [2]mlx.mlx_array = undefined;
+    for (&outs) |*o| o.ctx = @ptrFromInt(0xaaaa_aaaa_aaaa_aaa8);
+    try mlxEventWait(&g, ev, &.{ x, y }, 5, &.{}, &outs);
+    var got: [4]f32 = undefined;
+    _ = try g.hostF32(try g.add(outs[0], try g.reshape(outs[1], &.{4})), &got);
+    try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, &got);
+    g.reset();
 }
 
 test "dsv41 experts: the gated route builds every wave at once over event-wait aliases, no host waits" {

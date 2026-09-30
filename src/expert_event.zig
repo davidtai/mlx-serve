@@ -44,16 +44,26 @@ pub fn createHost(word: *i64, timeout_ns: i64) !Event {
 
 /// `outs[i]` alias `xs[i]`; nothing reads them before the event reaches
 /// `value`. `deps` only order the wait (after them); `track_inputs` orders it
-/// after the producers of `xs` (only for GPU-produced inputs).
+/// after the producers of `xs` (only for GPU-produced inputs). `outs` are fresh
+/// handles (`mlx_array_new`): the shim assigns each alias into its handle.
 pub fn wait(xs: []const mlx.mlx_array, event: Event, value: u64, deps: []const mlx.mlx_array, track_inputs: bool, stream: mlx.mlx_stream, outs: []mlx.mlx_array) !void {
     std.debug.assert(xs.len == outs.len and xs.len > 0);
+    if (std.debug.runtime_safety) std.debug.assert(allFresh(outs));
     if (c.dsv41ev_wait(xs.ptr, xs.len, event.id, value, deps.ptr, deps.len, track_inputs, stream, outs.ptr) != 0) return error.EventWaitRefused;
 }
 
-/// `outs` alias `xs`; the GPU hands `value` to a metal event after every pass
-/// encoded before it (probes).
+/// `outs` alias `xs` (fresh handles, as `wait`'s); the GPU hands `value` to a
+/// metal event after every pass encoded before it (probes).
 pub fn signal(xs: []const mlx.mlx_array, event: Event, value: u64, stream: mlx.mlx_stream, outs: []mlx.mlx_array) !void {
+    if (std.debug.runtime_safety) std.debug.assert(allFresh(outs));
     if (c.dsv41ev_signal(xs.ptr, xs.len, event.id, value, stream, outs.ptr) != 0) return error.EventSignalRefused;
+}
+
+/// Handles the shim may assign into: none holds an array (an `undefined` one is stack garbage, which the
+/// shim's move-assign would dereference).
+fn allFresh(outs: []const mlx.mlx_array) bool {
+    for (outs) |o| if (o.ctx != null) return false;
+    return true;
 }
 
 pub fn signaledValue(event: Event) u64 {
@@ -85,6 +95,16 @@ test "dsv41 event: the shim's ABI" {
     try testing.expect(ev.id >= 1);
     word = 7;
     try testing.expectEqual(@as(u64, 7), signaledValue(ev));
+}
+
+test "dsv41 event: a wait's and a signal's outputs must be fresh handles; stack garbage is refused in safe builds" {
+    // What an `undefined` [3]mlx_array holds in a safe build (0xaa bytes), and what mlx_array_new returns.
+    var outs: [3]mlx.mlx_array = undefined;
+    for (&outs) |*o| o.ctx = @ptrFromInt(0xaaaa_aaaa_aaaa_aaa8);
+    try testing.expect(!allFresh(&outs));
+    for (&outs) |*o| o.* = mlx.mlx_array_new();
+    try testing.expect(allFresh(&outs));
+    try testing.expect(allFresh(&@as([2]mlx.mlx_array, @splat(.{}))));
 }
 
 /// A pattern file and one record's nine destinations inside one uint8 MLX array.

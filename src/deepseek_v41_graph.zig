@@ -1879,14 +1879,40 @@ pub fn Trunk(comptime G: type) type {
         /// `MoE.__call__`: gate, routed experts (`routed.routed(g, xf, indices)`
         /// returns the unweighted `[n, k, dim]` outputs), shared expert, f32 combine.
         pub fn moe(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype) !T {
+            return moeWith(g, p, c, rt, lk, w, x, routed, null);
+        }
+
+        /// `routed.routed`, or, for a source that commits the arrays a call does not wait on once
+        /// its reads are issued (`routedHoist`), with those (VERIFY_ENCODE hoist).
+        fn routedWith(routed: anytype, g: *G, xf: T, indices: T, hoist: []const T) !T {
+            if (comptime @hasDecl(@TypeOf(routed), "routedHoist")) return routed.routedHoist(g, xf, indices, hoist);
+            return routed.routed(g, xf, indices);
+        }
+
+        /// `moe` with the caller's HC post and comb (`tail`), which do not wait on the routed call: at
+        /// decode rows the shared expert is built first and handed over with the gate weights and
+        /// `tail`, so a streaming source runs them during its read wait, not in the next routing barrier.
+        pub fn moeWith(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype, tail: ?[2]T) !T {
             const sh = g.shapeOf(x);
             const dim: c_int = @intCast(c.hidden_size);
             const xf = try g.reshape(x, &.{ -1, dim });
             const r = try router(g, p, c, rt, lk, w, xf);
-            const ro = try routed.routed(g, xf, r.indices);
+            const decode_rows = g.shapeOf(xf).dim(0) <= rc_max_rows;
+            const rc_shared: ?*const SharedRc(G) = if (decode_rows) lk.shared else null;
+            var hoist: [4]T = undefined;
+            var n_hoist: usize = 0;
+            if (decode_rows) {
+                hoist[0] = try g.astype(if (rc_shared) |s| try sharedExpertRc(g, c, s, xf) else try sharedExpertMinv(g, c, w, lk.minv, xf), .float32);
+                hoist[1] = r.weights;
+                n_hoist = 2;
+                if (tail) |t| {
+                    hoist[2..4].* = t;
+                    n_hoist = 4;
+                }
+            }
+            const ro = try routedWith(routed, g, xf, r.indices, hoist[0..n_hoist]);
             try p.put("moe.routed", ro);
-            const rc_shared: ?*const SharedRc(G) = if (g.shapeOf(xf).dim(0) <= rc_max_rows) lk.shared else null;
-            const shared = try g.astype(if (rc_shared) |s| try sharedExpertRc(g, c, s, xf) else try sharedExpertMinv(g, c, w, lk.minv, xf), .float32);
+            const shared = if (decode_rows) hoist[0] else try g.astype(try sharedExpertMinv(g, c, w, lk.minv, xf), .float32);
             try p.put("moe.shared", shared);
             const y = if (g.shapeOf(xf).dim(0) <= rt.attn_rows) blk: {
                 var o: [1]T = undefined;
@@ -2050,7 +2076,7 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("gate.indices", s2[2]);
                 try p.put("gate.weights", s2[1]);
                 try p.put("moe.shared", s2[3]);
-                const ro = try routed.routed(g, s2[0], s2[2]);
+                const ro = try routedWith(routed, g, s2[0], s2[2], &.{ s2[3], s2[1], s2[4], s2[5], s2[6], s2[7] });
                 try p.put("moe.routed", ro);
                 var s3: [1]T = undefined;
                 try g.tape(Seg3, c, &.{ ro, s2[1], s2[3], s2[4], s2[5], s2[6] }, &s3);
@@ -2059,7 +2085,7 @@ pub fn Trunk(comptime G: type) type {
                 return .{ .h = s3[0], .pre_mix = s2[7] };
             }
             const half = try attnAndMoeInput(g, p, c, rt, lk, li, w, inv_freq, h, pre_mix, positions, cache, shared);
-            const mo = try moe(g, p, c, rt, lk, w, half.moe_in, routed);
+            const mo = try moeWith(g, p, c, rt, lk, w, half.moe_in, routed, .{ half.post, half.comb });
             try p.put("moe.y", mo);
             const out = try hcPostRoute(g, c, rt, lk, mo, half.h1, half.post, half.comb);
             try p.put("out.h", out);

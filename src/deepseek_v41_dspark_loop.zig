@@ -13,6 +13,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
+const dt = @import("dsv41_decode_timers.zig");
 
 pub const Config = struct {
     /// Requested native draft depth (capped by the head's block size).
@@ -145,14 +146,23 @@ pub fn Loop(comptime G: type) type {
             return g.take(x, try g.arange(@floatFromInt(lo), @floatFromInt(hi), 1, .int32), 1);
         }
 
-        fn evalWindows(self: *Self) !void {
-            var ws: [8]T = undefined;
+        fn windows(self: *const Self, ws: *[8]T) []const T {
             var n: usize = 0;
             for (self.caches) |c| if (c.window) |w| {
                 ws[n] = w;
                 n += 1;
             };
-            try self.g.evalAll(ws[0..n]);
+            return ws[0..n];
+        }
+
+        fn evalWindows(self: *Self) !void {
+            var ws: [8]T = undefined;
+            try self.g.evalAll(self.windows(&ws));
+        }
+
+        fn dispatchWindows(self: *Self) !void {
+            var ws: [8]T = undefined;
+            try self.g.asyncEval(self.windows(&ws));
         }
 
         fn isStop(self: *const Self, tok: u32) bool {
@@ -409,13 +419,19 @@ pub fn Loop(comptime G: type) type {
             var drafts: []const u32 = &.{};
             var k_eff: u32 = 0;
             var native: [ds.max_block]u32 = undefined;
+            var tt = dt.now();
             if (self.k_cap > 0) {
                 const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
-                try g.evalAll(&.{ d.ids, d.conf });
+                // CYCLE_TRIM draftfold: the confidence sigmoid is realised by the draft's own eval (one
+                // sync), which also realises the main row and window update the previous commit left.
+                const sig = try g.sigmoid(try g.astype(d.conf, .float32));
+                tt = dt.charge(.draft_build, tt);
+                try g.evalAll(&.{ d.ids, sig });
+                tt = dt.charge(.draft_wait, tt);
                 _ = try g.hostU32(d.ids, native[0..bs]);
                 var conf: [ds.max_block]f32 = undefined;
-                _ = try g.hostF32(try g.sigmoid(try g.astype(d.conf, .float32)), conf[0..bs]);
+                _ = try g.hostF32(sig, conf[0..bs]);
                 k_eff = ds.effectiveDraftLen(conf[0..bs], self.k_cap, self.cfg.confidence_threshold);
                 if (log) |lg| {
                     lg.k_native = k_eff;
@@ -431,6 +447,7 @@ pub fn Loop(comptime G: type) type {
                 }
                 k_eff = @intCast(drafts.len);
             }
+            tt = dt.charge(.draft_host, tt);
             mark(stamp, .draft);
             // Verify [primary, drafts] in chunks of max_rows, stopping at the correction.
             var block: [ds.max_block + 1]u32 = undefined;
@@ -444,7 +461,9 @@ pub fn Loop(comptime G: type) type {
             while (start < n_block) {
                 const end = @min(start + self.max_rows, n_block);
                 const r = try self.model.forward(g, self.st, block[start..end], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
+                tt = dt.charge(.verify, tt);
                 try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
+                tt = dt.charge(.verify_eval, tt);
                 mark(stamp, .verify);
                 st.verify_calls += 1;
                 hiddens[n_hidden] = r.main_hidden.?;
@@ -462,6 +481,7 @@ pub fn Loop(comptime G: type) type {
                     }
                 }
                 const done = ds.acceptChunk(&o, st, drafts, k_eff, .{ start, end }, target[0 .. end - start], typ);
+                tt = dt.charge(.accept, tt);
                 mark(stamp, .decide);
                 start = end;
                 if (done) break;
@@ -472,10 +492,15 @@ pub fn Loop(comptime G: type) type {
             const kept = @min(o.accepted, accepted_cap);
             const next = if (kept < o.accepted) drafts[kept] else correction;
             const trimmed = o.verified - (kept + 1);
-            // Commit: keep [primary, d1 .. d_kept] in the target, seed the draft windows.
+            // Commit: keep [primary, d1 .. d_kept] in the target, seed the draft windows. CYCLE_TRIM gap:
+            // the window update is dispatched, not waited; the round boundary's host work (the tail, the
+            // caller's, the next draft's build) runs under it, and the next draft's eval waits for it.
             try self.model.trim(g, self.st, trimmed);
+            tt = dt.charge(.trim, tt);
             try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(kept + 1)), self.caches);
-            try self.evalWindows();
+            tt = dt.charge(.seed, tt);
+            try self.dispatchWindows();
+            _ = dt.charge(.window, tt);
             mark(stamp, .commit);
             if (log) |lg| {
                 lg.primary = self.primary;
@@ -497,6 +522,7 @@ pub fn Loop(comptime G: type) type {
             const g = self.g;
             const st = &self.stats;
             const c = try self.core(ex, log, stamp, std.math.maxInt(u32));
+            const tt = dt.now();
             var emitted: [ds.max_block + 1]u32 = undefined;
             @memcpy(emitted[0..c.kept], c.drafts[0..c.kept]);
             emitted[c.kept] = c.next;
@@ -515,11 +541,13 @@ pub fn Loop(comptime G: type) type {
             if (finish == null and out.items.len >= self.cfg.max_tokens) finish = .length;
             if (finish == null) {
                 self.primary = c.next;
+                // The next draft's main row, realised by that draft's eval.
                 self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
-                try g.evalAll(&.{self.main_h.?});
             }
             try ex.flush();
             g.reset();
+            _ = dt.charge(.tail, tt);
+            dt.countCycle();
             mark(stamp, .tail);
             return finish;
         }
@@ -537,6 +565,7 @@ pub fn Loop(comptime G: type) type {
             self.lookup_has_primary = true;
             self.primary = t1;
             const c = try self.core(ex, log, stamp, accepted_cap);
+            const tt = dt.now();
             const tokens = try a.alloc(u32, c.kept + 1);
             errdefer a.free(tokens);
             tokens[0] = t1;
@@ -547,10 +576,12 @@ pub fn Loop(comptime G: type) type {
                 try l.appendCommitted(&.{c.next});
             }
             self.primary = c.next;
+            // The next draft's main row, realised by that draft's eval.
             self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
-            try g.evalAll(&.{self.main_h.?});
             try ex.flush();
             g.reset();
+            _ = dt.charge(.tail, tt);
+            dt.countCycle();
             mark(stamp, .tail);
             return .{ .tokens = tokens, .accepted = c.kept, .next_token = c.next };
         }
@@ -712,6 +743,104 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(script.f32s.len, script.nf);
     // Every verify forward routed through the source: 3 prompt forwards + 4 verifies per layer.
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
+}
+
+test "dsv41 dspark loop: CYCLE_TRIM: one eval per draft with its sigmoid, the commit's window update dispatched and waited by the next draft" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    const g = &rig.g;
+    for (0..4) |_| {
+        const n0 = g.nodes.items.len;
+        const e0 = g.evals.items.len;
+        _ = try lp.cycle(&rig.ex, &out, a, null);
+        const nodes = g.nodes.items;
+        const evals = g.evals.items[e0..];
+        // Two syncs per greedy cycle: the draft and the verify. The draft's ids and confidence
+        // sigmoid are both read right after its eval, with nothing built between (realised in it).
+        try testing.expectEqual(@as(usize, 2), evals.len);
+        for (nodes[n0..evals[0]]) |nd| try testing.expect(nd.op != .host_read);
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[0]].op);
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[0] + 1].op);
+        // The last GPU commit of the cycle is the window update, after its last sync.
+        var last_async: usize = 0;
+        for (nodes[n0..], n0..) |nd, i| {
+            if (nd.op == .async_eval) last_async = i;
+        }
+        try testing.expect(last_async >= evals[evals.len - 1]);
+    }
+    // The same tokens as the unfolded cycles (the first test's script).
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
+}
+
+test "dsv41 dspark loop: VERIFY_ENCODE hoist: a verify forward hands each routed call its shared expert, gate weights and HC tail" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    // Each routed call's hoist, as the hook receives it: its length, and whether its first array is
+    // the shared expert's output (f32, the call's rows x hidden) and its second the gate weights.
+    const Recorder = struct {
+        ex: @TypeOf(&rig.ex),
+        lens: std.ArrayList(usize) = .empty,
+        shaped: bool = true,
+        const Rec = @This();
+        pub fn at(r: *Rec, l: u32) Hook {
+            return .{ .r = r, .l = l };
+        }
+        const Hook = struct {
+            r: *Rec,
+            l: u32,
+            pub fn routed(h: Hook, g: *TraceOps, xf: u32, idx: u32) !u32 {
+                try h.r.lens.append(testing.allocator, std.math.maxInt(usize));
+                return h.r.ex.at(h.l).routed(g, xf, idx);
+            }
+            pub fn routedHoist(h: Hook, g: *TraceOps, xf: u32, idx: u32, hoist: []const u32) !u32 {
+                try h.r.lens.append(testing.allocator, hoist.len);
+                if (hoist.len > 0) {
+                    const rows = g.shapeOf(xf).dim(0);
+                    const s = g.shapeOf(hoist[0]);
+                    h.r.shaped = h.r.shaped and g.dtypeOf(hoist[0]) == .float32 and s.dim(0) == rows and s.dim(1) == g.shapeOf(xf).dim(1);
+                    h.r.shaped = h.r.shaped and g.shapeOf(hoist[1]).eql(g.shapeOf(idx));
+                }
+                return h.r.ex.at(h.l).routedHoist(g, xf, idx, hoist);
+            }
+        };
+    };
+    var rec: Recorder = .{ .ex = &rig.ex };
+    defer rec.lens.deinit(a);
+    var ids: [12]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    // A verify-width forward (3 rows): every layer hands 4 arrays (shared, weights, post, comb).
+    _ = try rig.model.forward(&rig.g, &rig.st, ids[0..3], .{ .logits = .all, .main_hidden = true }, &rec, graph.NoProbe{});
+    try rig.ex.flush();
+    const n_layers = rig.m.c.n_layers;
+    try testing.expectEqual(@as(usize, n_layers), rec.lens.items.len);
+    for (rec.lens.items) |n| try testing.expectEqual(@as(usize, 4), n);
+    try testing.expect(rec.shaped);
+    // Wider than the decode rows: nothing is handed over.
+    rec.lens.clearRetainingCapacity();
+    _ = try rig.model.forward(&rig.g, &rig.st, ids[0..9], .{ .logits = .last }, &rec, graph.NoProbe{});
+    try rig.ex.flush();
+    try testing.expectEqual(@as(usize, n_layers), rec.lens.items.len);
+    for (rec.lens.items) |n| try testing.expectEqual(@as(usize, 0), n);
 }
 
 test "dsv41 dspark loop: the shell's prompt (all but the last token, then the last) and its rounds give the cell's tokens" {

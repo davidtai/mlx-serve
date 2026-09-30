@@ -827,18 +827,22 @@ pub const MlxOps = struct {
         try mlx.check(mlx.mlx_async_eval(vec));
     }
 
-    /// The routing barrier (`mx.eval(indices, indices.reshape(-1))` + `tolist`):
-    /// evaluates the integer ids `x` and copies them, row-major, into `out`
-    /// (x's size).
-    pub fn hostIds(g: *MlxOps, x: T, out: []u16) ![]const u16 {
-        const flat = try g.reshape(x, &.{-1});
-        try mlx.check(mlx.mlx_array_eval(flat));
-        const n = mlx.mlx_array_size(flat);
-        if (n != out.len) return error.HostIdsSize;
+    /// The routing barrier (`mx.eval(indices)` + `tolist`): evaluates the integer ids `x` and copies
+    /// them, row-major, into `out` (x's size). Read in place (`readInPlace`).
+    pub fn hostIds(_: *MlxOps, x: T, out: []u16) ![]const u16 {
+        try mlx.check(mlx.mlx_array_eval(x));
+        if (mlx.mlx_array_size(x) != out.len) return error.HostIdsSize;
         // One producer dtype: the router's int32 indices (the arm's stand-in emits the same).
-        std.debug.assert(mlx.mlx_array_dtype(flat) == .int32);
-        const p = mlx.mlx_array_data_int32(flat) orelse return error.MlxNoData;
-        for (out, p[0..n]) |*o, v| o.* = @intCast(v);
+        std.debug.assert(mlx.mlx_array_dtype(x) == .int32);
+        return readInPlace(i32, u16, x, mlx.mlx_array_data_int32(x), out);
+    }
+
+    /// Copies the evaluated `x`'s values, row-major, into `out`, reading its buffer through its own
+    /// strides: an array an eval already produced is read with no GPU round trip (a `reshape(-1)`
+    /// is a new array, and evaluating it is a fresh eval: a commit and a wait).
+    fn readInPlace(comptime S: type, comptime D: type, x: T, data: ?[*]const S, out: []D) ![]const D {
+        const nd = mlx.mlx_array_ndim(x);
+        copyStrided(S, D, data orelse return error.MlxNoData, mlx.mlx_array_shape(x)[0..nd], mlx.mlx_array_strides(x)[0..nd], out);
         return out;
     }
 
@@ -866,35 +870,27 @@ pub const MlxOps = struct {
         return g.reduce(mlx.mlx_logsumexp_axis, x, axis, keepdims);
     }
 
-    /// Evaluates `x` and copies its values, row-major, into `out` (x's size).
-    pub fn hostU32(g: *MlxOps, x: T, out: []u32) ![]const u32 {
-        const flat = try g.reshape(x, &.{-1});
-        try mlx.check(mlx.mlx_array_eval(flat));
-        const n = mlx.mlx_array_size(flat);
-        if (n != out.len) return error.HostReadSize;
-        std.debug.assert(mlx.mlx_array_dtype(flat) == .uint32); // argmax outputs and draft ids
-        @memcpy(out, (mlx.mlx_array_data_uint32(flat) orelse return error.MlxNoData)[0..n]);
-        return out;
+    /// Evaluates `x` (only a wait when an eval already produced it) and copies its values,
+    /// row-major, into `out` (x's size), read in place (`readInPlace`).
+    pub fn hostU32(_: *MlxOps, x: T, out: []u32) ![]const u32 {
+        try mlx.check(mlx.mlx_array_eval(x));
+        if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
+        std.debug.assert(mlx.mlx_array_dtype(x) == .uint32); // argmax outputs and draft ids
+        return readInPlace(u32, u32, x, mlx.mlx_array_data_uint32(x), out);
     }
 
-    pub fn hostF32(g: *MlxOps, x: T, out: []f32) ![]const f32 {
-        const flat = try g.reshape(x, &.{-1});
-        try mlx.check(mlx.mlx_array_eval(flat));
-        const n = mlx.mlx_array_size(flat);
-        if (n != out.len) return error.HostReadSize;
-        std.debug.assert(mlx.mlx_array_dtype(flat) == .float32);
-        @memcpy(out, (mlx.mlx_array_data_float32(flat) orelse return error.MlxNoData)[0..n]);
-        return out;
+    pub fn hostF32(_: *MlxOps, x: T, out: []f32) ![]const f32 {
+        try mlx.check(mlx.mlx_array_eval(x));
+        if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
+        std.debug.assert(mlx.mlx_array_dtype(x) == .float32);
+        return readInPlace(f32, f32, x, mlx.mlx_array_data_float32(x), out);
     }
 
-    pub fn hostBool(g: *MlxOps, x: T, out: []bool) ![]const bool {
-        const flat = try g.reshape(x, &.{-1});
-        try mlx.check(mlx.mlx_array_eval(flat));
-        const n = mlx.mlx_array_size(flat);
-        if (n != out.len) return error.HostReadSize;
-        std.debug.assert(mlx.mlx_array_dtype(flat) == .bool_);
-        @memcpy(out, (mlx.mlx_array_data_bool(flat) orelse return error.MlxNoData)[0..n]);
-        return out;
+    pub fn hostBool(_: *MlxOps, x: T, out: []bool) ![]const bool {
+        try mlx.check(mlx.mlx_array_eval(x));
+        if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
+        std.debug.assert(mlx.mlx_array_dtype(x) == .bool_);
+        return readInPlace(bool, bool, x, mlx.mlx_array_data_bool(x), out);
     }
 
     /// Greedy pick: `mx.argmax` over every logit of `x` (one row), evaluated and read.
@@ -959,6 +955,43 @@ pub const MlxOps = struct {
         return y;
     }
 };
+
+/// `out` = the elements of `src`, laid out by `shape` / `strides` (in elements), in row-major
+/// order, each converted to `D`. A row-major layout (dims of one element aside) is one pass; any
+/// other (a view: a slice or a transpose) walks the logical index.
+pub fn copyStrided(comptime S: type, comptime D: type, src: [*]const S, shape: []const c_int, strides: []const usize, out: []D) void {
+    var row_major = true;
+    var n: usize = 1;
+    var d = shape.len;
+    while (d > 0) {
+        d -= 1;
+        if (shape[d] != 1 and strides[d] != n) row_major = false;
+        n *= @intCast(shape[d]);
+    }
+    std.debug.assert(n == out.len);
+    if (row_major) {
+        if (S == D) {
+            @memcpy(out, src[0..n]);
+        } else {
+            for (out, src[0..n]) |*o, v| o.* = @intCast(v);
+        }
+        return;
+    }
+    var idx: [8]usize = @splat(0);
+    std.debug.assert(shape.len <= idx.len);
+    for (out) |*o| {
+        var off: usize = 0;
+        for (idx[0..shape.len], strides) |i, st| off += i * st;
+        o.* = if (S == D) src[off] else @intCast(src[off]);
+        var k = shape.len;
+        while (k > 0) {
+            k -= 1;
+            idx[k] += 1;
+            if (idx[k] < @as(usize, @intCast(shape[k]))) break;
+            idx[k] = 0;
+        }
+    }
+}
 
 /// f32 -> bf16 bits, round to nearest even (what MLX's host conversion does).
 pub fn bf16Bits(f: f32) u16 {
@@ -1875,6 +1908,25 @@ test "dsv41 ops: a host read of routed ids takes the router's int32 only" {
     defer g.deinit();
     var out: [6]u16 = undefined;
     try testing.expectError(error.HostIdsDtype, g.hostIds(try g.input(&.{ 2, 3 }, .uint32), &out));
+}
+
+test "dsv41 ops: a host read copies an evaluated array in place through its strides (READBACK)" {
+    // A [3, 4] int32 buffer read as itself, as a column slice [3, 2] (the router's top-k view: row
+    // stride 4), as its transpose [4, 3], and with a unit axis; ids narrowed to u16, floats as is.
+    const buf = [_]i32{ 0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23 };
+    var full: [12]u16 = undefined;
+    copyStrided(i32, u16, &buf, &.{ 3, 4 }, &.{ 4, 1 }, &full);
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23 }, &full);
+    var cols: [6]u16 = undefined;
+    copyStrided(i32, u16, buf[1..].ptr, &.{ 3, 2 }, &.{ 4, 1 }, &cols);
+    try testing.expectEqualSlices(u16, &.{ 1, 2, 11, 12, 21, 22 }, &cols);
+    var tr: [12]u16 = undefined;
+    copyStrided(i32, u16, &buf, &.{ 4, 3 }, &.{ 1, 4 }, &tr);
+    try testing.expectEqualSlices(u16, &.{ 0, 10, 20, 1, 11, 21, 2, 12, 22, 3, 13, 23 }, &tr);
+    const fb = [_]f32{ 0.5, -1.25, 3.0, 7.5 };
+    var one: [4]f32 = undefined;
+    copyStrided(f32, f32, &fb, &.{ 1, 4, 1 }, &.{ 99, 1, 7 }, &one);
+    try testing.expectEqualSlices(f32, &fb, &one);
 }
 
 test "dsv41 ops: resetTo frees exactly what was tracked after its mark" {

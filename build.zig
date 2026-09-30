@@ -113,6 +113,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "llama_tag", llama_tag);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
+    // The DSV4.1 DSpark cycle's host split (src/dsv41_decode_timers.zig): profile builds only.
+    build_options.addOption(bool, "dsv41_decode_timers", b.option(bool, "dsv41-decode-timers", "Compile the DSV4.1 DSpark cycle's phase timers in (profile builds only)") orelse false);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
