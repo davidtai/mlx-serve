@@ -805,6 +805,9 @@ pub fn Model(comptime G: type) type {
                         const started = try a.alloc(T, j - i);
                         for (pre_shared, started) |ps, *st_| st_.* = ps.?;
                         try g.asyncEval(started);
+                        // The profile's own stage for the group's shared experts (the last one's eval waits for all,
+                        // one queue), else their GPU time lands in the routed call's first drain (base_seed).
+                        try probe.put("moe.shared", started[started.len - 1]);
                     }
                     const hook = routed.at(@intCast(l));
                     const lk = self.kx.at(l);
