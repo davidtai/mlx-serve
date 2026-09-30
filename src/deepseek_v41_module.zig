@@ -111,6 +111,9 @@ pub const Module = struct {
     phase_change: ?PhaseChangeRecord = null,
     /// The prompt-start reference and the terminal refusal (`PhaseGate`).
     gate: PhaseGate = .{},
+    /// The file-backed pages the construction check measures the step's page cache from: the guard's
+    /// credited start cache when it runs the step (_GPU_WINDOW_FILE_START_BYTES), else this Module's entry.
+    file_backed_ref: u64 = 0,
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -137,6 +140,7 @@ pub const Module = struct {
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
+        self.file_backed_ref = fileBackedRef();
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
@@ -292,6 +296,15 @@ pub const Module = struct {
         log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
         checkConstructionBytes(billed, measured) catch |e| {
             log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
+            return e;
+        };
+        // The bill's assumption: the step creates no page cache (the guard credits only its start cache and
+        // counts speculative pages once the kernel ages them, which it can do at the grow).
+        const v = arm_mod.vmBytes();
+        const created = v.external -| self.file_backed_ref;
+        log.info("NATIVE construction check: page cache created {d} B (file-backed {d} B, reference {d} B, speculative {d} B; tolerance {d} B)", .{ created, v.external, self.file_backed_ref, v.speculative, page_cache_tolerance_bytes });
+        checkPageCache(created) catch |e| {
+            log.err("construction check: construction left {d} B of page cache ({d} B speculative); the bill assumes none", .{ created, v.speculative });
             return e;
         };
     }
@@ -782,6 +795,24 @@ pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u
     if (after.active + freed_device > before.active) return error.PhaseChangeActiveNotFreed;
     if (!footprintFreed(before, after, freed_device)) return error.PhaseChangeFootprintNotFreed;
     if (!physicalFreed(before, after, freed_device) or !outsideReclaimed(outside_ref, after)) return error.PhaseChangeNotReclaimed;
+}
+
+/// How much page cache the step may have created by the end of construction (other processes' file reads
+/// within a guarded window included).
+pub const page_cache_tolerance_bytes: u64 = 500_000_000;
+
+pub fn checkPageCache(created: u64) error{ConstructionLeftPageCache}!void {
+    if (created > page_cache_tolerance_bytes) return error.ConstructionLeftPageCache;
+}
+
+/// The construction check's page-cache reference, read once at `Module.init`: the guard's credited start
+/// file cache when the step runs under it (the loads before `Module.init` count too), else the box's
+/// file-backed pages now.
+fn fileBackedRef() u64 {
+    if (std.c.getenv("_GPU_WINDOW_FILE_START_BYTES")) |v| {
+        if (std.fmt.parseInt(u64, std.mem.span(v), 10)) |n| return n else |_| {}
+    }
+    return arm_mod.vmBytes().external;
 }
 
 pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
@@ -1504,6 +1535,15 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     // The prompt phase over it is refused first.
     b.prefill_wave += 20_000_000_000;
     try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
+}
+
+test "dsv41 memory: the construction check refuses the page cache the bill assumes away, by name" {
+    // v6c2's construction: file-backed 4.87 -> 19.95 GB (15.94 GB speculative): refused.
+    try std.testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
+    // A few configs, tokenizer and the metallib's pages: within the tolerance.
+    try checkPageCache(200_000_000);
+    try checkPageCache(page_cache_tolerance_bytes);
+    try std.testing.expectError(error.ConstructionLeftPageCache, checkPageCache(page_cache_tolerance_bytes + 1));
 }
 
 test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
