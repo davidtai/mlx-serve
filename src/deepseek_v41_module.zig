@@ -187,7 +187,7 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
             inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless },
         };
@@ -292,8 +292,21 @@ pub const Module = struct {
         defer self.gpa.free(scratch);
         const m = self.g.mark();
         defer self.g.resetTo(m);
-        var checks: [16]Tr.RouteCheck = undefined;
-        const n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
+        var checks: [40]Tr.RouteCheck = undefined;
+        var n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
+        n += try Tr.decodeRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, checks[n..]);
+        // C29's Engram wkv (the model's route): its first slot against the stock qmm at 5 rows.
+        if (self.model.engram_m1[0]) |*s| {
+            const en = self.model.engram.?;
+            const K = self.g.shapeOf(en.w[0].wkv.w).dim(1) * 4;
+            var rng = std.Random.DefaultPrng.init(0x5eed_d544);
+            const need: usize = @intCast(5 * K);
+            if (scratch.len < need) return error.PrefillCheckScratch;
+            for (scratch[0..need]) |*v| v.* = (rng.random().float(f32) * 2 - 1);
+            const x = try self.g.astype(try self.g.hostArray(std.mem.sliceAsBytes(scratch[0..need]), &.{ 5, K }, .float32), .bfloat16);
+            checks[n] = .{ .name = "engram_wkv", .ok = try Tr.checkCloseOf(&self.g, try s.call(&self.g, x), try Tr.qlinear(&self.g, x, en.w[0].wkv), 2e-2) };
+            n += 1;
+        }
         for (checks[0..n]) |ck| {
             var b: [1]bool = undefined;
             _ = try self.g.hostBool(ck.ok, &b);
