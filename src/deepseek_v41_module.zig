@@ -617,8 +617,9 @@ pub const Module = struct {
     /// target keeps [t1, at most `accepted_cap` accepted drafts] (the rejected rows trimmed: the KV
     /// rollback) and the draft windows take them. Returns [t1, the kept drafts] (owned by `a`) and the
     /// next token (the correction; not in the state). It never stops: EOS, stop strings and the token
-    /// budget are the caller's. The phase change runs before the first verify. Without a strategy (a
-    /// Module that decodes serially) it serves one serial step instead: [t1], its argmax next.
+    /// budget are the caller's. The decode handover (`decodeHandover`) ran before the first round, else it
+    /// refuses by name. Without a strategy (a Module that decodes serially) it serves one serial step
+    /// instead: [t1], its argmax next.
     pub fn dsparkRound(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !DsparkRound {
         return self.dsparkRoundLogged(a, t1, accepted_cap, null, {});
     }
@@ -626,7 +627,8 @@ pub const Module = struct {
     /// `dsparkRound` with the loop's cycle log and a stamper (the cell's receipts; `{}` compiles them out).
     pub fn dsparkRoundLogged(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, cycle_log: ?*dsl.CycleLog, stamp: anytype) !DsparkRound {
         self.reportPrompt();
-        if (!self.grown()) try self.phaseChange();
+        // The phase change is upstream's decode handover (`decodeHandover`), never taken here.
+        if (!self.grown()) return error.PhaseChangeNotRun;
         const d: *Dspark = if (self.dspark) |*x| x else {
             const logits = try self.forward(&.{t1});
             defer _ = mlx.mlx_array_free(logits);
@@ -670,7 +672,6 @@ pub const Module = struct {
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
         try self.gate.request();
         self.reportPrompt();
-        if (phaseChangeDue(ids.len, self.grown())) try self.phaseChange();
         // With a strategy the serial rows keep it in step (their main taps into the draft windows,
         // the lookup): the shell's prompt (prefill of all but the last token, then this) seeds as the
         // whole prompt does, and a serial step mid-request leaves the next round valid.
@@ -706,6 +707,18 @@ pub const Module = struct {
         self.logPhaseChange();
     }
 
+    /// Upstream's prefill-to-decode handover (`model.DecodeHandover`; `Transformer.decodeHandover` dispatches
+    /// it over the module-owned-state archs): the phase change below, once per request, after the prompt and
+    /// before the first decode forward or round. Refused by name without a prompt (`prefill` never ran) or,
+    /// when the shell drives native draft rounds, without the strategy the prompt seeded. The only entry to
+    /// the phase change: no forward width or round triggers it.
+    pub fn decodeHandover(self: *Module, h: model_io.DecodeHandover) !void {
+        try self.gate.request();
+        if (self.state == null) return error.HandoverWithoutPrompt;
+        if (h.native_draft and self.dspark == null) return error.HandoverWithoutSeed;
+        try self.phaseChange();
+    }
+
     /// The phase change, once (a no-op after): the prompt's frees, proven reclaimed, then the grow.
     /// 1. Every GPU command of the prompt retires (synchronize): MLX's completion handlers hand the buffers
     ///    they held back to its allocator, and Metal keeps a released buffer's pages until its command
@@ -719,7 +732,7 @@ pub const Module = struct {
     /// 4. The grow to the decode rows (the bill admitted both phases at construction).
     /// A refusal is a typed error (upstream's slotFailure reports it; the server stays up) and the Module
     /// refuses every later request by name: no retry grows over what the refused check saw.
-    pub fn phaseChange(self: *Module) !void {
+    fn phaseChange(self: *Module) !void {
         try self.gate.request();
         if (self.grown()) return;
         var marks: [4]VmMark = undefined;
@@ -1036,11 +1049,6 @@ pub const min_fill_rows = bill_mod.min_fill_rows;
 
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
-}
-
-/// The phase change runs before the first decode-width forward of a prompt, once.
-pub fn phaseChangeDue(rows: usize, grown: bool) bool {
-    return rows == 1 and !grown;
 }
 
 /// One forward of a served request: the model's own chunking, the last row's logits (kept), the
@@ -1508,14 +1516,12 @@ test "dsv41 module: the served request's forward schedule against the AR harness
             },
             .served => {
                 // The Generator: the prompt but its last token (step 0), then one id per forward; the module's
-                // phase change before the first decode-width forward.
+                // phase change at the decode handover, once the prompt's last token is in.
                 var ids: []const u32 = prompt[0 .. prompt.len - 1];
                 var step: usize = 0;
                 var next: u32 = prompt[prompt.len - 1];
                 while (step <= n_new) : (step += 1) {
-                    if (step > 0) {
-                        if (phaseChangeDue(ids.len, rec.grown_at.items.len > 0)) try rec.grow(&g, drows);
-                    }
+                    if (fed[ri].items.len >= prompt.len and rec.grown_at.items.len == 0) try rec.grow(&g, drows);
                     try fed[ri].appendSlice(a, ids);
                     const lg = try requestForward(ops.TraceOps, &g, model_, &st, ids, &rec);
                     if (step > 0) next = try g.hostArgmax(lg);
@@ -1545,7 +1551,7 @@ test "dsv41 module: the served request's forward schedule against the AR harness
     try std.testing.expectEqualSlices(u32, fed[0].items, fed[1].items);
     try std.testing.expectEqualSlices(i64, hist[0], hist[1]);
     // The documented difference: the shapes (8-row prompt forwards vs one prompt forward, the last token at M = 1
-    // after the phase change).
+    // before the decode handover's grow).
     try std.testing.expect(!std.mem.eql(u32, rows[0], rows[1]));
 }
 

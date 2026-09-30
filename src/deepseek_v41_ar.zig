@@ -458,19 +458,24 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
     memProbe("dsv41 ar served", "the prompt's calls");
-    // The box's pages beside this footprint, read fresh (vm_stat) around the call that runs the phase change.
+    // Upstream's decode handover, where the server calls it: after the prompt's calls, before the first
+    // decode step (the serial steps below; no native draft rounds here). The box's pages beside this
+    // footprint, read fresh (vm_stat) around it.
     var box_before: ?BoxMark = null;
     var box_grown: ?BoxMark = null;
+    {
+        const pre: ?BoxMark = if (m.phase_change == null) try boxMark(a, io) else null;
+        try m.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = 0, .native_draft = false });
+        if (pre != null and m.phase_change != null) {
+            box_before = pre;
+            box_grown = try boxMark(a, io);
+        }
+    }
     for (out, steps, 0..) |*o, *st, i| {
         if (i > 0) {
             _ = mlx.mlx_array_free(logits);
             const before = m.state.?.offset;
-            const pre: ?BoxMark = if (m.phase_change == null) try boxMark(a, io) else null;
             logits = try m.extend(&.{out[i - 1]});
-            if (pre != null and m.phase_change != null) {
-                box_before = pre;
-                box_grown = try boxMark(a, io);
-            }
             if (i <= 2) try readState(a, &state, m, probe, if (i == 1) "after_step1" else "after_step2", before);
         }
         st.* = try stepOf(a, logits, s);
@@ -478,7 +483,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     }
     _ = mlx.mlx_array_free(logits);
     const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
-    // The phase change ran inside the first decode-width extend: this interval spans it and the decode.
+    // The phase change ran at the decode handover, before the first decode step: this interval spans it and the decode.
     printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), 0, vm_start.external));
     if (m.phase_change) |pc| {
         if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {}
@@ -623,8 +628,6 @@ test "dsv41 ar: the served schedule's variants parse by name and plan their Modu
         for (calls[1..], calls[0 .. calls.len - 1]) |c, p| try testing.expectEqual(p.hi, c.lo);
         try testing.expectEqualSlices(u32, r.want, try forwardRows(a, calls, 32));
     }
-    // An 8-row extend is not a decode-width phase trigger: the phase change runs at the first 1-row call.
-    try testing.expect(!module.phaseChangeDue(8, false) and module.phaseChangeDue(1, false) and !module.phaseChangeDue(1, true));
     // The prompt override: both variables or neither, a number, within the file.
     try testing.expectEqual(@as(?[]const u32, null), try promptOverride(a, testing.io, null, null));
     try testing.expectError(error.ArPromptOverrideHalf, promptOverride(a, testing.io, "x.json", null));
@@ -1007,7 +1010,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // outside the timed span; judged after the receipt is written.
     const box_before = try boxMark(a, io);
     const t1 = std.Io.Timestamp.now(io, .boot);
-    try md.phaseChange();
+    // Upstream's decode handover, as the server calls it: after the prompt, before the first round.
+    try md.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = prompt.len + max_tokens, .native_draft = true });
     const phase_s = secondsSince(io, t1);
     const box_grown = try boxMark(a, io);
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);

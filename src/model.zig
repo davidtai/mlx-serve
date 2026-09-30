@@ -122,6 +122,10 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
+/// Upstream's prefill-to-decode handover, passed to a module-owned-state arch (`Transformer.decodeHandover`):
+/// the request's prompt length, the positions it reserved, and whether the shell drives native draft rounds.
+pub const DecodeHandover = struct { prompt_tokens: u32, reserved_tokens: u64, native_draft: bool };
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
