@@ -1428,7 +1428,7 @@ fn printBill(b: CellBill) void {
     const T = struct { name: []const u8, p: u64, d: u64 };
     for ([_]T{
         .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
-        .{ .name = "slot banks (layers x rows + 48) x record", .p = b.slot_prefill, .d = b.slot_decode },
+        .{ .name = "slot banks (layers x rows + transient) x record", .p = b.slot_prefill, .d = b.slot_decode },
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
         .{ .name = "residents (the embedding: host rows, else off at the fence)", .p = b.prefillTerms().residents, .d = b.residents - b.embedding },
         .{ .name = "Engram residents (row caches: host side)", .p = b.engram, .d = b.engram },

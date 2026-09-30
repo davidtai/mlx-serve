@@ -42,7 +42,8 @@ pub const Bill = struct {
     n_experts: u32 = 0,
     prefill_rows: u32,
     decode_rows: u32,
-    /// (layers x rows + the transient bank's max_route_ids rows) x the bank's record.
+    /// (layers x rows + the transient bank's rows: one max_route_ids window per wide read in flight) x the
+    /// bank's record.
     slot_prefill: u64,
     slot_decode: u64,
     lookahead_staging: u64,
@@ -256,7 +257,12 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     defer p.bank.deinit();
     defer if (p.draft_subset) |*x| x.deinit();
     const rec = p.inputs.record_bytes;
-    const transient: u64 = xp.max_route_ids;
+    // The stream's transient bank, allocated whole at construction: one window of max_route_ids rows per wide
+    // read the stream holds in flight (the arm's `.transient_rows = wide_depth x max_route_ids`). Billing one
+    // window left 48 records (0.64 GB) of device memory unbilled after c47001e folded the second window's named
+    // term into the host side; 9b's construction hid it behind ~0.64 GB of draft-head residents that load at the
+    // first draft block, and SERVED10b's draft-block warm-up showed it (MLX active +642,935,748 B).
+    const transient: u64 = @as(u64, opts.wide_depth) * xp.max_route_ids;
     var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
@@ -544,8 +550,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
 
 // DSV41_BANK=<bank> (host): this tree's rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB
 // stop; baselines 9.2 GB and pass3an's 9.55 GB), with the seed's copies as the retained prompt state (ac2121c:
-// 847,872 B, +2 decode rows over the views) and the Engram posted gathers off and on (the served tier's route):
-// the posted slot costs the 9.2 GB box one prompt row, no decode row.
+// 847,872 B) and both transient windows billed (b4473fa), the Engram posted gathers off and on (the served tier's route).
 test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetch's posted gathers off and on (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -560,8 +565,8 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 139, .decode = 168 }, .on = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 167 }, .on = .{ .prefill = 138, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 137, .decode = 167 }, .on = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 137, .decode = 166 }, .on = .{ .prefill = 137, .decode = 166 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -576,6 +581,34 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
         try testing.expectEqual(w.on, on);
     }
     std.debug.print("\n", .{});
+}
+
+// DSV41_BANK=<bank> (host): the bill's transient rows are the arm's allocation. The stream allocates its transient
+// bank whole at construction, one max_route_ids window per wide read in flight (Arm.init: `.transient_rows =
+// wide_depth x max_route_ids`; the admission's record of the rows past the first window is `wideWindowBytes`). On
+// the served tier (wide depth 2) that is 96 rows: 48 records more than the one window billed from c47001e to here.
+test "dsv41 memory: the bill's transient rows are the arm's allocation, every window (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_ceiling_bytes = 120_259_084_288;
+    config.memory_baseline_bytes = 9_200_000_000;
+    config.expert_rows = min_fill_rows;
+    config.expert_prefill_rows = min_fill_rows;
+    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null);
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const opts = module.armOptions(&config, module.boxCeiling(config.memory_ceiling_bytes.?, c.n_routed_experts), .host);
+    try testing.expectEqual(@as(u8, 2), opts.wide_depth);
+    try testing.expectEqual(@as(u64, opts.wide_depth) * xp.max_route_ids, b.transient_rows);
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
+    try testing.expectEqual(@as(u64, 13_315_584), rec);
+    try testing.expectEqual(xp.max_route_ids * rec + arm_mod.wideWindowBytes(opts.wide_depth, rec), b.transient_rows * rec);
+    try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + 96) * rec, b.slot_prefill);
+    // The second window: 48 records, 639,148,032 B (the 10b construction's unbilled MLX active, less ~3.8 MB).
+    try testing.expectEqual(@as(u64, 639_148_032), arm_mod.wideWindowBytes(opts.wide_depth, rec));
 }
 
 /// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
