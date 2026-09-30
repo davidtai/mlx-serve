@@ -900,15 +900,15 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     const prompt = inputs.prompt;
     var config = inputs.config;
-    try cellConfig(&config);
+    const ov = try cellConfig(&config);
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
     // The cap counts every generated id, the prompt pass's primary included (the Python headline's
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
     if (max_tokens < 2) return error.CellMaxTokens;
-    try cellFill(a, io, &config, prompt.len, max_tokens);
+    try cellFill(a, io, &config, ov, prompt.len, max_tokens);
     // The bill at the admitted rows (host): the phase records' billed terms.
-    const bill = try cellBill(a, io, &config, prompt.len, max_tokens);
+    const bill = try cellBill(a, io, &config, ov, prompt.len, max_tokens);
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -927,7 +927,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const vm_start = status.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, ov);
     defer md.deinit();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
     // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
@@ -1163,7 +1163,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
 /// DSV41_CELL_BASELINE_GB (the guard's box baseline, required), DSV41_CELL_CEILING_GB (the box the
 /// admission fits, required: the window and the bill plan the same rows) and DSV41_CELL_ROWS (a
 /// forced decode row count; unset = the admission's fill).
-fn cellConfig(config: *model.ModelConfig) !void {
+fn cellConfig(config: *model.ModelConfig) !module.RouteOverrides {
+    // The route overrides are the Module's construction options (`Module.initWith`), not the shared config's.
+    var ov: module.RouteOverrides = .{};
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
@@ -1190,20 +1192,20 @@ fn cellConfig(config: *model.ModelConfig) !void {
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);
     if (envStr("DSV41_CELL_WIDE_HOT_FIRST")) |v| config.expert_wide_hot_first = try cellBool("DSV41_CELL_WIDE_HOT_FIRST", v);
     // The attention call sites (the served tier's routes by default; 0 = the stock chain).
-    if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
-    if (envStr("DSV41_CELL_PREFILL_INDEX")) |v| config.prefill_index = try cellBool("DSV41_CELL_PREFILL_INDEX", v);
-    if (envStr("DSV41_CELL_PREFILL_HC")) |v| config.prefill_hc = try cellBool("DSV41_CELL_PREFILL_HC", v);
-    if (envStr("DSV41_CELL_PREFILL_COMBINE")) |v| config.prefill_combine = try cellBool("DSV41_CELL_PREFILL_COMBINE", v);
-    if (envStr("DSV41_CELL_PREFILL_OPROJ")) |v| config.prefill_oproj = try cellBool("DSV41_CELL_PREFILL_OPROJ", v);
-    if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| config.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
-    if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| config.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
-    if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| config.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
+    if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| ov.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
+    if (envStr("DSV41_CELL_PREFILL_INDEX")) |v| ov.prefill_index = try cellBool("DSV41_CELL_PREFILL_INDEX", v);
+    if (envStr("DSV41_CELL_PREFILL_HC")) |v| ov.prefill_hc = try cellBool("DSV41_CELL_PREFILL_HC", v);
+    if (envStr("DSV41_CELL_PREFILL_COMBINE")) |v| ov.prefill_combine = try cellBool("DSV41_CELL_PREFILL_COMBINE", v);
+    if (envStr("DSV41_CELL_PREFILL_OPROJ")) |v| ov.prefill_oproj = try cellBool("DSV41_CELL_PREFILL_OPROJ", v);
+    if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| ov.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
+    if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
+    if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
-    if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| config.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
-    if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| config.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
-    if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| config.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
-    if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| config.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
+    if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
+    if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
+    if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
+    if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;
@@ -1217,6 +1219,7 @@ fn cellConfig(config: *model.ModelConfig) !void {
     // A combination the bills do not cover is refused here, by name, before any window work
     // (the Module's own construction check: K16 only on the served tier, with its request bill).
     _ = try module.layerMajor(config);
+    return ov;
 }
 
 /// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
@@ -1226,12 +1229,12 @@ fn cellConfig(config: *model.ModelConfig) !void {
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
 /// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt
 /// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
-fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !void {
+fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !void {
     const target = config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes;
     if (std.c.getenv("DSV41_CELL_PREFILL_ROWS")) |v| {
         const decode = config.expert_rows orelse return error.CellPrefillRowsWithoutRows;
         config.expert_prefill_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellPrefillRowsValue;
-        const b = try cellBill(a, io, config, prompt_tokens, max_tokens);
+        const b = try cellBill(a, io, config, ov, prompt_tokens, max_tokens);
         std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"forced_rows\": [{d}, {d}], \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}}}\n", .{
             gbOf(b.baseline), gbOf(target), config.expert_prefill_rows.?, decode, gbOf(b.prefillTotal()), gbOf(b.decodeTotal()),
         });
@@ -1239,13 +1242,13 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, prompt
         return;
     }
     if (config.expert_rows != null) return;
-    var nr = try fillAt(a, io, config.*, prompt_tokens, max_tokens);
+    var nr = try fillAt(a, io, config.*, ov, prompt_tokens, max_tokens);
     if (std.c.getenv("DSV41_CELL_FILL_LADDER") != null) {
         for ([_]bool{ false, true }) |lm| {
             var wide = config.*;
             wide.expert_wide_depth = 2;
             wide.layer_major_prefill = lm;
-            const r = try fillAt(a, io, wide, prompt_tokens, max_tokens);
+            const r = try fillAt(a, io, wide, ov, prompt_tokens, max_tokens);
             nr = .{ .prefill = @min(nr.prefill, r.prefill), .decode = @min(nr.decode, r.decode) };
         }
     }
@@ -1268,15 +1271,15 @@ fn harnessWired() !?u64 {
 }
 
 /// The harness's bill (`bill_mod.billAt` at the window's wired bytes).
-pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
-    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, try harnessWired());
+pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !CellBill {
+    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, try harnessWired(), ov);
 }
 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less its 2.0 GB
 /// stop (the window's own numbers, passed explicitly), refused by name on stdout.
-pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     const target = (config.memory_ceiling_bytes orelse return error.CellCeilingMissing) -| module.ceiling_stop_bytes;
-    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, try harnessWired(), target) catch |e| {
+    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, try harnessWired(), target, ov) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };
@@ -1432,10 +1435,10 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     defer arena.deinit();
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
-    try cellConfig(&config);
+    const ov = try cellConfig(&config);
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
-    try cellFill(a, testing.io, &config, 16384, max_tokens);
-    const b = try cellBill(a, testing.io, &config, 16384, max_tokens);
+    try cellFill(a, testing.io, &config, ov, 16384, max_tokens);
+    const b = try cellBill(a, testing.io, &config, ov, 16384, max_tokens);
     printBill(b);
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
 }
@@ -1512,8 +1515,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
-    try cellConfig(&config);
-    try cellFill(a, io, &config, inputs.prompt.len, 1024);
+    const ov = try cellConfig(&config);
+    try cellFill(a, io, &config, ov, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
     defer {
@@ -1527,7 +1530,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer _ = mlx.mlx_stream_free(s);
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.init(gpa, io, &config, &weights, s);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, ov);
     defer md.deinit();
     const arm = switch (md.arm) {
         .host_waits => |t| t.arm,

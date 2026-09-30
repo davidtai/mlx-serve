@@ -240,7 +240,7 @@ pub const measured_host_side_bytes: u64 = 900_000_000;
 /// admission a harness asks for) for a request of `prompt_tokens` + `max_tokens`. `wired_bytes` pins the wired
 /// bytes `planRows` reads (null: now). A bill taken after construction passes the wired bytes the arm was
 /// planned with (`arm.inputs.wired_bytes`), never a live read: the module's own banks are wired by then.
-pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !Bill {
+pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ov: module.RouteOverrides) !Bill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
     errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
@@ -264,7 +264,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     var eck = try v41.Checkpoint.openFile(a, epath, &vd);
     defer eck.deinit();
     const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config));
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov));
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
@@ -289,7 +289,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         // the wave alone covers the pass (v6b: 13.54 GB measured incl. KV against 14.40 + 0.16 billed);
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
         .prefill_wave = if (config.dsv41LayerMajor())
-            (if (config.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
+            (if (ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
         else
             bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
         .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
@@ -302,7 +302,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .unbilled_overhead = 0,
         .embedding_host_rows = config.embedding_host_rows orelse true,
         .prompt_state = dsl.seedRetainedBytes(&c, prompt_tokens),
-        .engram_posted = if (engramPostedRoute(config, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
+        .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
     };
 }
 
@@ -317,20 +317,20 @@ pub fn engramPostedBytes(e: v41.Engram, prompt_tokens: u64) u64 {
 }
 
 /// Whether `config`'s prompt pass posts its Engram gathers: the K16 pass over a bank with Engram layers, the
-/// route set (the setting, else the served tier's). The route's declarations land with dsv41-engram-prefetch:
+/// route set (the harness's override, else the served tier's). The route's declarations land with dsv41-engram-prefetch:
 /// a tree without them posts nothing, and the term comes on with the route, no bill change.
-fn engramPostedRoute(config: *const model.ModelConfig, c: *const v41.Config) bool {
+fn engramPostedRoute(config: *const model.ModelConfig, ov: module.RouteOverrides, c: *const v41.Config) bool {
     if (!config.dsv41LayerMajor() or c.engram.n_layers == 0) return false;
-    if (comptime !(@hasField(graph.Routes, "engram_posted") and @hasField(model.ModelConfig, "engram_posted"))) return false;
-    return config.engram_posted orelse module.numericTier(.served).routes.engram_posted;
+    if (comptime !@hasField(graph.Routes, "engram_posted")) return false;
+    return ov.engram_posted orelse module.numericTier(.served).routes.engram_posted;
 }
 
 /// The fill for `config`'s routes: the bill at the floor rows (both phases' rows-free totals by
 /// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
 /// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
 /// `wired_bytes` as `billAt`.
-pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64) !arm_mod.NativeRows {
-    const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes);
+pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
+    const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes, ov);
     return fillRows(fillBillOf(b0), target, b0.n_experts);
 }
 
@@ -346,11 +346,11 @@ pub fn fillBillOf(b: Bill) FillBill {
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
-fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !Bill {
+fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ov: module.RouteOverrides) !Bill {
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
-    return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes);
+    return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes, ov);
 }
 
 /// What the module needs free to load at all, for upstream's load preflight (`scheduler.loadRequirementBytes`
@@ -360,7 +360,8 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.Mode
     var c = config;
     c.memory_baseline_bytes = 0;
     if (c.memory_ceiling_bytes == null) c.memory_ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
-    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null);
+    // The server's load preflight: the served routes, no harness override.
+    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, .{});
     return b.processBound();
 }
 
@@ -521,11 +522,11 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     config.memory_baseline_bytes = 8_548_761_600;
     config.memory_ceiling_bytes = 119_259_000_000;
     const wired: u64 = 3_380_379_648;
-    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes, .{});
     try testing.expect(nr.prefill <= nr.decode);
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
-    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired);
+    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired, .{});
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
     try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
@@ -539,7 +540,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // v6's failure mode is gone by construction: without the envelope planner the native bill does not read
     // the wired bytes at all (the constructed module's own +85 GB changes nothing).
-    const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000);
+    const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000, .{});
     try testing.expectEqual(b.prefillTotal(), b_live.prefillTotal());
     try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
 }
@@ -565,9 +566,9 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
         .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 167 }, .on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
-        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, .{});
         // This tree's own route decision: off without the route's declarations, the served tier's with them.
-        try testing.expectEqual(if (engramPostedRoute(&config, &c)) posted else 0, b0.engram_posted);
+        try testing.expectEqual(if (engramPostedRoute(&config, .{}, &c)) posted else 0, b0.engram_posted);
         b0.engram_posted = 0;
         const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
         b0.engram_posted = posted;
@@ -642,7 +643,7 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     floor.memory_baseline_bytes = 0;
     floor.expert_rows = min_fill_rows;
     floor.expert_prefill_rows = min_fill_rows;
-    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null);
+    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null, .{});
     try testing.expectEqual(b.processBound(), need);
     // Residents (17.7 GB) + the prompt wave (14.4 GB) + the floor's slot rows: tens of GB, never the bank's 204 GB.
     try testing.expect(need > 30_000_000_000 and need < 60_000_000_000);

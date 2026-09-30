@@ -445,28 +445,6 @@ pub const ModelConfig = struct {
     expert_prefill_rows: ?u32 = null,
     /// deepseek_v41's input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
-    /// deepseek_v41's prefill attention core (ATTNHALF ropefuse) at prompt widths: null = the tier's
-    /// route (served: on), false = the stock chain by construction.
-    prefill_attn: ?bool = null,
-    /// deepseek_v41's prefill indexer (ATTNHALF idxscore + INDEX_TOPK) at prompt widths: null = the
-    /// tier's route (served: on), false = the stock chain by construction.
-    prefill_index: ?bool = null,
-    /// deepseek_v41's prefill HC norms, SMALLK combine, DENSE16 o-projection (after the prefill
-    /// core): null = the tier's route (served: on), false = the stock chain by construction.
-    prefill_hc: ?bool = null,
-    prefill_combine: ?bool = null,
-    prefill_oproj: ?bool = null,
-    /// deepseek_v41's K16 PREFILL_HOST shared and JOINLESS: null = the tier's route (served: on).
-    prefill_host_shared: ?bool = null,
-    prefill_joinless: ?bool = null,
-    /// The deepseek_v41 prompt pass's Engram gathers posted ahead (null: the tier's route).
-    engram_posted: ?bool = null,
-    /// deepseek_v41's verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows): null =
-    /// the tier's route (served: on), false = the stock chain by construction.
-    decode_attn_softmax: ?bool = null,
-    decode_index_topk: ?bool = null,
-    decode_smallm: ?bool = null,
-    decode_mxfp8_rows: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

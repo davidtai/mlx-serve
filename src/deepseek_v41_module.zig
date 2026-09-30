@@ -76,6 +76,31 @@ pub const dspark_config: dsl.Config = .{
     .max_tokens = std.math.maxInt(u32),
 };
 
+/// The routes a harness overrides at construction (null: the tier's route; false: the stock chain by
+/// construction). They are the cell's levers, not serving settings, so they never sit on the shared
+/// ModelConfig: the server builds with none (`Module.init`), a harness passes its own (`Module.initWith`), and
+/// the bill reads the same ones.
+pub const RouteOverrides = struct {
+    /// The prefill attention core (ATTNHALF ropefuse) at prompt widths.
+    prefill_attn: ?bool = null,
+    /// The prefill indexer (ATTNHALF idxscore + INDEX_TOPK) at prompt widths.
+    prefill_index: ?bool = null,
+    /// The prefill HC norms, SMALLK combine, DENSE16 o-projection (after the prefill core).
+    prefill_hc: ?bool = null,
+    prefill_combine: ?bool = null,
+    prefill_oproj: ?bool = null,
+    /// K16's PREFILL_HOST shared and JOINLESS.
+    prefill_host_shared: ?bool = null,
+    prefill_joinless: ?bool = null,
+    /// ENGRAM=prefetch: the prompt pass's Engram gathers posted ahead.
+    engram_posted: ?bool = null,
+    /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows).
+    decode_attn_softmax: ?bool = null,
+    decode_index_topk: ?bool = null,
+    decode_smallm: ?bool = null,
+    decode_mxfp8_rows: ?bool = null,
+};
+
 /// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
 const Dspark = struct {
     lp: dsl.Loop(G),
@@ -151,6 +176,8 @@ pub const Module = struct {
     gate: PhaseGate = .{},
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
+    /// The harness's route overrides the Module was built with (the bill reads the same ones).
+    overrides: RouteOverrides = .{},
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
     /// windows). The construction log line and the receipts read these, never the settings.
     installed: Installed = .{},
@@ -163,6 +190,11 @@ pub const Module = struct {
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig, weights: *model_io.Weights, s: mlx.mlx_stream) !*Module {
+        return initWith(gpa, io, config, weights, s, .{});
+    }
+
+    /// `init` with a harness's route overrides (the served path passes none).
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig, weights: *model_io.Weights, s: mlx.mlx_stream, ov: RouteOverrides) !*Module {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -175,6 +207,7 @@ pub const Module = struct {
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
+        self.overrides = ov;
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
@@ -197,7 +230,7 @@ pub const Module = struct {
             admitted.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target);
+            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target, ov);
             if (admitted.expert_rows) |forced| {
                 admitted.expert_prefill_rows = @min(nr.prefill, forced);
             } else {
@@ -215,7 +248,7 @@ pub const Module = struct {
             cfg.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired) catch |e| {
+            const b = bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -246,24 +279,24 @@ pub const Module = struct {
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
-        if (config.prefill_attn) |v| {
+        if (ov.prefill_attn) |v| {
             // The core reads K30's selection: only a tier with selected keys can take it.
             if (v and !tier.routes.selected_keys) return error.PrefillAttnNeedsSelectedKeys;
             tier.routes.prefill_attn = v;
         }
-        tier.routes.prefill_index = try prefillIndexRoute(config);
+        tier.routes.prefill_index = try prefillIndexRoute(config, ov);
         // The HC norms, the combine and the o-projection: a setting overrides the tier's route.
-        if (config.prefill_hc) |v| tier.routes.prefill_hc = v;
-        if (config.prefill_combine) |v| tier.routes.prefill_combine = v;
-        if (config.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
-        if (config.prefill_joinless) |v| tier.routes.prefill_joinless = v;
-        if (config.engram_posted) |v| tier.routes.engram_posted = v;
+        if (ov.prefill_hc) |v| tier.routes.prefill_hc = v;
+        if (ov.prefill_combine) |v| tier.routes.prefill_combine = v;
+        if (ov.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
+        if (ov.prefill_joinless) |v| tier.routes.prefill_joinless = v;
+        if (ov.engram_posted) |v| tier.routes.engram_posted = v;
         // The verify-row routes (C23, C27-C29): a setting overrides the tier's route.
-        if (config.decode_attn_softmax) |v| tier.routes.rc_attn_softmax = v;
-        if (config.decode_index_topk) |v| tier.routes.rc_index_topk = v;
-        if (config.decode_smallm) |v| tier.routes.rc_smallm = v;
-        if (config.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
-        if (config.prefill_oproj) |v| {
+        if (ov.decode_attn_softmax) |v| tier.routes.rc_attn_softmax = v;
+        if (ov.decode_index_topk) |v| tier.routes.rc_index_topk = v;
+        if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
+        if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
+        if (ov.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
         }
@@ -369,7 +402,7 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired);
+        const b = try bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired, self.overrides);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
@@ -882,9 +915,9 @@ pub const Installed = struct {
 
 /// The prefill indexer route as the Module builds it (the setting, else the tier's route); the bill
 /// reads the same answer. It needs K30's selected keys.
-pub fn prefillIndexRoute(config: *const model_io.ModelConfig) !bool {
+pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides) !bool {
     const t = numericTier(config.numeric_tier orelse .served);
-    const on = config.prefill_index orelse t.routes.prefill_index;
+    const on = ov.prefill_index orelse t.routes.prefill_index;
     if (on and !t.routes.selected_keys) return error.PrefillIndexNeedsSelectedKeys;
     return on;
 }
