@@ -25,6 +25,7 @@ const xq = @import("exl3_quant.zig");
 const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
+const ar_bill = @import("deepseek_v41_ar.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const routes = @import("deepseek_v41_routes.zig");
@@ -100,6 +101,8 @@ pub const Module = struct {
     state: ?M.State = null,
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
     fenced: bool = false,
+    /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
+    bill: ar_bill.CellBill = undefined,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -142,7 +145,7 @@ pub const Module = struct {
             admitted.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try @import("deepseek_v41_ar.zig").fillAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens);
+            const nr = try ar_bill.fillAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens);
             admitted.expert_rows = nr.decode;
             admitted.expert_prefill_rows = nr.prefill;
             log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ nr.prefill, nr.decode, fill_prompt_tokens, admitted.memory_baseline_bytes.?, ceiling_bytes -| ceiling_stop_bytes });
@@ -208,7 +211,37 @@ pub const Module = struct {
             const measured = std.mem.max(u64, self.warm_peaks);
             log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
         }
+        // The construction check (once, before any request): the native bill at the rows the arm built,
+        // against the footprint the module holds now.
+        try self.checkConstruction(io, &admitted, ceiling_bytes);
         return self;
+    }
+
+    /// The module's native bill at its admitted rows (the standard request's), and the construction
+    /// check against it: the footprint after the install (warm-up released, cache cleared) must sit
+    /// within `construction_tolerance_bytes` of the bill's construction terms, else the module is
+    /// refused by name before any request.
+    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig, ceiling_bytes: u64) !void {
+        var cfg = admitted.*;
+        cfg.memory_ceiling_bytes = ceiling_bytes;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const b = try ar_bill.cellBill(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens);
+        const rows = switch (self.arm) {
+            inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
+        };
+        if (b.prefill_rows != rows.prefill or b.decode_rows != rows.decode) {
+            log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
+            return error.BillRowsMismatch;
+        }
+        self.bill = b;
+        const measured = arm_mod.footprint().now;
+        const billed = b.constructionTerms().sum();
+        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
+        checkConstructionBytes(billed, measured) catch |e| {
+            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
+            return e;
+        };
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
@@ -453,6 +486,14 @@ pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
         },
         .served => routes.served,
     };
+}
+
+/// How far the constructed footprint may sit above the bill's construction terms (the ledger's
+/// residual threshold; cell4 measured 0.59 GB UNDER them).
+pub const construction_tolerance_bytes: u64 = 250_000_000;
+
+pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
+    if (measured > billed + construction_tolerance_bytes) return error.ConstructionOverBill;
 }
 
 /// The admitted modeled peak lands this far under the box's ceiling.
@@ -1035,6 +1076,15 @@ test "dsv41 module: the native fill reaches the stop's target within one row and
     const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
     try std.testing.expectEqual(@as(u32, 384), cap.decode);
     try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
+}
+
+test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
+    // cell4 (106 / 148 rows): constructed footprint 76.41 GB against 77.00 GB of construction terms.
+    try checkConstructionBytes(77_000_000_000, 76_410_000_000);
+    // At the tolerance: passes; one byte over: refused.
+    try checkConstructionBytes(77_000_000_000, 77_000_000_000 + construction_tolerance_bytes);
+    try std.testing.expectError(error.ConstructionOverBill, checkConstructionBytes(77_000_000_000, 77_000_000_001 + construction_tolerance_bytes));
+    try std.testing.expect(construction_tolerance_bytes < ceiling_stop_bytes);
 }
 
 test "dsv41 module: the envelope admission (the old rule) admits today's 154 decode rows at today's inputs" {
