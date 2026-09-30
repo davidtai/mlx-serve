@@ -406,12 +406,13 @@ pub const ModelConfig = struct {
     /// the exported Engram token map beside it, stamped by `parseConfig` as `ngram_table_path`; owned.
     expert_bank_dir: ?[]const u8 = null,
     engram_token_map_path: ?[]const u8 = null,
-    /// The non-model box baseline (`--memory-baseline-gb`): the only override of the memory model.
+    /// The memory in use before a streamed-expert model loads: `--memory-baseline-gb`, else the load
+    /// preflight's own reading (total less available), stamped before the weights load.
     memory_baseline_bytes: ?u64 = null,
     /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
     expert_rows: ?u32 = null,
-    /// The memory a streamed-expert model's admission fits under (`--memory-ceiling-gb`); null = the GPU's
-    /// working set (the wired limit).
+    /// A harness's window ceiling for a streamed-expert model's fill (the guard's number, passed
+    /// explicitly); null = upstream's static GPU ceiling (`gpu_ceiling.staticGpuMemoryCeiling`).
     memory_ceiling_bytes: ?u64 = null,
     /// deepseek_v41's prompt-pass bill for the prefill admission (its own estimator, as deepseek_v4 has one).
     dsv41_prefill: ?deepseek_v41.PrefillBill = null,
@@ -1922,8 +1923,7 @@ var config_overrides: ?[]const u8 = null;
 /// `--memory-baseline-gb`, in bytes, and `--expert-rows`: stamped on every parsed config.
 pub var memory_baseline_override: ?u64 = null;
 pub var expert_rows_override: ?u32 = null;
-/// `--memory-ceiling-gb`, in bytes.
-pub var memory_ceiling_override: ?u64 = null;
+
 
 pub fn setConfigOverrides(raw: ?[]const u8) void {
     config_overrides = raw;
@@ -1989,7 +1989,6 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     var config = ModelConfig{};
     config.memory_baseline_bytes = memory_baseline_override;
     config.expert_rows = expert_rows_override;
-    config.memory_ceiling_bytes = memory_ceiling_override;
 
     // Detect model_type from top-level (always present)
     const model_type = if (root.get("model_type")) |v| v.string else "gemma3";

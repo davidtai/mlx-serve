@@ -3711,8 +3711,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
+    // A module-owned arch that bills its own load (streamed experts: the bill, not the shards) sizes itself
+    // against the memory already in use: sampled here, before the weights load (after, it would count them),
+    // unless `--memory-baseline-gb` stated it.
+    const arch_load_bytes = transformer_mod.archLoadRequirementBytes(sch.io, sch.allocator, params.config);
+    if (arch_load_bytes != null and params.config.memory_baseline_bytes == null)
+        params.config.memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes();
     if (!skip_mem_preflight) {
-        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const weights_bytes = arch_load_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),

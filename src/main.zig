@@ -152,14 +152,15 @@ fn printUsage(io: std.Io) void {
         \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
         \\                        it off: more context and concurrency, but a small Mac
         \\                        under heavy load can freeze or restart.
-        \\  --memory-baseline-gb <gb>  The non-model box baseline in decimal GB (memory
-        \\                        in use before the model loads): the only override of
-        \\                        mlx-serve's memory model, for streamed-expert models.
+        \\  --memory-baseline-gb <gb>  The memory in use before a streamed-expert model
+        \\                        loads, decimal GB (default: the load preflight's own
+        \\                        reading, total less available).
         \\  --expert-rows <n>     Decode slot rows per layer for a streamed-expert model
         \\                        (default: as many as its memory admission fits).
-        \\  --memory-ceiling-gb <gb>  The memory a streamed-expert model's admission fits
-        \\                        under, decimal GB (default: the GPU's working set, the
-        \\                        wired limit); the admitted peak lands 2 GB below it.
+        \\  --memory-ceiling-gb <gb>  The GPU memory ceiling every memory plan fits under,
+        \\                        decimal GB (default: Metal's working set); a
+        \\                        streamed-expert model's fill lands --wired-margin-gib
+        \\                        below it.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -905,7 +906,8 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--memory-ceiling-gb: expected decimal GB above 4, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
-            model_mod.memory_ceiling_override = @intFromFloat(@round(gb * 1e9));
+            // Upstream's static GPU ceiling (what MLX_SERVE_GPU_CEILING_MB sets): every bill reads it.
+            server_mod.gpu_ceiling_mod.static_ceiling_override = @intFromFloat(@round(gb * 1e9));
         } else if (std.mem.eql(u8, args[i], "--expert-rows") and i + 1 < args.len) {
             i += 1;
             model_mod.expert_rows_override = std.fmt.parseInt(u32, args[i], 10) catch {
@@ -914,13 +916,13 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+            server_mod.gpu_ceiling_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+            server_mod.gpu_ceiling_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

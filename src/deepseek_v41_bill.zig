@@ -1,0 +1,565 @@
+//! The DeepSeek-V4.1 streamed-expert module's native memory bill (NATIVE): each phase's terms, the fill that
+//! takes slot rows up to a box's target, the load requirement upstream's preflight bills, and the per-phase
+//! memory record. Production code, imported by the module and the harnesses alike; no environment reads (the
+//! harnesses pass their window's numbers explicitly).
+
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const model = @import("model.zig");
+const v41 = @import("deepseek_v41.zig");
+const ops = @import("deepseek_v41_ops.zig");
+const mdl = @import("deepseek_v41_model.zig");
+const xp = @import("deepseek_v41_experts.zig");
+const engram = @import("deepseek_v41_engram.zig");
+const status = @import("status.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
+const module = @import("deepseek_v41_module.zig");
+const arm_mod = @import("deepseek_v41_arm.zig");
+const expert_admission = @import("expert_admission.zig");
+
+const log = std.log.scoped(.dsv41);
+
+/// ASSUMPTION the bill rests on: the step creates no page cache. The guard credits only the file cache present
+/// at its start and does not count speculative pages until the kernel ages them into inactive, so page cache
+/// the step creates is unbilled memory that can land at any later allocation (v6c2: 15 GB of it from
+/// construction, 7.7 GB aged in at the grow). The harnesses assert it (`checkPageCache`), and each
+/// phase record carries `file_cache_created_bytes` and `box_speculative_bytes`.
+///
+/// Every prompt pass is billed at the prompt rows: the first one before the phase change grows the banks,
+/// every later one after the served path returned them to the prompt rows (the arm's shrink, proven by
+/// `Module.reclaimShrink` before the prompt allocates), so max(prompt total, decode total) bounds every request.
+///
+/// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
+/// admission the module builds with (`Module.armOptions` at the same config) and the arch's prefill
+/// bill (`v41.PrefillBill`, its wave pinned by the served 16K trace test): the prompt phase and the
+/// decode phase over the box baseline. `processBound` is what the child may hold above the baseline.
+pub const Bill = struct {
+    baseline: u64,
+    /// The slot banks' geometry: routed layers, the transient rows (max_route_ids x wide depth), the
+    /// layer's experts (the rows' cap).
+    layers: u32 = 0,
+    transient_rows: u64 = 0,
+    n_experts: u32 = 0,
+    prefill_rows: u32,
+    decode_rows: u32,
+    /// (layers x rows + the transient bank's max_route_ids rows) x the bank's record.
+    slot_prefill: u64,
+    slot_decode: u64,
+    lookahead_staging: u64,
+    /// Every resident tensor the index names (trunk, head, embedding, the DSpark head); the
+    /// embedding leaves the device at the prompt fence (decode phase).
+    residents: u64,
+    embedding: u64,
+    /// The Engram sidecar's residents and its row caches (host).
+    engram: u64,
+    /// The prompt pass's transient: K16's layer-major wave + the wide lane's routed-output copy
+    /// (`PrefillBill.layerMajorBilledBytes`), or the chunk-major widest wave x 5 / 4.
+    prefill_wave: u64,
+    /// The request's bounded KV (the served ring + the sources' lanes) for prompt + max_tokens + a block.
+    kv: u64,
+    /// The served tier's prefill allocator cache (4 GiB, D5) and the decode charge.
+    prefill_cache: u64,
+    decode_cache: u64,
+    /// A verify forward's wave (8 rows) with its index chain over every position, and the draft block's.
+    decode_wave: u64,
+    draft_wave: u64,
+    /// The admission's host reserve (pools, tables, the token map, the process).
+    host_reserve: u64,
+    /// The wide read schedule's depth window (the admission's `wide_window_bytes`: process lifetime).
+    wide_window: u64 = 0,
+    /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in the prompt phase.
+    unbilled_overhead: u64 = unbilled_process_overhead_bytes,
+    /// The input embedding reads its host rows from construction (`embedding_host_rows`, default on): the
+    /// device table is freed after the install warm-up, so no phase holds it.
+    embedding_host_rows: bool = false,
+    /// What the prompt pass leaves alive through decode beyond the KV: the DSpark seed keeps a view of
+    /// the whole prompt's main taps (`main_h` slices the concat of every row's `main_hidden`, f32
+    /// [seq, n_main x hidden]) and each draft stage's window a view of its whole-prompt main KV
+    /// ([seq, head_dim] f32); a view keeps its parent's buffer (v6b: +1.30 GB persistent after the prompt,
+    /// 1.11 GB of it these). Decode phase only (inside the prompt wave's kept state during the pass).
+    prompt_state: u64 = 0,
+
+    pub fn prefillTotal(b: Bill) u64 {
+        return b.baseline + b.prefillTerms().sum();
+    }
+
+    pub fn decodeTotal(b: Bill) u64 {
+        return b.baseline + b.decodeTerms().sum();
+    }
+
+    /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
+    pub fn prefillTerms(b: Bill) PhaseTerms {
+        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead };
+    }
+
+    /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
+    pub fn decodeTerms(b: Bill) PhaseTerms {
+        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state };
+    }
+
+    /// What the constructed module holds before any request (after the install warm-up released its
+    /// buffers and the allocator cache): the prompt phase's persistent terms, no wave, no KV, no cache.
+    pub fn constructionTerms(b: Bill) PhaseTerms {
+        var t = b.prefillTerms();
+        t.waves = 0;
+        t.kv = 0;
+        t.mlx_cache = 0;
+        return t;
+    }
+
+    pub fn processBound(b: Bill) u64 {
+        return @max(b.prefillTotal(), b.decodeTotal()) - b.baseline;
+    }
+};
+
+/// One phase's billed process terms (decimal bytes; the box baseline apart), as the receipt records them.
+pub const PhaseTerms = struct {
+    slot_banks: u64 = 0,
+    lookahead_staging: u64 = 0,
+    residents: u64 = 0,
+    engram: u64 = 0,
+    /// The prompt wave (prompt phase) or the verify + draft waves (decode phase).
+    waves: u64 = 0,
+    kv: u64 = 0,
+    mlx_cache: u64 = 0,
+    host_reserve: u64 = 0,
+    wide_window: u64 = 0,
+    unbilled_overhead: u64 = 0,
+    /// The retained prompt state (decode phase).
+    prompt_state: u64 = 0,
+
+    pub fn sum(t: PhaseTerms) u64 {
+        var n: u64 = 0;
+        inline for (@typeInfo(PhaseTerms).@"struct".field_names) |name| n += @field(t, name);
+        return n;
+    }
+};
+
+/// One phase boundary's memory record (NATIVE; probes at the four boundaries only: module constructed,
+/// end of the prompt pass, after the phase change, end of decode): the phase's billed terms, the
+/// process ledgers (the guard's footprint and its split), MLX's allocator (active, cache, the peak since
+/// the previous boundary), the box's pages as the guard reads them, and billed minus measured.
+pub const PhaseMemory = struct {
+    phase: []const u8,
+    billed: PhaseTerms,
+    billed_process_bytes: u64,
+    process: status.ProcessMemory,
+    mlx_active_bytes: u64,
+    mlx_cache_bytes: u64,
+    mlx_peak_bytes: u64,
+    box_physical_used_bytes: u64,
+    box_file_backed_bytes: u64,
+    /// Speculative (read-ahead) pages: not in the guard's used count until the kernel ages them into
+    /// inactive, which it can do at any later allocation (the v6c2 / SERVED kills: 7.7 GB at the grow).
+    box_speculative_bytes: u64 = 0,
+    /// The page cache the step created: file-backed pages now less at the step's vm start (the bill assumes 0).
+    file_cache_created_bytes: i64 = 0,
+    /// The phase's billed process bytes less its measured footprint high-water mark (negative: over the bill).
+    residual_bytes: i64,
+    /// Billed MLX-device terms (slots, residents, Engram residents, waves, KV) less MLX's peak over the phase.
+    mlx_residual_bytes: i64,
+    /// The phase change's boundary only: how long the driver took to reclaim the frees before the grow.
+    settle_ms: ?u32 = null,
+};
+
+/// The boundary's record from what the kernel and MLX already track (no new counter): reads the
+/// ledgers and MLX's allocator, then restarts both high-water marks for the next phase.
+/// `engram_host_bytes`: the part of the billed Engram term that is host memory (0 since the host side is billed
+/// as measured: the Engram term holds its device residents only).
+pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64, file_backed_start: u64) PhaseMemory {
+    var active: usize = 0;
+    var cache: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    const pm = status.processMemory();
+    const v = status.vmBytes();
+    _ = mlx.mlx_reset_peak_memory();
+    status.startFootprintInterval();
+    return recordOf(phase, billed, pm, active, cache, peak, status.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
+}
+
+/// `phaseMemory`'s arithmetic (host-testable): the MLX-device share of the bill is every term but the
+/// host ones (lookahead staging, host reserve, the wide window's host records, the overhead, the
+/// Engram row caches) and the allocator cache.
+pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: status.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
+    const process = billed.sum();
+    const measured = @max(pm.footprint_interval_peak, pm.footprint);
+    const device = billed.slot_banks + billed.residents + (billed.engram -| engram_host_bytes) + billed.waves + billed.kv;
+    return .{
+        .phase = phase,
+        .billed = billed,
+        .billed_process_bytes = process,
+        .process = pm,
+        .mlx_active_bytes = active,
+        .mlx_cache_bytes = cache,
+        .mlx_peak_bytes = @max(peak, active),
+        .box_physical_used_bytes = physical,
+        .box_file_backed_bytes = file_backed,
+        .box_speculative_bytes = speculative,
+        .file_cache_created_bytes = @as(i64, @intCast(file_backed)) - @as(i64, @intCast(file_backed_start)),
+        .residual_bytes = @as(i64, @intCast(process)) - @as(i64, @intCast(measured)),
+        .mlx_residual_bytes = @as(i64, @intCast(device)) - @as(i64, @intCast(@max(peak, active))),
+    };
+}
+
+pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
+    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
+    std.debug.print("NATIVE DSV41_PHASE_MEMORY {s}\n", .{json});
+}
+
+/// The measured process overhead the named terms do not cover, PROMPT PHASE ONLY: calibrated from the
+/// served cells' peak phys_footprint over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657
+/// GB = 0.637; standard 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up. Those peaks were
+/// decode peaks, and what they measured there is now attributed: the retained prompt state (`prompt_state`,
+/// 1.11 GB at 16K; pass3ak's decode: MLX 1.46 GB above the constructed module after the prompt, the host side
+/// 0.38-0.59 GB against 1.26 billed with this term), so the decode phase no longer carries it (pass3ak's decode
+/// residual was +1.30 GB with both). The prompt phase keeps it: its host side measured 1.64-1.87 GB against
+/// 1.26 billed without it.
+pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
+
+/// The process's host side (its footprint less MLX's active and cache: the read pool and its staging, the
+/// lookahead staging, the Engram row caches, the tables, the process itself), billed as measured with a
+/// 0.3 GB margin in place of the named host terms (lookahead staging, row caches, host reserve, the wide
+/// window's second transient window, the prompt phase's unattributed overhead: 1.90 GB together). pass3am (v7,
+/// served-cell-typical-fastest-20260930-065643): 0.31 GB after construction; host and cache together 0.59 GB
+/// at the prompt pass's footprint peak (MLX 104.90, footprint 105.49 GB); 0.50-0.59 GB in decode; 1.93 GB at the
+/// prompt's end, after its waves were freed (footprint 96.1 GB, far under the peak). MLX active equals the
+/// device terms without the wide window at every boundary, so that window is no device memory either.
+pub const measured_host_side_bytes: u64 = 900_000_000;
+
+/// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
+/// admission a harness asks for) for a request of `prompt_tokens` + `max_tokens`. `wired_bytes` pins the wired
+/// bytes `planRows` reads (null: now). A bill taken after construction passes the wired bytes the arm was
+/// planned with (`arm.inputs.wired_bytes`), never a live read: the module's own banks are wired by then.
+pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !Bill {
+    const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
+    var vd: v41.Diag = .{};
+    errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
+    const c = try v41.Config.load(a, io, dir, &vd);
+    const ceiling = module.boxCeiling(config.memory_ceiling_bytes orelse return error.CeilingMissing, c.n_routed_experts);
+    var diag: arm_mod.Diag = .{};
+    var opts = module.armOptions(config, ceiling, .host);
+    if (wired_bytes) |w| opts.wired_bytes = w;
+    var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
+        log.err("bill: refused: {s}", .{diag.message()});
+        return e;
+    };
+    defer p.bank.deinit();
+    defer if (p.draft_subset) |*x| x.deinit();
+    const rec = p.inputs.record_bytes;
+    const transient: u64 = xp.max_route_ids;
+    var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
+    defer ck.deinit();
+    const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
+    const epath = try std.fmt.allocPrint(a, "{s}/engram/engram-residents.safetensors", .{dir});
+    var eck = try v41.Checkpoint.openFile(a, epath, &vd);
+    defer eck.deinit();
+    const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config));
+    const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
+    const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
+    // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
+    const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
+    return .{
+        // Unset (a shell without a box baseline): the process terms alone.
+        .baseline = config.memory_baseline_bytes orelse 0,
+        .layers = c.n_layers,
+        .transient_rows = transient,
+        .n_experts = c.n_routed_experts,
+        .prefill_rows = p.prefill_rows,
+        .decode_rows = p.decode_rows,
+        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient) * rec,
+        // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
+        .lookahead_staging = 0,
+        .residents = m.totalBytes(),
+        .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
+        .engram = em.totalBytes(),
+        // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
+        // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no joined copy, and
+        // the wave alone covers the pass (v6b: 13.54 GB measured incl. KV against 14.40 + 0.16 billed);
+        // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
+        .prefill_wave = if (config.dsv41LayerMajor())
+            (if (config.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
+        else
+            bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
+        .prefill_cache = module.prefillCacheLimit(.served),
+        .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
+        .decode_wave = decode_wave,
+        .draft_wave = decode_wave,
+        .host_reserve = measured_host_side_bytes,
+        .wide_window = 0,
+        .unbilled_overhead = 0,
+        .embedding_host_rows = config.embedding_host_rows orelse true,
+        .prompt_state = prompt_tokens * (bill.n_main * bill.hidden * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4),
+    };
+}
+
+/// The fill for `config`'s routes: the bill at the floor rows (both phases' rows-free totals by
+/// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
+/// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
+/// `wired_bytes` as `billAt`.
+pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64) !arm_mod.NativeRows {
+    const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes);
+    const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
+    const per_row = @as(u64, b0.layers) * rec;
+    return fillRows(.{
+        .prefill_fixed = b0.prefillTotal() - b0.prefill_rows * per_row,
+        .decode_fixed = b0.decodeTotal() - b0.decode_rows * per_row,
+        .per_row = per_row,
+    }, target, b0.n_experts);
+}
+
+/// The bill at the fill's floor rows (`min_fill_rows` in both phases).
+fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !Bill {
+    var c = config;
+    c.expert_rows = min_fill_rows;
+    c.expert_prefill_rows = min_fill_rows;
+    return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes);
+}
+
+/// What the module needs free to load at all, for upstream's load preflight (`scheduler.loadRequirementBytes`
+/// is fed this in place of the shards' disk bytes): the process bound of the standard request's bill at the
+/// fill's floor rows. The fill then takes rows up to the box's target; below the floor it refuses by name.
+pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig) !u64 {
+    var c = config;
+    c.memory_baseline_bytes = 0;
+    if (c.memory_ceiling_bytes == null) c.memory_ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
+    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null);
+    return b.processBound();
+}
+
+/// A native bill in the fill's shape: each phase's billed bytes (the box baseline included) without its
+/// persistent slot rows, and one row on every routed layer (layers x the record); a phase's total at
+/// r rows is `fixed + r * per_row`.
+pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
+
+/// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
+/// layer's experts) whose phase totals each stay under `target` (the caller's box: the ceiling less its margin). The slot banks
+/// hold the prompt rows through the prompt pass and grow to the decode rows at the phase change, which
+/// grows only after the prompt's frees are proven complete (`Module.phaseChange`), so the process bound is
+/// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
+pub fn fillRows(b: FillBill, target: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
+    const most = struct {
+        fn f(fixed: u64, t: u64, per_row: u64) u64 {
+            return if (fixed >= t) 0 else (t - fixed) / per_row;
+        }
+    }.f;
+    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
+    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
+    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
+    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
+}
+
+/// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
+/// request is admitted, or refused by name, by the server's per-request prefill bill at its time).
+pub const fill_prompt_tokens: u64 = 16384;
+pub const fill_max_tokens: u64 = 1024;
+
+/// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
+pub const min_fill_rows = 16;
+
+
+/// Both phases' billed totals within the fill's target (the fill guarantees it; forced rows are checked
+/// here), once, before construction: the grow at the phase change is then admitted by construction.
+pub fn admitPhases(b: Bill, target: u64) error{ PromptOverTarget, DecodeOverTarget }!void {
+    if (b.prefillTotal() > target) return error.PromptOverTarget;
+    if (b.decodeTotal() > target) return error.DecodeOverTarget;
+}
+
+
+// ── Tests ──
+
+const testing = std.testing;
+
+/// cell4's bill (served-cell-typical-fastest-20260929-195452: 106 / 148 rows, the 8.716 GB non-file
+/// baseline), term by term in bytes as the bill built it on the bank then (a test fixture).
+pub fn cell4Bill() Bill {
+    const rec: u64 = 13_315_584;
+    return .{
+        .baseline = 8_716_419_072,
+        .layers = 40,
+        .transient_rows = 48,
+        .n_experts = 384,
+        .prefill_rows = 106,
+        .decode_rows = 148,
+        .slot_prefill = (40 * 106 + 48) * rec,
+        .slot_decode = (40 * 148 + 48) * rec,
+        .lookahead_staging = 54_460_416,
+        .residents = 17_680_000_000,
+        .embedding = 1_323_827_200,
+        .engram = 480_000_000,
+        .prefill_wave = 17_995_900_000,
+        .kv = 160_000_000,
+        .prefill_cache = 4_294_967_296,
+        .decode_cache = 270_000_000,
+        .decode_wave = 350_000_000,
+        .draft_wave = 350_000_000,
+        .host_reserve = 408_944_640,
+        .wide_window = 48 * rec,
+    };
+}
+
+test "dsv41 memory: a phase's total is the baseline plus its terms; the construction terms drop the wave, the KV and the cache" {
+    const b = cell4Bill();
+    try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window, b.prefillTotal());
+    // The decode phase carries no unbilled overhead (what it covered there is the retained prompt state).
+    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state, b.decodeTotal());
+    try testing.expectEqual(@as(u64, 0), b.decodeTerms().unbilled_overhead);
+    const c = b.constructionTerms();
+    try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache, c.sum());
+    // cell4's constructed footprint (76.41 GB) sits under its construction terms (77.00 GB).
+    try testing.expect(c.sum() > 76_410_000_000 and c.sum() < 77_100_000_000);
+}
+
+test "dsv41 memory: with the embedding on its host rows no phase bills the device table, and the one-count fill gains 2 rows" {
+    var dev = cell4Bill();
+    dev.embedding_host_rows = false;
+    var host = dev;
+    host.embedding_host_rows = true;
+    try testing.expectEqual(dev.prefillTotal() - dev.embedding, host.prefillTotal());
+    try testing.expectEqual(dev.decodeTotal(), host.decodeTotal());
+    try testing.expectEqual(dev.constructionTerms().sum() - dev.embedding, host.constructionTerms().sum());
+    const per_row = @as(u64, dev.layers) * 13_315_584;
+    const at = struct {
+        fn f(b: Bill, base: u64, pr: u64) FillBill {
+            return .{ .prefill_fixed = b.prefillTotal() - b.baseline + base - @as(u64, b.prefill_rows) * pr, .decode_fixed = b.decodeTotal() - b.baseline + base - @as(u64, b.decode_rows) * pr, .per_row = pr };
+        }
+    }.f;
+    const r_dev = try fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
+    const r_host = try fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
+    try testing.expectEqual(r_dev.prefill + 2, r_host.prefill);
+}
+
+test "dsv41 memory: the phase record's residuals: billed less the interval peak, billed device terms less MLX's peak" {
+    const b = cell4Bill();
+    // cell4's prompt boundary: footprint 83.03 GB now; MLX active 76.56, peak 91.35 GB.
+    const pm: status.ProcessMemory = .{ .footprint = 83_030_000_000, .footprint_interval_peak = 97_000_000_000, .footprint_lifetime_peak = 97_000_000_000 };
+    const r = recordOf("prompt pass", b.prefillTerms(), pm, 76_560_000_000, 5_000_000_000, 91_350_000_000, 110_000_000_000, 3_000_000_000, 850_000_000, 4_870_000_000, engram.row_cache_host_bytes);
+    // The page cache the step created (file-backed now less at its vm start) and the speculative pages, recorded.
+    try testing.expectEqual(@as(i64, 3_000_000_000 - 4_870_000_000), r.file_cache_created_bytes);
+    try testing.expectEqual(@as(u64, 850_000_000), r.box_speculative_bytes);
+    try testing.expectEqual(b.prefillTotal() - b.baseline, r.billed_process_bytes);
+    try testing.expectEqual(@as(i64, @intCast(r.billed_process_bytes)) - 97_000_000_000, r.residual_bytes);
+    const device = b.slot_prefill + b.residents + (b.engram - engram.row_cache_host_bytes) + b.prefill_wave + b.kv;
+    try testing.expectEqual(@as(i64, @intCast(device)) - 91_350_000_000, r.mlx_residual_bytes);
+    // A footprint above its (stale) interval peak counts as the measurement; a peak below active reads active.
+    const late: status.ProcessMemory = .{ .footprint = 99_000_000_000, .footprint_interval_peak = 0 };
+    const r2 = recordOf("decode", b.decodeTerms(), late, 97_000_000_000, 0, 0, 0, 19_950_000_000, 15_940_000_000, 4_870_000_000, engram.row_cache_host_bytes);
+    // v6c2's construction: 15.08 GB of page cache created, 15.94 GB of it speculative.
+    try testing.expectEqual(@as(i64, 15_080_000_000), r2.file_cache_created_bytes);
+    try testing.expectEqual(@as(i64, @intCast(b.decodeTotal() - b.baseline)) - 99_000_000_000, r2.residual_bytes);
+    try testing.expectEqual(@as(u64, 97_000_000_000), r2.mlx_peak_bytes);
+    // The record serialises for the receipt.
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, r, .{});
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"footprint_interval_peak\":97000000000") != null);
+}
+
+// DSV41_BANK=<bank> (host): the fill and the bill that checks it agree at the same inputs (v6 211422's:
+// non-file 8.5487616 GB, box 119.259 GB, wired 3.380 GB); a bill re-read with the constructed module's wired
+// bytes (live, +85 GB) refused v6 through the envelope planner, which the served path no longer runs.
+test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 8_548_761_600;
+    config.memory_ceiling_bytes = 119_259_000_000;
+    const wired: u64 = 3_380_379_648;
+    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    try testing.expect(nr.prefill <= nr.decode);
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
+    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired);
+    try testing.expectEqual(nr.prefill, b.prefill_rows);
+    try testing.expectEqual(nr.decode, b.decode_rows);
+    try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
+    try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
+    try testing.expectEqual(@as(u64, 2 << 30), b.prefill_cache);
+    // The host side billed as measured, the named host terms folded into it.
+    try testing.expectEqual(measured_host_side_bytes, b.host_reserve);
+    try testing.expectEqual(@as(u64, 0), b.lookahead_staging + b.wide_window + b.unbilled_overhead);
+    std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
+    // v6's failure mode is gone by construction: without the envelope planner the native bill does not read
+    // the wired bytes at all (the constructed module's own +85 GB changes nothing).
+    const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000);
+    try testing.expectEqual(b.prefillTotal(), b_live.prefillTotal());
+    try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
+}
+
+/// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
+/// baseline and the cell bill's phase totals at the envelope's 112 / 154 rows (decimal GB, 3 places).
+pub const fill_fixture = struct {
+    pub const record: u64 = 13_315_584;
+    pub const per_row: u64 = 40 * record;
+    pub const baseline: u64 = 13_408_305_152;
+    pub const prefill_total: u64 = 114_365_000_000;
+    pub const decode_total: u64 = 115_140_000_000;
+    pub const ceiling: u64 = 120_259_000_000;
+
+    pub fn at(base: u64) FillBill {
+        return .{ .prefill_fixed = prefill_total - 112 * per_row - baseline + base, .decode_fixed = decode_total - 154 * per_row - baseline + base, .per_row = per_row };
+    }
+};
+
+test "dsv41 memory: the native fill takes two row counts, each phase at its target within one row" {
+    const f = fill_fixture;
+    const target = f.ceiling - module.ceiling_stop_bytes;
+    for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
+        const b = f.at(base);
+        const r = try fillRows(b, target, 384);
+        try std.testing.expect(r.prefill <= r.decode);
+        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
+        try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
+        std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
+    }
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), target, 384));
+    // Capped at the layer's experts; refused by name when not even the floor fits.
+    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, target, 384);
+    try std.testing.expectEqual(@as(u32, 384), cap.decode);
+    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, target, 384));
+}
+
+test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
+    var b = cell4Bill();
+    const target: u64 = 118_259_084_288;
+    try admitPhases(b, target);
+    // Decode rows forced past the target (148 -> 170 rows: +11.72 GB).
+    b.decode_rows = 170;
+    b.slot_decode = (40 * 170 + 48) * 13_315_584;
+    try std.testing.expect(b.decodeTotal() > target);
+    try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
+    // The prompt phase over it is refused first.
+    b.prefill_wave += 20_000_000_000;
+    try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
+}
+
+
+// DSV41_BANK=<bank> (host): what upstream's load preflight bills for the module (in place of the shards' disk
+// bytes): the standard request's process bound at the fill's floor rows, well above the shards' bytes and
+// well under a full fill's bound.
+test "dsv41 memory: the load preflight's requirement is the bill at the fill's floor rows (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_ceiling_bytes = 120_259_084_288;
+    const need = try loadRequirementBytes(a, testing.io, config);
+    var floor = config;
+    floor.memory_baseline_bytes = 0;
+    floor.expert_rows = min_fill_rows;
+    floor.expert_prefill_rows = min_fill_rows;
+    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null);
+    try testing.expectEqual(b.processBound(), need);
+    // Residents (17.7 GB) + the prompt wave (14.4 GB) + the floor's slot rows: tens of GB, never the bank's 204 GB.
+    try testing.expect(need > 30_000_000_000 and need < 60_000_000_000);
+    std.debug.print("\nload preflight requirement: {d} B at {d} rows\n", .{ need, min_fill_rows });
+}

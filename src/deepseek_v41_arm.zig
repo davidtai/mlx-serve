@@ -71,10 +71,13 @@ pub const Options = struct {
     /// Wired bytes at construction; null reads them now.
     wired_bytes: ?u64 = null,
     fixed_rows: ?u32 = null,
-    /// Rows chosen by the caller's native bill (`deepseek_v41_module.fillRows`): the stream's prefill
-    /// and decode rows per layer. The envelope admission still runs (AUTO, for its record); its rows
-    /// are not used. Exclusive with `fixed_rows`.
+    /// Rows chosen by the caller's native bill (`deepseek_v41_bill.fillRows`): the stream's prefill
+    /// and decode rows per layer. Exclusive with `fixed_rows`.
     native_rows: ?NativeRows = null,
+    /// Run the Python-calibrated envelope admission (`expert_admission.Admission.plan`) for its rows and its
+    /// record: the Python-paired receipts only. The served path passes native rows and never runs it; a
+    /// plan without native rows and without this is refused by name (NativeRowsRequired).
+    envelope_record: bool = false,
     /// Every layer's slot banks at their decode rows from construction: the prompt phase holds the
     /// same rows and the phase change allocates nothing (no bank growth, no transient beside the
     /// frees). Native rows must then be one count (prefill == decode).
@@ -113,7 +116,8 @@ pub const Planned = struct {
     bank: expert_bank.Bank,
     draft_subset: ?dspark_head.Subset = null,
     inputs: expert_admission.Inputs,
-    plan: expert_admission.Plan,
+    /// The envelope admission (`Options.envelope_record` only).
+    plan: ?expert_admission.Plan,
     /// Per layer, before and after the phase change.
     prefill_rows: u32,
     decode_rows: u32,
@@ -127,7 +131,9 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         return refuse(diag, error.ConfigBankMismatch, "config: hidden {d}, inter {d}, {d} experts, {d} layers; the bank lane decodes {d}, {d}, {d}, {d}", .{
             c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, im.hidden, im.inter, im.n_experts, im.n_layers,
         });
-    const baseline = opt.baseline_bytes orelse return refuse(diag, error.BaselineMissing, "admission: no measured box baseline", .{});
+    if (opt.native_rows == null and !opt.envelope_record) return refuse(diag, error.NativeRowsRequired, "admission: no native rows and no envelope admission asked for", .{});
+    // The envelope planner needs the guard's measured baseline; the native rows need none.
+    const baseline = opt.baseline_bytes orelse if (opt.envelope_record) return refuse(diag, error.BaselineMissing, "admission: no measured box baseline", .{}) else 0;
     var subset: ?dspark_head.Subset = null;
     errdefer if (subset) |*x| x.deinit();
     var draft_pruned = opt.draft_pruned_bytes;
@@ -160,13 +166,17 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
         .rowsx = opt.rowsx,
         .draft_pruned_bytes = draft_pruned,
     };
-    const plan_ = expert_admission.Admission.plan(opt.envelope, inputs) catch |e| return refuse(diag, e, "admission: {s}", .{@errorName(e)});
+    const plan_: ?expert_admission.Plan = if (opt.envelope_record) expert_admission.Admission.plan(opt.envelope, inputs) catch |e| return refuse(diag, e, "admission: {s}", .{@errorName(e)}) else null;
     // The stream holds what the admitted prefill bank bound holds (the
     // Python engine resolves its own plan within it); a layer never
     // holds more rows than it has experts.
     const n_experts = bank.n_experts;
-    var prefill = @min(plan_.admission.prefill_capacity, n_experts);
-    var decode = @min(plan_.admission.decode_rows, n_experts);
+    var prefill: u32 = 0;
+    var decode: u32 = 0;
+    if (plan_) |pl| {
+        prefill = @min(pl.admission.prefill_capacity, n_experts);
+        decode = @min(pl.admission.decode_rows, n_experts);
+    }
     if (opt.native_rows) |nr| {
         if (opt.fixed_rows != null) return refuse(diag, error.NativeRowsWithFixedRows, "admission: native rows and forced rows are exclusive", .{});
         if (nr.prefill == 0 or nr.prefill > nr.decode or nr.decode > n_experts) return refuse(diag, error.InvalidNativeRows, "admission: native rows {d} prefill / {d} decode (1..{d})", .{ nr.prefill, nr.decode, n_experts });
@@ -207,7 +217,8 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         /// The pinned subset of the DSpark head's experts (`Options.draft_subset`).
         draft_subset: ?dspark_head.Subset,
         inputs: expert_admission.Inputs,
-        plan: expert_admission.Plan,
+        /// The envelope admission, when the arm was planned for its record.
+        plan: ?expert_admission.Plan,
         /// Per layer: the stream's rows before and after the phase change.
         prefill_rows: []u32,
         decode_rows: []u32,
@@ -292,7 +303,8 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         }
 
         pub fn admissionRecord(self: *const Self) AdmissionRecord {
-            return AdmissionRecord.of(self.inputs, self.plan, self.prefill_rows[0], self.decode_rows[0], self.config.n_layers);
+            // The Python-paired receipts' record: an arm planned with `Options.envelope_record`.
+            return AdmissionRecord.of(self.inputs, self.plan.?, self.prefill_rows[0], self.decode_rows[0], self.config.n_layers);
         }
 
         /// The one phase change, at the admitted decode rows.
@@ -689,6 +701,8 @@ pub const TestModel = struct {
             .implemented = implemented,
             .baseline_bytes = 7_200_000_000,
             .wired_bytes = 3_300_000_000,
+            // The synthetic receipts are the Python-paired envelope's.
+            .envelope_record = true,
             // A 2,880 B record under the causal allocator's room leaves no
             // predecessor row budget small enough: the uniform allocation.
             .allocation = .uniform,
@@ -713,7 +727,7 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
     defer arm.deinit();
     // The plan is Admission.plan's; a layer never holds more rows than its 4 experts.
     const want = try expert_admission.Admission.plan(.dsv41_pass2, arm.inputs);
-    try testing.expectEqual(want.admission.decode_rows, arm.plan.admission.decode_rows);
+    try testing.expectEqual(want.admission.decode_rows, arm.plan.?.admission.decode_rows);
     try testing.expectEqual(@as(u64, 2880), arm.inputs.record_bytes);
     for (arm.prefill_rows, arm.decode_rows) |p, d| {
         try testing.expectEqual(@as(u32, 4), p);
@@ -725,7 +739,7 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
         try testing.expect(b[@backingInt(xp.BankKind.transient)] != null);
     }
     const rec = arm.admissionRecord();
-    try testing.expectEqual(arm.plan.admission.decode_rows, rec.decode_slots_per_layer);
+    try testing.expectEqual(arm.plan.?.admission.decode_rows, rec.decode_slots_per_layer);
     try testing.expectEqual(@as(u32, 4), rec.stream_decode_rows_per_layer);
     try testing.expect(rec.tcq3_peak_fill != null and rec.q3_rowsx == null);
     try arm.grow(&g);
@@ -742,6 +756,7 @@ test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
         .baseline_bytes = 7_755_397_656,
         .wired_bytes = 3_377_741_824,
         .fixed_rows = 147,
+        .envelope_record = true,
         .lookahead = .{},
         .slot_memory = .host,
     }, &diag) catch |e| {
@@ -751,7 +766,7 @@ test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
     defer p.bank.deinit();
     try testing.expectEqual(@as(u64, 13_315_584), p.inputs.record_bytes);
     try testing.expectEqual(@as(u64, 54_460_416), p.inputs.lookahead_staging_bytes);
-    const adm = p.plan.admission;
+    const adm = p.plan.?.admission;
     try testing.expectEqual(@as(u32, 147), adm.decode_rows);
     try testing.expectEqual(@as(u32, 80), adm.prefill_rows);
     try testing.expectEqual(@as(u32, 113), p.prefill_rows);
@@ -760,7 +775,7 @@ test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
     try testing.expectEqual(@as(u64, 108_921_111_644), adm.physical_bound_bytes);
     try testing.expectEqual(@as(u64, 78_934_781_952), adm.final_bank_bytes);
     std.debug.print("dsv41 arm on the real bank: {d} prefill / {d} decode rows per layer, slot banks {d} B, modeled peak {d} B\n", .{
-        p.prefill_rows, p.decode_rows, adm.final_bank_bytes, p.plan.peak_fill.?.modeled_peak_bytes,
+        p.prefill_rows, p.decode_rows, adm.final_bank_bytes, p.plan.?.peak_fill.?.modeled_peak_bytes,
     });
 }
 
@@ -773,6 +788,7 @@ test "dsv41 arm: the real bank's preallocated plan holds the decode rows in the 
         .baseline_bytes = 7_755_397_656,
         .wired_bytes = 3_377_741_824,
         .fixed_rows = 147,
+        .envelope_record = true,
         .lookahead = .{},
         .slot_memory = .host,
         .preallocate = true,

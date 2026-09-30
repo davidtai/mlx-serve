@@ -26,7 +26,8 @@ const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const status = @import("status.zig");
-const ar_bill = @import("deepseek_v41_ar.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
+const bill_mod = @import("deepseek_v41_bill.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const routes = @import("deepseek_v41_routes.zig");
@@ -139,10 +140,10 @@ pub const Module = struct {
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
     fenced: bool = false,
     /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
-    bill: ar_bill.CellBill = undefined,
+    bill: bill_mod.Bill = undefined,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
-    /// The fill's target (ceiling - `ceiling_stop_bytes`): each phase's billed total stays under it.
+    /// The fill's target (the ceiling less upstream's wired margin): each phase's billed total stays under it.
     fill_target: u64 = 0,
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
@@ -181,20 +182,29 @@ pub const Module = struct {
             return e;
         };
         try self.acceptKernels(gpa, &c0, s, &diag);
-        // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
-        const ceiling_bytes = config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet();
+        // The box the admission fits: upstream's static GPU ceiling (Metal's working set, or its static override:
+        // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB), unless a harness states its window's ceiling; the
+        // fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill's totals carry
+        // the baseline (the preflight's sample of the memory in use before the load, or `--memory-baseline-gb`).
+        const ceiling_bytes = config.memory_ceiling_bytes orelse gpu_ceiling.staticGpuMemoryCeiling();
+        const target = ceiling_bytes -| gpu_ceiling.wired_limit_margin_bytes;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
-        // The served admission: rows filled by the native bill (the standard request's) up to the stop's
-        // target, unless the shell forced them.
+        // The served admission, one kind only (the native bill; the Python envelope planner never runs here):
+        // rows filled up to the stop's target, or `--expert-rows R` as the decode rows with the prompt rows
+        // the fill's capped at R. Both row counts then reach the arm as native rows.
         var admitted = config.*;
-        if (admitted.expert_rows == null and admitted.expert_prefill_rows == null and admitted.memory_baseline_bytes != null) {
+        if (admitted.expert_prefill_rows == null) {
             admitted.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try ar_bill.fillAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens);
-            admitted.expert_rows = nr.decode;
-            admitted.expert_prefill_rows = nr.prefill;
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ nr.prefill, nr.decode, fill_prompt_tokens, admitted.memory_baseline_bytes.?, ceiling_bytes -| ceiling_stop_bytes });
+            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target);
+            if (admitted.expert_rows) |forced| {
+                admitted.expert_prefill_rows = @min(nr.prefill, forced);
+            } else {
+                admitted.expert_rows = nr.decode;
+                admitted.expert_prefill_rows = nr.prefill;
+            }
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, fill_prompt_tokens, admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
@@ -205,11 +215,11 @@ pub const Module = struct {
             cfg.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired) catch |e| {
+            const b = bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
-            self.fill_target = ceiling_bytes -| ceiling_stop_bytes;
+            self.fill_target = target;
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             admitPhases(b, self.fill_target) catch |e| {
                 log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
@@ -332,7 +342,7 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired);
+        const b = try bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
@@ -734,6 +744,14 @@ pub const Module = struct {
     }
 };
 
+/// The load preflight's requirement (`transformer.archLoadRequirementBytes`): the native bill at the fill's
+/// floor rows (`deepseek_v41_bill.loadRequirementBytes`).
+pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig) !u64 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    return bill_mod.loadRequirementBytes(arena.allocator(), io, config.*);
+}
+
 /// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
 /// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
 pub const layer_major_billed = true;
@@ -834,13 +852,6 @@ pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's
 /// residual threshold; cell4 measured 0.59 GB UNDER them).
 pub const construction_tolerance_bytes: u64 = 250_000_000;
-
-/// Both phases' billed totals within the fill's target (the fill guarantees it; forced rows are checked
-/// here), once, before construction: the grow at the phase change is then admitted by construction.
-pub fn admitPhases(b: ar_bill.CellBill, target: u64) error{ PromptOverTarget, DecodeOverTarget }!void {
-    if (b.prefillTotal() > target) return error.PromptOverTarget;
-    if (b.decodeTotal() > target) return error.DecodeOverTarget;
-}
 
 /// MLX's allocator, the process footprint and the box's physical pages (vm_stat's wired + active + inactive
 /// + compressor: the guard's own metric, the source it samples) at the phase boundary: existing counters only.
@@ -958,9 +969,11 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .envelope = envelope,
         .baseline_bytes = config.memory_baseline_bytes,
         .fixed_rows = if (config.expert_prefill_rows == null) config.expert_rows else null,
-        // Rows the caller's native bill filled (both set): the stream's rows, the envelope's record only.
+        // Rows the native bill filled (both set): the stream's rows. The Module always sets both.
         .native_rows = if (config.expert_prefill_rows) |p| .{ .prefill = p, .decode = config.expert_rows orelse p } else null,
-        // No growth transient: the banks at their decode rows from construction (one row count).
+        // `expert_rows` alone (a harness's Python-paired forced-rows admission, never the served Module): the
+        // envelope planner runs for its rows and its record.
+        .envelope_record = config.expert_prefill_rows == null and config.expert_rows != null,
         // The banks grow at the phase change (two row counts); `phaseChange` proves the prompt's frees
         // complete before the grow, so the growth never meets unreleased buffers (SERVED7).
         .preallocate = false,
@@ -972,36 +985,13 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
     };
 }
 
-/// A native bill in the fill's shape: each phase's billed bytes (the box baseline included) without its
-/// persistent slot rows, and one row on every routed layer (layers x the record); a phase's total at
-/// r rows is `fixed + r * per_row`.
-pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
-
-/// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
-/// layer's experts) whose phase totals each stay within `ceiling_stop_bytes` of the ceiling. The slot banks
-/// hold the prompt rows through the prompt pass and grow to the decode rows at the phase change, which
-/// grows only after the prompt's frees are proven complete (`Module.phaseChange`), so the process bound is
-/// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
-pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
-    const target = ceiling_bytes -| ceiling_stop_bytes;
-    const most = struct {
-        fn f(fixed: u64, t: u64, per_row: u64) u64 {
-            return if (fixed >= t) 0 else (t - fixed) / per_row;
-        }
-    }.f;
-    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
-    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
-    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
-    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
-}
-
-/// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
-/// request is admitted, or refused by name, by the server's per-request prefill bill at its time).
-pub const fill_prompt_tokens: u64 = 16384;
-pub const fill_max_tokens: u64 = 1024;
-
-/// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
-pub const min_fill_rows = 16;
+/// The fill's shape and target (the bill module's), re-exported for the module's callers.
+pub const FillBill = bill_mod.FillBill;
+pub const fillRows = bill_mod.fillRows;
+pub const admitPhases = bill_mod.admitPhases;
+pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
+pub const fill_max_tokens = bill_mod.fill_max_tokens;
+pub const min_fill_rows = bill_mod.min_fill_rows;
 
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
@@ -1172,6 +1162,7 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         .baseline_bytes = try gb("DSV41_MODULE_BASELINE_GB", 7.755397656),
         .wired_bytes = try gb("DSV41_MODULE_WIRED_GB", 3.377741824),
         .fixed_rows = if (std.c.getenv("DSV41_MODULE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else null,
+        .envelope_record = true,
         .slot_memory = .host,
         .draft_pruned_bytes = if (std.c.getenv("DSV41_MODULE_HEAD") != null) null else 0,
         .lookahead = lookahead,
@@ -1181,13 +1172,13 @@ test "dsv41 module: the served plan on the real bank at a box baseline" {
         return e;
     };
     defer p.bank.deinit();
-    const ad = p.plan.admission;
+    const ad = p.plan.?.admission;
     const rec: u64 = 13_315_584;
     std.debug.print("\nDSV41_MODULE_PLAN {{\"prefill_rows\": {d}, \"decode_rows\": {d}, \"slot_bank_prefill_bytes\": {d}, \"slot_bank_decode_bytes\": {d}, \"active_bound_bytes\": {d}, \"physical_bound_bytes\": {d}, \"host_reserve_bytes\": {d}, \"baseline_bytes\": {d}}}\n", .{
         p.prefill_rows, p.decode_rows, (40 * @as(u64, p.prefill_rows) + 48) * rec, (40 * @as(u64, p.decode_rows) + 48) * rec, ad.active_bound_bytes, ad.physical_bound_bytes, ad.host_reserve_bytes, p.inputs.baseline_bytes,
     });
     const box: u64 = if (p.inputs.ceiling) |cl| cl.box_bytes else expert_admission.box_ceiling_bytes;
-    const modeled = if (p.plan.peak_fill) |pf| pf.modeled_peak_bytes else ad.physical_bound_bytes;
+    const modeled = if (p.plan.?.peak_fill) |pf| pf.modeled_peak_bytes else ad.physical_bound_bytes;
     std.debug.print("DSV41_MODULE_BOX {{\"box_bytes\": {d}, \"modeled_peak_bytes\": {d}}}\n", .{ box, modeled });
     try std.testing.expect(p.decode_rows >= p.prefill_rows and ad.physical_bound_bytes <= box);
 }
@@ -1509,39 +1500,6 @@ test "dsv41 module: the served request's forward schedule against the AR harness
     try std.testing.expect(!std.mem.eql(u32, rows[0], rows[1]));
 }
 
-/// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
-/// baseline and the cell bill's phase totals at the envelope's 112 / 154 rows (decimal GB, 3 places).
-const fill_fixture = struct {
-    const record: u64 = 13_315_584;
-    const per_row: u64 = 40 * record;
-    const baseline: u64 = 13_408_305_152;
-    const prefill_total: u64 = 114_365_000_000;
-    const decode_total: u64 = 115_140_000_000;
-    const ceiling: u64 = 120_259_000_000;
-
-    fn at(base: u64) FillBill {
-        return .{ .prefill_fixed = prefill_total - 112 * per_row - baseline + base, .decode_fixed = decode_total - 154 * per_row - baseline + base, .per_row = per_row };
-    }
-};
-
-test "dsv41 memory: the native fill takes two row counts, each phase at its target within one row" {
-    const f = fill_fixture;
-    const target = f.ceiling - ceiling_stop_bytes;
-    for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
-        const b = f.at(base);
-        const r = try fillRows(b, f.ceiling, 384);
-        try std.testing.expect(r.prefill <= r.decode);
-        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
-        try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
-        std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
-    }
-    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
-    // Capped at the layer's experts; refused by name when not even the floor fits.
-    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
-    try std.testing.expectEqual(@as(u32, 384), cap.decode);
-    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
-}
-
 test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, by name (this process's ledgers)" {
     const gb: u64 = 1_000_000_000;
     const emb: u64 = 1_323_827_200;
@@ -1647,20 +1605,6 @@ test "dsv41 memory: the return to the prompt rows (shrink) is judged like the ph
     try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, grown_rows));
 }
 
-test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
-    var b = ar_bill.cell4BillForTests();
-    const target: u64 = 118_259_084_288;
-    try admitPhases(b, target);
-    // Decode rows forced past the target (148 -> 170 rows: +11.72 GB).
-    b.decode_rows = 170;
-    b.slot_decode = (40 * 170 + 48) * 13_315_584;
-    try std.testing.expect(b.decodeTotal() > target);
-    try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
-    // The prompt phase over it is refused first.
-    b.prefill_wave += 20_000_000_000;
-    try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
-}
-
 test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
     // cell4 (106 / 148 rows): constructed footprint 76.41 GB against 77.00 GB of construction terms.
     try checkConstructionBytes(77_000_000_000, 76_410_000_000);
@@ -1671,7 +1615,7 @@ test "dsv41 memory: the construction check passes the constructed footprints of 
 }
 
 test "dsv41 module: the envelope admission (the old rule) admits today's 154 decode rows at today's inputs" {
-    const f = fill_fixture;
+    const f = bill_mod.fill_fixture;
     const ceiling = boxCeiling(f.ceiling, 384);
     const in: expert_admission.Inputs = .{
         .baseline_bytes = f.baseline,
