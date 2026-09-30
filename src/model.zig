@@ -437,6 +437,9 @@ pub const ModelConfig = struct {
     expert_wide_cold_rows: ?u8 = null,
     /// The wide call's base-bank rows as one deferred call (`expert_wide_defer_base`; null = the served tier's).
     expert_wide_defer_base: ?bool = null,
+    /// P1: each layer's predicted seed read ahead during its attention (`expert_wide_read_ahead`; null = on
+    /// wherever the prompt pass is layer-major with the wide seed).
+    expert_wide_read_ahead: ?bool = null,
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
@@ -702,8 +705,9 @@ pub const ModelConfig = struct {
         return self.layer_major_prefill orelse self.dsv41ServedTier();
     }
 
+    /// The served tier reads 3 groups ahead (P1's v1b: the SSD kept busy through the routed stage's drains).
     pub fn dsv41WideDepth(self: *const ModelConfig) u8 {
-        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 2 else 1;
+        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 3 else 1;
     }
 
     pub fn dsv41WideFeed(self: *const ModelConfig) bool {
@@ -722,6 +726,11 @@ pub const ModelConfig = struct {
     /// The deferred base-bank call: the setting, else on for the served tier without cold rows.
     pub fn dsv41WideDeferBase(self: *const ModelConfig) bool {
         return self.expert_wide_defer_base orelse (self.dsv41ServedTier() and (self.expert_wide_cold_rows orelse 0) == 0);
+    }
+
+    /// P1's read-ahead: the setting, else on wherever the prompt pass is layer-major with the wide seed.
+    pub fn dsv41WideReadAhead(self: *const ModelConfig) bool {
+        return self.expert_wide_read_ahead orelse (self.dsv41LayerMajor() and self.dsv41WideSeed());
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {

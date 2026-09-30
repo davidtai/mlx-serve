@@ -343,7 +343,7 @@ test "dsv41 lookahead: the recorded trace selects exactly like the Python lane" 
         policies[l] = try LayerPolicy.init(a, f.experts, f.prefill_capacity[l]);
         n_init += 1;
         const p = &policies[l];
-        try p.prepareSeed(a, f.resident0[l]);
+        p.prepareSeed(f.resident0[l]);
         const sorted = try a.dupe(u16, f.resident0[l]);
         defer a.free(sorted);
         std.sort.pdq(u16, sorted, {}, std.sort.asc(u16));

@@ -18,6 +18,7 @@ const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
 const routes = @import("deepseek_v41_routes.zig");
+const expert_policy = @import("expert_policy.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
 pub const Want = struct {
@@ -607,6 +608,37 @@ pub fn Model(comptime G: type) type {
             }
         }
 
+        /// P1: layer `l`'s predictor pass before its attention: per chunk `Tr.predictIds` and one host read; the counts'
+        /// ranking (`expert_policy.rankHottest`, the seed's order) to the hook, which reads that seed ahead. Profile
+        /// stage "moe.predict" ("moe.predict.in" before it: the previous layer's carried-over work).
+        fn predictSeed(self: *const Self, g: *G, l: usize, lw: *const Tr.W, hook: anytype, hs: []const T, pms: []const T, probe: anytype) !void {
+            const c = &self.c;
+            const gpa = self.gpa;
+            try probe.put("moe.predict.in", hs[0]);
+            // Host scratch off the forward's allocator (a short forward's is the state's fixed scratch).
+            const counts = try gpa.alloc(u32, c.n_routed_experts);
+            defer gpa.free(counts);
+            @memset(counts, 0);
+            const ranked = try gpa.alloc(u16, c.n_routed_experts);
+            defer gpa.free(ranked);
+            var rows: usize = 0;
+            for (hs) |h| rows = @max(rows, @as(usize, @intCast(g.shapeOf(h).dim(1))));
+            const ids = try gpa.alloc(u16, rows * c.n_experts_per_tok);
+            defer gpa.free(ids);
+            const wave = g.mark();
+            defer g.resetTo(wave);
+            const wf = try g.astype(lw.gate_w, .float32);
+            for (hs, pms) |h, pm| {
+                const chunk = g.mark();
+                defer g.resetTo(chunk);
+                const idx = try Tr.predictIds(g, c, self.kx.at(l), lw, h, pm, wf);
+                const n: usize = @intCast(g.shapeOf(idx).numel());
+                for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
+            }
+            try hook.readAheadSeed(expert_policy.rankHottest(counts, ranked));
+            try probe.put("moe.predict", wf);
+        }
+
         /// K16 `_forward_layer_major`: every layer over all chunks before the next;
         /// the gate and shared expert per chunk, the routed call batched across
         /// chunks (row-capped), the ffn combine the compiled `_PREFILL_HC_POST`.
@@ -659,6 +691,11 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const lc = &st.layers[l];
+                // P1: the layer's predicted seed read ahead while its attention runs (the hook's construction option).
+                const ahead = routed.at(@intCast(l));
+                if (comptime @hasDecl(@TypeOf(ahead), "readAheadSeed")) {
+                    if (ahead.readAhead()) try self.predictSeed(g, l, lw, ahead, hs, pms, probe);
+                }
                 // One wave per layer (freed at its end; hs, pms and the chunks' shared runtime carried).
                 const layer_wave = g.mark();
                 for (spans, 0..) |sp, i| {
@@ -1117,7 +1154,7 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
         },
         .release => n_release += 1,
         .wait_gu, .wait_down => try testing.expectEqual((layer_next + nl - 1) % nl, e.layer),
-        .flush, .grow, .gate => {},
+        .flush, .grow, .gate, .read_ahead, .await_read_ahead => {},
     };
     try testing.expectEqual(n_route, n_release);
     try testing.expectEqual(@as(u32, 4), host.picks);
@@ -1186,6 +1223,81 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
     }
     // One route per layer for the wide forward (4 experts: one group), one per layer per decode forward.
     try testing.expectEqual(@as(u64, 3 * nl), src.stats().route_calls);
+}
+
+test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted ids, hands the seed's ranking to the hook, and the call lands it before routing" {
+    const xp = @import("deepseek_v41_experts.zig");
+    const quant = @import("quant.zig");
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const nl = m.c.n_layers;
+    const n: u16 = @intCast(m.c.n_routed_experts);
+    const k = m.c.n_experts_per_tok;
+    var rows0: [8]u32 = @splat(2);
+    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = n, .rows = rows0[0..nl] });
+    defer src.deinit();
+    const Count = struct {
+        pub fn call(_: *@This(), gg: *TraceOps, act: u32, r: quant.PrefillRows, _: xp.BankArraysOf(u32)) !u32 {
+            return gg.input(&.{ @intCast(r.slot.len), gg.shapeOf(act).d[1] }, .float32);
+        }
+        pub fn finish(_: *@This(), _: *TraceOps) !void {}
+    };
+    var counts: [8]Count = @splat(.{});
+    const Math = xp.WithPrefillRoutes(TraceOps, xp.TraceMath, Count);
+    const Ex = xp.ExpertsWith(TraceOps, xp.FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(testing.allocator, &g, &src, .{ .d = .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, .routes = counts[0..nl] }, &m.c, .{ .wide = .{ .seed = true, .read_ahead = true } });
+    defer ex.deinit();
+    // Every host read of ids (a predictor chunk's, a routing barrier's) is the same pattern: 0, 3, 2, 1, ...
+    const Host = struct {
+        n: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i * 3) % h.n);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 7;
+        }
+    };
+    var host: Host = .{ .n = n };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    // 25 prompt rows in chunks of 8, 8, 8, 1: the predictor's counts per layer are the four reads' ids.
+    var want_counts: [4]u32 = @splat(0);
+    for ([_]usize{ 8, 8, 8, 1 }) |rows| for (0..rows * k) |i| {
+        want_counts[(i * 3) % n] += 1;
+    };
+    var rank_buf: [4]u16 = undefined;
+    const want = expert_policy.rankHottest(&want_counts, &rank_buf);
+    try testing.expectEqualSlices(u16, &.{ 0, 3, 1, 2 }, want);
+    var out: [1]u32 = undefined;
+    try model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {});
+    // Per layer: the ranking's head admitted (2 rows), in order; read ahead, landed, then the layer's routes.
+    try testing.expectEqual(@as(usize, 2 * nl), src.ahead_log.items.len);
+    for (0..nl) |l| try testing.expectEqualSlices(u16, want[0..2], src.ahead_log.items[2 * l ..][0..2]);
+    var stage: [8]u8 = @splat(0);
+    for (src.log.items) |e| switch (e.kind) {
+        .read_ahead => {
+            try testing.expectEqual(@as(u8, 0), stage[e.layer]);
+            try testing.expectEqual(@as(u32, 2), e.part);
+            stage[e.layer] = 1;
+        },
+        .await_read_ahead => {
+            try testing.expectEqual(@as(u8, 1), stage[e.layer]);
+            stage[e.layer] = 2;
+        },
+        .route => try testing.expectEqual(@as(u8, 2), stage[e.layer]),
+        else => {},
+    };
+    for (stage[0..nl]) |s_| try testing.expectEqual(@as(u8, 2), s_);
+    // The seed the call chose is the read-ahead's pair: each layer's first route hits both.
+    try testing.expectEqual(@as(u64, 2 * nl), src.stats().expert_cache_hits);
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {

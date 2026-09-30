@@ -1809,6 +1809,22 @@ pub fn Trunk(comptime G: type) type {
             return r;
         }
 
+        /// P1's predictor: layer `w`'s router over its input `h` collapsed with the attention's pre mix and normed as its
+        /// MoE input is (attention's part left out), each row's top-k ids unordered, int32 [rows, k]; `wf` = the gate in
+        /// f32. It chooses reads only: no output depends on it.
+        pub fn predictIds(g: *G, c: *const v41.Config, lk: LK, w: *const W, h: T, pre_mix: T, wf: T) !T {
+            const x = if (hcNormFor(lk.hc_norm, g, h)) |hn| try hn.preNorm(g, h, pre_mix, w.ffn_norm) else try rmsnorm(g, try hcPre(g, h, pre_mix), w.ffn_norm, c.rms_norm_eps);
+            return predictTopk(g, c, try g.reshape(x, &.{ -1, @as(c_int, @intCast(c.hidden_size)) }), wf, w.gate_bias);
+        }
+
+        /// The predictor's selection over `x` [rows, dim]: `gatePrefix`'s biased scores (the gate `wf` in f32)
+        /// and each row's top-k ids by `gateSelect`'s partition, unordered, int32 [rows, k].
+        pub fn predictTopk(g: *G, c: *const v41.Config, x: T, wf: T, bias: T) !T {
+            const biased = try g.add(try g.sqrt(try g.softplus(try linear(g, try g.astype(x, .float32), wf))), bias);
+            const k: c_int = @intCast(c.n_experts_per_tok);
+            return g.astype(try sliceLast(g, try g.argpartition(try g.neg(biased), k - 1, -1), 0, k), .int32);
+        }
+
         /// `Expert.__call__` (the shared expert): clamped SwiGLU in f32.
         pub fn sharedExpert(g: *G, c: *const v41.Config, w: *const W, x: T) !T {
             return sharedExpertQ(g, c, x, w.sh_w1, w.sh_w3, w.sh_w2);
@@ -2336,6 +2352,50 @@ fn realConfig() !v41.Config {
 fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
     for (g.nodes.items[from..]) |nd| if (nd.op == op) return false;
     return true;
+}
+
+// Inside a guarded window (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
+// selection on the GPU stream against the router's own (`gatePrefix` + `gateSelect`) over the same rows and gate.
+test "dsv41 smoke 0b: P1's predictor top-k is the router's selection on the same rows (MLX, GPU stream)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const mlx = @import("mlx.zig");
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    const c = try realConfig();
+    const TrM = Trunk(ops.MlxOps);
+    const rows = 64;
+    const dim: usize = c.hidden_size;
+    const n: usize = c.n_routed_experts;
+    const k: usize = c.n_experts_per_tok;
+    try testing.expect(n <= 512 and k <= 8);
+    var rng = std.Random.DefaultPrng.init(0x5eed_91a1);
+    const r = rng.random();
+    const xs = try testing.allocator.alloc(f32, rows * dim);
+    defer testing.allocator.free(xs);
+    for (xs) |*v| v.* = r.floatNorm(f32);
+    const ws = try testing.allocator.alloc(f32, n * dim);
+    defer testing.allocator.free(ws);
+    for (ws) |*v| v.* = r.floatNorm(f32) * 0.02;
+    var bs: [512]f32 = undefined;
+    for (bs[0..n]) |*v| v.* = r.floatNorm(f32) * 0.1;
+    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ rows, @intCast(dim) }, .float32), .bfloat16);
+    const w = try g.astype(try g.hostArray(std.mem.sliceAsBytes(ws), &.{ @intCast(n), @intCast(dim) }, .float32), .bfloat16);
+    const bias = try g.hostArray(std.mem.sliceAsBytes(bs[0..n]), &.{@intCast(n)}, .float32);
+    const pre = try TrM.gatePrefix(&g, x, w, bias);
+    const route = try TrM.gateSelect(&g, &c, pre[0], pre[1]);
+    const got = try TrM.predictTopk(&g, &c, x, try g.astype(w, .float32), bias);
+    var want_ids: [rows * 8]u16 = undefined;
+    var got_ids: [rows * 8]u16 = undefined;
+    _ = try g.hostIds(route.indices, want_ids[0 .. rows * k]);
+    _ = try g.hostIds(got, got_ids[0 .. rows * k]);
+    for (0..rows) |i| {
+        std.mem.sort(u16, want_ids[i * k ..][0..k], {}, std.sort.asc(u16));
+        std.mem.sort(u16, got_ids[i * k ..][0..k], {}, std.sort.asc(u16));
+    }
+    try testing.expectEqualSlices(u16, want_ids[0 .. rows * k], got_ids[0 .. rows * k]);
+    std.debug.print("\nP1 predictor smoke: {d} rows x {d} experts: the predictor's top-{d} sets == the router's\n", .{ rows, n, k });
 }
 
 fn miniConfig() !v41.Config {

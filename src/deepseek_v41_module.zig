@@ -449,6 +449,12 @@ pub const Module = struct {
                 return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
             log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)", .{arm.config.n_experts_per_tok});
         }
+        // P1, once before any request: records read ahead against the same records read on demand.
+        if (wideRoute(config).read_ahead) {
+            const n = arm.hook.checkReadAhead() catch |e|
+                return refused(refuse(diag, e, "read-ahead: a record read ahead differs from its demand read, or a read failed", .{}), diag);
+            log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)", .{n});
+        }
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -700,6 +706,12 @@ pub const Module = struct {
         log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes", .{
             self.prompt_tokens, s1.expert_bytes_read - s0.expert_bytes_read, s1.preadv_calls - s0.preadv_calls, s1.expert_cache_misses - s0.expert_cache_misses, s1.route_calls - s0.route_calls,
         });
+        const ahead = switch (self.arm) {
+            inline else => |t| t.arm.hook.wide_route.read_ahead,
+        };
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead", .{
+            s1.ahead_posted - s0.ahead_posted, s1.ahead_hits - s0.ahead_hits, s1.ahead_demand - s0.ahead_demand, s1.ahead_bytes - s0.ahead_bytes,
+        });
     }
 
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
@@ -867,7 +879,9 @@ pub const layer_major_billed = true;
 
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
-pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockTier, LayerMajorNotBilled }!bool {
+pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockTier, LayerMajorNotBilled, ReadAheadNeedsLayerMajor }!bool {
+    // P1's predictor pass is the layer-major prompt pass's (a chunk-major one has no layer top to read ahead from).
+    if (config.dsv41WideReadAhead() and (!config.dsv41LayerMajor() or !config.dsv41WideSeed())) return error.ReadAheadNeedsLayerMajor;
     if (!config.dsv41LayerMajor()) return false;
     if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
     if (!layer_major_billed) return error.LayerMajorNotBilled;
@@ -946,7 +960,7 @@ pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase() };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -1276,14 +1290,23 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_depth = null;
     c.expert_wide_cold_rows = null;
     c.expert_wide_defer_base = null;
+    c.expert_wide_read_ahead = null;
     try std.testing.expect(try layerMajor(&c));
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2, .defer_base = true }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .read_ahead = true }, wideRoute(&c));
     c.expert_wide_hot_first = false;
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 2, .defer_base = true }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 3, .defer_base = true, .read_ahead = true }, wideRoute(&c));
     c.expert_wide_hot_first = null;
     c.expert_wide_defer_base = false;
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2 }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .read_ahead = true }, wideRoute(&c));
     c.expert_wide_defer_base = null;
+    // P1 off by its setting (the A/B's other arm); on without the layer-major seed, refused by name.
+    c.expert_wide_read_ahead = false;
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true }, wideRoute(&c));
+    c.expert_wide_read_ahead = true;
+    c.expert_wide_seed = false;
+    try std.testing.expectError(error.ReadAheadNeedsLayerMajor, layerMajor(&c));
+    c.expert_wide_seed = null;
+    c.expert_wide_read_ahead = null;
     c.numeric_tier = .stock;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));

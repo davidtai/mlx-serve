@@ -76,6 +76,8 @@ pub const LayerPolicy = struct {
     prefill_freq: []u32,
     seed: std.DynamicBitSetUnmanaged,
     protected: std.DynamicBitSetUnmanaged,
+    /// The last `prepareSeed` call's routed rows per expert (P1's barrier tally reads them).
+    call_counts: []u32,
     /// Pool clock stamp of each resident expert (0 = none).
     recency: []u64,
     clock: u64 = 0,
@@ -118,6 +120,7 @@ pub const LayerPolicy = struct {
             .prefill_freq = undefined,
             .seed = undefined,
             .protected = undefined,
+            .call_counts = undefined,
             .recency = undefined,
             .last_used = undefined,
             .counts = undefined,
@@ -141,6 +144,8 @@ pub const LayerPolicy = struct {
         errdefer p.seed.deinit(a);
         p.protected = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
         errdefer p.protected.deinit(a);
+        p.call_counts = try a.alloc(u32, n);
+        errdefer a.free(p.call_counts);
         p.recency = try a.alloc(u64, n);
         errdefer a.free(p.recency);
         p.last_used = try a.alloc(i64, n);
@@ -169,6 +174,7 @@ pub const LayerPolicy = struct {
         @memset(p.slot_to_expert, no_expert);
         @memset(p.expert_to_slot, no_slot);
         @memset(p.prefill_freq, 0);
+        @memset(p.call_counts, 0);
         @memset(p.recency, 0);
         @memset(p.last_used, -1);
         @memset(p.counts, 0);
@@ -184,6 +190,7 @@ pub const LayerPolicy = struct {
         a.free(p.prefill_freq);
         p.seed.deinit(a);
         p.protected.deinit(a);
+        a.free(p.call_counts);
         a.free(p.recency);
         a.free(p.last_used);
         a.free(p.counts);
@@ -208,28 +215,17 @@ pub const LayerPolicy = struct {
     /// prepare_prefill_seed: counts the prompt's routed ids, then re-protects
     /// the resident part of its top-(capacity - protected) and marks the rest to
     /// be admitted first, protected, by the prefill routes.
-    pub fn prepareSeed(p: *LayerPolicy, a: std.mem.Allocator, ids: []const u16) !void {
-        for (ids) |e| p.prefill_freq[e] += 1;
+    pub fn prepareSeed(p: *LayerPolicy, ids: []const u16) void {
+        const counts = p.call_counts;
+        @memset(counts, 0);
+        for (ids) |e| {
+            p.prefill_freq[e] += 1;
+            counts[e] += 1;
+        }
         const empty: i64 = @as(i64, p.capacity) - @as(i64, @intCast(p.protected.count()));
         p.seed.unsetAll();
         if (empty <= 0) return;
-        const counts = try a.alloc(u32, p.n_experts);
-        defer a.free(counts);
-        @memset(counts, 0);
-        var n_unique: usize = 0;
-        for (ids) |e| {
-            if (counts[e] == 0) {
-                p.candidates[n_unique] = e;
-                n_unique += 1;
-            }
-            counts[e] += 1;
-        }
-        const ranked = p.candidates[0..n_unique];
-        std.sort.pdq(u16, ranked, @as([]const u32, counts), struct {
-            fn lessThan(c: []const u32, x: u16, y: u16) bool {
-                return if (c[x] != c[y]) c[x] > c[y] else x < y;
-            }
-        }.lessThan);
+        const ranked = rankHottest(counts, p.candidates);
         const chosen = ranked[0..@min(ranked.len, @as(usize, @intCast(empty)))];
         // Resident choices: re-protected in ascending count order (stable).
         var n_res: usize = 0;
@@ -270,6 +266,29 @@ pub const LayerPolicy = struct {
             if (e != no_expert) p.invalidate(e);
         }
         p.capacity = capacity;
+    }
+
+    /// One read-ahead admission (`admitReadAhead`): the expert and the persistent slot it took.
+    pub const ReadAhead = struct { expert: u16, slot: u32 };
+
+    /// P1's read-ahead: each predicted expert (hottest first) not resident takes an empty persistent slot, unprotected,
+    /// until they run out (no eviction); `prepareSeed` then re-protects those its seed chooses (hits), the rest stay
+    /// evictable. Returns the admissions (at most `out.len`).
+    pub fn admitReadAhead(p: *LayerPolicy, experts: []const u16, out: []ReadAhead) []ReadAhead {
+        var n: usize = 0;
+        for (experts) |e| {
+            if (n == out.len) break;
+            if (e >= p.n_experts or p.expert_to_slot[e] != no_slot) continue;
+            const slot = p.emptySlot() orelse break;
+            p.slot_to_expert[slot] = e;
+            p.expert_to_slot[e] = slot;
+            p.occupancy += 1;
+            p.clock += 1;
+            p.recency[e] = p.clock;
+            out[n] = .{ .expert = e, .slot = slot };
+            n += 1;
+        }
+        return out[0..n];
     }
 
     /// Forgets a resident expert (its record failed to load).
@@ -568,6 +587,22 @@ pub const LayerPolicy = struct {
 /// placement order: parts of at most `per_part`, each cut moved back to the
 /// last physical gap inside its window so a contiguous run stays whole.
 /// Writes each part's end index; returns them.
+/// The seed's ranking (`prepareSeed`; P1's predicted seed): every expert counted at least once, count
+/// descending, ties by id. A strict total order, so the result is a function of `counts` alone.
+pub fn rankHottest(counts: []const u32, out: []u16) []u16 {
+    var n: usize = 0;
+    for (counts, 0..) |c, e| if (c > 0) {
+        out[n] = @intCast(e);
+        n += 1;
+    };
+    std.sort.pdq(u16, out[0..n], counts, struct {
+        fn lessThan(cs: []const u32, x: u16, y: u16) bool {
+            return if (cs[x] != cs[y]) cs[x] > cs[y] else x < y;
+        }
+    }.lessThan);
+    return out[0..n];
+}
+
 pub fn boundedParts(offsets: []const u64, lengths: []const u64, per_part: u32, ends: []u32) []u32 {
     const n = offsets.len;
     var n_parts: usize = 0;
@@ -690,11 +725,63 @@ test "dsv41 policy: decode fills empty slots in slot order and never evicts a hi
     }
 }
 
+test "dsv41 policy: a read-ahead admits predicted experts to empty slots, unprotected; the seed keeps the ones it chose" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 4);
+    defer p.deinit(a);
+    var buf: [8]LayerPolicy.ReadAhead = undefined;
+    // Predicted hottest first: 5, 9, 1, 12, 7 (four slots: 7 does not fit); a repeat is skipped.
+    const got = p.admitReadAhead(&.{ 5, 9, 5, 1, 12, 7 }, &buf);
+    try testing.expectEqual(@as(usize, 4), got.len);
+    for (got, [_]u16{ 5, 9, 1, 12 }) |r, e| {
+        try testing.expectEqual(e, r.expert);
+        try testing.expectEqual(r.slot, p.slotOf(e).?);
+        try testing.expect(!p.protected.isSet(e));
+    }
+    // Full: nothing more is admitted, nothing evicted.
+    try testing.expectEqual(@as(usize, 0), p.admitReadAhead(&.{ 7, 3 }, &buf).len);
+    // The call's true counts: 5 x3, 12 x2, 3 x2, 9 x1 -> seed = {5, 12, 3, 9} (capacity 4, nothing protected).
+    p.prepareSeed(&.{ 5, 5, 5, 12, 12, 3, 3, 9 });
+    // The read-ahead experts the seed chose are re-protected (resident: hits); 3 is to be admitted;
+    // 1 (mispredicted) stays an unprotected, evictable resident.
+    try testing.expect(p.protected.isSet(5) and p.protected.isSet(12) and p.protected.isSet(9));
+    try testing.expect(!p.protected.isSet(1) and p.slotOf(1) != null);
+    try testing.expect(p.seed.isSet(3));
+    // The first prefill route: 5 and 12 hit, 3 is admitted into 1's slot (the one probationary resident).
+    var plan_: Plan = .{};
+    const slot1 = p.slotOf(1).?;
+    p.plan(&.{ 5, 12, 3 }, .prefill, &plan_);
+    try testing.expectEqual(@as(u32, 2), plan_.n_hits);
+    try testing.expectEqual(@as(u32, 1), plan_.n_loads);
+    try testing.expectEqual(slot1, plan_.loads[0].slot);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(1));
+}
+
+test "dsv41 policy: P1's predicted counts rank as the seed ranks (count descending, ties by id), the same from any count order" {
+    const a = testing.allocator;
+    // Counts: 7 x4, 2 x3, 9 x3, 4 x1, 11 x1, 0 x1; never predicted: every other expert.
+    var counts: [16]u32 = @splat(0);
+    for ([_]u16{ 9, 7, 2, 11, 7, 9, 4, 7, 2, 0, 9, 2, 7 }) |e| counts[e] += 1;
+    var out: [16]u16 = undefined;
+    const ranked = rankHottest(&counts, &out);
+    try testing.expectEqualSlices(u16, &.{ 7, 2, 9, 0, 4, 11 }, ranked);
+    // The same counts reached in another order rank the same (a function of the counts alone).
+    var again: [16]u32 = @splat(0);
+    for ([_]u16{ 0, 2, 2, 2, 4, 7, 7, 7, 7, 9, 9, 9, 11 }) |e| again[e] += 1;
+    var out2: [16]u16 = undefined;
+    try testing.expectEqualSlices(u16, ranked, rankHottest(&again, &out2));
+    // prepareSeed chooses the ranking's head: capacity 4 seeds {7, 2, 9, 0}.
+    var p = try LayerPolicy.init(a, 16, 4);
+    defer p.deinit(a);
+    p.prepareSeed(&.{ 9, 7, 2, 11, 7, 9, 4, 7, 2, 0, 9, 2, 7 });
+    for (0..16) |e| try testing.expectEqual(std.mem.indexOfScalar(u16, ranked[0..4], @intCast(e)) != null, p.seed.isSet(e));
+}
+
 test "dsv41 policy: prefill admits the seed first and never evicts it" {
     var p = try LayerPolicy.init(testing.allocator, 16, 2);
     defer p.deinit(testing.allocator);
     // Prompt frequency: 5 x3, 9 x2, 1 x1 -> seed = {5, 9}.
-    try p.prepareSeed(testing.allocator, &.{ 5, 9, 1, 5, 9, 5 });
+    p.prepareSeed(&.{ 5, 9, 1, 5, 9, 5 });
     var out: Plan = .{};
     p.plan(&.{ 1, 9, 5 }, .prefill, &out);
     // Seed first, least frequent first; the pool is then full of protected
@@ -709,7 +796,7 @@ test "dsv41 policy: prefill admits the seed first and never evicts it" {
     // A probationary resident is evicted before any protected one.
     var q = try LayerPolicy.init(testing.allocator, 16, 2);
     defer q.deinit(testing.allocator);
-    try q.prepareSeed(testing.allocator, &.{3});
+    q.prepareSeed(&.{3});
     q.plan(&.{ 3, 4 }, .prefill, &out);
     q.plan(&.{6}, .prefill, &out);
     try testing.expectEqualSlices(Eviction, &.{.{ .slot = 1, .previous = 4, .next = 6 }}, out.evictionsOf());
@@ -751,7 +838,7 @@ test "dsv41 policy: shrink forgets every expert past the new capacity; plans sta
     try testing.expectEqual(@as(u32, 2), p.occupancy);
     for (p.slot_to_expert[2..4]) |e| try testing.expectEqual(no_expert, e);
     // A later prompt plans within the kept slots (a persistent load never lands on a freed row).
-    try p.prepareSeed(testing.allocator, &.{ 3, 3, 5 });
+    p.prepareSeed(&.{ 3, 3, 5 });
     p.plan(&.{ 3, 5 }, .prefill, &out);
     try checkPlan(&p, &.{ 3, 5 }, &out, max_route_ids);
     for (out.loadsOf()) |l| if (l.persistent) try testing.expect(l.slot < 2);
@@ -900,7 +987,7 @@ test "dsv41 policy: the recorded trace plans exactly like the Python bank" {
         policies[l] = try LayerPolicy.init(a, f.experts, f.prefill_capacity[l]);
         n_init += 1;
         const p = &policies[l];
-        try p.prepareSeed(a, f.resident0[l]);
+        p.prepareSeed(f.resident0[l]);
         for (f.seed_plans[l]) |want| {
             p.plan(want.ids, .prefill, &out);
             try expectPlan(&out, want);

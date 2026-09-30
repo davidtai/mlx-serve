@@ -225,6 +225,33 @@ pub const StreamSource = struct {
         return self.stream.seedPrefill(layer, ids);
     }
 
+    /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`).
+    pub fn readAheadSeed(self: *StreamSource, layer: u32, experts: []const u16) !void {
+        return self.stream.readAheadSeed(layer, experts);
+    }
+
+    /// P1: the layer's read-ahead landed (`Stream.awaitReadAhead`).
+    pub fn awaitReadAhead(self: *StreamSource, layer: u32) Error!void {
+        return self.stream.awaitReadAhead(layer);
+    }
+
+    /// P1's construction self-check over `n` experts of `layer` not resident there (the highest ids):
+    /// read ahead == demand read, bit for bit (`Stream.checkReadAhead`). Returns how many were checked.
+    pub fn checkReadAhead(self: *StreamSource, layer: u32, n: u32) !u32 {
+        const policy = &self.stream.layers[layer].policy;
+        var experts: [max_route_ids]u16 = undefined;
+        var k: u32 = 0;
+        var e: u32 = policy.n_experts;
+        while (e > 0 and k < @min(n, max_route_ids)) {
+            e -= 1;
+            if (policy.slotOf(@intCast(e)) != null) continue;
+            experts[k] = @intCast(e);
+            k += 1;
+        }
+        try self.stream.checkReadAhead(layer, experts[0..k]);
+        return k;
+    }
+
     /// A live prefill call's persistent slots kept pinned and held past its release (`Wide.defer_base`).
     pub fn holdBase(self: *StreamSource, call: *Call) !void {
         return self.stream.holdBase(call.route.?);
@@ -306,6 +333,10 @@ pub const FakeSource = struct {
     selector: ?expert_lookahead.Selector = null,
     picks: std.ArrayList(Pick) = .empty,
     gate_value: u64 = 0,
+    /// P1: the layer whose read-ahead is live (the Stream's rule: its first route or the barrier lands it),
+    /// and every admission in order (the tests' view of the seed the model handed over).
+    ahead_layer: ?u32 = null,
+    ahead_log: std.ArrayList(u16) = .empty,
 
     pub const Pick = struct { layer: u32, n: u8 = 0, experts: [expert_lookahead.max_budget]u16 = undefined };
 
@@ -319,7 +350,7 @@ pub const FakeSource = struct {
     };
 
     pub const Event = struct {
-        pub const Kind = enum { route, wait_gu, wait_down, release, flush, grow, gate };
+        pub const Kind = enum { route, wait_gu, wait_down, release, flush, grow, gate, read_ahead, await_read_ahead };
         kind: Kind,
         layer: u32 = 0,
         part: u32 = 0,
@@ -373,6 +404,7 @@ pub const FakeSource = struct {
         self.a.free(self.ext_rows);
         self.log.deinit(self.a);
         self.held.deinit(self.a);
+        self.ahead_log.deinit(self.a);
         self.* = undefined;
     }
 
@@ -399,8 +431,28 @@ pub const FakeSource = struct {
 
     pub fn seedPrefill(self: *FakeSource, layer: u32, ids: []const u16) !void {
         if (self.phase != .prefill) return error.NotPrefill;
-        try self.policies[layer].prepareSeed(self.a, ids);
+        self.policies[layer].prepareSeed(ids);
     }
+
+    /// P1: the Stream's admission (`LayerPolicy.admitReadAhead`), no reads; `part` = experts admitted.
+    pub fn readAheadSeed(self: *FakeSource, layer: u32, experts: []const u16) !void {
+        if (self.phase != .prefill) return error.NotPrefill;
+        if (self.ahead_layer) |l| try self.awaitReadAhead(l);
+        var out: [max_ahead]expert_policy.LayerPolicy.ReadAhead = undefined;
+        const admitted = self.policies[layer].admitReadAhead(experts, &out);
+        const n = admitted.len;
+        for (admitted) |r| self.ahead_log.append(self.a, r.expert) catch @panic("fake source read-ahead log: out of memory");
+        if (n > 0) self.ahead_layer = layer;
+        self.note(.{ .kind = .read_ahead, .layer = layer, .part = @intCast(n) });
+    }
+
+    pub fn awaitReadAhead(self: *FakeSource, layer: u32) Error!void {
+        if (self.ahead_layer != layer) return;
+        self.ahead_layer = null;
+        self.note(.{ .kind = .await_read_ahead, .layer = layer });
+    }
+
+    const max_ahead = 1024;
 
     fn slotRef(self: *const FakeSource, layer: u32, slot: u32) SlotRef {
         const cap = self.policies[layer].capacity;
@@ -412,6 +464,7 @@ pub const FakeSource = struct {
     pub fn route(self: *FakeSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
         std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
         std.debug.assert(scores.len == 0 or self.selector != null);
+        if (self.ahead_layer == layer) try self.awaitReadAhead(layer);
         try self.flush();
         const call = for (&self.calls) |*c| {
             if (c.state == .free) break c;
@@ -787,6 +840,10 @@ pub const Wide = struct {
     /// waves (their slots held until then): fewer, fuller waves. Exact: a wave's rows are
     /// independent of its composition and the combine folds by routed position.
     defer_base: bool = false,
+    /// P1: each layer's predicted seed read into its free persistent rows while its attention runs (the
+    /// model's predictor pass hands it over, `Hook.readAheadSeed`), landed at the routing barrier before
+    /// the seed. Exact: it chooses reads and rows only. Needs `seed`.
+    read_ahead: bool = false,
     pub const max_cold_rows = 8;
 };
 
@@ -886,6 +943,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.cold_rows > Wide.max_cold_rows) return error.InvalidWideRoute;
             if (wr.seed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
             if (wr.defer_base and (wr.cold_rows > 0 or !routes.prefill or comptime !@hasDecl(S, "holdBase"))) return error.InvalidWideRoute;
+            if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -980,6 +1038,17 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             pub fn releaseParts(h: Hook, g: *G) void {
                 h.ex.releaseParts(g);
+            }
+
+            /// P1 (`Wide.read_ahead`, fixed at construction): the model runs its predictor pass for this layer.
+            pub fn readAhead(h: Hook) bool {
+                return h.ex.wide_route.read_ahead;
+            }
+
+            /// P1: the layer's predicted seed, experts hottest first, read ahead of its routed call.
+            pub fn readAheadSeed(h: Hook, experts: []const u16) !void {
+                if (comptime !@hasDecl(S, "readAheadSeed")) return error.ReadAheadNotStreamed;
+                return h.ex.source.readAheadSeed(h.layer, experts);
             }
         };
 
@@ -1178,6 +1247,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try self.checkGated(g, 0, xf, ids[0..top_k], outs[0..kh], outs[kh..]);
         }
 
+        /// P1's construction self-check (`Wide.read_ahead`), once on the real stream before any request:
+        /// layer 0's records read ahead equal their demand reads, bit for bit, over two pool jobs.
+        /// Returns how many records were checked.
+        pub fn checkReadAhead(self: *Self) !u32 {
+            if (comptime !@hasDecl(S, "checkReadAhead")) return error.ReadAheadNotStreamed;
+            return self.source.checkReadAhead(0, expert_io.max_items + 1);
+        }
+
         /// LOOKAHEAD4's construction check, once on the real stream before any request: one call of
         /// `ids` (one row `xf`) over `layer`, whose misses' waves wait on event gates and are
         /// evaluated (the GPU held until the pool publishes their bytes), then the same slots' waves
@@ -1322,6 +1399,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             // The call's residency seed (the seed route), then its experts hottest first (the order route).
             if (feed) {
+                // P1: the layer's read-ahead lands before its seed (which protects the ones it chooses).
+                if (comptime @hasDecl(S, "awaitReadAhead")) if (self.wide_route.read_ahead) try self.source.awaitReadAhead(layer);
                 if (comptime @hasDecl(S, "seedPrefill")) try self.source.seedPrefill(layer, w.ids.items) else unreachable;
             }
             if (hot_first) {
@@ -1509,6 +1588,8 @@ fn kindsOf(log: []const FakeSource.Event, buf: []u8) []const u8 {
         .flush => 'f',
         .grow => 'G',
         .gate => 'E',
+        .read_ahead => 'A',
+        .await_read_ahead => 'W',
     };
     return buf[0..log.len];
 }
@@ -2763,7 +2844,7 @@ test "dsv41 experts: a read-ahead deeper than the source's windows is refused at
     var rrs = [_]StreamRec{ StreamRec.init(a), StreamRec.init(a) };
     const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
     try testing.expectError(error.WideDepthExceedsSource, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 2 } }));
-    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 3 } }));
+    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = expert_stream.max_wide_depth + 1 } }));
     const Plain = ExpertsWith(TraceOps, StreamSource, Math, .{});
     try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true } }));
     try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .hot_first = true } }));

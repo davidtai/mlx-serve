@@ -770,6 +770,11 @@ const StreamPhase = struct {
     preadv_calls: u64,
     read_busy_s: f64,
     read_seconds: f64,
+    /// P1's read-ahead (`Stats.ahead_*`): records posted, hits and demand at the barriers, bytes read ahead.
+    ahead_posted: u64 = 0,
+    ahead_hits: u64 = 0,
+    ahead_demand: u64 = 0,
+    ahead_bytes: u64 = 0,
 
     fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
         return .{
@@ -780,6 +785,10 @@ const StreamPhase = struct {
             .preadv_calls = b.preadv_calls -| a.preadv_calls,
             .read_busy_s = @as(f64, @floatFromInt(b.read_wall_ns -| a.read_wall_ns)) / 1e9,
             .read_seconds = b.expert_read_seconds - a.expert_read_seconds,
+            .ahead_posted = b.ahead_posted -| a.ahead_posted,
+            .ahead_hits = b.ahead_hits -| a.ahead_hits,
+            .ahead_demand = b.ahead_demand -| a.ahead_demand,
+            .ahead_bytes = b.ahead_bytes -| a.ahead_bytes,
         };
     }
 };
@@ -854,6 +863,8 @@ const CellReceipt = struct {
     wide_hot_first: ?bool = null,
     wide_depth: ?u8 = null,
     wide_cold_rows: ?u8 = null,
+    /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
+    wide_read_ahead: ?bool = null,
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
     prefill_index: ?bool = null,
@@ -1137,6 +1148,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_hot_first = md.installed.wide.hot_first,
         .wide_depth = md.installed.wide.depth,
         .wide_cold_rows = md.installed.wide.cold_rows,
+        .wide_read_ahead = md.installed.wide.read_ahead,
         .prefill_attn = md.installed.prefill_attn,
         .prefill_index = md.installed.prefill_index,
         .prefill_hc = md.installed.prefill_hc,
@@ -1240,6 +1252,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
+    if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
@@ -1247,7 +1260,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
-        if (d < 1 or d > 2) return error.CellWideDepth;
+        if (d < 1 or d > expert_stream.max_wide_depth) return error.CellWideDepth;
         config.expert_wide_depth = d;
     }
     if (envStr("DSV41_CELL_WIDE_COLD_ROWS")) |v| {
@@ -1266,7 +1279,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
 /// change); the config then carries it as both row counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
 /// later lines at its first line's rows): billed, and refused by name above the target. DSV41_CELL_ROWS
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
-/// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt
+/// ladder's widest admission (the widest windows, `max_wide_depth`, and the larger of the chunk-major and layer-major prompt
 /// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
 fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !void {
     const target = args.ceiling -| args.stop;
@@ -1285,7 +1298,7 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: 
     if (args.fill_ladder) {
         for ([_]bool{ false, true }) |lm| {
             var wide = config.*;
-            wide.expert_wide_depth = 2;
+            wide.expert_wide_depth = expert_stream.max_wide_depth;
             wide.layer_major_prefill = lm;
             const r = try fillAt(a, io, wide, args, prompt_tokens, max_tokens);
             nr = .{ .prefill = @min(nr.prefill, r.prefill), .decode = @min(nr.decode, r.decode) };
@@ -1437,13 +1450,13 @@ fn printBill(b: CellBill) void {
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "host side, measured (pools, staging, caches, process)", .p = b.host_reserve, .d = b.host_reserve },
-        .{ .name = "wide read window (depth 2)", .p = b.wide_window, .d = b.wide_window },
+        .{ .name = "wide read windows past the first", .p = b.wide_window, .d = b.wide_window },
         .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
         .{ .name = "page cache created by the step (assumed 0; enforced)", .p = 0, .d = 0 },
         .{ .name = "unbilled process overhead (prompt phase; decode's is prompt_state)", .p = b.unbilled_overhead, .d = 0 },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
-    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()) });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows });
 }
 
 test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {

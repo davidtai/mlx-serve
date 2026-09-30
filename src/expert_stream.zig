@@ -315,6 +315,12 @@ pub const Stats = struct {
     /// Event gates registered and forced by the watchdog.
     gates: u64 = 0,
     gates_forced: u64 = 0,
+    /// P1's read-ahead: records posted; at each barrier, the records read ahead that the call routes (its hits)
+    /// and its seed's records not read ahead (its demand loads); the bytes read ahead (in `expert_bytes_read` too).
+    ahead_posted: u64 = 0,
+    ahead_hits: u64 = 0,
+    ahead_demand: u64 = 0,
+    ahead_bytes: u64 = 0,
 };
 
 pub const Error = error{
@@ -386,8 +392,8 @@ pub const Route = struct {
 
 /// The route being served plus released ones awaiting the next flush.
 const route_capacity = 4;
-/// Prefill routes one layer may hold live at once (`Options.wide_depth`).
-pub const max_wide_depth = 2;
+/// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1's v1b: 3, the served default).
+pub const max_wide_depth = 3;
 const wait_timeout_ns: i64 = 60 * std.time.ns_per_s;
 
 /// Expert residency for one model: per-layer persistent slot pools at the
@@ -442,6 +448,22 @@ pub const Stream = struct {
     /// The thread that built the stream (mlx-serve: the inference thread, the
     /// only MLX caller); `grow` allocates slot memory and refuses any other.
     owner: std.Thread.Id,
+    /// P1: the prompt pass's read-ahead in flight (one layer's predicted seed).
+    ahead: Ahead,
+
+    /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
+    /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
+    const Ahead = struct {
+        live: bool = false,
+        /// The layer's barrier has counted it (`seedPrefill`: hits and demand, once).
+        tallied: bool = false,
+        layer: u32 = 0,
+        n: u32 = 0,
+        n_parts: u32 = 0,
+        loads: []LayerPolicy.ReadAhead,
+        reads: []bool,
+        parts: []Part,
+    };
 
     const LayerSlots = struct {
         policy: LayerPolicy,
@@ -526,6 +548,12 @@ pub const Stream = struct {
         const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
         errdefer a.free(transient_meta);
         @memset(transient_meta, .{});
+        const ahead_loads = try a.alloc(LayerPolicy.ReadAhead, bank.n_experts);
+        errdefer a.free(ahead_loads);
+        const ahead_reads = try a.alloc(bool, bank.n_experts);
+        errdefer a.free(ahead_reads);
+        const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items) catch unreachable);
+        errdefer a.free(ahead_parts);
         const pool = try expert_io.Pool.start(a, pool_opt);
         errdefer pool.stop();
         if (opt.lookahead) |la| if (la.preread) try pool.armPreRead(&layers[widest].lens);
@@ -552,6 +580,7 @@ pub const Stream = struct {
             .event_word = word,
             .gated = opt.event != null,
             .owner = std.Thread.getCurrentId(),
+            .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts },
         };
         return self;
     }
@@ -573,6 +602,9 @@ pub const Stream = struct {
         a.free(self.transient_meta);
         if (self.selector) |*sel| sel.deinit(a);
         if (self.event_word) |w| a.destroy(w);
+        a.free(self.ahead.loads);
+        a.free(self.ahead.reads);
+        a.free(self.ahead.parts);
         a.destroy(self);
     }
 
@@ -653,7 +685,16 @@ pub const Stream = struct {
     /// prefill routes.
     pub fn seedPrefill(self: *Stream, layer: u32, ids: []const u16) !void {
         if (self.phase != .prefill) return error.NotPrefill;
-        try self.layers[layer].policy.prepareSeed(self.allocator, ids);
+        const ah = &self.ahead;
+        if (ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
+        const policy = &self.layers[layer].policy;
+        policy.prepareSeed(ids);
+        // P1's engagement, once at the layer's barrier: the records read ahead that its call routes, and its seed's
+        // records not read ahead (the seed's misses, loaded on demand).
+        if (ah.layer != layer or ah.n == 0 or ah.tallied) return;
+        ah.tallied = true;
+        for (ah.loads[0..ah.n]) |l| self.counters.ahead_hits += @intFromBool(policy.call_counts[l.expert] > 0);
+        self.counters.ahead_demand += policy.seed.count();
     }
 
     /// Resolves `ids` (the router's top-k of one layer call, host values read
@@ -670,6 +711,8 @@ pub const Stream = struct {
     pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
         if (self.failed) return error.StreamFailed;
         std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
+        // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
+        if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
         const lookahead = self.route_lookahead;
         const tag = self.clock + 1;
         if (self.route_preread) try self.preRead(layer, ids, tag);
@@ -914,6 +957,145 @@ pub const Stream = struct {
         if (!ok) return self.fail(if (waited) |_| error.ReadFailed else |e| e);
     }
 
+    /// P1: layer `layer`'s predicted seed (`experts`, hottest first) read into its empty persistent rows, no route, while
+    /// its attention runs: `LayerPolicy.admitReadAhead` (unprotected; the seed re-protects its choices), pool jobs of
+    /// `max_items` within the ticket ring. `awaitReadAhead` or a route of the layer lands it; a live one lands first.
+    pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
+        if (self.failed) return error.StreamFailed;
+        if (self.phase != .prefill) return error.NotPrefill;
+        if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
+        const ah = &self.ahead;
+        const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / 2);
+        const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
+        const n: u32 = @intCast(admitted.len);
+        ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts };
+        if (n == 0) return;
+        std.sort.pdq(LayerPolicy.ReadAhead, admitted, {}, struct {
+            fn less(_: void, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
+                return x.expert < y.expert;
+            }
+        }.less);
+        for (admitted, ah.reads[0..n]) |l, *rd| {
+            const m = self.locate(layer, l.slot).meta;
+            if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
+            rd.* = !(m.state == .ready and m.layer == layer and m.expert == l.expert);
+            if (rd.*) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
+            m.pins = 1;
+        }
+        ah.live = true;
+        const lens = &self.layers[layer].lens;
+        var start: u32 = 0;
+        while (start < n) {
+            const end = @min(start + expert_io.max_items, n);
+            var part: Part = .{ .first = start, .n = end - start };
+            var rows: [expert_io.max_items][n_components]u64 = undefined;
+            var gu: [expert_io.max_items]u64 = undefined;
+            var down: [expert_io.max_items]u64 = undefined;
+            var nr: u32 = 0;
+            for (admitted[start..end], ah.reads[start..end]) |l, rd| if (rd) {
+                const loc = self.locate(layer, l.slot);
+                rows[nr] = loc.rows.rowDest(loc.row);
+                const sp = self.bank.spans(layer, l.expert);
+                gu[nr] = sp.gu_offset;
+                down[nr] = sp.down_offset;
+                nr += 1;
+            };
+            if (nr > 0) {
+                part.ticket = self.pool.submit(self.bank.sidecar_fd, self.bank.sidecar_file_size, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
+                part.n_reads = nr;
+                self.counters.ahead_posted += nr;
+            } else part.settled = true;
+            ah.parts[ah.n_parts] = part;
+            ah.n_parts += 1;
+            start = end;
+        }
+    }
+
+    /// P1: lands layer `layer`'s read-ahead (none live for it: nothing to do). Every job waited and its
+    /// rows ready, the rows' pins dropped; a record that failed is forgotten by the policy and fails the
+    /// stream, as a route's failed load does.
+    pub fn awaitReadAhead(self: *Stream, layer: u32) Error!void {
+        const ah = &self.ahead;
+        if (!ah.live or ah.layer != layer) return;
+        ah.live = false;
+        const policy = &self.layers[layer].policy;
+        var first_error: ?Error = null;
+        for (ah.parts[0..ah.n_parts]) |*p| {
+            if (p.settled) continue;
+            p.settled = true;
+            const count = 2 * p.n_reads;
+            const waited = self.pool.wait(p.ticket, count, wait_timeout_ns);
+            var ok = if (waited) |_| true else |_| false;
+            if (ok) for (0..count) |k| {
+                const res = self.pool.result(p.ticket + @as(u32, @intCast(k)));
+                if (res.status != .ok) ok = false;
+                self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
+                self.counters.ahead_bytes += @intCast(@max(res.payload, 0));
+                self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
+                self.read_ns += @intCast(@max(res.t_end_ns - res.t_start_ns, 0));
+            };
+            for (ah.loads[p.first..][0..p.n], ah.reads[p.first..][0..p.n]) |l, rd| if (rd) {
+                self.locate(layer, l.slot).meta.state = if (ok) .ready else .failed;
+                if (!ok) policy.invalidate(l.expert);
+            };
+            if (!ok and first_error == null) first_error = if (waited) |_| error.ReadFailed else |e| e;
+        }
+        for (ah.loads[0..ah.n]) |l| self.locate(layer, l.slot).meta.pins -= 1;
+        if (first_error) |e| return self.fail(e);
+    }
+
+    /// P1's construction self-check: `experts` of `layer` (none resident, one route wide) read ahead, hashed, zeroed and
+    /// forgotten, then read again by a demand route; each record's bytes must equal both ways, bit for bit. The layer
+    /// is left as found (the experts not resident, their rows empty).
+    pub fn checkReadAhead(self: *Stream, layer: u32, experts: []const u16) !void {
+        const ls = &self.layers[layer];
+        if (experts.len == 0 or experts.len > self.max_route_ids or experts.len > ls.policy.capacity - ls.policy.occupancy) return error.ReadAheadCheckShape;
+        for (experts) |e| if (ls.policy.slotOf(e) != null) return error.ReadAheadCheckShape;
+        var ahead_sums: [max_route_ids][32]u8 = undefined;
+        try self.readAheadSeed(layer, experts);
+        if (self.ahead.n != experts.len) return error.ReadAheadCheckNotAdmitted;
+        try self.awaitReadAhead(layer);
+        for (experts, ahead_sums[0..experts.len]) |e, *sum| {
+            const slot = ls.policy.slotOf(e).?;
+            sum.* = self.recordDigest(layer, slot);
+            for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0..len], 0);
+            self.locate(layer, slot).meta.state = .empty;
+            ls.policy.invalidate(e);
+        }
+        const r = try self.route(layer, experts, &.{});
+        for (r.parts[0..r.n_parts]) |*p| self.settle(r, p) catch |e| {
+            self.release(r);
+            return e;
+        };
+        // Every expert a load that read (the zeroed rows refilled), its bytes the read-ahead's.
+        var mismatch = r.plan.n_loads != experts.len;
+        for (r.plan.loadsOf(), r.reads[0..r.plan.n_loads]) |l, rd| {
+            const i = std.mem.indexOfScalar(u16, experts, l.expert) orelse {
+                mismatch = true;
+                continue;
+            };
+            const d = self.recordDigest(layer, l.slot);
+            if (!rd or !std.mem.eql(u8, &ahead_sums[i], &d)) mismatch = true;
+        }
+        self.release(r);
+        try self.flush();
+        for (experts) |e| if (ls.policy.slotOf(e)) |slot| {
+            self.locate(layer, slot).meta.state = .empty;
+            ls.policy.invalidate(e);
+        };
+        self.ahead.n = 0;
+        if (mismatch) return error.ReadAheadCheckMismatch;
+    }
+
+    /// sha256 of the record a layer's slot holds (its component rows at their logical lengths).
+    fn recordDigest(self: *Stream, layer: u32, slot: u32) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0..len]);
+        var d: [32]u8 = undefined;
+        h.final(&d);
+        return d;
+    }
+
     /// Hands a route back. Its slots stay pinned until the next flush: the
     /// kernels that read them finish only with a later eval.
     pub fn release(self: *Stream, r: *Route) void {
@@ -958,6 +1140,7 @@ pub const Stream = struct {
         if (self.phase != .prefill) return error.AlreadyGrown;
         if (self.failed) return error.StreamFailed;
         if (decode_rows.len != self.layers.len) return error.InvalidRows;
+        if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
         try self.flush();
         for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
         for (self.layers, decode_rows) |*ls, rows| {
@@ -1446,6 +1629,117 @@ test "dsv41 stream: a failed read fails the route and every later one" {
     try testing.expectError(error.ReadFailed, s.waitDown(r, 0));
     try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(1));
     try testing.expectError(error.StreamFailed, s.route(0, &.{1}, &.{}));
+}
+
+/// One layer's prompt call on a fresh stream (the pool is the process's: one stream at a time), its predicted
+/// seed read ahead first when given: every routed id served from its record; the call's hits and stats.
+fn p1Call(sb: *const SynthBank, predicted: ?[]const u16) !struct { hits: u64, st: Stats } {
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 6, 6 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    if (predicted) |p| {
+        try s.readAheadSeed(0, p);
+        try testing.expect(s.ahead.live and s.ahead.n == p.len);
+        try s.awaitReadAhead(0);
+        for (p) |e| {
+            const slot = s.layers[0].policy.slotOf(e).?;
+            try testing.expectEqual(SlotState.ready, s.locate(0, slot).meta.state);
+            try testing.expectEqual(@as(u16, 0), s.pinsOf(0, slot));
+        }
+    }
+    // The layer's routed ids at its barrier, then its distinct experts in two groups.
+    try s.seedPrefill(0, &.{ 1, 2, 3, 1, 2, 1, 4, 5, 6, 9, 10, 4, 1, 2 });
+    var hits: u64 = 0;
+    for ([_][]const u16{ &.{ 1, 2, 4, 3, 5 }, &.{ 6, 9, 10 } }) |grp| {
+        const r = try serve(s, 0, grp);
+        try expectServed(s, sb, r, grp);
+        hits += r.plan.n_hits;
+        s.release(r);
+    }
+    try s.flush();
+    return .{ .hits = hits, .st = s.stats() };
+}
+
+test "dsv41 stream: P1: a read-ahead's records land before the layer's routes, which serve them as hits; every served byte is a stream's without it" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    // The predicted seed: three of the call's four hottest, and 7 (mispredicted).
+    const on = try p1Call(&sb, &.{ 1, 2, 7, 4 });
+    const off = try p1Call(&sb, null);
+    // 1, 2 and 4: hits, read during the attention; 7: read and never served (the waste); the rest as without.
+    try testing.expectEqual(off.hits + 3, on.hits);
+    try testing.expectEqual(off.st.expert_cache_misses - 3, on.st.expert_cache_misses);
+    const rec = sb.bank.layers[0].logical_bytes;
+    try testing.expectEqual(off.st.expert_bytes_read + (4 - 3) * rec, on.st.expert_bytes_read);
+    // Its engagement at the barrier: 4 posted, 3 routed by the call (7 not), the seed's 3, 5 and 6 on demand.
+    try testing.expectEqual(@as(u64, 4), on.st.ahead_posted);
+    try testing.expectEqual(@as(u64, 3), on.st.ahead_hits);
+    try testing.expectEqual(@as(u64, 3), on.st.ahead_demand);
+    try testing.expectEqual(4 * rec, on.st.ahead_bytes);
+    try testing.expectEqual(@as(u64, 0), off.st.ahead_posted + off.st.ahead_hits + off.st.ahead_demand + off.st.ahead_bytes);
+}
+
+test "dsv41 stream: P1: a route lands its layer's read-ahead first, another layer's lands the live one, full rows admit none, the phase change lands one" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 3, 3 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    // Three rows: 4, 5 and 6 admitted, 7 does not fit.
+    try s.readAheadSeed(0, &.{ 4, 5, 6, 7 });
+    try testing.expectEqual(@as(u32, 3), s.ahead.n);
+    try s.readAheadSeed(1, &.{8});
+    try testing.expect(s.ahead.live and s.ahead.layer == 1);
+    for ([_]u16{ 4, 5, 6 }) |e| try testing.expectEqual(SlotState.ready, s.locate(0, s.layers[0].policy.slotOf(e).?).meta.state);
+    try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(7));
+    // A route of layer 1 before its barrier's await: the read-ahead lands first, 8 is a hit.
+    const r = try serve(s, 1, &.{ 8, 9 });
+    try testing.expect(!s.ahead.live);
+    try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
+    try expectServed(s, &sb, r, &.{ 8, 9 });
+    s.release(r);
+    try s.readAheadSeed(0, &.{ 10, 11 });
+    try testing.expect(!s.ahead.live and s.ahead.n == 0);
+    try s.readAheadSeed(1, &.{12});
+    try testing.expect(s.ahead.live);
+    try s.grow(&.{ 4, 4 });
+    try testing.expect(!s.ahead.live);
+    try testing.expectEqual(SlotState.ready, s.locate(1, s.layers[1].policy.slotOf(12).?).meta.state);
+    try testing.expectError(error.NotPrefill, s.readAheadSeed(1, &.{13}));
+}
+
+test "dsv41 stream: P1: a read-ahead whose record fails to land forgets its job's records and fails the stream" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    defer expert_io.clearFaults();
+    const page = std.heap.pageSize();
+    expert_io.injectFault(sb.bank.spans(0, 2).gu_offset / page * page, 2, 0);
+    try s.readAheadSeed(0, &.{ 1, 2, 3 });
+    try testing.expectError(error.ReadFailed, s.awaitReadAhead(0));
+    for ([_]u16{ 1, 2, 3 }) |e| try testing.expectEqual(@as(?u32, null), s.layers[0].policy.slotOf(e));
+    try testing.expectError(error.StreamFailed, s.route(0, &.{1}, &.{}));
+}
+
+test "dsv41 stream: P1's construction self-check: records read ahead equal their demand reads over two jobs; the layer is left as found" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 12, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    const experts = [_]u16{ 31, 30, 29, 28, 27, 26, 25, 24, 23 };
+    try s.checkReadAhead(0, &experts);
+    try testing.expectEqual(@as(u32, 0), s.layers[0].policy.occupancy);
+    for (0..12) |slot| {
+        try testing.expectEqual(@as(u16, 0), s.pinsOf(0, @intCast(slot)));
+        try testing.expectEqual(SlotState.empty, s.locate(0, @intCast(slot)).meta.state);
+    }
+    try testing.expect(!s.ahead.live and !s.failed);
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 2 * experts.len) * sb.bank.layers[0].logical_bytes, st.expert_bytes_read);
+    // Refused shapes: a resident expert; more experts than free rows.
+    const r = try serve(s, 0, &.{5});
+    s.release(r);
+    try testing.expectError(error.ReadAheadCheckShape, s.checkReadAhead(0, &.{5}));
+    try testing.expectError(error.ReadAheadCheckShape, s.checkReadAhead(0, &(experts ++ [_]u16{ 22, 21, 20 })));
 }
 
 /// sha256 of a served slot's logical record (its nine component rows).
