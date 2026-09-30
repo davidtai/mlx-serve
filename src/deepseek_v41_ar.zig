@@ -1225,6 +1225,9 @@ pub const CellBill = struct {
     wide_window: u64 = 0,
     /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in both phases.
     unbilled_overhead: u64 = unbilled_process_overhead_bytes,
+    /// The input embedding reads its host rows from construction (`embedding_host_rows`, default on): the
+    /// device table is freed after the install warm-up, so no phase holds it.
+    embedding_host_rows: bool = false,
 
     pub fn prefillTotal(b: CellBill) u64 {
         return b.baseline + b.prefillTerms().sum();
@@ -1236,7 +1239,7 @@ pub const CellBill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: CellBill) PhaseTerms {
-        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead };
+        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead };
     }
 
     /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
@@ -1413,6 +1416,7 @@ pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.Mode
         .draft_wave = decode_wave,
         .host_reserve = p.inputs.host_reserve_bytes,
         .wide_window = p.inputs.wide_window_bytes,
+        .embedding_host_rows = config.embedding_host_rows orelse true,
     };
 }
 
@@ -1428,7 +1432,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
         .{ .name = "slot banks (layers x rows + 48) x record", .p = b.slot_prefill, .d = b.slot_decode },
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
-        .{ .name = "residents (the embedding off at the fence)", .p = b.residents, .d = b.residents - b.embedding },
+        .{ .name = "residents (the embedding: host rows, else off at the fence)", .p = b.prefillTerms().residents, .d = b.residents - b.embedding },
         .{ .name = "Engram residents + row caches", .p = b.engram, .d = b.engram },
         .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify + draft", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
@@ -1477,6 +1481,25 @@ test "dsv41 memory: a phase's total is the baseline plus its terms; the construc
     try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache, c.sum());
     // cell4's constructed footprint (76.41 GB) sits under its construction terms (77.00 GB).
     try testing.expect(c.sum() > 76_410_000_000 and c.sum() < 77_100_000_000);
+}
+
+test "dsv41 memory: with the embedding on its host rows no phase bills the device table, and the one-count fill gains 2 rows" {
+    var dev = cell4Bill();
+    dev.embedding_host_rows = false;
+    var host = dev;
+    host.embedding_host_rows = true;
+    try testing.expectEqual(dev.prefillTotal() - dev.embedding, host.prefillTotal());
+    try testing.expectEqual(dev.decodeTotal(), host.decodeTotal());
+    try testing.expectEqual(dev.constructionTerms().sum() - dev.embedding, host.constructionTerms().sum());
+    const per_row = @as(u64, dev.layers) * 13_315_584;
+    const at = struct {
+        fn f(b: CellBill, base: u64, pr: u64) module.FillBill {
+            return .{ .prefill_fixed = b.prefillTotal() - b.baseline + base - @as(u64, b.prefill_rows) * pr, .decode_fixed = b.decodeTotal() - b.baseline + base - @as(u64, b.decode_rows) * pr, .per_row = pr };
+        }
+    }.f;
+    const r_dev = try module.fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288, 384);
+    const r_host = try module.fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288, 384);
+    try testing.expectEqual(r_dev.prefill + 2, r_host.prefill);
 }
 
 test "dsv41 memory: the phase record's residuals: billed less the interval peak, billed device terms less MLX's peak" {
