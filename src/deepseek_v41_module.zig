@@ -655,7 +655,7 @@ pub const Module = struct {
 
     /// `dsparkRound` with the loop's cycle log and a stamper (the cell's receipts; `{}` compiles them out).
     pub fn dsparkRoundLogged(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, cycle_log: ?*dsl.CycleLog, stamp: anytype) !DsparkRound {
-        self.reportPrompt();
+        try self.gate.request();
         // The phase change is upstream's decode handover (`decodeHandover`), never taken here.
         if (!self.grown()) return error.PhaseChangeNotRun;
         const d: *Dspark = if (self.dspark) |*x| x else {
@@ -697,13 +697,28 @@ pub const Module = struct {
         return @intCast(budget + mdl.Model(G).scratch_rows);
     }
 
-    /// Later positions of the request: a decode-width forward runs the phase change first, once.
+    /// A decode step of the request (the served seam's every call after the prompt; the phase is the
+    /// decode handover's, `decodeHandover`): refused by name before the handover, so a driver that skips it
+    /// never decodes at the prompt rows.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
         try self.gate.request();
-        self.reportPrompt();
-        // With a strategy the serial rows keep it in step (their main taps into the draft windows,
-        // the lookup): the shell's prompt (prefill of all but the last token, then this) seeds as the
-        // whole prompt does, and a serial step mid-request leaves the next round valid.
+        if (!self.grown()) return error.PhaseChangeNotRun;
+        return self.step(ids);
+    }
+
+    /// The prompt's continuation: a split prompt runs `prefill` over its first part, then this over each
+    /// later part, all before the decode handover (refused by name after it: the prompt's rows are gone).
+    pub fn prefillContinue(self: *Module, ids: []const u32) !mlx.mlx_array {
+        try self.gate.request();
+        if (self.state == null) return error.ContinueWithoutPrompt;
+        if (self.grown()) return error.PromptAfterHandover;
+        return self.step(ids);
+    }
+
+    /// One forward over `ids` at the request's next positions. With a strategy the rows keep it in step
+    /// (their main taps into the draft windows, the lookup): a split prompt seeds as the whole prompt does,
+    /// and a serial step mid-request leaves the next round valid.
+    fn step(self: *Module, ids: []const u32) !mlx.mlx_array {
         if (self.dspark) |*d| switch (self.arm) {
             inline else => |t| return d.lp.extendLogits(self.gpa, &t.arm.hook, ids),
         };
@@ -745,6 +760,8 @@ pub const Module = struct {
         try self.gate.request();
         if (self.state == null) return error.HandoverWithoutPrompt;
         if (h.native_draft and self.dspark == null) return error.HandoverWithoutSeed;
+        // The prompt pass is complete (a split prompt's continuations included): its reads, once.
+        self.reportPrompt();
         try self.phaseChange();
     }
 

@@ -457,7 +457,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
     for (calls[1..]) |c| {
         _ = mlx.mlx_array_free(logits);
-        logits = try m.extend(prompt[c.lo..c.hi]);
+        logits = try m.prefillContinue(prompt[c.lo..c.hi]);
     }
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
