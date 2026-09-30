@@ -315,6 +315,8 @@ pub fn Model(comptime G: type) type {
                 const hd: usize = en.src.bank.head_dim;
                 n += rows * en.src.perToken() * @sizeOf(i64) + pad;
                 n += self.c.engram.n_layers * (rows * cols * @sizeOf(i64) + rows * cols * hd + rows * cols * (hd / 32) + 3 * pad);
+                // A posted gather's ids, records and job (`forwardSpan`'s decode-width posts).
+                if (en.posted) n += self.c.engram.n_layers * (rows * cols * @sizeOf(i64) + rows * cols * @as(usize, en.src.bank.record_bytes) + @sizeOf(eng.RowSource.Posted) + 3 * pad);
             }
             return n;
         }
@@ -355,6 +357,14 @@ pub fn Model(comptime G: type) type {
             const sa = try g.hostArray(scales, &.{ nr, @intCast(hd / 32) }, .uint8);
             const er = try Tr.engramRows(g, ca, sa, 1, @intCast(n), @intCast(cols));
             return Tr.engramApplyM1(g, &self.c, en.w[slot], if (self.engram_m1[slot]) |*x| x else null, h, er);
+        }
+
+        /// A span's posted gathers, drained (their poster done with the memory) and released (`a` = post's).
+        fn dropPosts(self: *const Self, a: std.mem.Allocator, posts: []?*eng.RowSource.Posted) void {
+            for (posts) |p| if (p) |x| {
+                self.engram.?.src.drain(x);
+                self.engram.?.src.release(a, x);
+            };
         }
 
         /// A slot's per-chunk posted gathers (`gpa`-owned; null until posted).
@@ -433,6 +443,13 @@ pub fn Model(comptime G: type) type {
             const positions = try g.arange(@floatFromInt(st.offset), @floatFromInt(st.offset + n), 1, .int32);
             const e = try self.embedSpan(g, a, ids);
             const rows = try self.engramRowsFor(st, a, ids);
+            // ENGRAM=prefetch at decode width: every Engram slot's gather posted before the first layer (each
+            // slot's table runs its own; per table the order is the blocking path's), each taken at its layer.
+            var posts: [eng.max_layers]?*eng.RowSource.Posted = @splat(null);
+            defer self.dropPosts(a, &posts);
+            if (self.engram) |en| if (en.posted and n <= scratch_rows) {
+                for (posts[0..en.src.hashing.n_layers], 0..) |*p, sl| p.* = try en.src.post(a, sl, rows, n);
+            };
             var h = e.h;
             var pm = e.pre_mix;
             var shared: Tr.Share = .{};
@@ -446,7 +463,7 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const wave = g.mark();
-                if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows, n);
+                if (li.engram_slot) |slot| h = if (posts[slot]) |p| try self.engramLayerPosted(g, a, slot, h, p, n) else try self.engramLayer(g, a, slot, h, rows, n);
                 if (want_main and li.dspark_target) {
                     mains[n_main] = g.keep(try mainOf(g, h));
                     n_main += 1;
@@ -960,6 +977,56 @@ test "dsv41 model: the mini model binds every resident and runs prefill, decode 
     try testing.expectEqual(@as(u32, 23), st.offset);
     try testing.expectEqual(@as(u32, 23), st.layers[3].compress.rows());
     try testing.expectEqual(@as(usize, 23), st.hash.?.hist.items.len);
+}
+
+test "dsv41 model: ENGRAM=prefetch at decode width: the forward's posted Engram gathers feed the blocking read's bytes" {
+    // One run per route over its own mini bank (identical bytes): a prompt in chunks of 8, then a verify of 3.
+    const Run = struct {
+        fn of(m: *Mini, g: *TraceOps, posted: bool) !void {
+            var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_WINDOW_RING", "1" }, .{ "MTPLX_DSV41_SELECTED_KEYS", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+            tier.routes.head = .mxfp8;
+            const lookup: SpecLookup = .{ .g = g, .spec = m.spec };
+            const model_ = try TM.init(testing.allocator, g, m.c, tier, &lookup, &m.src);
+            defer model_.deinit(g);
+            if (posted) {
+                try m.src.enablePosting();
+                model_.engram.?.posted = true;
+            }
+            var st = try model_.newState();
+            defer st.deinit(g, testing.allocator);
+            var ids: [20]u32 = undefined;
+            for (&ids, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+            _ = try model_.forward(g, &st, &ids, .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+            _ = try model_.forward(g, &st, ids[0..3], .{ .logits = .all }, TraceRouted{}, graph.NoProbe{});
+        }
+    };
+    const blocking = try Mini.init();
+    defer blocking.deinit();
+    const posting = try Mini.init();
+    defer posting.deinit();
+    var gb = TraceOps.init(testing.allocator);
+    defer gb.deinit();
+    var gp = TraceOps.init(testing.allocator);
+    defer gp.deinit();
+    gb.record_host = true;
+    gp.record_host = true;
+    try Run.of(blocking, &gb, false);
+    try Run.of(posting, &gp, true);
+    // The same graphs, and every host array (the Engram codes and scales among them) the same bytes.
+    try testing.expectEqual(gb.nodes.items.len, gp.nodes.items.len);
+    var n_host: usize = 0;
+    for (gb.nodes.items, gp.nodes.items, 0..) |nb, np, i| {
+        try testing.expectEqual(nb.op, np.op);
+        if (nb.op != .host) continue;
+        n_host += 1;
+        try testing.expectEqualSlices(u8, gb.hostBytesOf(@intCast(i)).?, gp.hostBytesOf(@intCast(i)).?);
+    }
+    try testing.expect(n_host > 0);
+    // The posted run never took the blocking read (its record scratch untouched); the blocking run did.
+    try testing.expect(blocking.src.recs.?.items.len > 0);
+    try testing.expectEqual(@as(usize, 0), posting.src.recs.?.items.len);
+    // The row caches saw the same gathers.
+    for (0..blocking.c.engram.n_layers) |li| try testing.expectEqual(blocking.src.cacheStats(li), posting.src.cacheStats(li));
 }
 
 test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one compiled combine per chunk" {
