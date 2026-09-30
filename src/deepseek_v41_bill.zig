@@ -18,6 +18,7 @@ const dsl = @import("deepseek_v41_dspark_loop.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
+const graph = @import("deepseek_v41_graph.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -347,7 +348,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient_decode) * rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
-        .residents = m.totalBytes(),
+        .residents = m.totalBytes() - droppedResidentBytes(&m, headRoute(ov)) + builtResidentBytes(&c, headRoute(ov)),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes(),
         // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
@@ -378,6 +379,27 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
 fn promptWave(bill: v41.PrefillBill, layer_major: bool, joinless: bool, prompt_tokens: u64) u64 {
     if (!layer_major) return bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5;
     return if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served);
+}
+
+/// The head codec the request's model builds: the override's, else the served tier's (`RouteOverrides.head_mode`).
+fn headRoute(ov: module.RouteOverrides) graph.Routes.Head {
+    return ov.head_mode orelse module.numericTier(.served).routes.head;
+}
+
+/// Device bytes the model builds at construction beyond the checkpoint's residents (`Model.builtBytes`, computed before
+/// construction from the same formulas): HEAD_MODE mxfp8's codes and scales (vocab x hidden x 33 / 32), and W97's dense
+/// f32 wo_a per layer when the served tier routes it (off today).
+pub fn builtResidentBytes(c: *const v41.Config, head: graph.Routes.Head) u64 {
+    var n: u64 = 0;
+    if (module.numericTier(.served).routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
+    if (head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
+    return n;
+}
+
+/// Checkpoint residents the Module drops once the model is built (`Model.droppedBytes`): the dense bf16 head under
+/// HEAD_MODE mxfp8, its bytes as the resident map holds them (`head.weight`).
+pub fn droppedResidentBytes(m: *const v41.WeightMap, head: graph.Routes.Head) u64 {
+    return if (head == .mxfp8) m.bytes_by_module[@backingInt(v41.Module.head)] else 0;
 }
 
 /// ENGRAM=prefetch (the served tier's `engram_posted` route, dsv41-engram-prefetch b198dbd): the K16 prompt pass
@@ -776,6 +798,48 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         std.debug.print("\nbill variants at baseline {d:.2} GB (posted gathers on): conservative {d} / {d}, tight {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, cons.prefill, cons.decode, tight.prefill, tight.decode });
         try testing.expectEqual(w.conservative, cons);
         try testing.expectEqual(w.tight, tight);
+    }
+    std.debug.print("\n", .{});
+}
+
+// DSV41_BANK=<bank> (host): HEAD_MODE mxfp8 (cell arm 5) bills the head it runs: the dense bf16 head the Module drops
+// after construction (1,323,827,200 B) out of the residents, its codes and scales (682,598,400 B) in, net -641,228,800 B.
+// Arm 5's own fill therefore sits about a row a phase above the bf16 arm's.
+test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank_dir, &vd);
+    defer ck.deinit();
+    const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
+    try testing.expectEqual(@as(u64, 1_323_827_200), droppedResidentBytes(&m, .mxfp8));
+    try testing.expectEqual(@as(u64, c.vocab_size) * c.hidden_size * 2, droppedResidentBytes(&m, .mxfp8));
+    try testing.expectEqual(@as(u64, 0), droppedResidentBytes(&m, .bf16));
+    try testing.expectEqual(@as(u64, 682_598_400), builtResidentBytes(&c, .mxfp8) - builtResidentBytes(&c, .bf16));
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
+    for ([_]Want{
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 135, .decode = 169 }, .mxfp8 = .{ .prefill = 136, .decode = 170 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 169 }, .mxfp8 = .{ .prefill = 136, .decode = 170 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        var b5 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .head_mode = .mxfp8 });
+        try testing.expectEqual(@as(i64, -641_228_800), @as(i64, @intCast(b5.residents)) - @as(i64, @intCast(b1.residents)));
+        b1.engram_posted = posted;
+        b5.engram_posted = posted;
+        const r1 = try fillRows(fillBillOf(b1), target, b1.n_experts);
+        const r5 = try fillRows(fillBillOf(b5), target, b5.n_experts);
+        std.debug.print("\nhead modes at baseline {d:.2} GB (posted gathers on): bf16 {d} / {d}, mxfp8 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r5.prefill, r5.decode });
+        try testing.expectEqual(w.bf16, r1);
+        try testing.expectEqual(w.mxfp8, r5);
     }
     std.debug.print("\n", .{});
 }
