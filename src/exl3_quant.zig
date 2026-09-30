@@ -254,19 +254,8 @@ pub fn Accepted(comptime G: type) type {
 /// a self-check failure (SelfCheckFailed, `diag` naming kernel / check / site). The set's
 /// launcher must be installed on `g` first (`Set.install`): a backend that prepares launches
 /// prepares them through it.
-/// What `accept` self-checks on the device: this consumer's kernels less the texts no route launches yet. The
-/// 128-row DIG-X GEMMs stay out until their route flips: their 0b smoke checks them (and prices them) on the device
-/// first, so a device fault costs that smoke line, not a served construction.
-const unrouted_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
-const checked_at_accept = blk: {
-    var out: [kernels.len - unrouted_texts.len]Kernel = undefined;
-    var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &unrouted_texts, k) == null) {
-        out[n] = k;
-        n += 1;
-    };
-    break :blk out;
-};
+/// The 128-row DIG-X GEMM texts (their 0b smoke checks them by name).
+const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
 
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
     const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
@@ -277,7 +266,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
+    try set.selfCheck(a, &kernels, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -514,10 +503,11 @@ pub fn digTableBm(experts: []const WaveExpert, tiles: u32, bm: u32) DigTable {
 pub fn DigX(comptime G: type) type {
     return struct {
         const Self = @This();
+        /// the 64-row GEMM texts: the 128-row texts' twin reference (their device self-check, the 0b smoke), not
+        /// launched by the route
         gemm_gu: *const Entry,
         gemm_dn: *const Entry,
-        /// the GEMMs at a 128-row M tile (`..._m128`): registered, and launched by their 0b smoke only, until their
-        /// route flips; the route launches the 64-row texts
+        /// the GEMMs the route launches: 128-row M tiles (one decoded B stage feeds 128 rows)
         gemm_gu128: *const Entry,
         gemm_dn128: *const Entry,
         /// the lane's take2 text: the retune's bitwise reference (its 0b smoke), not launched by the route
@@ -544,27 +534,32 @@ pub fn DigX(comptime G: type) type {
             };
         }
 
-        /// The GEMMs' threadgroups per 64-row tile: gate|up (both operands), down.
+        /// The routed GEMMs' M tile rows: their wave tables count ceil(rows / m_tile) tiles per expert (`digTableBm`).
+        pub const m_tile: u32 = 128;
+
+        /// The GEMMs' threadgroups per M tile: gate|up (both operands), down (the same at 64 and 128 rows).
         pub fn digTiles(self: *const Self, proj: enum { gate_up, down }) u32 {
             const e = if (proj == .down) self.gemm_dn else self.gemm_gu;
             return argOf(e, "tbl").domain.tiles;
         }
 
-        /// x0 / x1 [rows, 1, 5120] f16 (take2), gate / up code, the gate|up table -> (zg, zu) [rows, 2304] f32.
+        /// x0 / x1 [rows, 1, 5120] f16 (take2), gate / up code, the gate|up table at `m_tile` rows -> (zg, zu)
+        /// [rows, 2304] f32: the 128-row text, the 64-row text's words.
         pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32) ![2]G.T {
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.gemm_gu, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
+            try launchRule(G, g, self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
             return out;
         }
 
-        /// x [rows, 1, 2304] f16 (onepass), down code, the down table -> z [rows, 5120] f32.
+        /// x [rows, 1, 2304] f16 (onepass), down code, the down table at `m_tile` rows -> z [rows, 5120] f32: the
+        /// 128-row text, the 64-row text's words.
         pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32) !G.T {
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.gemm_dn, &vars, &.{ x, code_d, tbl }, &out);
+            try launchRule(G, g, self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
             return out[0];
         }
 
@@ -824,8 +819,9 @@ pub fn DigXPrefill(comptime G: type) type {
         /// One wave's five launches -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
         fn submit(self: *Self, g: *G, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32) !G.T {
             const n: c_int = @intCast(ridx.len);
-            const tg = digTable(ex, self.tiles_gu);
-            const td = digTable(ex, self.tiles_dn);
+            // at the routed GEMMs' M tile; take2, onepass and widen1 read the tables' slot column only
+            const tg = digTableBm(ex, self.tiles_gu, DigX(G).m_tile);
+            const td = digTableBm(ex, self.tiles_dn, DigX(G).m_tile);
             const tgu = try g.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32);
             const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
             const ridx_a = try g.hostArray(std.mem.sliceAsBytes(ridx), &.{n}, .int32);
@@ -1112,6 +1108,130 @@ fn swapTake2(a: Allocator, line: []const u8, from: Take2Form, to: Take2Form) ![]
     return std.mem.concat(a, u8, &.{ to.prefix, rest[0..comma], &.{ ',', to.z }, rest[comma + 2 ..] });
 }
 
+/// The route's launch lines in the lane's text. The lane samples and the move's pinned log name the lane's take2 (grid
+/// z 2) and the 64-row GEMMs (grid 128 x tgs, t=128) over 64-row wave tables; the route launches the take2 retune (grid
+/// z 1) and the 128-row GEMMs (grid 256 x tgs', t=256) over 128-row tables, whose slot / first-row / row columns are
+/// the same and whose first-threadgroup column counts 128-row tiles. `init` takes, per 128-row table the trace holds
+/// (recomputed and compared word for word), its 64-row twin's reference and threadgroups; `lane` rewrites a rendered
+/// line: a take2 retune launch into the lane's, a 128-row GEMM launch's name, grid and threadgroup into the 64-row
+/// text's, and every 128-row table reference into its twin's. Nothing else changes.
+const LaneMap = struct {
+    const table_ref = "host:int32:[80]:";
+    const Twin = struct { ref: [16]u8, tgs: u32, tgs128: u32 };
+    const GemmForm = struct { m128: []const u8, lane: []const u8 };
+    const gemm_forms = [_]GemmForm{
+        .{ .m128 = "launch dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 g=", .lane = "launch q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 g=" },
+        .{ .m128 = "launch dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 g=", .lane = "launch q3_prefill_dig_gemm_2304x5120_xmul1hk3 g=" },
+    };
+    twins: std.AutoHashMapUnmanaged([16]u8, Twin) = .empty,
+    n_take2: usize = 0,
+    n_gemm: usize = 0,
+
+    fn refOf(tb: *const [80]i32) [16]u8 {
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(tb), &d, .{});
+        const hex = std.fmt.bytesToHex(d, .lower);
+        return hex[0..16].*;
+    }
+
+    /// The 64-row twin of an 80-word table when it is a 128-row wave table (recomputed, word for word), else null.
+    fn twinOf(tb: *const [80]i32) ?Twin {
+        const n: usize = @intCast(@max(tb[64], 0));
+        if (n == 0 or n > wave_max or tb[65] <= 0) return null;
+        var ex: [wave_max]WaveExpert = undefined;
+        var t128: u64 = 0;
+        for (0..n) |j| {
+            if (tb[j] < 0 or tb[32 + j] <= 0) return null;
+            ex[j] = .{ .slot = @intCast(tb[j]), .rows = @intCast(tb[32 + j]) };
+            t128 += (ex[j].rows + 127) / 128;
+        }
+        const total: u64 = @intCast(tb[65]);
+        if (total % t128 != 0) return null;
+        const tiles: u32 = @intCast(total / t128);
+        const as128 = digTableBm(ex[0..n], tiles, 128);
+        if (!std.mem.eql(i32, &as128.table, tb)) return null;
+        const twin = digTableBm(ex[0..n], tiles, 64);
+        return .{ .ref = refOf(&twin.table), .tgs = twin.tgs, .tgs128 = as128.tgs };
+    }
+
+    fn init(a: Allocator, t: *const Trace) !LaneMap {
+        var m: LaneMap = .{};
+        errdefer m.deinit(a);
+        for (t.nodes.items) |nd| {
+            if (nd.origin != .host or nd.dtype != .int32 or nd.bytes.len != 80 * 4) continue;
+            var tb: [80]i32 = undefined;
+            @memcpy(std.mem.sliceAsBytes(&tb), nd.bytes);
+            if (twinOf(&tb)) |tw| try m.twins.put(a, refOf(&tb), tw);
+        }
+        return m;
+    }
+
+    fn deinit(m: *LaneMap, a: Allocator) void {
+        m.twins.deinit(a);
+    }
+
+    /// `line` in the lane's text (allocated in `a` when rewritten).
+    fn lane(m: *LaneMap, a: Allocator, line: []const u8) ![]const u8 {
+        var l = try swapTake2(a, line, take2_retune, take2_lane);
+        m.n_take2 += @intFromBool(l.ptr != line.ptr);
+        for (gemm_forms) |f| {
+            if (!std.mem.startsWith(u8, l, f.m128)) continue;
+            // the table is the GEMM's last input
+            const refs_at = (std.mem.indexOf(u8, l, " in=") orelse return error.TestUnexpectedResult) + " in=".len;
+            const refs_end = std.mem.indexOfPos(u8, l, refs_at, " out=") orelse return error.TestUnexpectedResult;
+            const refs = l[refs_at..refs_end];
+            const last = refs[(std.mem.lastIndexOfScalar(u8, refs, ';') orelse return error.TestUnexpectedResult) + 1 ..];
+            if (!std.mem.startsWith(u8, last, table_ref) or last.len != table_ref.len + 16) return error.TestUnexpectedResult;
+            const tw = m.twins.get(last[table_ref.len..][0..16].*) orelse return error.TestUnexpectedResult;
+            const geo = l[f.m128.len..];
+            const sp = std.mem.indexOfScalar(u8, geo, ' ') orelse return error.TestUnexpectedResult;
+            var gb: [32]u8 = undefined;
+            if (!std.mem.eql(u8, geo[0..sp], try std.fmt.bufPrint(&gb, "{d},1,1", .{256 * tw.tgs128}))) return error.TestUnexpectedResult;
+            const t256 = " t=256,1,1 ";
+            if (!std.mem.startsWith(u8, geo[sp..], t256)) return error.TestUnexpectedResult;
+            l = try std.fmt.allocPrint(a, "{s}{d},1,1 t=128,1,1 {s}", .{ f.lane, 128 * tw.tgs, geo[sp + t256.len ..] });
+            m.n_gemm += 1;
+            break;
+        }
+        if (std.mem.indexOf(u8, l, table_ref) == null) return l;
+        var out: std.ArrayList(u8) = .empty;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, l, at, table_ref)) |p| {
+            const h = p + table_ref.len;
+            try out.appendSlice(a, l[at..h]);
+            at = h;
+            if (h + 16 <= l.len) if (m.twins.get(l[h..][0..16].*)) |tw| {
+                try out.appendSlice(a, &tw.ref);
+                at = h + 16;
+            };
+        }
+        try out.appendSlice(a, l[at..]);
+        return out.items;
+    }
+};
+
+/// `expectEvents` with the route's lines in the lane's text (`LaneMap.lane`).
+fn expectEventsVia(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8, lm: *LaneMap) !void {
+    const got = t.log.items[from..];
+    var arena = std.heap.ArenaAllocator.init(t.a);
+    defer arena.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(t.a);
+    for (got[0..@min(got.len, want.len)], want[0..@min(got.len, want.len)], 0..) |e, w, i| {
+        buf.clearRetainingCapacity();
+        try traceEvent(t, e, &buf);
+        const line = try lm.lane(arena.allocator(), buf.items);
+        if (!std.mem.eql(u8, line, w)) {
+            std.debug.print("prefill {s} {s} event {d}:\n  route: {s}\n  lane:  {s}\n", .{ case, what, i, line, w });
+            return error.TestExpectedEqual;
+        }
+    }
+    if (got.len != want.len) {
+        std.debug.print("prefill {s} {s}: {d} events, the lane {d}\n", .{ case, what, got.len, want.len });
+        return error.TestExpectedEqual;
+    }
+}
+
 /// The trace's log from `from` on is the lane's `want`, event for event.
 fn expectEvents(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8) !void {
     const got = t.log.items[from..];
@@ -1207,7 +1327,8 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
     try testing.expectEqualStrings("mlx-serve-exl3-prefill-wave-samples-v1", parsed.value.format);
     var n_calls: usize = 0;
     var n_waves: usize = 0;
-    var n_retuned: usize = 0;
+    var n_take2: usize = 0;
+    var n_gemm: usize = 0;
     for (parsed.value.cases) |*cs| {
         var t: Trace = .{ .a = a };
         defer t.deinit();
@@ -1225,15 +1346,13 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             const nodes0 = t.nodes.items.len;
             const resets0 = t.freed.items.len;
             const res = try r.call(&t, act, .{ .slot = slots }, bank);
-            // the lane's take2 launches in the retune's form (name and grid z); every other event as sampled
-            var want_arena = std.heap.ArenaAllocator.init(a);
-            defer want_arena.deinit();
-            const want = try want_arena.allocator().alloc([]const u8, cl.events.len);
-            for (want, cl.events) |*w, e| {
-                w.* = try swapTake2(want_arena.allocator(), e, take2_lane, take2_retune);
-                n_retuned += @intFromBool(w.*.ptr != e.ptr);
-            }
-            try expectEvents(&t, mark, want, cs.case, cl.name);
+            // the route's events in the lane's text (the take2 retune and the 128-row GEMMs mapped); every other
+            // byte as sampled
+            var lm = try LaneMap.init(a, &t);
+            defer lm.deinit(a);
+            try expectEventsVia(&t, mark, cl.events, cs.case, cl.name, &lm);
+            n_take2 += lm.n_take2;
+            n_gemm += lm.n_gemm;
             // the wave lifecycle: one mark / resetTo per wave and one around the join; nothing the
             // call built outlives it but the kept result and the waves still in flight
             const waves = (t.launches.items.len - launches0) / 5;
@@ -1262,8 +1381,9 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
         try testing.expectEqual(@as(isize, 0), t.keeps);
     }
     try testing.expect(n_calls >= 10 and n_waves >= 60);
-    // every sampled wave's take2 went through the retune
-    try testing.expectEqual(n_waves, n_retuned);
+    // every sampled wave's take2 went through the retune, and both its GEMMs through the 128-row texts
+    try testing.expectEqual(n_waves, n_take2);
+    try testing.expectEqual(2 * n_waves, n_gemm);
 }
 
 test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wave, half of Record 3's waves, every row once" {
@@ -1620,21 +1740,21 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     };
     try acc.finishPrefill(&tb);
     try renderLog(&tb, b0, &lb);
-    // The route launches the take2 retune (same inputs and outputs; name and grid z differ): its lines back in the
-    // lane's form, then every byte as pinned at the move.
+    // The route launches the take2 retune and the 128-row GEMMs (same inputs and output words; names, grids and the
+    // wave tables' first-threadgroup column differ): their lines back in the lane's text, then every byte as pinned
+    // at the move.
     var lane_arena = std.heap.ArenaAllocator.init(a);
     defer lane_arena.deinit();
     var lane_log: std.ArrayList(u8) = .empty;
     defer lane_log.deinit(a);
-    var n_retuned: usize = 0;
+    var lm = try LaneMap.init(a, &tb);
+    defer lm.deinit(a);
     var lines = std.mem.splitScalar(u8, lb.items, '\n');
     while (lines.next()) |line| {
-        const l2 = try swapTake2(lane_arena.allocator(), line, take2_retune, take2_lane);
-        n_retuned += @intFromBool(l2.ptr != line.ptr);
-        try lane_log.appendSlice(a, l2);
+        try lane_log.appendSlice(a, try lm.lane(lane_arena.allocator(), line));
         if (lines.index != null) try lane_log.append(a, '\n');
     }
-    try testing.expect(n_retuned > 0);
+    try testing.expect(lm.n_take2 > 0 and lm.n_gemm == 2 * lm.n_take2);
     try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lane_log.items, "\n"));
     try testing.expectEqualStrings(moved_log_sha256, &digestOf(lane_log.items));
     // checkBank: the moved per-projection check's refusals, through the quant's entry
@@ -1916,7 +2036,7 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &unrouted_texts, &report, &kd) catch |e| {
+        set.selfCheck(a, &m128_texts, &report, &kd) catch |e| {
             std.debug.print("m128 self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
@@ -1998,10 +2118,11 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
             }
             const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.gu[0].table), &.{80}, .int32);
             const x = try d.take2(gg, act, ridx_a, rhs_a, tbl, bank_.gate.rin, bank_.up.rin);
-            const z = try d.gemmGateUp(gg, x[0], x[1], bank_.gate.code, bank_.up.code, tbl, w.gu[0].tgs);
-            w.hd = try d.onePass(gg, z[0], z[1], rhs_a, tbl, bank_.gate.rout, bank_.up.rout, bank_.down.rin);
             w.x0 = x[0];
             w.x1 = x[1];
+            // the 64-row gate|up through its own entry, whichever text the route launches
+            const z = try w.gemm(gg, d, bank_, 0, 0);
+            w.hd = try d.onePass(gg, z[0], z[1], rhs_a, tbl, bank_.gate.rout, bank_.up.rout, bank_.down.rin);
             try gg.evalAll(&.{ w.x0, w.x1, w.hd });
             return w;
         }

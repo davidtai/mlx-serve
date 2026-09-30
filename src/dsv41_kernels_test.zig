@@ -113,12 +113,9 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), t.launcher.?);
     var plan: usize = 0;
     for (&set.reg.entries) |*e| plan += e.checks.count();
-    // the 128-row DIG-X GEMMs' checks run in their 0b smoke, not at accept, until their route flips
-    const m128_checks = set.reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128).checks.count() + set.reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128).checks.count();
-    try testing.expectEqual(@as(usize, 8), m128_checks);
-    // the EXL3 quant: exactly its 52 checks (49 + the take2 retune's 3), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
+    // the EXL3 quant: exactly its 60 checks (49 + the take2 retune's 3 + the 128-row GEMMs' 8), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set }, v41_spec, &diag);
-    try testing.expectEqual(@as(usize, 52), acc.report.results.items.len);
+    try testing.expectEqual(@as(usize, 60), acc.report.results.items.len);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
@@ -127,7 +124,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
-    try testing.expectEqual(plan - 52 - m128_checks, rep.results.items.len);
+    try testing.expectEqual(plan - 60, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
@@ -520,14 +517,15 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     {
         const r = DigX(Trace).init(&reg);
-        for (r.gemm_gu.samples) |*s| {
-            const e, const v = .{ r.gemm_gu, &s.vars };
+        // the GEMMs launch the 128-row texts (their own samples: grid 256 x tgs, 128-row tables)
+        for (r.gemm_gu128.samples) |*s| {
+            const e, const v = .{ r.gemm_gu128, &s.vars };
             const x0, const x1, const c0, const c1, const tbl = .{ try t.arg(e, "x0", v), try t.arg(e, "x1", v), try t.arg(e, "code0", v), try t.arg(e, "code1", v), try t.arg(e, "tbl", v) };
             _ = try r.gemmGateUp(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)));
             try expectLaunch(t.back(1), e, s, &.{ x0, x1, c0, c1, tbl });
         }
-        for (r.gemm_dn.samples) |*s| {
-            const e, const v = .{ r.gemm_dn, &s.vars };
+        for (r.gemm_dn128.samples) |*s| {
+            const e, const v = .{ r.gemm_dn128, &s.vars };
             const x, const c0, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "tbl", v) };
             _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)));
             try expectLaunch(t.back(1), e, s, &.{ x, c0, tbl });
@@ -568,11 +566,12 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
     // only), the DRAFTRC entries and decode / prefill batch 2 (their routes' own tests cover those),
     // the lane's take2: the retune's bitwise reference (its device self-check and the 0b smoke
-    // launch it; the route launches the retune), and the 128-row DIG-X GEMMs until their route
-    // flips (their 0b smoke launches them; the registry's round trip covers their geometry)
+    // launch it; the route launches the retune), and the 64-row DIG-X GEMMs: the 128-row texts'
+    // twin reference (their device self-checks, the 128-row texts' twin check and the 0b smoke
+    // launch them; the route launches the 128-row texts)
     for (reg.entries) |e| {
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
-            e.kernel == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or e.kernel == .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128;
+            e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3;
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
