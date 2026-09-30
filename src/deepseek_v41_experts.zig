@@ -2014,7 +2014,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
     defer g.deinit();
     const Chain = EagerChain(TraceOps, TraceGemv);
     const Math = WithPrefillRoutes(TraceOps, Chain, xq.DigXPrefill(TraceOps));
-    var digx = [_]xq.DigXPrefill(TraceOps){try xq.DigXPrefill(TraceOps).init(a, &reg, .tier, null)};
+    var digx = [_]xq.DigXPrefill(TraceOps){try xq.DigXPrefill(TraceOps).init(a, &reg, xq.PrefillShape.record3, null)};
     defer digx[0].deinit(&g);
     const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
     var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &digx }, &c);

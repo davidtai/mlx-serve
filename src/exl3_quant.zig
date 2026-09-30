@@ -605,8 +605,15 @@ pub const PrefillShape = struct {
     /// a call of at most `carry_rows` rows leaves its last waves in flight (to the next call or `finish`)
     carry_rows: u32,
 
-    /// Record 3 (pass3r-record3-fast-typical-exl3-30-guard-20260928.log).
-    pub const tier: PrefillShape = .{ .wave = 4, .inflight = 2, .row_budget = 7168, .carry_rows = 8192 };
+    /// Record 3 (pass3r-record3-fast-typical-exl3-30-guard-20260928.log): the lane's shape, the one its wave
+    /// samples and the move's pinned launches were taken at.
+    pub const record3: PrefillShape = .{ .wave = 4, .inflight = 2, .row_budget = 7168, .carry_rows = 8192 };
+    /// The served tier: Record 3 with L1, 8 experts per wave. Under K16 a group call's experts carry about 256
+    /// rows each (98,304 routed rows over 384 experts), so Record 3's four-expert cap bound, not the row budget:
+    /// eight halve the waves, and with them the per-wave host encode (five launches, four host arrays, one async
+    /// eval). Exact: a wave's rows are independent of its composition (each 64-row tile reads one expert's rows
+    /// and weights; the join restores the assignment order).
+    pub const tier: PrefillShape = .{ .wave = 8, .inflight = record3.inflight, .row_budget = record3.row_budget, .carry_rows = record3.carry_rows };
 };
 
 /// A layer bank's three projections (the streamer's `BankArrays`).
@@ -1195,6 +1202,44 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
     try testing.expect(n_calls >= 10 and n_waves >= 60);
 }
 
+test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wave, half of Record 3's waves, every row once" {
+    const a = testing.allocator;
+    var reg = try testRegistry();
+    defer reg.deinit();
+    // One group call of a K16 layer at 16K: 48 experts (max_route_ids) of 256 rows each (98,304 / 384), the
+    // row budget (7,168) far above 8 x 256.
+    const n_experts: u32 = 48;
+    const per: u32 = 256;
+    const slots = try a.alloc(u32, n_experts * per);
+    defer a.free(slots);
+    for (slots, 0..) |*s, i| s.* = @intCast(i % n_experts);
+    try testing.expectEqual(@as(u32, 8), PrefillShape.tier.wave);
+    for ([_]struct { wave: u32, waves: usize }{ .{ .wave = PrefillShape.record3.wave, .waves = 12 }, .{ .wave = PrefillShape.tier.wave, .waves = 6 } }) |c| {
+        var t: Trace = .{ .a = a };
+        defer t.deinit();
+        var shape = PrefillShape.tier;
+        shape.wave = c.wave;
+        var r = try DigXPrefill(Trace).init(a, &reg, shape, null);
+        defer r.deinit(&t);
+        const bank = try testBank(&t, @intCast(n_experts));
+        const act = try t.ext("act", &.{ @intCast(slots.len), 5120 }, .bfloat16);
+        const l0 = t.launches.items.len;
+        const res = try r.call(&t, act, .{ .slot = slots }, bank);
+        // five launches per wave, and one wave per `wave` experts
+        const launches = t.launches.items.len - l0;
+        try testing.expectEqual(@as(usize, 0), launches % 5);
+        try testing.expectEqual(c.waves, launches / 5);
+        // the result keeps every assignment row, in assignment order (the join), whatever the waves
+        const rsh = t.shapeOf(res);
+        const rs = rsh.slice();
+        try testing.expectEqual(@as(usize, 2), rs.len);
+        try testing.expectEqual(@as(i64, @intCast(slots.len)), @as(i64, rs[0]));
+        try testing.expectEqual(@as(i64, 5120), @as(i64, rs[1]));
+        t.release(res);
+        try r.finish(&t);
+    }
+}
+
 test "dsv41 kernels ops: the prefill wave route refuses by name, before any launch" {
     const a = testing.allocator;
     var reg = try testRegistry();
@@ -1335,7 +1380,11 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         const hb = try acc.gateUp(&tb, xb, ib, bb.gate, bb.up);
         _ = try acc.down(&tb, hb, ib, bb.down);
     }
-    // prefill: the lane samples' calls at the tier shape, then the boundary
+    // prefill: the lane samples' calls at the lane's shape (Record 3: the move's pinned launches), then the boundary
+    for (acc.waves) |*w| {
+        w.deinit(&tb);
+        w.* = try DigXPrefill(Trace).init(a, &set.reg, PrefillShape.record3, null);
+    }
     const parsed = try std.json.parseFromSlice(JSamples, a, prefill_samples, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     for (parsed.value.cases) |*cs| for (cs.calls) |*cl| {
