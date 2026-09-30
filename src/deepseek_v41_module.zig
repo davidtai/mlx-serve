@@ -355,7 +355,8 @@ pub const Module = struct {
     pub fn phaseChange(self: *Module) !void {
         if (self.grown()) return;
         // The box's pages and this process's footprint at each step (once per process): what the
-        // guard's metric holds beyond the footprint while the banks grow.
+        // guard's metric holds beyond the footprint at the frees (the banks are preallocated: grow
+        // only flips the phase).
         var marks: [4]VmMark = undefined;
         marks[0] = VmMark.now();
         if (!self.fenced) {
@@ -470,6 +471,8 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .fixed_rows = if (config.expert_prefill_rows == null) config.expert_rows else null,
         // Rows the caller's native bill filled (both set): the stream's rows, the envelope's record only.
         .native_rows = if (config.expert_prefill_rows) |p| .{ .prefill = p, .decode = config.expert_rows orelse p } else null,
+        // No growth transient: the banks at their decode rows from construction (one row count).
+        .preallocate = true,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
         .lookahead = lookahead,
