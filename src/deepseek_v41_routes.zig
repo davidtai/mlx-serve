@@ -99,6 +99,7 @@ pub const served: Tier = blk: {
     t.routes.prefill_oproj = true; // DENSE16 oproj after the prefill core (rows > 32)
     t.routes.prefill_host_shared = true; // PREFILL_HOST shared: the shared expert under the host's wave plan
     t.routes.prefill_joinless = true; // JOINLESS: the K16 combine reads the unjoined routed outputs
+    t.routes.engram_posted = true; // ENGRAM=prefetch: the K16 pass's Engram gathers posted ahead of their layers
     t.routes.rc_smallm = true; // C28 MINVARIANT smallm_all (rows <= 8)
     t.routes.rc_mxfp8_rows = true; // C29 MINVARIANT mxfp8 rows m1order (rows <= 8)
     t.routes.rc_index_topk = true; // C27 INDEX_TOPK=metal (rows <= 8)
@@ -407,6 +408,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.prefill_oproj = false;
     rc_off.prefill_host_shared = false;
     rc_off.prefill_joinless = false;
+    rc_off.engram_posted = false;
     rc_off.rc_smallm = false;
     rc_off.rc_mxfp8_rows = false;
     rc_off.rc_index_topk = false;

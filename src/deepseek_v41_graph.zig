@@ -137,6 +137,9 @@ pub const Routes = struct {
     /// JOINLESS (K16): the combine reads the wide call's unjoined outputs in place (each
     /// assignment's (output, row)); no concatenate / take of the routed rows. Exact vs SMALLK.
     prefill_joinless: bool = false,
+    /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
+    /// source's poster threads (the blocking read's bytes, in its order). Exact.
+    engram_posted: bool = false,
     /// C28 MINVARIANT smallm_all at rows <= 8 (the verify / decode forwards): the compressor wkv /
     /// wgate, the indexer wk and weights_proj as MLX's M = 1 GEMV order per row, bound per layer over
     /// its bf16 weights (needs rc_proj: the bf16 stream at these rows; RCTAIL keeps the premix / gate).

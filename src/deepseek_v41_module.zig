@@ -257,6 +257,7 @@ pub const Module = struct {
         if (config.prefill_combine) |v| tier.routes.prefill_combine = v;
         if (config.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
         if (config.prefill_joinless) |v| tier.routes.prefill_joinless = v;
+        if (config.engram_posted) |v| tier.routes.engram_posted = v;
         // The verify-row routes (C23, C27-C29): a setting overrides the tier's route.
         if (config.decode_attn_softmax) |v| tier.routes.rc_attn_softmax = v;
         if (config.decode_index_topk) |v| tier.routes.rc_index_topk = v;
@@ -271,8 +272,17 @@ pub const Module = struct {
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
+        // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
+        if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
+            try self.engram.enablePosting();
+            self.checkEngramPosted(gpa) catch |e| {
+                log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}", .{@errorName(e)});
+                return e;
+            };
+            self.model.engram.?.posted = true;
+        }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .engram_posted = if (self.model.engram) |en| en.posted else false },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -497,6 +507,20 @@ pub const Module = struct {
         self.prompt_tokens = ids.len;
         if (self.dspark_cfg) |cfg| return self.prefillSeeded(ids, cfg);
         return self.forward(ids);
+    }
+
+    /// ENGRAM=prefetch's construction check: a fixed span's rows hashed, every Engram slot's posted gather
+    /// against a read past the cache, bitwise (`eng.RowSource.checkPosted`).
+    fn checkEngramPosted(self: *Module, gpa: std.mem.Allocator) !void {
+        const n = 64;
+        var ids: [n]u32 = undefined;
+        for (&ids, 0..) |*x, i| x.* = @intCast((i * 7919 + 13) % self.model.c.vocab_size);
+        var st: eng.HashState = .{};
+        defer st.deinit(gpa);
+        const rows = try gpa.alloc(i64, n * self.engram.perToken());
+        defer gpa.free(rows);
+        try self.engram.advance(gpa, &st, &ids, rows);
+        try self.engram.checkPosted(gpa, rows, n);
     }
 
     /// A few ids' rows through the resident table and through the host rows, compared bitwise.
@@ -798,6 +822,8 @@ pub const Installed = struct {
     /// PREFILL_HOST shared and JOINLESS (K16's routed group; installed).
     prefill_host_shared: bool = false,
     prefill_joinless: bool = false,
+    /// ENGRAM=prefetch: the prompt pass's Engram gathers posted ahead (started and past its self-check).
+    engram_posted: bool = false,
     /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows; installed).
     decode_attn_softmax: bool = false,
     decode_index_topk: bool = false,
@@ -811,7 +837,7 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.

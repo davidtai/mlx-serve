@@ -453,6 +453,8 @@ pub const ModelConfig = struct {
     /// deepseek_v41's K16 PREFILL_HOST shared and JOINLESS: null = the tier's route (served: on).
     prefill_host_shared: ?bool = null,
     prefill_joinless: ?bool = null,
+    /// The deepseek_v41 prompt pass's Engram gathers posted ahead (null: the tier's route).
+    engram_posted: ?bool = null,
     /// deepseek_v41's verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows): null =
     /// the tier's route (served: on), false = the stock chain by construction.
     decode_attn_softmax: ?bool = null,

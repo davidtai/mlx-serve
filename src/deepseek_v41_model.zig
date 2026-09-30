@@ -67,7 +67,10 @@ pub fn Model(comptime G: type) type {
         /// C29: the Engram wkv's M-invariant rows route per Engram slot (rows <= 8).
         engram_m1: [eng.max_layers]?kr.Mxfp8Rows(G) = @splat(null),
 
-        const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
+        /// `posted`: the prompt pass gathers each Engram layer's rows ahead of it on the row source's poster
+        /// threads (`eng.RowSource.post`), the first before the first layer, each later one once the layer
+        /// before it took its own; the blocking read otherwise.
+        const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T), posted: bool = false };
 
         /// The input embedding's source. Either way a lookup of `ids` is the
         /// table's rows, byte for byte, `[1, n, dim]` in the table's dtype:
@@ -329,11 +332,48 @@ pub fn Model(comptime G: type) type {
             const codes = try a.alloc(u8, n * cols * hd);
             const scales = try a.alloc(u8, n * cols * (hd / 32));
             try en.src.read(slot, rows, n, ids, codes, scales);
+            return self.engramApply(g, slot, h, codes, scales, n);
+        }
+
+        /// `engramLayer` over a posted gather's records (the same bytes; `take` waits for them).
+        fn engramLayerPosted(self: *const Self, g: *G, a: std.mem.Allocator, slot: usize, h: T, p: *eng.RowSource.Posted, n: usize) !T {
+            const en = &self.engram.?;
+            const cols = en.src.hashing.cols();
+            const hd: usize = en.src.bank.head_dim;
+            const codes = try a.alloc(u8, n * cols * hd);
+            const scales = try a.alloc(u8, n * cols * (hd / 32));
+            try en.src.take(p, codes, scales);
+            return self.engramApply(g, slot, h, codes, scales, n);
+        }
+
+        fn engramApply(self: *const Self, g: *G, slot: usize, h: T, codes: []u8, scales: []u8, n: usize) !T {
+            const en = &self.engram.?;
+            const cols = en.src.hashing.cols();
+            const hd: usize = en.src.bank.head_dim;
             const nr: c_int = @intCast(n * cols);
             const ca = try g.hostArray(codes, &.{ nr, @intCast(hd / 4) }, .uint32);
             const sa = try g.hostArray(scales, &.{ nr, @intCast(hd / 32) }, .uint8);
             const er = try Tr.engramRows(g, ca, sa, 1, @intCast(n), @intCast(cols));
             return Tr.engramApplyM1(g, &self.c, en.w[slot], if (self.engram_m1[slot]) |*x| x else null, h, er);
+        }
+
+        /// Every chunk's gather of Engram slot `slot`, posted in chunk order (`gpa`-owned until released).
+        fn postSlot(self: *const Self, slot: usize, rows: []const []const i64, spans: []const [2]u32) ![]*eng.RowSource.Posted {
+            const en = &self.engram.?;
+            const list = try self.gpa.alloc(*eng.RowSource.Posted, spans.len);
+            var n: usize = 0;
+            errdefer {
+                for (list[0..n]) |p| {
+                    en.src.drain(p);
+                    en.src.release(self.gpa, p);
+                }
+                self.gpa.free(list);
+            }
+            for (spans, rows) |sp, r| {
+                list[n] = try en.src.post(self.gpa, slot, r, sp[1] - sp[0]);
+                n += 1;
+            }
+            return list;
         }
 
         /// `mean(h.astype(f32), axis=2).astype(h.dtype)`.
@@ -579,6 +619,19 @@ pub fn Model(comptime G: type) type {
             }
             try g.evalAll(hs);
             g.resetTo(embed_wave);
+            // The Engram gathers ahead of the layers that read them (every chunk's rows are hashed above): the
+            // first Engram slot's now, each later slot's once the slot before it is taken (one slot's records held).
+            const posting = if (self.engram) |en| en.posted else false;
+            var posts: [eng.max_layers]?[]*eng.RowSource.Posted = @splat(null);
+            defer for (&posts) |*ps| if (ps.*) |list| {
+                for (list) |p| {
+                    self.engram.?.src.drain(p);
+                    self.engram.?.src.release(self.gpa, p);
+                }
+                self.gpa.free(list);
+                ps.* = null;
+            };
+            if (posting) posts[0] = try self.postSlot(0, rows, spans);
             // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
             const carries = try a.alloc(Tr.Carry, nc);
             @memset(carries, .{});
@@ -599,7 +652,10 @@ pub fn Model(comptime G: type) type {
                     // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
                     const wave = g.mark();
                     var h = hs[i];
-                    if (li.engram_slot) |slot| h = try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                    if (li.engram_slot) |slot| h = if (posts[slot]) |list|
+                        try self.engramLayerPosted(g, a, slot, h, list[i], sp[1] - sp[0])
+                    else
+                        try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
                     // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
@@ -697,6 +753,13 @@ pub fn Model(comptime G: type) type {
                 try g.evalAll(hs);
                 for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
                 g.resetTo(layer_wave);
+                // This layer's gathers are taken and its waves evaluated: free them, post the next slot's.
+                if (li.engram_slot) |slot| if (posts[slot]) |list| {
+                    for (list) |p| self.engram.?.src.release(self.gpa, p);
+                    self.gpa.free(list);
+                    posts[slot] = null;
+                    if (slot + 1 < c.engram.n_layers) posts[slot + 1] = try self.postSlot(slot + 1, rows, spans);
+                };
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));
             st.offset += @intCast(ids.len);

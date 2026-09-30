@@ -362,18 +362,96 @@ pub const RowSource = struct {
         return self.readIds(li, ids_buf[0 .. n * cols], codes, scales);
     }
 
-    /// The records of row ids `ids` of layer slot `li`, through the bank's row cache.
-    pub fn readIds(self: *const RowSource, li: usize, ids: []const i64, codes: []u8, scales: []u8) !void {
+    /// Start every layer slot's poster thread (`post` / `take`): the prompt pass's gathers run ahead of it.
+    pub fn enablePosting(self: *RowSource) !void {
+        for (self.tables[0..self.hashing.n_layers]) |t| try t.?.enablePosting();
+    }
+
+    /// Layer slot `li`'s gather for the `n` positions of `rows`, posted: `read`'s ids now, its records
+    /// when `take` returns (the table's poster runs `read`'s gather, cache included, in post order).
+    pub const Posted = struct { job: qwen4.NgramTable.Posted, li: usize };
+
+    /// Post layer slot `li`'s gather for `n` positions of `rows` (`advance`'s output); `a` holds the ids and
+    /// records until `take` (and every later wave that reads them) is done.
+    pub fn post(self: *const RowSource, a: std.mem.Allocator, li: usize, rows: []const i64, n: usize) !*Posted {
+        const cols = self.hashing.cols();
+        const per = self.perToken();
+        const ids = try a.alloc(i64, n * cols);
+        for (0..n) |t| @memcpy(ids[t * cols ..][0..cols], rows[t * per + li * cols ..][0..cols]);
+        const p = try a.create(Posted);
+        p.* = .{ .job = .{ .rows = ids, .out = try a.alloc(u8, ids.len * self.bank.record_bytes) }, .li = li };
+        self.tables[li].?.post(&p.job);
+        return p;
+    }
+
+    /// A posted gather's records, split as `read` splits them (`codes` `[n * cols][head_dim]`, `scales`
+    /// `[n * cols][head_dim / 32]`).
+    pub fn take(self: *const RowSource, p: *Posted, codes: []u8, scales: []u8) !void {
+        try self.tables[p.li].?.wait(&p.job);
+        self.split(p.job.out, p.job.rows.len, codes, scales);
+    }
+
+    /// Wait a posted gather without its records (an aborted pass drains its posts before its memory goes).
+    pub fn drain(self: *const RowSource, p: *Posted) void {
+        self.tables[p.li].?.wait(&p.job) catch {};
+    }
+
+    /// Free a taken (or drained) posted gather's ids, records and itself (`a` = `post`'s allocator).
+    pub fn release(_: *const RowSource, a: std.mem.Allocator, p: *Posted) void {
+        a.free(p.job.rows);
+        a.free(p.job.out);
+        a.destroy(p);
+    }
+
+    fn split(self: *const RowSource, recs: []const u8, n_rows: usize, codes: []u8, scales: []u8) void {
         const rb: usize = self.bank.record_bytes;
         const hd: usize = self.bank.head_dim;
-        const recs = self.recs.?;
-        try recs.resize(self.arena.child_allocator, ids.len * rb);
-        try self.tables[li].?.gatherRecords(ids, recs.items);
-        for (0..ids.len) |i| {
-            const rec = recs.items[i * rb ..][0..rb];
+        for (0..n_rows) |i| {
+            const rec = recs[i * rb ..][0..rb];
             @memcpy(codes[i * hd ..][0..hd], rec[0..hd]);
             @memcpy(scales[i * (hd / 32) ..][0 .. hd / 32], rec[hd..rb]);
         }
+    }
+
+    /// Every layer slot's posted gather against an independent read past the cache, bitwise, for `n`
+    /// positions of `rows`: the construction check of the posted route (refused by name otherwise).
+    pub fn checkPosted(self: *const RowSource, gpa: std.mem.Allocator, rows: []const i64, n: usize) !void {
+        const cols = self.hashing.cols();
+        const hd: usize = self.bank.head_dim;
+        const rb: usize = self.bank.record_bytes;
+        const per = self.perToken();
+        const codes = try gpa.alloc(u8, n * cols * hd);
+        defer gpa.free(codes);
+        const scales = try gpa.alloc(u8, n * cols * (hd / 32));
+        defer gpa.free(scales);
+        const ids = try gpa.alloc(i64, n * cols);
+        defer gpa.free(ids);
+        const recs = try gpa.alloc(u8, n * cols * rb);
+        defer gpa.free(recs);
+        for (0..self.hashing.n_layers) |li| {
+            const p = try self.post(gpa, li, rows, n);
+            defer self.release(gpa, p);
+            self.take(p, codes, scales) catch |e| {
+                self.drain(p);
+                return e;
+            };
+            for (0..n) |t| @memcpy(ids[t * cols ..][0..cols], rows[t * per + li * cols ..][0..cols]);
+            try self.tables[li].?.readUncached(ids, recs);
+            for (0..ids.len) |i| {
+                const rec = recs[i * rb ..][0..rb];
+                if (!std.mem.eql(u8, codes[i * hd ..][0..hd], rec[0..hd]) or !std.mem.eql(u8, scales[i * (hd / 32) ..][0 .. hd / 32], rec[hd..rb]))
+                    return error.EngramPostedSelfCheck;
+            }
+        }
+    }
+
+    /// The records of row ids `ids` of layer slot `li`, through the bank's row cache.
+    pub fn readIds(self: *const RowSource, li: usize, ids: []const i64, codes: []u8, scales: []u8) !void {
+        const rb: usize = self.bank.record_bytes;
+        const recs = self.recs.?;
+        try recs.resize(self.arena.child_allocator, ids.len * rb);
+        try self.tables[li].?.gatherRecords(ids, recs.items);
+        self.split(recs.items, ids.len, codes, scales);
     }
 };
 
@@ -595,6 +673,58 @@ test "dsv41 engram: a synthetic bank opens and its rows come back through the ro
     try testing.expectError(error.RowOutOfRange, src.readIds(0, &.{97}, codes[0..32], scales[0..1]));
 }
 
+test "dsv41 engram: posted gathers return the blocking reads' bytes in post order and leave the cache as they do" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const map_path = try writeMiniBank(a, &tmp, root, .{});
+    const c = try miniConfig();
+    var diag: v41.Diag = .{};
+    var blocking = try RowSource.open(testing.allocator, testing.io, root, map_path, &c, &diag);
+    defer blocking.deinit();
+    var posted = try RowSource.open(testing.allocator, testing.io, root, map_path, &c, &diag);
+    defer posted.deinit();
+    try posted.enablePosting();
+    // Two spans' rows (the second repeats some of the first's: cache hits on both paths).
+    var st: HashState = .{};
+    defer st.deinit(testing.allocator);
+    var rows1: [3 * 4]i64 = undefined;
+    var rows2: [4 * 4]i64 = undefined;
+    try blocking.advance(testing.allocator, &st, &.{ 5, 7, 9 }, &rows1);
+    try blocking.advance(testing.allocator, &st, &.{ 5, 7, 9, 11 }, &rows2);
+    var idb: [16]i64 = undefined;
+    var want1_c: [12 * 32]u8 = undefined;
+    var want1_s: [12]u8 = undefined;
+    var want2_c: [16 * 32]u8 = undefined;
+    var want2_s: [16]u8 = undefined;
+    try blocking.read(0, &rows1, 3, &idb, &want1_c, &want1_s);
+    try blocking.read(0, &rows2, 4, &idb, &want2_c, &want2_s);
+    // Both posted before either is taken: the poster runs them in post order.
+    const p1 = try posted.post(a, 0, &rows1, 3);
+    const p2 = try posted.post(a, 0, &rows2, 4);
+    var got2_c: [16 * 32]u8 = undefined;
+    var got2_s: [16]u8 = undefined;
+    var got1_c: [12 * 32]u8 = undefined;
+    var got1_s: [12]u8 = undefined;
+    try posted.take(p2, &got2_c, &got2_s);
+    try posted.take(p1, &got1_c, &got1_s);
+    try testing.expectEqualSlices(u8, &want1_c, &got1_c);
+    try testing.expectEqualSlices(u8, &want1_s, &got1_s);
+    try testing.expectEqualSlices(u8, &want2_c, &got2_c);
+    try testing.expectEqualSlices(u8, &want2_s, &got2_s);
+    try testing.expectEqual(blocking.cacheStats(0), posted.cacheStats(0));
+    // A row out of the bank fails its own job, by name; the poster keeps serving.
+    const bad = try posted.post(a, 0, &.{ 97, 97, 97, 97 }, 1);
+    try testing.expectError(error.RowOutOfRange, posted.take(bad, got1_c[0..128], got1_s[0..4]));
+    const again = try posted.post(a, 0, &rows1, 3);
+    try posted.take(again, &got1_c, &got1_s);
+    try testing.expectEqualSlices(u8, &want1_c, &got1_c);
+}
+
 test "dsv41 engram: the row source refuses a map or bank built for something else, by name" {
     const Case = struct { f: MiniBank, err: anyerror };
     const cases = [_]Case{
@@ -634,6 +764,32 @@ test "dsv41 engram: the row source refuses a map or bank built for something els
 }
 
 // DSV41_BANK=<bank> DSV41_ENGRAM_TOKEN_MAP=<converter output> DSV41_ENGRAM_FIXTURE=<m0 fixture json>
+// DSV41_BANK + DSV41_ENGRAM_TOKEN_MAP (host only, F_NOCACHE reads): the module's construction check of the
+// posted route on the real tables, over one 2048-position chunk; prints the posted gathers' wall time.
+test "dsv41 engram: the real bank's posted gathers equal a read past the cache on a prefill chunk" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("refused: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(testing.allocator, testing.io, bank_dir, &diag);
+    var src = try RowSource.open(testing.allocator, testing.io, bank_dir, map_path, &c, &diag);
+    defer src.deinit();
+    try src.enablePosting();
+    const n = 2048;
+    const ids = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*x, i| x.* = @intCast((i * 7919 + 13) % c.vocab_size);
+    const rows = try testing.allocator.alloc(i64, n * src.perToken());
+    defer testing.allocator.free(rows);
+    var st: HashState = .{};
+    defer st.deinit(testing.allocator);
+    try src.advance(testing.allocator, &st, ids, rows);
+    const t0 = std.Io.Timestamp.now(testing.io, .awake);
+    try src.checkPosted(testing.allocator, rows, n);
+    const ms = @divTrunc(t0.untilNow(testing.io, .awake).nanoseconds, std.time.ns_per_ms);
+    std.debug.print("dsv41 engram posted: {d} positions x {d} slots x {d} cols gathered, posted and checked in {d} ms\n", .{ n, src.hashing.n_layers, src.hashing.cols(), ms });
+}
+
 test "dsv41 engram: the real bank's row source hashes and reads like the Python oracle" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);

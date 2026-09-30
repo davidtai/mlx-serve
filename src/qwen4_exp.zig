@@ -208,6 +208,19 @@ pub const NgramTable = struct {
     nocache: bool = false,
     /// A record table's resident rows (`attachCache`); without it every row is read.
     cache: ?*RowCache = null,
+    /// The table's posted gathers (`enablePosting`): one thread runs them in post order.
+    poster: ?*Poster = null,
+
+    /// A gather handed to the table's poster thread: exactly `gatherRecords(rows, out)`, run in post
+    /// order (the cache included), ready once `wait` returns. The caller keeps `rows` and `out` alive and
+    /// makes no other gather on the table until every posted one is waited.
+    pub const Posted = struct {
+        rows: []const i64,
+        out: []u8,
+        state: enum { queued, done, failed } = .queued,
+        err: anyerror = error.RecordRead,
+        next: ?*Posted = null,
+    };
 
     /// `bits` of a record table: raw fixed-width records, never dequantized here.
     pub const records_bits: u32 = 0;
@@ -224,6 +237,29 @@ pub const NgramTable = struct {
         var t: NgramTable = .{ .map = &empty_map, .rows = rows, .dim = record_bytes, .bits = records_bits, .group_size = 0, .w_off = @intCast(data_offset), .s_off = 0, .b_off = 0, .wcols = 0, .scols = 0, .fd = fd, .nocache = true };
         if (record_bytes <= PrefetchPool.ROW_BUF) t.pool = try PrefetchPool.create();
         return t;
+    }
+
+    /// The records of `row_ids` read past the cache (a check's independent read).
+    pub fn readUncached(self: *const NgramTable, row_ids: []const i64, out: []u8) !void {
+        std.debug.assert(self.bits == records_bits and out.len == row_ids.len * self.dim);
+        for (row_ids) |r| if (r < 0 or @as(u64, @intCast(r)) >= self.rows) return error.RowOutOfRange;
+        return self.readRecords(row_ids, out);
+    }
+
+    /// Start the table's poster thread (`post` / `wait`). Call once the table sits at its final address.
+    pub fn enablePosting(self: *NgramTable) !void {
+        std.debug.assert(self.poster == null);
+        self.poster = try Poster.create(self);
+    }
+
+    /// Queue `job` on the poster thread; the gather starts once the jobs before it finish.
+    pub fn post(self: *NgramTable, job: *Posted) void {
+        self.poster.?.push(job);
+    }
+
+    /// Block until `job` ran; its gather's error, if any.
+    pub fn wait(self: *NgramTable, job: *Posted) !void {
+        return self.poster.?.await(job);
     }
 
     /// Keep up to `budget_bytes` of this record table's rows resident (`RowCache`).
@@ -489,6 +525,8 @@ pub const NgramTable = struct {
     }
 
     pub fn close(self: *NgramTable) void {
+        if (self.poster) |p| p.destroy();
+        self.poster = null;
         if (self.warm_thread) |th| {
             self.warm_stop.store(true, .release);
             th.join();
@@ -832,6 +870,80 @@ pub const RowCache = struct {
         if (self.removed >= self.slot_count / 2 + 1) {
             self.index.rehash(std.hash_map.AutoContext(u64){});
             self.removed = 0;
+        }
+    }
+};
+
+/// One table's posted gathers: a thread that runs them in post order (each is `gatherRecords`, so the
+/// pool's rounds and the cache's order are the blocking path's). Jobs are drained before it stops.
+const Poster = struct {
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    head: ?*NgramTable.Posted = null,
+    tail: ?*NgramTable.Posted = null,
+    quit: bool = false,
+    table: *NgramTable,
+    thread: std.Thread = undefined,
+
+    fn create(table: *NgramTable) !*Poster {
+        const a = std.heap.page_allocator;
+        const p = try a.create(Poster);
+        errdefer a.destroy(p);
+        p.* = .{ .table = table };
+        p.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{p});
+        return p;
+    }
+
+    fn destroy(self: *Poster) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.quit = true;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        self.thread.join();
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn push(self: *Poster, job: *NgramTable.Posted) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        job.state = .queued;
+        job.next = null;
+        self.mu.lockUncancelable(io);
+        if (self.tail) |t| t.next = job else self.head = job;
+        self.tail = job;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+    }
+
+    fn await(self: *Poster, job: *NgramTable.Posted) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        while (job.state == .queued) self.cv.wait(io, &self.mu) catch {};
+        const failed = job.state == .failed;
+        self.mu.unlock(io);
+        if (failed) return job.err;
+    }
+
+    fn run(self: *Poster) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (true) {
+            self.mu.lockUncancelable(io);
+            while (self.head == null and !self.quit) self.cv.wait(io, &self.mu) catch {};
+            const job = self.head orelse {
+                self.mu.unlock(io);
+                return;
+            };
+            self.head = job.next;
+            if (self.head == null) self.tail = null;
+            self.mu.unlock(io);
+            const r = self.table.gatherRecords(job.rows, job.out);
+            self.mu.lockUncancelable(io);
+            if (r) |_| job.state = .done else |e| {
+                job.err = e;
+                job.state = .failed;
+            }
+            self.cv.broadcast(io);
+            self.mu.unlock(io);
         }
     }
 };
