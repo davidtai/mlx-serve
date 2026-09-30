@@ -35,6 +35,7 @@ const expert_event = @import("expert_event.zig");
 const xk = @import("exl3_kernels.zig");
 const quant = @import("quant.zig");
 const dt = @import("dsv41_decode_timers.zig");
+const prof = @import("dsv41_prefill_timers.zig");
 const xq = @import("exl3_quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
@@ -1384,7 +1385,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const cold: u32 = self.wide_route.cold_rows;
             const cold_chunk: usize = if (@hasDecl(M, "max_decode_rows")) M.max_decode_rows else max_route_ids;
             try w.ids.resize(a, n_ids);
+            var tp = prof.now();
             _ = try g.hostIds(indices, w.ids.items);
+            prof.charge(.barrier, tp);
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
             w.distinct.clearRetainingCapacity();
@@ -1436,16 +1439,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     return d[gi * max_route_ids .. @min((gi + 1) * max_route_ids, d.len)];
                 }
             }.f;
+            tp = prof.now();
             for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi), &.{});
+            prof.charge(.route, tp);
             for (0..n_groups) |gi| {
                 const start = gi * max_route_ids;
                 const group = groupOf(w.distinct.items, gi);
                 const call = calls[gi % depth].?;
                 const sv = self.source.served(call);
+                tp = prof.now();
                 for (0..sv.n_parts) |p| {
                     try self.source.waitGu(call, @intCast(p));
                     try self.source.waitDown(call, @intCast(p));
                 }
+                prof.charge(.read_wait, tp);
                 const k0 = w.kept.items.len;
                 for ([_]BankKind{ .base, .ext, .transient }) |kind| {
                     const kb = w.kept.items.len;
@@ -1508,19 +1515,25 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     }
                     if (!feed) {
                         if (hot) try self.math.finishPrefill(g);
+                        tp = prof.now();
                         try g.evalAll(w.kept.items[kb..]);
+                        prof.charge(.drain, tp);
                     }
                 }
                 // Feed: the group's banks queued back to back, one drain before its slots go back.
                 if (feed) {
                     try self.math.finishPrefill(g);
+                    tp = prof.now();
                     try g.evalAll(w.kept.items[k0..]);
+                    prof.charge(.drain, tp);
                 }
+                tp = prof.now();
                 // The group's base-bank slots stay pinned and held for the deferred call past its release.
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) try self.source.holdBase(call);
                 self.source.release(call);
                 calls[gi % depth] = null;
                 if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
+                prof.charge(.route, tp);
             }
             // The deferred base-bank rows: one call's waves over every group's, then the slots let go.
             if (comptime @hasDecl(S, "holdBase")) if (defer_base) {
@@ -1538,7 +1551,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         try w.pos.appendSlice(a, w.def_pos.items);
                     }
                     try self.math.finishPrefill(g);
+                    const td = prof.now();
                     try g.evalAll(w.kept.items[kb..]);
+                    prof.charge(.drain, td);
                 }
                 self.source.releaseHeld();
             };

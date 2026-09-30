@@ -146,7 +146,9 @@ pub const PrefillBill = struct {
         const d = b.hidden;
         const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
         const halves = seq * (b.hc * d * 4 + d * 4 + 2 * b.hc * 4 + b.hc * b.hc * 4);
-        const selection = seq * ((if (b.min_ratio > 0) seq / b.min_ratio else 0) + b.index_topk * 4);
+        // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
+        const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
+        const selection = seq * ((if (b.min_ratio > 0) seq / b.min_ratio else 0) + b.index_topk * 4) + win_sel;
         const attn = b.waveBytes(b.chunkRows(seq), seq, tier) - seq * kept_pos_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
@@ -206,14 +208,14 @@ fn bank30Bill() PrefillBill {
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
     const b = bank30Bill();
     const wave = b.layerMajorWaveBytes(16384, .served);
-    try std.testing.expectEqual(@as(u64, 14_396_751_872), wave);
+    try std.testing.expectEqual(@as(u64, 14_407_237_632), wave);
     try std.testing.expectEqual(@as(u64, 2_013_265_920), b.wideLaneBytes(16384));
     const billed = b.layerMajorBilledBytes(16384, .served);
     // The K16 cells' prompt MLX peak over the constructed module (16.25 GB) less the request's KV (0.16 GB).
     const measured: u64 = 16_250_000_000 - 160_000_000;
     try std.testing.expect(billed >= measured and billed - measured < 400_000_000);
     // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
-    try std.testing.expectEqual(@as(u64, 1_585_922_048), wave / 4 * 5 - billed);
+    try std.testing.expectEqual(@as(u64, 1_588_543_488), wave / 4 * 5 - billed);
     // The per-request bill (the server's admission) carries the same transient.
     try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
 }

@@ -17,6 +17,7 @@ const xp = @import("deepseek_v41_experts.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_stream = @import("expert_stream.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
+const dsv41_prof = @import("dsv41_prefill_timers.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dss = @import("deepseek_v41_dspark_serve.zig");
 const xk = @import("exl3_kernels.zig");
@@ -874,6 +875,8 @@ const CellReceipt = struct {
     prefill_host_shared: ?bool = null,
     prefill_joinless: ?bool = null,
     embedding_rows: ?bool = null,
+    /// (v10) HCPOST, as installed (read back from the Module).
+    prefill_hc_post: ?bool = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
     engram_posted: ?bool = null,
     deferred_base: ?bool = null,
@@ -1157,6 +1160,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_host_shared = md.installed.prefill_host_shared,
         .prefill_joinless = md.installed.prefill_joinless,
         .embedding_rows = md.installed.embedding_rows,
+        .prefill_hc_post = md.installed.prefill_hc_post,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
@@ -1250,6 +1254,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_OPROJ")) |v| ov.prefill_oproj = try cellBool("DSV41_CELL_PREFILL_OPROJ", v);
     if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| ov.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
+    if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
@@ -1608,7 +1613,8 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
 /// read counters. The syncs serialize the pass: the profile's wall exceeds the unprobed TTFT; the
 /// split, not the sum, is the reading.
 const PrefillProbe = struct {
-    const n_max = 40;
+    /// Distinct stage names (37 in the trunk, the K16 pass and the experts today); a 65th refuses by name.
+    const n_max = 64;
     g: *ops.MlxOps,
     io: std.Io,
     stats_of: *const fn (*anyopaque) expert_stream.Stats,
@@ -1619,6 +1625,8 @@ const PrefillProbe = struct {
     ns: [n_max]u64 = @splat(0),
     n: usize = 0,
     layers_done: u64 = 0,
+    /// K16's chunk of the stages that follow (set by the layer-major pass), else the chunk-major count.
+    cur_chunk: ?usize = null,
     chunk_ns: [64]u64 = @splat(0),
     chunk_rows: [64]u32 = @splat(0),
     read_wall_ns: u64 = 0,
@@ -1626,8 +1634,13 @@ const PrefillProbe = struct {
     misses: u64 = 0,
     before: expert_stream.Stats = .{},
 
-    fn slot(self: *PrefillProbe, name: []const u8) usize {
+    pub fn atChunk(self: *PrefillProbe, i: usize) void {
+        self.cur_chunk = i;
+    }
+
+    fn slot(self: *PrefillProbe, name: []const u8) !usize {
         for (self.names[0..self.n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return i;
+        if (self.n == n_max) return error.ProbeStagesFull;
         self.names[self.n] = name;
         self.n += 1;
         return self.n - 1;
@@ -1640,17 +1653,21 @@ const PrefillProbe = struct {
         try self.g.evalAll(&.{x});
         const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
-        self.ns[self.slot(name)] += d;
-        const chunk: usize = @min(self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        self.ns[try self.slot(name)] += d;
+        const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
         if (is_routed) {
             const after = self.stats_of(self.stats_ctx);
             self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
             self.read_bytes += after.expert_bytes_read -| self.before.expert_bytes_read;
             self.misses += after.expert_cache_misses -| self.before.expert_cache_misses;
-            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(self.g.shapeOf(x).dim(0));
         }
-        if (std.mem.eql(u8, name, "out.h")) self.layers_done += 1;
+        // Every pass puts out.h once per chunk and layer ([b, s, hc, dim]): the header's chunks and each chunk's rows.
+        if (std.mem.eql(u8, name, "out.h")) {
+            self.layers_done += 1;
+            const sh = self.g.shapeOf(x);
+            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(sh.dim(0) * sh.dim(1));
+        }
     }
 };
 
@@ -1709,6 +1726,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer st.deinit(g, gpa);
     var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
     const s0 = stats_of(@ptrCast(&arm.hook));
+    dsv41_prof.reset(); // the construction's warm-up routed calls do not count
     const t0 = std.Io.Timestamp.now(io, .boot);
     probe.last = t0;
     const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
@@ -1728,6 +1746,10 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+    // A profile build (-Ddsv41-prefill-timers=true): the routed calls' host time by step, the waves and launches.
+    if (dsv41_prof.enabled) std.debug.print("PREFILL_PROFILE_ROUTED {{\"barrier_s\": {d:.3}, \"route_s\": {d:.3}, \"read_wait_s\": {d:.3}, \"encode_s\": {d:.3}, \"drain_s\": {d:.3}, \"join_s\": {d:.3}, \"dig_calls\": {d}, \"waves\": {d}, \"launches\": {d}}}\n", .{
+        dsv41_prof.seconds(.barrier), dsv41_prof.seconds(.route), dsv41_prof.seconds(.read_wait), dsv41_prof.seconds(.encode), dsv41_prof.seconds(.drain), dsv41_prof.seconds(.join), dsv41_prof.calls, dsv41_prof.waves, dsv41_prof.launches,
+    });
 }
 
 /// DECODE_PROFILE lines: the per-phase means over the cycles (ms per cycle) and the stream's.

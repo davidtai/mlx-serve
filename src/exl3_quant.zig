@@ -16,6 +16,7 @@ const selfcheck = @import("exl3_selfcheck.zig");
 const kr = @import("kernel_routes.zig");
 const ks = @import("kernel_set.zig");
 const quant = @import("quant.zig");
+const prof = @import("dsv41_prefill_timers.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -692,7 +693,9 @@ pub fn DigXPrefill(comptime G: type) type {
 
         /// The prefill boundary: every wave still in flight evaluated, oldest first.
         pub fn finish(self: *Self, g: *G) !void {
+            const t = prof.now();
             while (self.flight.items.len > 0) try self.drainOne(g);
+            prof.charge(.drain, t);
         }
 
         fn drainOne(self: *Self, g: *G) !void {
@@ -713,6 +716,8 @@ pub fn DigXPrefill(comptime G: type) type {
             const a_rows = rowsOf(G, g, act, 0);
             if (rows.act_row == null and a_rows != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill act has {d} rows for {d} routed rows", .{ a_rows, n_rows });
             if (rows.act_row) |ar| if (ar.len != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: {d} act rows for {d} routed rows", .{ ar.len, n_rows });
+            var tp = prof.now();
+            prof.countCall();
             try self.group(rows, rowsOf(G, g, bank.gate.code, 0), a_rows);
             const carried = n_rows <= self.shape.carry_rows;
             const a = self.a;
@@ -729,7 +734,12 @@ pub fn DigXPrefill(comptime G: type) type {
                 while (i < order.len and i - first < self.shape.wave and wave_rows + cnt[order[i]] <= self.shape.row_budget) : (i += 1) wave_rows += cnt[order[i]];
                 const solo = wave_rows > self.shape.row_budget;
                 const keep: usize = if (solo) 0 else self.shape.inflight - 1;
+                prof.charge(.encode, tp);
+                tp = prof.now();
                 while (self.flight.items.len > keep) try self.drainOne(g);
+                prof.charge(.drain, tp);
+                tp = prof.now();
+                prof.count(1, 5);
                 var ex: [wave_max]WaveExpert = undefined;
                 for (order[first..i], 0..) |gi, j| {
                     ex[j] = .{ .slot = self.gslot.items[gi], .rows = cnt[gi] };
@@ -743,31 +753,46 @@ pub fn DigXPrefill(comptime G: type) type {
                 const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off]);
                 self.parts.appendAssumeCapacity(g.keep(y));
                 if (solo) {
+                    prof.charge(.encode, tp);
+                    tp = prof.now();
                     try g.evalAll(&.{y});
+                    prof.charge(.drain, tp);
+                    tp = prof.now();
                 } else {
                     try g.asyncEval(&.{y});
                     self.flight.appendAssumeCapacity(g.keep(y));
                 }
                 g.resetTo(m);
             }
+            prof.charge(.encode, tp);
             return carried;
         }
 
         pub fn call(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !G.T {
             const n_rows = rows.slot.len;
             const carried = try self.runWaves(g, act, rows, bank);
+            var tp = prof.now();
             if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
+            prof.charge(.drain, tp);
+            tp = prof.now();
             const m = g.mark();
             const joined = try g.concat(self.parts.items, 0);
             for (self.parts.items) |x| g.release(x);
             self.parts.clearRetainingCapacity();
+            prof.charge(.join, tp);
+            tp = prof.now();
             if (!carried) try g.evalAll(&.{joined});
+            prof.charge(.drain, tp);
+            tp = prof.now();
             for (self.pos.items, 0..) |p, j| self.inv.items[p] = @intCast(j);
             const ord = try g.hostArray(std.mem.sliceAsBytes(self.inv.items), &.{@intCast(n_rows)}, .uint32);
             const result = try g.take(joined, ord, 0);
             const kept = g.keep(result);
             errdefer g.release(kept);
+            prof.charge(.join, tp);
+            tp = prof.now();
             if (carried) try g.asyncEval(&.{result}) else try g.evalAll(&.{result});
+            prof.charge(.drain, tp);
             g.resetTo(m);
             return kept;
         }
@@ -778,7 +803,9 @@ pub fn DigXPrefill(comptime G: type) type {
         /// values are `call`'s: the same wave arrays, no concatenate or take.
         pub fn callParts(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T), alloc: Allocator, outs: *std.ArrayList(G.T), pos: *std.ArrayList(u32)) !void {
             const carried = try self.runWaves(g, act, rows, bank);
+            const tp = prof.now();
             if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
+            prof.charge(.drain, tp);
             try outs.ensureUnusedCapacity(alloc, self.parts.items.len);
             try pos.appendSlice(alloc, self.pos.items);
             outs.appendSliceAssumeCapacity(self.parts.items);
@@ -1238,6 +1265,90 @@ test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wav
         t.release(res);
         try r.finish(&t);
     }
+}
+
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device): L1's
+// first device run and its exactness proof, seconds long, no model load. A handful of real records (layer 0's
+// first 16 experts, loaded by the stream into MLX slot rows) through the real DIG-X prefill launches, one K16-shaped
+// group call at 8 experts per wave against the same call at Record 3's 4: the outputs equal, bit for bit.
+test "dsv41 smoke 0b: L1: DIG-X prefill waves at 8 experts per wave equal Record 3's 4, bit for bit, on real records" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const ops = @import("deepseek_v41_ops.zig");
+    const es = @import("expert_stream.zig");
+    const eb = @import("expert_bank.zig");
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(a, s);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("kernel set refused: {s}\n", .{kd.message()});
+        return e;
+    };
+    defer set.deinit();
+    set.install(ops.MlxOps, &g);
+    defer ks.Set.uninstall(ops.MlxOps, &g);
+    // Layer 0's first 16 experts, read by the stream into 16 persistent MLX rows (the base bank).
+    var bdiag: eb.Diag = .{};
+    var bank = eb.Bank.open(a, io, dir, eb.dsv41, &bdiag) catch |e| {
+        std.debug.print("bank refused: {s}\n", .{bdiag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const n_experts = 16;
+    var rows: [40]u32 = @splat(0);
+    rows[0] = n_experts;
+    const st = try es.Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = n_experts, .transient_rows = n_experts, .slot_memory = .{ .mlx = s } });
+    defer st.deinit();
+    var ids: [n_experts]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(i);
+    const r = try st.route(0, &ids, &.{});
+    defer st.release(r);
+    for (0..r.n_parts) |p| {
+        try st.waitGu(r, @intCast(p));
+        try st.waitDown(r, @intCast(p));
+    }
+    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    const rf = st.refsOf(r, &refs);
+    try testing.expectEqual(@as(usize, n_experts), rf.len);
+    for (rf) |x| try testing.expectEqual(es.BankKind.base, x.bank);
+    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    const bank_arrays: BankArrays(ops.MlxOps.T) = .{
+        .gate = .{ .code = ba.gate.code, .rout = ba.gate.rout, .rin = ba.gate.rin },
+        .up = .{ .code = ba.up.code, .rout = ba.up.rout, .rin = ba.up.rin },
+        .down = .{ .code = ba.down.code, .rout = ba.down.rout, .rin = ba.down.rin },
+    };
+    // A K16-shaped group call at a handful of records: 16 experts x 64 rows, rows interleaved by expert.
+    const per = 64;
+    const slots = try a.alloc(u32, n_experts * per);
+    defer a.free(slots);
+    for (slots, 0..) |*sl, i| sl.* = rf[i % n_experts].row;
+    const xs = try a.alloc(f32, slots.len * 5120);
+    defer a.free(xs);
+    for (xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) / 32.0;
+    const act = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ @intCast(slots.len), 5120 }, .float32), .bfloat16);
+    var outs: [2][]f32 = undefined;
+    var n_out: usize = 0;
+    defer for (outs[0..n_out]) |o| a.free(o);
+    for ([_]PrefillShape{ PrefillShape.record3, PrefillShape.tier }) |shape| {
+        var w = try DigXPrefill(ops.MlxOps).init(a, &set.reg, shape, &kd);
+        defer w.deinit(&g);
+        const y = try w.call(&g, act, .{ .slot = slots }, bank_arrays);
+        defer g.release(y);
+        try w.finish(&g);
+        outs[n_out] = try a.alloc(f32, slots.len * 5120);
+        n_out += 1;
+        _ = try g.hostF32(y, outs[n_out - 1]);
+    }
+    try testing.expect(PrefillShape.tier.wave == 8 and PrefillShape.record3.wave == 4);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(outs[0]), std.mem.sliceAsBytes(outs[1]));
+    var nonzero: usize = 0;
+    for (outs[1]) |v| nonzero += @intFromBool(v != 0);
+    std.debug.print("\nL1 smoke: {d} rows x 5120 over {d} real records: wave 8 == wave 4, bit for bit ({d} nonzero values)\n", .{ slots.len, n_experts, nonzero });
+    try testing.expect(nonzero > slots.len);
 }
 
 test "dsv41 kernels ops: the prefill wave route refuses by name, before any launch" {

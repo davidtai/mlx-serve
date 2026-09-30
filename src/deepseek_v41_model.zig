@@ -154,6 +154,16 @@ pub fn Model(comptime G: type) type {
                 lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
                 if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
             }
+            // The prefill core's sink views, once per layer (`W.sink4`).
+            if (tier.routes.prefill_attn) for (self.layers) |*lw| {
+                lw.sink4 = try self.own(g, try Tr.sinkView(g, cp, lw.attn_sink));
+            };
+            // DENSE16 o-projection: its rhs index pair, once, shared by every layer (`W.oproj_idx`).
+            if (tier.routes.prefill_oproj) {
+                const oi = try Tr.oprojIndices(g, cp);
+                const owned: [2]T = .{ try self.own(g, oi[0]), try self.own(g, oi[1]) };
+                for (self.layers) |*lw| lw.oproj_idx = owned;
+            }
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, cp));
             self.inv_yarn = try self.own(g, try Tr.yarnInvFreq(g, cp));
             self.embed = .{ .table = try req(lookup, "embed.weight") };
@@ -679,6 +689,7 @@ pub fn Model(comptime G: type) type {
             }
             try g.evalAll(hs);
             g.resetTo(embed_wave);
+            try probe.put("embed", hs[0]);
             // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
             const carries = try a.alloc(Tr.Carry, nc);
             @memset(carries, .{});
@@ -703,24 +714,34 @@ pub fn Model(comptime G: type) type {
                     // One sub-wave per chunk: its attention side is freed before the next chunk's, only
                     // its Half and its shared runtime kept to the layer's routed call (as chunk-major
                     // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
+                    probeChunk(probe, i);
                     const wave = g.mark();
                     var h = hs[i];
-                    if (li.engram_slot) |slot| h = if (posting)
-                        try self.engramLayerPosted(g, a, slot, h, (posts[slot] orelse return error.EngramPostMissing)[i] orelse return error.EngramPostMissing, sp[1] - sp[0])
-                    else
-                        try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                    if (li.engram_slot) |slot| {
+                        h = if (posting)
+                            try self.engramLayerPosted(g, a, slot, h, (posts[slot] orelse return error.EngramPostMissing)[i] orelse return error.EngramPostMissing, sp[1] - sp[0])
+                        else
+                            try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                        // The profile's own stage for the Engram read and add (else it lands in attn.pre).
+                        try probe.put("engram.add", h);
+                    }
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
                     // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
                     const hf = halves[i];
                     try fence(g, st, &.{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb });
+                    // The profile's split of the chunk's carry-over: the fence's evaluation, then the keeps and
+                    // the wave's frees (each probe re-reads an evaluated kept array: its segment is the host work).
+                    try probe.put("chunk.fence", hf.moe_in);
                     keepHalf(g, &halves[i]);
                     carries[i].persistShared(g, &shareds[i]);
                     g.resetTo(wave);
+                    try probe.put("chunk.frees", halves[i].moe_in);
                 }
                 if (want_main and li.dspark_target) n_main += 1;
                 // Per chunk: the resident gate (M == the chunk, as chunk-major).
-                for (halves, xfs, routes_) |hf, *xf, *r| {
+                for (halves, xfs, routes_, 0..) |hf, *xf, *r, ri| {
+                    probeChunk(probe, ri);
                     xf.* = try g.reshape(hf.moe_in, &.{ -1, dim });
                     r.* = try Tr.router(g, probe, c, rt, self.kx.at(l), lw, xf.*);
                 }
@@ -736,6 +757,7 @@ pub fn Model(comptime G: type) type {
                     }
                     // One sub-wave per routed group: its routed outputs, combines and HC posts are freed
                     // once the group's new hidden states are evaluated and kept.
+                    probeChunk(probe, i);
                     const group_wave = g.mark();
                     const cat_xf = if (j - i == 1) xfs[i] else try g.concat(xfs[i..j], 0);
                     const idxs = try a.alloc(T, j - i);
@@ -776,6 +798,7 @@ pub fn Model(comptime G: type) type {
                     }
                     var pos: c_int = 0;
                     for (i..j) |k| {
+                        probeChunk(probe, k);
                         const nk = g.shapeOf(xfs[k]).dim(0);
                         const y = if (parts) |pt| blk: {
                             const loc = if (j - i == 1) pt.loc else try g.slice(pt.loc, &.{ pos, 0, 0 }, &.{ pos + nk, top, 2 }, &.{ 1, 1, 1 });
@@ -789,7 +812,9 @@ pub fn Model(comptime G: type) type {
                         pos += nk;
                         const sh = g.shapeOf(halves[k].moe_in);
                         const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
+                        try probe.put("moe.y", mo);
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
+                        try probe.put("out.h", next);
                         g.release(hs[k]);
                         hs[k] = g.keep(next);
                         g.release(pms[k]);
@@ -801,6 +826,7 @@ pub fn Model(comptime G: type) type {
                         if (parts != null) hook.releaseParts(g);
                     }
                     g.resetTo(group_wave);
+                    try probe.put("group.frees", hs[i]);
                     i = j;
                 }
                 try g.evalAll(hs);
@@ -816,6 +842,7 @@ pub fn Model(comptime G: type) type {
                         try self.postSlot(posts[slot + 1].?, slot + 1, rows, spans);
                     }
                 };
+                try probe.put("layer.end", hs[0]);
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));
             st.offset += @intCast(ids.len);
@@ -838,6 +865,13 @@ pub fn Model(comptime G: type) type {
         }
 
         /// K16's per-chunk sub-wave keeps a chunk's Half past its reset (released after its HC post).
+        /// A probe that attributes by chunk (the profile's) learns which K16 chunk the next stages belong to;
+        /// compiled out for every other probe (NoProbe in timed builds).
+        fn probeChunk(probe: anytype, i: usize) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "atChunk")) probe.atChunk(i);
+        }
+
         fn keepHalf(g: *G, hf: *Tr.Half) void {
             inline for (@typeInfo(Tr.Half).@"struct".field_names) |name| @field(hf, name) = g.keep(@field(hf, name));
         }
@@ -1092,6 +1126,72 @@ test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one
     try testing.expectEqual(@as(u32, 10), st.layers[1].compress.rows());
     // The engram needs its row source; a model without it refuses at construction.
     try testing.expectError(error.EngramSourceRequired, TM.init(testing.allocator, &g, m.c, tier, &lookup, null));
+}
+
+/// Records each stage a pass publishes and the chunk the profile charges it to (PrefillProbe's attribution).
+const StageProbe = struct {
+    names: std.ArrayList([]const u8) = .empty,
+    chunks: std.ArrayList(usize) = .empty,
+    cur: usize = 0,
+    fn deinit(self: *StageProbe) void {
+        self.names.deinit(testing.allocator);
+        self.chunks.deinit(testing.allocator);
+    }
+    pub fn atChunk(self: *StageProbe, i: usize) void {
+        self.cur = i;
+    }
+    pub fn put(self: *StageProbe, name: []const u8, _: anytype) !void {
+        try self.names.append(testing.allocator, name);
+        try self.chunks.append(testing.allocator, self.cur);
+    }
+    fn count(self: *const StageProbe, name: []const u8) usize {
+        var n: usize = 0;
+        for (self.names.items) |x| n += @intFromBool(std.mem.eql(u8, x, name));
+        return n;
+    }
+};
+
+test "dsv41 model: the K16 profile charges a chunk's carry-over to its own stages (combine, HC post, fence, frees, layer end); out.h once per chunk and layer" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    var p: StageProbe = .{};
+    defer p.deinit();
+    _ = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, &p);
+    const nl: usize = m.c.n_layers;
+    const nc = 3; // 8 + 8 + 4 rows
+    try testing.expectEqualStrings("embed", p.names.items[0]);
+    // out.h once per chunk and layer, layer-major, each charged to its own chunk (the header's chunks: 3, not 0).
+    var outs: std.ArrayList(usize) = .empty;
+    defer outs.deinit(testing.allocator);
+    for (p.names.items, p.chunks.items) |x, ch| if (std.mem.eql(u8, x, "out.h")) try outs.append(testing.allocator, ch);
+    try testing.expectEqual(nl * nc, outs.items.len);
+    for (outs.items, 0..) |ch, k| try testing.expectEqual(k % nc, ch);
+    for ([_][]const u8{ "chunk.fence", "chunk.frees", "moe.y", "attn.in" }) |x| try testing.expectEqual(nl * nc, p.count(x));
+    try testing.expectEqual(nl, p.count("layer.end"));
+    try testing.expect(p.count("group.frees") >= nl);
+    // attn.in follows only a carry-over stage of its own, and every moe.y is its chunk's HC post's predecessor.
+    for (p.names.items, p.chunks.items, 0..) |x, ch, k| {
+        if (std.mem.eql(u8, x, "attn.in")) {
+            const prev = p.names.items[k - 1];
+            var ok = false;
+            for ([_][]const u8{ "embed", "chunk.frees", "layer.end", "engram.add" }) |want| ok = ok or std.mem.eql(u8, prev, want);
+            try testing.expect(ok);
+        }
+        if (std.mem.eql(u8, x, "out.h")) {
+            try testing.expectEqualStrings("moe.y", p.names.items[k - 1]);
+            try testing.expectEqual(ch, p.chunks.items[k - 1]);
+        }
+    }
 }
 
 test "dsv41 model: the AR dry path routes every layer call of every forward through the expert source" {

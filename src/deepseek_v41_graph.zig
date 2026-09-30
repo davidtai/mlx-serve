@@ -48,6 +48,13 @@ pub fn LayerW(comptime T: type) type {
         idx_q: ?struct { wq_b: Q(T), weights_proj: T } = null,
         /// W97: the grouped wo_a dequantized once to f32 `[g, rank, in]`.
         wo_a_dense: ?T = null,
+        /// DENSE16 o-projection (`Routes.prefill_oproj`): the two gather_qmm rhs index arrays (uint32), wo_a's
+        /// groups `arange(o_groups)` and wo_b's `[0]`, built once at construction and shared by every layer
+        /// (Python builds them once too; per call they were 4 of the route's 9 launches).
+        oproj_idx: ?[2]T = null,
+        /// The prefill core (`Routes.prefill_attn`): the attention sink as its `[1, 1, H, 1]` f32 view, built once at
+        /// construction (the checkpoint stores it f32: the cast was already free, the per-call reshape was not).
+        sink4: ?T = null,
         gate_w: T,
         gate_bias: T,
         sh_w1: Q(T),
@@ -75,6 +82,12 @@ pub fn Shared(comptime T: type) type {
         win_mask: ?T = null,
         win_rows: u32 = 0,
         win_drop: u32 = 0,
+        /// The prefill core's window rows `[s, W]` and their validity (`_window_selected_idx`), identical for
+        /// every layer of one forward or K16 chunk (same key as the mask's): built by its first layer and reused.
+        win_idx: ?T = null,
+        win_valid: ?T = null,
+        win_sel_rows: u32 = 0,
+        win_sel_drop: u32 = 0,
     };
 }
 
@@ -137,6 +150,10 @@ pub const Routes = struct {
     /// JOINLESS (K16): the combine reads the wide call's unjoined outputs in place (each
     /// assignment's (output, row)); no concatenate / take of the routed rows. Exact vs SMALLK.
     prefill_joinless: bool = false,
+    /// HCPOST (Q3_PREFILL_ATTN hcpost): the attention side's HC post above `rc_max_rows` (C15's tape below) as the
+    /// compiled `_hc_post_impl` (HcPost's region, the closure K16's ffn combine already runs), not the eager chain;
+    /// the single-span pass's MoE-side combine too (`hcPostRoute`; K16's is always compiled). Exact.
+    prefill_hc_post: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,
@@ -885,6 +902,17 @@ pub fn Trunk(comptime G: type) type {
             return g.broadcastTo(try g.expandDims(inside, 0), &.{ b, s, t_len });
         }
 
+        /// The prefill core's window selection, built by a forward's (a K16 chunk's) first layer and reused.
+        fn windowSelection(g: *G, c: *const v41.Config, shared: *Share, positions: T, t_len: c_int, drop: u32) !struct { idx: T, valid: T } {
+            if (shared.win_idx) |idx| if (shared.win_sel_rows == t_len and shared.win_sel_drop == drop) return .{ .idx = idx, .valid = shared.win_valid.? };
+            const sel = try windowSelectedIdx(g, c, positions, t_len, drop);
+            shared.win_idx = sel.idx;
+            shared.win_valid = sel.valid;
+            shared.win_sel_rows = @intCast(t_len);
+            shared.win_sel_drop = drop;
+            return .{ .idx = sel.idx, .valid = sel.valid };
+        }
+
         /// The forward's window mask, built by its first layer and reused.
         fn windowMask(g: *G, c: *const v41.Config, shared: *Share, positions: T, t_len: c_int, drop: u32, b: c_int, s: c_int) !T {
             if (shared.win_mask) |m| if (shared.win_rows == t_len and shared.win_drop == drop) return m;
@@ -1369,6 +1397,20 @@ pub fn Trunk(comptime G: type) type {
                 out[n] = .{ .name = "o-projection DENSE16", .ok = try checkClose(g, try outProjDense16(g, c, og, w, 1, S), try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, 1, S), 3e-2) };
                 n += 1;
             }
+            if (rt.prefill_hc_post) {
+                // HCPOST: the compiled `_hc_post_impl` against the eager chain at a prompt width, bit for bit, on
+                // both stream dtypes (the f32 attention output over a bf16 or an f32 residual: the two fused texts).
+                const x = try checkFill(g, r, scratch, &.{ 1, S, dim }, 1.0, .float32);
+                const post = try checkFill(g, r, scratch, &.{ 1, S, hc }, 1.0, .float32);
+                const comb = try checkFill(g, r, scratch, &.{ 1, S, hc, hc }, 0.5, .float32);
+                for ([_]Dtype{ .bfloat16, .float32 }, [_][]const u8{ "HC post compiled, bf16 stream", "HC post compiled, f32 stream" }) |dt, name| {
+                    const res = try checkFill(g, r, scratch, &.{ 1, S, hc, dim }, 1.0, dt);
+                    var o: [1]T = undefined;
+                    try g.tape(HcPost, c, &.{ x, res, post, comb }, &o);
+                    out[n] = .{ .name = name, .ok = try checkEqual(g, o[0], try hcPost(g, x, res, post, comb)) };
+                    n += 1;
+                }
+            }
             if (kx.joinless) |*jl| {
                 // Three outputs (40 + 24 + 64 rows) holding 64 rows x top-k assignments in a
                 // deterministic shuffle; against take(concat(outs), inverse) and the stock combine.
@@ -1589,6 +1631,19 @@ pub fn Trunk(comptime G: type) type {
             return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size, .hc_mult = c.hc_mult };
         }
 
+        /// `W.sink4`: a layer's attention sink as the prefill core's `[1, 1, H, 1]` f32 view.
+        pub fn sinkView(g: *G, c: *const v41.Config, attn_sink: T) !T {
+            return g.reshape(try g.astype(attn_sink, .float32), &.{ 1, 1, @intCast(c.n_heads), 1 });
+        }
+
+        /// `W.oproj_idx`: wo_a's group indices `arange(o_groups)` and wo_b's `[0]`, uint32, built once.
+        pub fn oprojIndices(g: *G, c: *const v41.Config) ![2]T {
+            return .{
+                try g.astype(try g.arange(0, @floatFromInt(c.o_groups), 1, .int32), .uint32),
+                try g.astype(try g.arange(0, 1, 1, .int32), .uint32),
+            };
+        }
+
         /// DENSE16 `outProj` after the prefill core: og f32 [g, S, in] -> bf16, the grouped o-LoRA as
         /// gather_qmm over wo_a's packed [g, rank, in] view (rhs = arange(g)), [S, g x rank], then
         /// wo_b's qmm, widened to f32.
@@ -1599,8 +1654,9 @@ pub fn Trunk(comptime G: type) type {
             const ss = g.shapeOf(w.wo_a.s);
             const wa = try g.reshape(w.wo_a.w, &.{ G_, R, ws.dim(-1) });
             const sa = try g.reshape(w.wo_a.s, &.{ G_, R, ss.dim(-1) });
-            const idx = try g.astype(try g.arange(0, @floatFromInt(G_), 1, .int32), .uint32);
-            const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, idx, w.wo_a.mode);
+            // The rhs indices, built once at construction (`W.oproj_idx`; the route sets them by construction).
+            const oi = w.oproj_idx.?;
+            const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, oi[0], w.wo_a.mode);
             // [S, g x rank] (the bf16 copy), then wo_b as the lane does: one gather_qmm over its [1, out,
             // in / 4] view with rhs [0] (the NAX gather kernel at the chunk's rows), widened to f32.
             const flat = try g.reshape(try g.transposeAxes(o2, &.{ 1, 0, 2 }), &.{ 1, b * s, G_ * R });
@@ -1608,8 +1664,7 @@ pub fn Trunk(comptime G: type) type {
             const bss = g.shapeOf(w.wo_b.s);
             const wb = try g.reshape(w.wo_b.w, &.{ 1, bs_.dim(0), bs_.dim(1) });
             const sb = try g.reshape(w.wo_b.s, &.{ 1, bss.dim(0), bss.dim(1) });
-            const idx0 = try g.astype(try g.arange(0, 1, 1, .int32), .uint32);
-            const y = try g.gatherQmm(flat, wb, sb, idx0, w.wo_b.mode);
+            const y = try g.gatherQmm(flat, wb, sb, oi[1], w.wo_b.mode);
             return g.astype(try g.reshape(y, &.{ b, s, bs_.dim(0) }), .float32);
         }
 
@@ -1699,9 +1754,10 @@ pub fn Trunk(comptime G: type) type {
                 };
                 if (pa) |core| {
                     // o f32 [8, S, 4096]: inverse-roped, in the o-LoRA group layout.
-                    const sel = try windowSelectedIdx(g, c, positions, g.shapeOf(window).dim(1), drop);
+                    const sel = try windowSelection(g, c, shared, positions, g.shapeOf(window).dim(1), drop);
                     const cmp: ?[2]T = if (ckv) |kv| .{ kv, cidx.? } else null;
-                    const sink = try g.reshape(try g.astype(w.attn_sink, .float32), &.{ 1, 1, H, 1 });
+                    // The sink's [1, 1, H, 1] view, built once at construction (`W.sink4`; the route sets it).
+                    const sink = w.sink4.?;
                     // The core's QK scores live inside the score wave, as the eager chain's do.
                     const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                     var og = try core.attend(g, q, window, sel.idx, sel.valid, cmp, sink, .{ cs.cos, cs.sin });
@@ -1963,7 +2019,19 @@ pub fn Trunk(comptime G: type) type {
                 const mx = try tapeMixes(g, c, t, lk.ffnMix(), d, f[1], f[2], fnw, base, scale);
                 return .{ try g.reshape(f[3], &.{ d.b, d.s, d.dim }), try g.reshape(f[0], &.{ d.b, d.s, d.hc, d.dim }), mx.post, mx.comb, mx.pre };
             };
-            const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
+            return hcFfnFrom(g, c, lk, try hcPost(g, attn_out, residual, attn_post, attn_comb), attn_pre, fnw, base, scale, norm_w);
+        }
+
+        /// `hcFfnPrep` at prompt widths with the attention HC post compiled (HCPOST: HcPost's region, prepared at
+        /// construction): the eager chain's ops in one region; the ffn mixes and pre-norm follow as there.
+        pub fn hcFfnPrepCompiledPost(g: *G, c: *const v41.Config, lk: LK, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+            var o: [1]T = undefined;
+            try g.tape(HcPost, c, &.{ attn_out, residual, attn_post, attn_comb }, &o);
+            return hcFfnFrom(g, c, lk, o[0], attn_pre, fnw, base, scale, norm_w);
+        }
+
+        /// The ffn side after the attention HC post `h1`: its mixes, collapse and RMSNorm.
+        fn hcFfnFrom(g: *G, c: *const v41.Config, lk: LK, h1: T, attn_pre: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
             const m = try hcMixes(g, c, lk.ffnMix(), h1, fnw, base, scale);
             const x = if (hcNormFor(lk.hc_norm, g, h1)) |hn| try hn.preNorm(g, h1, attn_pre, norm_w) else try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
             return .{ x, h1, m.post, m.comb, m.pre };
@@ -1990,13 +2058,14 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// The MoE-side HC combine (`_hc_post_impl`): C15's `q3ht_combine` at <= 8 rows, else
-        /// K4's tape at its rows, else the eager einsum.
+        /// K4's tape at its rows or HCPOST's above 8 (the compiled region K16's combine runs), else the eager einsum.
         pub fn hcPostRoute(g: *G, c: *const v41.Config, rt: *const Routes, lk: LK, x: T, residual: T, post: T, comb: T) !T {
             if (lk.tape) |t| if (tapeRows(g, residual)) |d| {
                 const h = try t.combine(g, try g.reshape(x, &.{ d.m, d.dim }), try g.reshape(residual, &.{ d.m, d.hc, d.dim }), try g.reshape(post, &.{ d.m, d.hc }), try g.reshape(comb, &.{ d.m, d.hc * d.hc }));
                 return g.reshape(h, &.{ d.b, d.s, d.hc, d.dim });
             };
-            if (rowsOf(g, residual, 2) <= rt.hc_rows) {
+            const rows = rowsOf(g, residual, 2);
+            if (rows <= rt.hc_rows or (rt.prefill_hc_post and rows > rc_max_rows)) {
                 var o: [1]T = undefined;
                 try g.tape(HcPost, c, &.{ x, residual, post, comb }, &o);
                 return o[0];
@@ -2073,7 +2142,7 @@ pub fn Trunk(comptime G: type) type {
             if (rt.attn_rows > 0) inline for (.{ QkvPrep, OutPrep, GatePrefix, MoeCombine }) |B| try g.prepareTape(B, c);
             if (rt.hc_rows > 0) inline for (.{ HcAttnPrep, HcFfnPrep, HcPost }) |B| try g.prepareTape(B, c);
             if (rt.small_rows > 0) inline for (.{ HcAttnPrep, Seg2, Seg3, HcPost }) |B| try g.prepareTape(B, c);
-            if (layer_major) try g.prepareTape(HcPost, c);
+            if (layer_major or rt.prefill_hc_post) try g.prepareTape(HcPost, c);
         }
 
         /// `DecoderLayer.__call__`: attention and MoE, each inside a
@@ -2121,6 +2190,9 @@ pub fn Trunk(comptime G: type) type {
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
             } else {
+                // The chunk's inputs (evaluated already): this stage takes whatever ran since the previous probe
+                // (the previous chunk's fence and frees, a layer's end), so attn.pre is the HC premix alone.
+                try p.put("attn.in", h);
                 a = try hcAttnPrep(g, c, lk, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
                 try p.put("attn.pre", a[1]);
                 try p.put("attn.post", a[2]);
@@ -2132,7 +2204,10 @@ pub fn Trunk(comptime G: type) type {
             if (hc_tape) {
                 try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
             } else {
-                f = try hcFfnPrep(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
+                f = if (rt.prefill_hc_post and rowsOf(g, h, 2) > rc_max_rows)
+                    try hcFfnPrepCompiledPost(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm)
+                else
+                    try hcFfnPrep(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
                 try p.put("hc1.h", f[1]);
                 try p.put("ffn.pre", f[4]);
                 try p.put("ffn.post", f[2]);
@@ -2339,6 +2414,8 @@ fn traceLayerW(g: *TraceOps, c: *const v41.Config, li: v41.LayerInfo) !LayerW(u3
     if (li.index_source) {
         w.idx_q = .{ .wq_b = try qIn(g, c.index_n_heads * c.index_head_dim, c.q_lora_rank, .mxfp8), .weights_proj = try g.input(&.{ ci(c.index_n_heads), ci(H) }, .bfloat16) };
     }
+    // The prefill core's sink view, as the model builds it when the route is on.
+    w.sink4 = try Tr.sinkView(g, c, w.attn_sink);
     return w;
 }
 
@@ -2699,6 +2776,31 @@ test "dsv41 graph: the m1rows head takes rows 1..8, M 5 and 7 padded to M + 1, f
     try testing.expectError(error.RouteInput, kr.HeadRows(TraceOps).init(&g, &reg, try g.input(&.{ 4096, 5120 }, .bfloat16), null));
 }
 
+test "dsv41 graph: the DENSE16 o-projection takes its rhs index pair from construction (no per-call arange or u32 cast)" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    var w = try traceLayerW(&g, &c, c.layers[1]);
+    w.oproj_idx = try Tr.oprojIndices(&g, &c);
+    const s: c_int = 64;
+    const og = try g.input(&.{ @intCast(c.o_groups), s, @intCast(c.n_heads * c.head_dim / c.o_groups) }, .float32);
+    const from = g.nodes.items.len;
+    const out = try Tr.outProjDense16(&g, &c, og, &w, 1, s);
+    try testing.expectEqual(@as(u8, 3), g.shapeOf(out).n);
+    var aranges: usize = 0;
+    var u32_casts: usize = 0;
+    var gathers: usize = 0;
+    for (g.nodes.items[from..]) |nd| {
+        aranges += @intFromBool(nd.op == .arange);
+        u32_casts += @intFromBool(nd.op == .astype and nd.dtype == .uint32);
+        gathers += @intFromBool(nd.op == .gather_qmm);
+    }
+    try testing.expectEqual(@as(usize, 0), aranges);
+    try testing.expectEqual(@as(usize, 0), u32_casts);
+    // Both projections still gather through their packed views (wo_a's groups, wo_b's one expert).
+    try testing.expectEqual(@as(usize, 2), gathers);
+}
+
 test "dsv41 graph: the prefill attention core takes the prompt widths per layer kind; no gathered KVg; verify widths keep the chain" {
     var kd: xk.Diag = .{};
     var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
@@ -2747,14 +2849,18 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
         try testing.expectEqual(Dtype.bool_, g.dtypeOf(o.?));
         try testing.expectEqual(@as(u8, 0), g.shapeOf(o.?).n);
     }
-    // Every prefill route's check builds (all routes on: 3 core kinds, score, select, 2 x 2 HC, combine).
+    // Every prefill route's check builds (all routes on: 3 core kinds, score, select, 2 x 2 HC norms, DENSE16,
+    // 2 compiled HC posts, JOINLESS, the combine).
     const all: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_joinless = true, .selected_keys = true };
     var ka = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &all, &.{});
     defer ka.deinit(&g);
     var checks: [16]Tr.RouteCheck = undefined;
-    const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .prefill_joinless = true, .selected_keys = true };
+    const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .prefill_joinless = true, .prefill_hc_post = true, .selected_keys = true };
+    const oi = try Tr.oprojIndices(&g, &c);
+    for (ws[0..c.n_layers]) |*w| w.oproj_idx = oi;
+    try g.prepareTape(Tr.HcPost, &c);
     const n = try Tr.prefillRoutesCheck(&g, &c, &all_o, &ka, ws[0..c.n_layers], scratch, &checks);
-    try testing.expectEqual(@as(usize, 12), n);
+    try testing.expectEqual(@as(usize, 14), n);
     for (checks[0..n]) |ck| {
         try testing.expectEqual(Dtype.bool_, g.dtypeOf(ck.ok));
         try testing.expectEqual(@as(u8, 0), g.shapeOf(ck.ok).n);
@@ -2762,6 +2868,47 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
     var bad = c;
     bad.window = 64;
     try testing.expectError(error.RouteInput, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &rt, &.{}));
+}
+
+test "dsv41 graph: the prefill core's window selection is built by a chunk's first layer and reused by the next" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    const rt: Routes = .{ .prefill_attn = true, .selected_keys = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+    defer k.deinit(&g);
+    const li = c.layers[1];
+    const w = try traceLayerW(&g, &c, li);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    // Two layers' window lanes at the same state (K16: every layer has taken the same chunks), one chunk's Share.
+    var cache_a = Tr.Cache.init(li, c.window, .{});
+    defer cache_a.deinit(&g);
+    var cache_b = Tr.Cache.init(li, c.window, .{});
+    defer cache_b.deinit(&g);
+    var shared: Tr.Share = .{};
+    const pos = try g.arange(0, 64, 1, .int32);
+    const n0 = g.nodes.items.len;
+    _ = try Tr.attention(&g, NoProbe{}, &c, &rt, k.at(1), li, &w, inv, try g.input(&.{ 1, 64, 5120 }, .float32), pos, &cache_a, &shared);
+    const first = g.nodes.items.len - n0;
+    const idx = shared.win_idx.?;
+    const valid = shared.win_valid.?;
+    try testing.expect(!noneOf(&g, n0, .arange));
+    const n1 = g.nodes.items.len;
+    _ = try Tr.attention(&g, NoProbe{}, &c, &rt, k.at(1), li, &w, inv, try g.input(&.{ 1, 64, 5120 }, .float32), pos, &cache_b, &shared);
+    // The second layer builds no selection (its only arange was the selection's) and holds the first one's arrays.
+    try testing.expect(noneOf(&g, n1, .arange));
+    try testing.expect(g.nodes.items.len - n1 < first);
+    try testing.expectEqual(idx, shared.win_idx.?);
+    try testing.expectEqual(valid, shared.win_valid.?);
+    try expectShape(&g, idx, &.{ 64, @intCast(c.window) }, .int32);
+    // A lane at another length (a different key) builds its own.
+    var cache_c = Tr.Cache.init(li, c.window, .{});
+    defer cache_c.deinit(&g);
+    _ = try Tr.attention(&g, NoProbe{}, &c, &rt, k.at(1), li, &w, inv, try g.input(&.{ 1, 40, 5120 }, .float32), try g.arange(0, 40, 1, .int32), &cache_c, &shared);
+    try testing.expect(shared.win_idx.? != idx);
 }
 
 test "dsv41 graph: the prefill indexer scores and selects in two launches at prompt widths; verify widths keep the chain" {
@@ -3201,6 +3348,96 @@ test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only 
     const prefill = try layerOps(&.{ .attn_rows = attn_compile_max_rows, .hc_rows = hc_compile_max_rows, .small_rows = small_stages_max_rows }, 33);
     defer testing.allocator.free(prefill);
     try testing.expectEqual(@as(usize, 0), std.mem.count(O, prefill, &.{.tape_begin}));
+}
+
+/// K16's attention side and ffn combine over two layers (layer 0 on the bf16 embedding stream, layer 1 on the f32
+/// stream the combine writes), one chunk per width in order: the HcPost region's traces (`mx.compile`'s cache).
+fn k16HcPostTraces(rt: *const Routes, widths: []const c_int) !usize {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    try Tr.prepareRegions(&g, &c, rt, true);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    var ws: [2]LayerW(u32) = undefined;
+    for (&ws, 0..) |*w, l| w.* = try traceLayerW(&g, &c, c.layers[l]);
+    for (widths) |s| {
+        var h = try g.input(&.{ 1, s, 4, 5120 }, .bfloat16);
+        var pm = try g.input(&.{ 1, s, 4 }, .float32);
+        for (&ws, 0..) |*w, l| {
+            const li = c.layers[l];
+            var cache = Tr.Cache.init(li, c.window, .{});
+            defer cache.deinit(&g);
+            var shared: Tr.Share = .{};
+            const half = try Tr.attnAndMoeInput(&g, NoProbe{}, &c, rt, .{}, li, w, inv, h, pm, try g.arange(0, @floatFromInt(s), 1, .int32), &cache, &shared);
+            // The combine's x at the MoE input's dtype (f32: the stream dtype of h1), as forwardLayerMajor casts it.
+            try testing.expectEqual(Dtype.float32, g.dtypeOf(half.moe_in));
+            h = try Tr.prefillHcPost(&g, &c, try g.input(g.shapeOf(half.moe_in).slice(), g.dtypeOf(half.moe_in)), half);
+            try testing.expectEqual(Dtype.float32, g.dtypeOf(h));
+            pm = half.ffn_pre;
+        }
+    }
+    return g.compiles;
+}
+
+/// The single-span pass (`layer`) over two layers, one forward per width in order: the HcPost region's traces.
+fn spanHcPostTraces(rt: *const Routes, widths: []const c_int) !usize {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    try Tr.prepareRegions(&g, &c, rt, false);
+    const inv = try Tr.swaInvFreq(&g, &c);
+    var ws: [2]LayerW(u32) = undefined;
+    for (&ws, 0..) |*w, l| w.* = try traceLayerW(&g, &c, c.layers[l]);
+    for (widths) |s| {
+        var h = try g.input(&.{ 1, s, 4, 5120 }, .bfloat16);
+        var pm = try g.input(&.{ 1, s, 4 }, .float32);
+        for (&ws, 0..) |*w, l| {
+            const li = c.layers[l];
+            var cache = Tr.Cache.init(li, c.window, .{});
+            defer cache.deinit(&g);
+            var shared: Tr.Share = .{};
+            const o = try Tr.layer(&g, NoProbe{}, &c, rt, .{}, li, w, inv, h, pm, try g.arange(0, @floatFromInt(s), 1, .int32), &cache, &shared, TraceRouted{});
+            h = o.h;
+            pm = o.pre_mix;
+        }
+    }
+    return g.compiles;
+}
+
+test "dsv41 graph: HCPOST compiles both HC posts above 8 rows over the eager ops; 8 rows and below keep their chain; one added trace per chunk width" {
+    const O = ops.Op;
+    // Above 8 rows (the part's `rows > SMALL_ROWS`): two tapes, the attention side's and the single-span pass's MoE-side
+    // combine (prepared by prepareRegions for the route alone, not layer-major), holding the eager chain's op multiset.
+    for ([_]c_int{ 9, 32, 64 }) |rows| {
+        const eager = try layerOps(&.{}, rows);
+        defer testing.allocator.free(eager);
+        const hp = try layerOps(&.{ .prefill_hc_post = true }, rows);
+        defer testing.allocator.free(hp);
+        var got = countOps(hp);
+        try testing.expectEqual(@as(u32, 2), got[@backingInt(O.tape_begin)]);
+        got[@backingInt(O.tape_begin)] = 0;
+        got[@backingInt(O.tape_end)] = 0;
+        try testing.expectEqual(countOps(eager), got);
+    }
+    // Decode and verify widths (8 rows and below: C15's tape where it is bound) keep their chain, op for op.
+    for ([_]c_int{ 1, 8 }) |rows| {
+        const e = try layerOps(&.{}, rows);
+        defer testing.allocator.free(e);
+        const on = try layerOps(&.{ .prefill_hc_post = true }, rows);
+        defer testing.allocator.free(on);
+        try testing.expectEqualSlices(O, e, on);
+    }
+    // The compile cost: K16's ffn combine already traces the region once per chunk width (x, h1, post, comb all
+    // f32); the attention side reuses that trace on the f32 stream (layers 1..) and adds one on layer 0's bf16
+    // stream: one added trace per chunk width, at that width's first chunk (two chunks of 64 rows, a 40-row tail).
+    const widths = [_]c_int{ 64, 64, 40 };
+    try testing.expectEqual(@as(usize, 2), try k16HcPostTraces(&.{}, &widths));
+    try testing.expectEqual(@as(usize, 4), try k16HcPostTraces(&.{ .prefill_hc_post = true }, &widths));
+    // The single-span pass (short prompts, the warm-up's 9..32): both combines traced per width, the bf16 stream's
+    // attention post and one f32 signature the ffn combine and later layers share; none with the route off.
+    const span = [_]c_int{ 16, 16, 12 };
+    try testing.expectEqual(@as(usize, 0), try spanHcPostTraces(&.{}, &span));
+    try testing.expectEqual(@as(usize, 4), try spanHcPostTraces(&.{ .prefill_hc_post = true }, &span));
 }
 
 test "dsv41 graph: head codecs and the cached wo_a keep the Python dtypes" {
