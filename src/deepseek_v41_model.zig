@@ -357,23 +357,21 @@ pub fn Model(comptime G: type) type {
             return Tr.engramApplyM1(g, &self.c, en.w[slot], if (self.engram_m1[slot]) |*x| x else null, h, er);
         }
 
-        /// Every chunk's gather of Engram slot `slot`, posted in chunk order (`gpa`-owned until released).
-        fn postSlot(self: *const Self, slot: usize, rows: []const []const i64, spans: []const [2]u32) ![]*eng.RowSource.Posted {
-            const en = &self.engram.?;
-            const list = try self.gpa.alloc(*eng.RowSource.Posted, spans.len);
-            var n: usize = 0;
-            errdefer {
-                for (list[0..n]) |p| {
-                    en.src.drain(p);
-                    en.src.release(self.gpa, p);
-                }
-                self.gpa.free(list);
-            }
-            for (spans, rows) |sp, r| {
-                list[n] = try en.src.post(self.gpa, slot, r, sp[1] - sp[0]);
-                n += 1;
-            }
-            return list;
+        /// A slot's per-chunk posted gathers (`gpa`-owned; null until posted).
+        const PostList = []?*eng.RowSource.Posted;
+
+        /// Every chunk's gather of Engram slot `slot`, posted in chunk order into `list` (its entries null).
+        fn postSlot(self: *const Self, list: PostList, slot: usize, rows: []const []const i64, spans: []const [2]u32) !void {
+            for (spans, rows, list) |sp, r, *p| p.* = try self.engram.?.src.post(self.gpa, slot, r, sp[1] - sp[0]);
+        }
+
+        /// Drain and free a slot's posted gathers (every one taken on the way through; an abort's too).
+        fn releasePosts(self: *const Self, list: PostList) void {
+            for (list) |p| if (p) |x| {
+                self.engram.?.src.drain(x);
+                self.engram.?.src.release(self.gpa, x);
+            };
+            self.gpa.free(list);
         }
 
         /// `mean(h.astype(f32), axis=2).astype(h.dtype)`.
@@ -607,6 +605,18 @@ pub fn Model(comptime G: type) type {
             const shareds = try a.alloc(Tr.Share, nc);
             const mains = try a.alloc([8]T, nc);
             var n_main: usize = 0;
+            // The Engram gathers ahead of the layers that read them: the first Engram slot's chunk by chunk as
+            // the embedding hashes it, each later slot's once the slot before it is taken (one slot held).
+            const posting = if (self.engram) |en| en.posted else false;
+            var posts: [eng.max_layers]?PostList = @splat(null);
+            defer for (&posts) |*ps| if (ps.*) |list| {
+                self.releasePosts(list);
+                ps.* = null;
+            };
+            if (posting) {
+                posts[0] = try self.gpa.alloc(?*eng.RowSource.Posted, nc);
+                @memset(posts[0].?, null);
+            }
             // The embedding's own wave: only each chunk's (kept) h, pre_mix and positions survive it.
             const embed_wave = g.mark();
             for (spans, 0..) |sp, i| {
@@ -615,23 +625,11 @@ pub fn Model(comptime G: type) type {
                 pms[i] = g.keep(e.pre_mix);
                 poss[i] = g.keep(try g.arange(@floatFromInt(offset0 + sp[0]), @floatFromInt(offset0 + sp[1]), 1, .int32));
                 rows[i] = try self.engramRowsFor(st, a, ids[sp[0]..sp[1]]);
+                if (posting) posts[0].?[i] = try self.engram.?.src.post(self.gpa, 0, rows[i], sp[1] - sp[0]);
                 shareds[i] = .{};
             }
             try g.evalAll(hs);
             g.resetTo(embed_wave);
-            // The Engram gathers ahead of the layers that read them (every chunk's rows are hashed above): the
-            // first Engram slot's now, each later slot's once the slot before it is taken (one slot's records held).
-            const posting = if (self.engram) |en| en.posted else false;
-            var posts: [eng.max_layers]?[]*eng.RowSource.Posted = @splat(null);
-            defer for (&posts) |*ps| if (ps.*) |list| {
-                for (list) |p| {
-                    self.engram.?.src.drain(p);
-                    self.engram.?.src.release(self.gpa, p);
-                }
-                self.gpa.free(list);
-                ps.* = null;
-            };
-            if (posting) posts[0] = try self.postSlot(0, rows, spans);
             // Each chunk's shared runtime outlives the per-layer reset (`Tr.Carry`).
             const carries = try a.alloc(Tr.Carry, nc);
             @memset(carries, .{});
@@ -652,8 +650,8 @@ pub fn Model(comptime G: type) type {
                     // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
                     const wave = g.mark();
                     var h = hs[i];
-                    if (li.engram_slot) |slot| h = if (posts[slot]) |list|
-                        try self.engramLayerPosted(g, a, slot, h, list[i], sp[1] - sp[0])
+                    if (li.engram_slot) |slot| h = if (posting)
+                        try self.engramLayerPosted(g, a, slot, h, (posts[slot] orelse return error.EngramPostMissing)[i] orelse return error.EngramPostMissing, sp[1] - sp[0])
                     else
                         try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
@@ -754,11 +752,14 @@ pub fn Model(comptime G: type) type {
                 for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
                 g.resetTo(layer_wave);
                 // This layer's gathers are taken and its waves evaluated: free them, post the next slot's.
-                if (li.engram_slot) |slot| if (posts[slot]) |list| {
-                    for (list) |p| self.engram.?.src.release(self.gpa, p);
-                    self.gpa.free(list);
+                if (posting) if (li.engram_slot) |slot| {
+                    self.releasePosts(posts[slot].?);
                     posts[slot] = null;
-                    if (slot + 1 < c.engram.n_layers) posts[slot + 1] = try self.postSlot(slot + 1, rows, spans);
+                    if (slot + 1 < c.engram.n_layers) {
+                        posts[slot + 1] = try self.gpa.alloc(?*eng.RowSource.Posted, nc);
+                        @memset(posts[slot + 1].?, null);
+                        try self.postSlot(posts[slot + 1].?, slot + 1, rows, spans);
+                    }
                 };
             }
             for (st.layers) |*lc| lc.advance(@intCast(ids.len));

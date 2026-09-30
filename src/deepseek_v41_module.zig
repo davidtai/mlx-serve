@@ -274,6 +274,11 @@ pub const Module = struct {
         if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
+            // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
+            for (c.engram.layer_ids[0..c.engram.n_layers], 0..) |l, sl| {
+                const slot = c.layers[l].engram_slot orelse return error.EngramSlotOrder;
+                if (slot != sl or (sl > 0 and l <= c.engram.layer_ids[sl - 1])) return error.EngramSlotOrder;
+            }
             try self.engram.enablePosting();
             self.checkEngramPosted(gpa) catch |e| {
                 log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}", .{@errorName(e)});
