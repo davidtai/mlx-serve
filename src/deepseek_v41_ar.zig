@@ -844,6 +844,9 @@ const CellReceipt = struct {
     prefill_host_shared: ?bool = null,
     prefill_joinless: ?bool = null,
     embedding_rows: ?bool = null,
+    /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
+    engram_posted: ?bool = null,
+    deferred_base: ?bool = null,
     /// NATIVE per-phase memory: each boundary's billed terms beside the measured footprint (its interval
     /// high-water mark), its task_vm_info split, MLX active / cache / peak, the box's pages, the residuals.
     bill_baseline_bytes: ?u64 = null,
@@ -1114,6 +1117,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_host_shared = md.installed.prefill_host_shared,
         .prefill_joinless = md.installed.prefill_joinless,
         .embedding_rows = md.installed.embedding_rows,
+        .engram_posted = md.installed.engram_posted,
+        .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
         .phase_change = md.phase_change,
@@ -1173,6 +1178,8 @@ fn cellConfig(config: *model.ModelConfig) !void {
     if (envStr("DSV41_CELL_PREFILL_OPROJ")) |v| config.prefill_oproj = try cellBool("DSV41_CELL_PREFILL_OPROJ", v);
     if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| config.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| config.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
+    if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| config.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
+    if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| config.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| config.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
