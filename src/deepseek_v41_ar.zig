@@ -814,6 +814,7 @@ const CellReceipt = struct {
     /// high-water mark), its task_vm_info split, MLX active / cache / peak, the box's pages, the residuals.
     bill_baseline_bytes: ?u64 = null,
     phase_memory: ?[]const PhaseMemory = null,
+    embedding_rows: ?bool = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -1032,6 +1033,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_attn = md.installed.prefill_attn,
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
+        .embedding_rows = md.installed.embedding_rows,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1077,6 +1079,7 @@ fn cellConfig(config: *model.ModelConfig) !void {
     if (envStr("DSV41_CELL_WIDE_HOT_FIRST")) |v| config.expert_wide_hot_first = try cellBool("DSV41_CELL_WIDE_HOT_FIRST", v);
     // The attention call sites (the served tier's routes by default; 0 = the stock chain).
     if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
+    if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;

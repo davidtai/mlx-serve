@@ -2712,6 +2712,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     if (o.expert_wide_feed) |n| config.expert_wide_feed = n;
     if (o.expert_wide_depth) |n| config.expert_wide_depth = n;
     if (o.expert_wide_seed) |n| config.expert_wide_seed = n;
+    if (o.embedding_host_rows) |n| config.embedding_host_rows = n;
     if (o.expert_wide_hot_first) |n| config.expert_wide_hot_first = n;
     if (o.expert_wide_cold_rows) |n| config.expert_wide_cold_rows = n;
     config.drafter_override = o.drafter;
