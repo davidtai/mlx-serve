@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "230f778d9db6d66789316f10d45f9d445ba95dab4e888e7ec7539986708f0912";
+pub const manifest_sha256 = "efe9bb1adf9d9cfd0ec6b79bd22b20fac12077b04b57758b3c544e578eb1839d";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -110,6 +110,10 @@ pub const Kernel = enum {
     // The take2 retune (09-30, mlx-serve native; its lane pin is its own text): q3_prefill_dig_rot_take2_5120's values
     // with both outputs per simdgroup from one act load (the same butterfly pairs in the same bit order)
     dsv41_prefill_dig_take2v_5120,
+    // The DIG-X GEMMs at a 128-row M tile (09-30, mlx-serve native): 8 simdgroups, each running the 64-row text's
+    // 32 x 32 share, so one decoded B stage feeds 128 rows (twin check: the 64-row text's words)
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -237,8 +241,10 @@ pub const Domain = struct {
     used: ?Var = null,
     ints: []const i64 = &.{},
     floats: []const f64 = &.{},
-    /// wave_table: N tiles x operands per 64-row M tile (the GEMMs' first-threadgroup column).
+    /// wave_table: N tiles x operands per M tile (the GEMMs' first-threadgroup column).
     tiles: u32 = 0,
+    /// wave_table: the GEMM's M tile rows (64, or 128 for the 128-row texts).
+    bm: u32 = 64,
 };
 
 pub const Arg = struct {
@@ -270,7 +276,7 @@ pub const Launch = union(enum) { rule: Rule, plans: []const Plan };
 /// A plan kernel's weight site (rcproj): N outputs per group, K inputs, G groups, strides.
 pub const Site = struct { name: []const u8, N: u32, K: u32, G: u32, XS: u32, XG: u32, YS: u32, YG: u32 };
 
-pub const Check = enum { compile, row_invariance, decode_table, golden_tiles, mlx_chain, f64, layout_guard, composition, join_equiv };
+pub const Check = enum { compile, row_invariance, decode_table, golden_tiles, mlx_chain, f64, layout_guard, composition, join_equiv, twin };
 
 /// The lane's own launch at sample sizes, captured by the extractor (the geometry's witness).
 pub const Sample = struct {
@@ -620,6 +626,7 @@ const JDomain = struct {
     ints: ?[]const i64 = null,
     floats: ?[]const f64 = null,
     tiles: ?u32 = null,
+    bm: ?u32 = null,
 };
 const JArg = struct { name: []const u8, dtype: []const u8, shape: []const JDim, role: ?[]const u8 = null, domain: ?JDomain = null, row_axis: u8 = 0 };
 const JTemplate = struct { name: []const u8, int: ?i64 = null, dtype: ?[]const u8 = null };
@@ -770,9 +777,12 @@ fn adoptArgs(a: Allocator, js: []const JArg, k: Kernel, diag: ?*Diag) (Refusal |
                 .ints = dom.ints orelse &.{},
                 .floats = dom.floats orelse &.{},
                 .tiles = dom.tiles orelse 0,
+                .bm = dom.bm orelse 64,
             },
             .row_axis = j.row_axis,
         };
+        if (arg.domain.kind == .wave_table and arg.domain.bm != 64 and arg.domain.bm != 128)
+            return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: {s} M tile of {d} rows (64 or 128)", .{ k, j.name, arg.domain.bm });
         if (arg.row_axis >= @max(arg.shape.len, 1)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: {s} row axis {d}", .{ k, j.name, arg.row_axis });
         if (arg.role == .static and !staticHasValue(arg)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: static {s} carries no {t} value", .{ k, j.name, arg.dtype });
     }
@@ -1104,7 +1114,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 75), n_kernels);
+    try testing.expectEqual(@as(usize, 77), n_kernels);
     try testing.expectEqual(@as(usize, 15), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1119,10 +1129,12 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 5), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 6), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
+    // the 128-row GEMMs' manifest lists the take2 retune's (every kernel and header unchanged)
+    try testing.expect(reg.acceptsManifest("230f778d9db6d66789316f10d45f9d445ba95dab4e888e7ec7539986708f0912"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each

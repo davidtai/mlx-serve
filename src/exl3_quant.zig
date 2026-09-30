@@ -51,6 +51,8 @@ pub const kernels = [_]Kernel{
     .q3_prefill_fused_exl3x3_mul1lut_k3_bf16,
     .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
     .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128,
     .q3_prefill_dig_rot_take2_5120,
     .dsv41_prefill_dig_take2v_5120,
     .q3_prefill_dig_rot_roundx_2304,
@@ -252,6 +254,20 @@ pub fn Accepted(comptime G: type) type {
 /// a self-check failure (SelfCheckFailed, `diag` naming kernel / check / site). The set's
 /// launcher must be installed on `g` first (`Set.install`): a backend that prepares launches
 /// prepares them through it.
+/// What `accept` self-checks on the device: this consumer's kernels less the texts no route launches yet. The
+/// 128-row DIG-X GEMMs stay out until their route flips: their 0b smoke checks them (and prices them) on the device
+/// first, so a device fault costs that smoke line, not a served construction.
+const unrouted_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
+const checked_at_accept = blk: {
+    var out: [kernels.len - unrouted_texts.len]Kernel = undefined;
+    var n: usize = 0;
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &unrouted_texts, k) == null) {
+        out[n] = k;
+        n += 1;
+    };
+    break :blk out;
+};
+
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
     const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
     try checkSpec(spec, diag);
@@ -261,7 +277,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &kernels, &acc.report, diag);
+    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -467,6 +483,12 @@ pub const DigTable = struct { table: [80]i32, tgs: u32 };
 /// slot, first row, rows, first threadgroup (unused: INT32_MAX); [64] experts, [65] threadgroups.
 /// `tiles` = the GEMM's threadgroups per 64-row tile (`digTiles`).
 pub fn digTable(experts: []const WaveExpert, tiles: u32) DigTable {
+    return digTableBm(experts, tiles, 64);
+}
+
+/// `digTable` at `bm`-row M tiles (64, or 128 for the 128-row GEMM texts): the first-threadgroup column counts
+/// ceil(rows / bm) tiles per expert; the slot, first-row and row columns are the same.
+pub fn digTableBm(experts: []const WaveExpert, tiles: u32, bm: u32) DigTable {
     var t: [80]i32 = @splat(0);
     var row0: i64 = 0;
     var tg: i64 = 0;
@@ -480,7 +502,7 @@ pub fn digTable(experts: []const WaveExpert, tiles: u32) DigTable {
         t[32 + j] = @intCast(experts[j].rows);
         t[48 + j] = @intCast(tg);
         row0 += experts[j].rows;
-        tg += @as(i64, @intCast((experts[j].rows + 63) / 64)) * tiles;
+        tg += @as(i64, @intCast((experts[j].rows + bm - 1) / bm)) * tiles;
     }
     t[64] = @intCast(experts.len);
     t[65] = @intCast(tg);
@@ -494,6 +516,10 @@ pub fn DigX(comptime G: type) type {
         const Self = @This();
         gemm_gu: *const Entry,
         gemm_dn: *const Entry,
+        /// the GEMMs at a 128-row M tile (`..._m128`): registered, and launched by their 0b smoke only, until their
+        /// route flips; the route launches the 64-row texts
+        gemm_gu128: *const Entry,
+        gemm_dn128: *const Entry,
         /// the lane's take2 text: the retune's bitwise reference (its 0b smoke), not launched by the route
         take2_e: *const Entry,
         /// the take2 retune the route launches (both outputs per simdgroup from one act load)
@@ -507,6 +533,8 @@ pub fn DigX(comptime G: type) type {
             return .{
                 .gemm_gu = reg.get(.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3),
                 .gemm_dn = reg.get(.q3_prefill_dig_gemm_2304x5120_xmul1hk3),
+                .gemm_gu128 = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128),
+                .gemm_dn128 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128),
                 .take2_e = reg.get(.q3_prefill_dig_rot_take2_5120),
                 .take2v_e = reg.get(.dsv41_prefill_dig_take2v_5120),
                 .roundx_e = reg.get(.q3_prefill_dig_rot_roundx_2304),
@@ -1415,6 +1443,96 @@ test "dsv41 kernels ops: the take2 retune's butterflies are the lane text's, bit
     }
 }
 
+// The 128-row DIG-X GEMMs' exactness argument, on the host: the texts' (threadgroup, simdgroup) -> output-block
+// mapping, emulated from their own index arithmetic over the wave tables. At 64 rows per M tile (4 simdgroups) and at
+// 128 (8), the blocks with rows to compute are the same list (op, first row, valid rows, 32-column block), and each
+// (op, column block) tiles the wave's rows exactly once. Each stage's decode jobs cover the 16 x 16 trellis tiles'
+// 256 (tile, column half, column) jobs exactly once at either simdgroup count. The per-simdgroup text is unchanged, so
+// the blocks' words are the 64-row texts'.
+test "dsv41 kernels ops: the 128-row DIG-X GEMMs compute every output block as the 64-row texts do (row-to-simdgroup mapping, host emulation)" {
+    const a = testing.allocator;
+    const Block = struct { op: u32, row: u32, valid: u32, col: u32 };
+    const Emu = struct {
+        /// The texts' mapping over one table: every (threadgroup, simdgroup) that has rows to compute.
+        fn blocks(al: Allocator, tbl: *const [80]i32, tgs: u32, bm: i32, nsg: i32, ntiles: i32, out: *std.ArrayList(Block)) !void {
+            const sm: i32 = 32;
+            const sn: i32 = 32;
+            const wn: i32 = 2;
+            for (0..tgs) |gi| {
+                const g: i32 = @intCast(gi);
+                var j: usize = 0;
+                for (1..16) |q| j = if (tbl[48 + q] <= g) q else j;
+                const row0 = tbl[16 + j];
+                const rows = tbl[32 + j];
+                const local = g - tbl[48 + j];
+                const tiles_m = @divTrunc(rows + bm - 1, bm);
+                const nt_all = @divTrunc(local, tiles_m);
+                const m0 = (local - nt_all * tiles_m) * bm;
+                const op = @divTrunc(nt_all, ntiles);
+                const n0 = (nt_all - op * ntiles) * 64;
+                var sg: i32 = 0;
+                while (sg < nsg) : (sg += 1) {
+                    const tm = sm * @divTrunc(sg, wn);
+                    const tn = sn * @mod(sg, wn);
+                    const valid = @min(sm, @max(0, @min(bm, rows - m0) - tm));
+                    if (valid > 0) try out.append(al, .{ .op = @intCast(op), .row = @intCast(row0 + m0 + tm), .valid = @intCast(valid), .col = @intCast(n0 + tn) });
+                }
+            }
+        }
+        fn lessThan(_: void, x: Block, y: Block) bool {
+            if (x.op != y.op) return x.op < y.op;
+            if (x.col != y.col) return x.col < y.col;
+            return x.row < y.row;
+        }
+    };
+    const Gemm = struct { tiles: u32, ntiles: i32, n_ops: u32, cols: u32 };
+    const gemms = [_]Gemm{ .{ .tiles = 72, .ntiles = 36, .n_ops = 2, .cols = 2304 }, .{ .tiles = 80, .ntiles = 80, .n_ops = 1, .cols = 5120 } };
+    const waves = [_][]const u32{ &.{ 1, 17, 64, 127, 128, 129, 270 }, &.{ 256, 256, 256, 256, 256, 256, 256, 256 }, &.{ 270, 270, 270, 270 }, &.{ 32, 32, 32, 32, 32, 32, 32, 32 } };
+    var n_blocks: usize = 0;
+    for (waves) |per| for (gemms) |gm| {
+        var ex: [wave_max]WaveExpert = undefined;
+        var total: u32 = 0;
+        for (per, 0..) |r, j| {
+            ex[j] = .{ .slot = @intCast(j), .rows = r };
+            total += r;
+        }
+        var lists: [2]std.ArrayList(Block) = .{ .empty, .empty };
+        defer for (&lists) |*l| l.deinit(a);
+        for ([_]u32{ 64, 128 }, 0..) |bm, i| {
+            const t = digTableBm(ex[0..per.len], gm.tiles, bm);
+            try Emu.blocks(a, &t.table, t.tgs, @intCast(bm), if (bm == 64) 4 else 8, gm.ntiles, &lists[i]);
+            std.mem.sort(Block, lists[i].items, {}, Emu.lessThan);
+        }
+        try testing.expectEqualSlices(Block, lists[0].items, lists[1].items);
+        // each (op, column block) tiles the rows [0, total) exactly once
+        var at: usize = 0;
+        for (0..gm.n_ops) |op| {
+            var col: u32 = 0;
+            while (col < gm.cols) : (col += 32) {
+                var next: u32 = 0;
+                while (at < lists[0].items.len and lists[0].items[at].op == op and lists[0].items[at].col == col) : (at += 1) {
+                    try testing.expectEqual(next, lists[0].items[at].row);
+                    next += lists[0].items[at].valid;
+                }
+                try testing.expectEqual(total, next);
+            }
+        }
+        try testing.expectEqual(lists[0].items.len, at);
+        n_blocks += at;
+    };
+    try testing.expect(n_blocks > 10_000);
+    // each stage's decode jobs: the 256 (trellis tile, column half, column) jobs exactly once, at 4 and 8 simdgroups
+    for ([_]u32{ 4, 8 }) |nsg| {
+        var seen: [256]u8 = @splat(0);
+        const jobs = 8 / nsg;
+        for (0..nsg) |sg| for (0..32) |lane| for (0..jobs) |jj| {
+            const t = (lane >> 3) + 4 * ((sg >> 1) + (nsg / 2) * jj);
+            seen[(t * 2 + (sg & 1)) * 8 + (lane & 7)] += 1;
+        };
+        for (seen) |x| try testing.expectEqual(@as(u8, 1), x);
+    }
+}
+
 // ── 3. Move invariance: the C2 entries launch what today's EXL3 entries launch ──
 
 /// A trace's log from `from` on as text: every launch with its kernel, grid, threadgroup,
@@ -1755,6 +1873,243 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
                 .widen1 => @tagName(Kernel.q3_prefill_dig_rot_widen1_5120),
             };
             std.debug.print("DIGX_WAVE_MICROBENCH {{\"kernel\": \"{s}\", \"rows\": {d}, \"us\": {d:.1}, \"host_us\": {d:.1}}}\n", .{ kname, w.rows, @as(f64, @floatFromInt(best_eval)) / 8000.0, @as(f64, @floatFromInt(best_host)) / 8000.0 });
+        }
+    }
+}
+
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device); seconds,
+// no model load. The 128-row DIG-X GEMMs on the device, and the decode share's price:
+// 1. both 128-row texts' construction self-checks on the device (compile, composition, f64, twin);
+// 2. the 64- and 128-row texts on real records (layer 0's first 16 experts' codes, read by the stream), each wave's
+//    x / hd from the routed take2 / gate|up / onepass chain: a wave at every partial-tile edge (1 / 17 / 64 / 127 /
+//    128 / 129 / 270 rows) and a K16 wave (8 x 256), every z word of gate, up and down equal, bit for bit.
+//    Fail-closed: a mismatch, an all-zero output, or DSV41_PHASE0B_MLX without the bank fails the test;
+// 3. DIGX_WAVE_MICROBENCH lines for both texts' GEMMs at the tier's 2,048-row wave and the DIG-X probe's 4 x 270 =
+//    1,080, and DIGX_GEMM_SWEEP lines for today's texts at 8 experts x 32 / 64 / 256 rows (the decode share's fit:
+//    per 64-row tile T64 / 8 = d + m, T32 / 8 = d + m / 2). Per launch: the best of 5 runs of 8 back-to-back
+//    launches and one eval ("us": the eval's encode + GPU + wait; "host_us": the launches' graph build).
+test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row texts' on real records, bit for bit; GEMM microbench and sweep" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse {
+        std.debug.print("\nm128 smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
+        return error.TestUnexpectedResult;
+    });
+    const ops = @import("deepseek_v41_ops.zig");
+    const es = @import("expert_stream.zig");
+    const eb = @import("expert_bank.zig");
+    const G = ops.MlxOps;
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("kernel set refused: {s}\n", .{kd.message()});
+        return e;
+    };
+    defer set.deinit();
+    set.install(G, &g);
+    defer ks.Set.uninstall(G, &g);
+    // 1. both 128-row texts' construction self-checks, on the device
+    {
+        var report: selfcheck.Report = .{};
+        defer report.deinit(a);
+        set.selfCheck(a, &unrouted_texts, &report, &kd) catch |e| {
+            std.debug.print("m128 self-checks refused: {s}\n", .{kd.message()});
+            return e;
+        };
+        var twins: usize = 0;
+        for (report.results.items) |r| twins += @intFromBool(r.check == .twin and r.ok and r.bad == 0 and r.words > 0);
+        try testing.expectEqual(@as(usize, 2), twins);
+    }
+    // layer 0's first 16 experts, read by the stream into 16 persistent MLX rows (the base bank)
+    var bdiag: eb.Diag = .{};
+    var bank = eb.Bank.open(a, io, dir, eb.dsv41, &bdiag) catch |e| {
+        std.debug.print("bank refused: {s}\n", .{bdiag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const n_experts = 16;
+    var base_rows: [40]u32 = @splat(0);
+    base_rows[0] = n_experts;
+    const st = try es.Stream.init(a, &bank, .{ .rows = &base_rows, .max_route_ids = n_experts, .transient_rows = n_experts, .slot_memory = .{ .mlx = s } });
+    defer st.deinit();
+    var ids: [n_experts]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(i);
+    const route = try st.route(0, &ids, &.{});
+    defer st.release(route);
+    for (0..route.n_parts) |p| {
+        try st.waitGu(route, @intCast(p));
+        try st.waitDown(route, @intCast(p));
+    }
+    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    const rf = st.refsOf(route, &refs);
+    try testing.expectEqual(@as(usize, n_experts), rf.len);
+    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    const dig = DigX(G).init(&set.reg);
+    const tiles_gu = dig.digTiles(.gate_up);
+    const tiles_dn = dig.digTiles(.down);
+    const Wave = struct {
+        rows: u32,
+        x0: G.T,
+        x1: G.T,
+        hd: G.T,
+        gu: [2]DigTable,
+        dn: [2]DigTable,
+
+        /// A wave's rows grouped by expert in order (expert j at real record `refs_[j]`), its GEMM inputs from the
+        /// routed chain: x0 / x1 = take2(act), hd = onepass(the 64-row gate|up); tables at 64 and 128 rows.
+        fn init(al: Allocator, gg: *G, per: []const u32, refs_: []const es.SlotRef, d: DigX(G), bank_: anytype, t_gu: u32, t_dn: u32, seed: u64) !@This() {
+            var ex: [wave_max]WaveExpert = undefined;
+            var n: u32 = 0;
+            for (per, 0..) |c, j| {
+                ex[j] = .{ .slot = refs_[j].row, .rows = c };
+                n += c;
+            }
+            const ridx = try al.alloc(i32, n);
+            defer al.free(ridx);
+            const rhs = try al.alloc(u32, n);
+            defer al.free(rhs);
+            var i: usize = 0;
+            for (per, 0..) |c, j| for (0..c) |_| {
+                ridx[i] = @intCast(i);
+                rhs[i] = @intCast(j);
+                i += 1;
+            };
+            const xs = try al.alloc(f32, @as(usize, n) * 5120);
+            defer al.free(xs);
+            var h: u64 = seed;
+            for (xs) |*v| {
+                h = h *% 6364136223846793005 +% 1442695040888963407;
+                const u_1: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 40)))) / 16777216.0;
+                const u_2: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 16)) & 0xffffff)) / 16777216.0;
+                v.* = (u_1 + u_2 - 1.0) * 2.0;
+            }
+            const ni: c_int = @intCast(n);
+            const act = try gg.astype(try gg.hostArray(std.mem.sliceAsBytes(xs), &.{ ni, 5120 }, .float32), .bfloat16);
+            const ridx_a = try gg.hostArray(std.mem.sliceAsBytes(ridx), &.{ni}, .int32);
+            const rhs_a = try gg.hostArray(std.mem.sliceAsBytes(rhs), &.{ni}, .uint32);
+            var w: @This() = .{ .rows = n, .x0 = undefined, .x1 = undefined, .hd = undefined, .gu = undefined, .dn = undefined };
+            for ([_]u32{ 64, 128 }, 0..) |bm, k| {
+                w.gu[k] = digTableBm(ex[0..per.len], t_gu, bm);
+                w.dn[k] = digTableBm(ex[0..per.len], t_dn, bm);
+            }
+            const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.gu[0].table), &.{80}, .int32);
+            const x = try d.take2(gg, act, ridx_a, rhs_a, tbl, bank_.gate.rin, bank_.up.rin);
+            const z = try d.gemmGateUp(gg, x[0], x[1], bank_.gate.code, bank_.up.code, tbl, w.gu[0].tgs);
+            w.hd = try d.onePass(gg, z[0], z[1], rhs_a, tbl, bank_.gate.rout, bank_.up.rout, bank_.down.rin);
+            w.x0 = x[0];
+            w.x1 = x[1];
+            try gg.evalAll(&.{ w.x0, w.x1, w.hd });
+            return w;
+        }
+
+        /// The gate|up (k = 0) or down (k = 1) GEMM at M tile `bm` (index 0: 64 rows, 1: 128).
+        fn gemm(w: *const @This(), gg: *G, d: DigX(G), bank_: anytype, k: usize, bi: usize) ![2]G.T {
+            var out: [2]G.T = undefined;
+            if (k == 0) {
+                const e = if (bi == 0) d.gemm_gu else d.gemm_gu128;
+                var vars = rowsVars(w.rows);
+                vars.set(.tgs, w.gu[bi].tgs);
+                const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.gu[bi].table), &.{80}, .int32);
+                try launchRule(G, gg, e, &vars, &.{ w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl }, &out);
+            } else {
+                const e = if (bi == 0) d.gemm_dn else d.gemm_dn128;
+                var vars = rowsVars(w.rows);
+                vars.set(.tgs, w.dn[bi].tgs);
+                const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.dn[bi].table), &.{80}, .int32);
+                try launchRule(G, gg, e, &vars, &.{ w.hd, bank_.down.code, tbl }, out[0..1]);
+                out[1] = out[0];
+            }
+            return out;
+        }
+    };
+    const k16 = [_]u32{ 256, 256, 256, 256, 256, 256, 256, 256 };
+    // 2. the 64- and 128-row texts on the same inputs: every z word
+    for ([_][]const u32{ &.{ 1, 17, 64, 127, 128, 129, 270 }, &k16 }, 0..) |per, wi| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const w = try Wave.init(a, &g, per, rf, dig, ba, tiles_gu, tiles_dn, 0x3128 + wi);
+        var words: usize = 0;
+        var mismatch: usize = 0;
+        var nonzero: usize = 0;
+        for (0..2) |k| {
+            const z64 = try w.gemm(&g, dig, ba, k, 0);
+            const z128 = try w.gemm(&g, dig, ba, k, 1);
+            try g.evalAll(&.{ z64[0], z64[1], z128[0], z128[1] });
+            const n_out: usize = if (k == 0) 2 else 1;
+            const cols: usize = if (k == 0) 2304 else 5120;
+            for (0..n_out) |o| {
+                const px = mlx.mlx_array_data_uint8(z64[o]) orelse return error.TestUnexpectedResult;
+                const py = mlx.mlx_array_data_uint8(z128[o]) orelse return error.TestUnexpectedResult;
+                const n_words = @as(usize, w.rows) * cols;
+                for (0..n_words) |q| {
+                    const wx = std.mem.readInt(u32, px[4 * q ..][0..4], .little);
+                    const wy = std.mem.readInt(u32, py[4 * q ..][0..4], .little);
+                    mismatch += @intFromBool(wx != wy);
+                    nonzero += @intFromBool(wx & 0x7fffffff != 0);
+                }
+                words += n_words;
+            }
+        }
+        std.debug.print("\nM128_GEMM_SMOKE {{\"rows\": {d}, \"experts\": {d}, \"words\": {d}, \"mismatch\": {d}, \"nonzero\": {d}}}\n", .{ w.rows, per.len, words, mismatch, nonzero });
+        try testing.expectEqual(@as(usize, 0), mismatch);
+        try testing.expect(nonzero > words / 2);
+    }
+    // 3. per-launch time: both texts at 2,048 and 1,080 rows (DIGX_WAVE_MICROBENCH), today's at 8 x 32 / 64 / 256
+    //    (DIGX_GEMM_SWEEP)
+    const Time = struct {
+        /// The best of 5 timed runs (after a warm one) of 8 launches of GEMM `k` at M tile index `bi`, per launch.
+        fn best(gg: *G, io_: std.Io, w: anytype, d: DigX(G), bank_: anytype, k: usize, bi: usize) !struct { eval: u64, host: u64 } {
+            var best_eval: u64 = std.math.maxInt(u64);
+            var best_host: u64 = std.math.maxInt(u64);
+            for (0..6) |run| {
+                const mr = gg.mark();
+                defer gg.resetTo(mr);
+                var outs: [16]G.T = undefined;
+                const t0 = std.Io.Timestamp.now(io_, .boot);
+                for (0..8) |q| {
+                    const o = try w.gemm(gg, d, bank_, k, bi);
+                    outs[2 * q] = o[0];
+                    outs[2 * q + 1] = o[1];
+                }
+                const host: u64 = @intCast(t0.untilNow(io_, .boot).nanoseconds);
+                const t1 = std.Io.Timestamp.now(io_, .boot);
+                try gg.evalAll(&outs);
+                const eval: u64 = @intCast(t1.untilNow(io_, .boot).nanoseconds);
+                if (run > 0) {
+                    best_eval = @min(best_eval, eval);
+                    best_host = @min(best_host, host);
+                }
+            }
+            return .{ .eval = best_eval / 8, .host = best_host / 8 };
+        }
+    };
+    for ([_][]const u32{ &k16, &.{ 270, 270, 270, 270 } }) |per| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const w = try Wave.init(a, &g, per, rf, dig, ba, tiles_gu, tiles_dn, 0xbe7c);
+        for (0..2) |k| for (0..2) |bi| {
+            const t = try Time.best(&g, io, &w, dig, ba, k, bi);
+            const kname = switch (k * 2 + bi) {
+                0 => @tagName(Kernel.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3),
+                1 => @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128),
+                2 => @tagName(Kernel.q3_prefill_dig_gemm_2304x5120_xmul1hk3),
+                else => @tagName(Kernel.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128),
+            };
+            std.debug.print("DIGX_WAVE_MICROBENCH {{\"kernel\": \"{s}\", \"rows\": {d}, \"us\": {d:.1}, \"host_us\": {d:.1}}}\n", .{ kname, w.rows, @as(f64, @floatFromInt(t.eval)) / 1000.0, @as(f64, @floatFromInt(t.host)) / 1000.0 });
+        };
+    }
+    for ([_]u32{ 32, 64, 256 }) |r| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const per = [_]u32{ r, r, r, r, r, r, r, r };
+        const w = try Wave.init(a, &g, &per, rf, dig, ba, tiles_gu, tiles_dn, 0x5eeb);
+        for (0..2) |k| {
+            const t = try Time.best(&g, io, &w, dig, ba, k, 0);
+            std.debug.print("DIGX_GEMM_SWEEP {{\"gemm\": \"{s}\", \"experts\": 8, \"rows_per_expert\": {d}, \"us\": {d:.1}}}\n", .{ if (k == 0) "gate_up" else "down", r, @as(f64, @floatFromInt(t.eval)) / 1000.0 });
         }
     }
 }
