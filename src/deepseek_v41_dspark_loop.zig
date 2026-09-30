@@ -260,9 +260,11 @@ pub fn Loop(comptime G: type) type {
             return .{ .primary = self.primary, .logits = kept };
         }
 
-        /// The target's decision on a verify chunk: its rows' argmax and, for the
-        /// typical tier, `_TYPICAL_DECIDE`'s flags on the drafted rows (one sync).
-        fn decide(self: *Self, logits: T, drafts: []const u32, rows: [2]u32, k_eff: u32, target: []u32, flags: []bool) !?[]const bool {
+        /// The target's decision on a verify chunk, as a graph over its (lazy) logits: the rows' argmax and,
+        /// for the typical tier, `_TYPICAL_DECIDE`'s flags on the drafted rows. The verify's eval realises it.
+        const Decision = struct { tt: T, typical: ?T = null, width: u32, drafted: u32 = 0 };
+
+        fn decideGraph(self: *Self, logits: T, drafts: []const u32, rows: [2]u32, k_eff: u32) !Decision {
             const g = self.g;
             const s = g.shapeOf(logits);
             const vocab = s.dim(-1);
@@ -270,17 +272,11 @@ pub fn Loop(comptime G: type) type {
             const row2 = try g.reshape(logits, &.{ @intCast(width), vocab });
             const tt = try g.argmax(row2, -1);
             const typ = switch (self.cfg.acceptance) {
-                .greedy => {
-                    _ = try g.hostU32(tt, target[0..width]);
-                    return null;
-                },
+                .greedy => return .{ .tt = tt, .width = width },
                 .typical => |t| t,
             };
             const drafted: u32 = @min(k_eff -| rows[0], width);
-            if (drafted == 0) {
-                _ = try g.hostU32(tt, target[0..width]);
-                return flags[0..0];
-            }
+            if (drafted == 0) return .{ .tt = tt, .width = width };
             const lg = try g.astype(try g.slice(row2, &.{ 0, 0 }, &.{ @intCast(drafted), vocab }, &.{ 1, 1 }), .float32);
             const log_p = try g.sub(lg, try g.logsumexp(lg, -1, true));
             const p = try g.exp(log_p);
@@ -290,9 +286,17 @@ pub fn Loop(comptime G: type) type {
             for (idb[0..drafted], drafts[rows[0]..][0..drafted]) |*d, v| d.* = @intCast(v);
             const ids = try g.hostArray(std.mem.sliceAsBytes(idb[0..drafted]), &.{ @intCast(drafted), 1 }, .int32);
             const typical = try g.greater(try g.reshape(try g.takeAlongAxis(p, ids, -1), &.{-1}), floor);
-            try g.evalAll(&.{ tt, typical });
-            _ = try g.hostU32(tt, target[0..width]);
-            return try g.hostBool(typical, flags[0..drafted]);
+            return .{ .tt = tt, .typical = typical, .width = width, .drafted = drafted };
+        }
+
+        /// The evaluated decision's host values: the argmax per row into `target`; the typical tier's flags
+        /// (empty when no row of the chunk is drafted), null on the greedy tier.
+        fn decideRead(self: *Self, d: Decision, target: []u32, flags: []bool) !?[]const bool {
+            _ = try self.g.hostU32(d.tt, target[0..d.width]);
+            return switch (self.cfg.acceptance) {
+                .greedy => null,
+                .typical => if (d.typical) |ty| try self.g.hostBool(ty, flags[0..d.drafted]) else flags[0..0],
+            };
         }
 
         /// The install warm-up (the lane's pipelines warmed at install): every
@@ -461,8 +465,16 @@ pub fn Loop(comptime G: type) type {
             while (start < n_block) {
                 const end = @min(start + self.max_rows, n_block);
                 const r = try self.model.forward(g, self.st, block[start..end], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
+                // The decision folded into the verify's eval (one sync): its graph over the lazy logits.
+                const dec = try self.decideGraph(r.logits.?, drafts, .{ start, end }, k_eff);
                 tt = dt.charge(.verify, tt);
-                try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
+                var ev: [3]T = .{ dec.tt, r.main_hidden.?, undefined };
+                var n_ev: usize = 2;
+                if (dec.typical) |ty| {
+                    ev[2] = ty;
+                    n_ev = 3;
+                }
+                try g.evalAll(ev[0..n_ev]);
                 tt = dt.charge(.verify_eval, tt);
                 mark(stamp, .verify);
                 st.verify_calls += 1;
@@ -470,7 +482,7 @@ pub fn Loop(comptime G: type) type {
                 n_hidden += 1;
                 var target: [ds.max_block + 1]u32 = undefined;
                 var flags: [ds.max_block + 1]bool = undefined;
-                const typ = try self.decide(r.logits.?, drafts, .{ start, end }, k_eff, &target, &flags);
+                const typ = try self.decideRead(dec, &target, &flags);
                 if (log) |lg| {
                     if (lg.want_top) try self.topTwo(r.logits.?, end - start, lg.top_ids[lg.n_targets..], lg.top_logits[lg.n_targets..], lg.rms[lg.n_targets..]);
                     @memcpy(lg.targets[lg.n_targets..][0 .. end - start], target[0 .. end - start]);
@@ -1705,6 +1717,45 @@ test "dsv41 dspark loop: typical flags accept what the argmax rejects; the corre
     var n_lse: usize = 0;
     for (rig.g.nodes.items) |nd| n_lse += @intFromBool(nd.op == .logsumexp);
     try testing.expectEqual(@as(usize, 2), n_lse);
+}
+
+test "dsv41 dspark loop: the typical decision is realised by the verify's eval (two syncs per cycle), then read" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 7, 8, 9 }, &.{ 11, 12 }, &.{ 13, 14, 15 } },
+        .f32s = &.{ &.{ 0.9, 0.9 }, &.{ 0.9, 0.9 } },
+        .bools = &.{ &.{ true, true }, &.{ true, false } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .lookup = null, .acceptance = .{ .typical = .{ .delta = 0.5 } }, .max_tokens = 5 });
+    defer lp.deinit();
+    var prompt: [9]u32 = @splat(4);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    const g = &rig.g;
+    for (0..2) |_| {
+        const n0 = g.nodes.items.len;
+        const e0 = g.evals.items.len;
+        _ = try lp.cycle(&rig.ex, &out, a, null);
+        const evals = g.evals.items[e0..];
+        const nodes = g.nodes.items;
+        // The draft's eval and the verify's, which also realises the decision (argmax, logsumexp, flags).
+        try testing.expectEqual(@as(usize, 2), evals.len);
+        var lse: usize = 0;
+        for (nodes[n0..evals[1]]) |nd| lse += @intFromBool(nd.op == .logsumexp);
+        try testing.expectEqual(@as(usize, 1), lse);
+        // Its reads follow at once: the argmax, then the flags, nothing built between.
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[1]].op);
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[1] + 1].op);
+    }
+    // The decisions of the unfolded decide (the test above's script).
+    try testing.expectEqualSlices(u32, &.{ 5, 6, 9, 11, 14 }, out.items);
 }
 
 // DSV41_DSPARK_CYCLES_FIXTURE=<json from R/exl3/runtime/dump_dsv41_dspark_cycles.py>
