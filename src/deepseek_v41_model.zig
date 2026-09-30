@@ -667,10 +667,14 @@ pub fn Model(comptime G: type) type {
                     // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
                     const wave = g.mark();
                     var h = hs[i];
-                    if (li.engram_slot) |slot| h = if (posting)
-                        try self.engramLayerPosted(g, a, slot, h, (posts[slot] orelse return error.EngramPostMissing)[i] orelse return error.EngramPostMissing, sp[1] - sp[0])
-                    else
-                        try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                    if (li.engram_slot) |slot| {
+                        h = if (posting)
+                            try self.engramLayerPosted(g, a, slot, h, (posts[slot] orelse return error.EngramPostMissing)[i] orelse return error.EngramPostMissing, sp[1] - sp[0])
+                        else
+                            try self.engramLayer(g, a, slot, h, rows[i], sp[1] - sp[0]);
+                        // The profile's own stage for the Engram read and add (else it lands in attn.pre).
+                        try probe.put("engram.add", h);
+                    }
                     if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
                     // Every kept array evaluated before the reset: a lazy one would hold its whole graph.

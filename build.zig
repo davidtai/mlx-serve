@@ -125,6 +125,8 @@ pub fn build(b: *std.Build) void {
     // src/ane_stub.c on Linux. The stub selection reads this option, NOT `ios`
     // — `ios` keeps its own meaning (low-mem policy, sandboxing assumptions).
     build_options.addOption(bool, "macos_engines", true);
+    // The DSV4.1 prompt pass routed-call timers (src/dsv41_prefill_timers.zig): profile builds only.
+    build_options.addOption(bool, "dsv41_prefill_timers", b.option(bool, "dsv41-prefill-timers", "Compile the DSV4.1 prompt pass routed-call timers in (profile builds only)") orelse false);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`

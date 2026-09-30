@@ -17,6 +17,7 @@ const xp = @import("deepseek_v41_experts.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_stream = @import("expert_stream.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
+const dsv41_prof = @import("dsv41_prefill_timers.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dss = @import("deepseek_v41_dspark_serve.zig");
 const xk = @import("exl3_kernels.zig");
@@ -1696,6 +1697,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer st.deinit(g, gpa);
     var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
     const s0 = stats_of(@ptrCast(&arm.hook));
+    dsv41_prof.reset(); // the construction's warm-up routed calls do not count
     const t0 = std.Io.Timestamp.now(io, .boot);
     probe.last = t0;
     const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
@@ -1715,6 +1717,10 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+    // A profile build (-Ddsv41-prefill-timers=true): the routed calls' host time by step, the waves and launches.
+    if (dsv41_prof.enabled) std.debug.print("PREFILL_PROFILE_ROUTED {{\"barrier_s\": {d:.3}, \"route_s\": {d:.3}, \"read_wait_s\": {d:.3}, \"encode_s\": {d:.3}, \"drain_s\": {d:.3}, \"join_s\": {d:.3}, \"dig_calls\": {d}, \"waves\": {d}, \"launches\": {d}}}\n", .{
+        dsv41_prof.seconds(.barrier), dsv41_prof.seconds(.route), dsv41_prof.seconds(.read_wait), dsv41_prof.seconds(.encode), dsv41_prof.seconds(.drain), dsv41_prof.seconds(.join), dsv41_prof.calls, dsv41_prof.waves, dsv41_prof.launches,
+    });
 }
 
 /// DECODE_PROFILE lines: the per-phase means over the cycles (ms per cycle) and the stream's.
