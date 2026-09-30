@@ -1446,11 +1446,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.wide.kept.clearRetainingCapacity();
         }
 
-        /// The deferred base-bank rows gathered so far as one call's waves, drained; their slots stay held.
-        fn deferredBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool) !void {
+        /// The deferred base-bank rows gathered so far as one call's waves, drained; their slots stay held. `at_seed`:
+        /// P1b's call at the seed (the profile's split charges it apart from the end call's).
+        fn deferredBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool, at_seed: bool) !void {
             const a = self.a;
             const w = &self.wide;
             if (w.def_slot.items.len == 0) return;
+            prof.setMode(if (at_seed) .base_seed else .base_end);
+            defer prof.setMode(.stream);
             const kb = w.kept.items.len;
             const b = self.banks[layer][@backingInt(BankKind.base)].?;
             const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
@@ -1475,6 +1478,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
+            prof.countWideCall();
             const n_ids = n * k;
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
@@ -1641,13 +1645,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 // P1b: the seed has landed (its groups read, the next routes' reads posted): its base call drains now.
                 if (base_due and streamed) {
                     base_due = false;
-                    try self.deferredBase(g, layer, act, parts);
+                    try self.deferredBase(g, layer, act, parts, true);
                 }
             }
             // The deferred base-bank rows: one call's waves over every group's (with P1b, the later ones'), then the
             // slots let go.
             if (comptime @hasDecl(S, "holdBase")) if (defer_base) {
-                try self.deferredBase(g, layer, act, parts);
+                try self.deferredBase(g, layer, act, parts, false);
                 self.source.releaseHeld();
             };
         }
