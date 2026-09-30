@@ -36,6 +36,7 @@ const PhaseMemory = bill_mod.PhaseMemory;
 const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
 const dt = @import("dsv41_decode_timers.zig");
+const recall = @import("dsv41_decode_recall.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -859,6 +860,8 @@ const CellReceipt = struct {
     decode_stream: ?StreamPhase = null,
     /// Set by a decode-profile run only (not a timed cell: its stamps sit in the loop).
     decode_profile: ?[]const ProfCycle = null,
+    /// A profile build's recall check (A1: P1's predictor at every verify layer against its routes), else null.
+    decode_recall: ?recall.Summary = null,
     /// The prefill ladder's routes the Module was built with (null = the setting's default, off).
     layer_major: ?bool = null,
     event_gates: ?bool = null,
@@ -1053,7 +1056,11 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     defer out.deinit(gpa);
     var cycles: std.ArrayList(CellCycle) = .empty;
     // A profile build's decode timers count the cycles only (not the warm-up, not the prompt).
-    if (comptime dt.enabled) dt.reset();
+    if (comptime dt.enabled) {
+        dt.reset();
+        recall.reset();
+        recall.active = profile;
+    }
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
     var prof: std.ArrayList(ProfCycle) = .empty;
@@ -1106,6 +1113,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (comptime dt.enabled) {
         var lb: [2048]u8 = undefined;
         std.debug.print("\nNATIVE {s}\n", .{dt.line(&lb)});
+        if (recall.active) {
+            var rb: [16384]u8 = undefined;
+            std.debug.print("NATIVE {s}\n", .{recall.line(&rb, md.model.c.n_layers)});
+        }
     }
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
@@ -1153,6 +1164,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         // The decode window starts at the prompt's end: it includes the phase change's grow.
         .decode_stream = StreamPhase.of(s_prompt, s_end),
         .decode_profile = if (profile) prof.items else null,
+        .decode_recall = if (comptime dt.enabled) (if (recall.active) recall.summary(md.model.c.n_layers) else null) else null,
         // The routes the module installed (read back from it, not from the settings).
         .layer_major = md.installed.layer_major,
         .event_gates = md.arm == .event_gates,
@@ -1187,6 +1199,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
+    if (comptime dt.enabled) recall.active = false;
     std.debug.print("\nNATIVE dsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
         delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
         ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
