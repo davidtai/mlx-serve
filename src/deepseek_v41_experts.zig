@@ -758,6 +758,14 @@ pub const Wide = struct {
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
 /// bound once at `init` (base, transient) and at `grow` (the grown rows).
 /// `at(layer)` is the per-layer hook the trunk calls.
+/// The MLX event wait (the gated arm's): aliases of `xs` into `outs`, which may hold anything (a caller's
+/// `undefined`): the shim assigns each alias into its handle, so every handle is made fresh first.
+fn mlxEventWait(g: *ops.MlxOps, event: expert_event.Event, xs: []const mlx.mlx_array, value: u64, deps: []const mlx.mlx_array, outs: []mlx.mlx_array) !void {
+    for (outs) |*o| o.* = mlx.mlx_array_new();
+    try expert_event.wait(xs, event, value, deps, false, g.s, outs);
+    for (outs) |*o| o.* = try g.adopt(o.*);
+}
+
 pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
     return ExpertsWith(G, S, M, .{});
 }
@@ -865,11 +873,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
         }
 
-        /// An event wait's aliases of `xs` (the GPU reads them after `value`).
+        /// An event wait's aliases of `xs` (the GPU reads them after `value`), into `outs` (any contents).
         fn eventWait(self: *Self, g: *G, xs: []const T, value: u64, deps: []const T, outs: []T) !void {
             if (G == ops.MlxOps) {
-                try expert_event.wait(xs, self.event, value, deps, false, g.s, outs);
-                for (outs) |*o| o.* = try g.adopt(o.*);
+                try mlxEventWait(g, self.event, xs, value, deps, outs);
             } else {
                 for (xs, outs) |x, *o| o.* = try g.eventAlias(x, value, deps.len);
             }
@@ -2223,6 +2230,30 @@ test "dsv41 experts: LOOKAHEAD4's construction check: the gated waves against th
     // Resident experts only: nothing is gated, nothing checked.
     try testing.expectError(error.GateCheckNoMiss, ex.checkGated(&g, 0, xf, &.{ 7, 8, 9, 10, 11, 12 }, &gated, &waited));
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
+}
+
+// DSV41_PHASE0B_MLX=1, inside a guarded window only (any MLX array allocates through Metal, on a CPU stream too).
+test "dsv41 experts 0b: a gated wait over handles left as garbage (waitProj's undefined outs) aliases its inputs" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try ops.MlxOps.init(testing.allocator, stream);
+    defer g.deinit();
+    // A host event already past the gate's value: the CPU consumer runs the WaitEvent without blocking.
+    const word = try testing.allocator.create(i64);
+    defer testing.allocator.destroy(word);
+    word.* = 7;
+    const ev = try expert_event.createHost(word, std.time.ns_per_s);
+    const vals = [_]f32{ 1, 2, 3, 4 };
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{4}, .float32);
+    const y = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{ 2, 2 }, .float32);
+    var outs: [2]mlx.mlx_array = undefined;
+    for (&outs) |*o| o.ctx = @ptrFromInt(0xaaaa_aaaa_aaaa_aaa8);
+    try mlxEventWait(&g, ev, &.{ x, y }, 5, &.{}, &outs);
+    var got: [4]f32 = undefined;
+    _ = try g.hostF32(try g.add(outs[0], try g.reshape(outs[1], &.{4})), &got);
+    try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, &got);
+    g.reset();
 }
 
 test "dsv41 experts: the gated route builds every wave at once over event-wait aliases, no host waits" {
