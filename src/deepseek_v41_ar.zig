@@ -1251,6 +1251,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
         .{ .name = "residents (the embedding: host rows, else off at the fence)", .p = b.prefillTerms().residents, .d = b.residents - b.embedding },
         .{ .name = "Engram residents (row caches: host side)", .p = b.engram, .d = b.engram },
+        .{ .name = "Engram posted gathers (ENGRAM=prefetch: one slot's, host)", .p = b.engram_posted, .d = 0 },
         .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify + draft", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },

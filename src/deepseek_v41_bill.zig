@@ -13,6 +13,7 @@ const xp = @import("deepseek_v41_experts.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
 const gpu_ceiling = @import("gpu_ceiling.zig");
+const graph = @import("deepseek_v41_graph.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -78,6 +79,9 @@ pub const Bill = struct {
     /// ([seq, head_dim] f32); a view keeps its parent's buffer (v6b: +1.30 GB persistent after the prompt,
     /// 1.11 GB of it these). Decode phase only (inside the prompt wave's kept state during the pass).
     prompt_state: u64 = 0,
+    /// ENGRAM=prefetch's posted gathers (`engramPostedBytes`: one Engram slot's ids and records, host), prompt
+    /// phase only; 0 when the route is off.
+    engram_posted: u64 = 0,
 
     pub fn prefillTotal(b: Bill) u64 {
         return b.baseline + b.prefillTerms().sum();
@@ -89,7 +93,7 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead };
+        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted };
     }
 
     /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
@@ -104,6 +108,7 @@ pub const Bill = struct {
         t.waves = 0;
         t.kv = 0;
         t.mlx_cache = 0;
+        t.engram_posted = 0;
         return t;
     }
 
@@ -127,6 +132,8 @@ pub const PhaseTerms = struct {
     unbilled_overhead: u64 = 0,
     /// The retained prompt state (decode phase).
     prompt_state: u64 = 0,
+    /// ENGRAM=prefetch's posted gathers (prompt phase).
+    engram_posted: u64 = 0,
 
     pub fn sum(t: PhaseTerms) u64 {
         var n: u64 = 0;
@@ -295,7 +302,27 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .unbilled_overhead = 0,
         .embedding_host_rows = config.embedding_host_rows orelse true,
         .prompt_state = prompt_tokens * (bill.n_main * bill.hidden * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4),
+        .engram_posted = if (engramPostedRoute(config, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
     };
+}
+
+/// ENGRAM=prefetch (the served tier's `engram_posted` route, dsv41-engram-prefetch b198dbd): the K16 prompt pass
+/// posts each Engram layer slot's gathers ahead of the layer that reads them and holds one slot's at a time
+/// (released after that slot's layer, before the next slot's are posted): every prompt position's hashed row ids
+/// (i64) and records (the mxfp8 codes and their E8M0 scales, `eng.Bank.record_bytes`). Host memory (the row
+/// source's allocator), prompt phase only. The two poster threads' stacks (256 KB each) are not billed.
+pub fn engramPostedBytes(e: v41.Engram, prompt_tokens: u64) u64 {
+    const record: u64 = @as(u64, e.head_dim) + e.head_dim / 32;
+    return prompt_tokens * e.hashCols() * (record + @sizeOf(i64));
+}
+
+/// Whether `config`'s prompt pass posts its Engram gathers: the K16 pass over a bank with Engram layers, the
+/// route set (the setting, else the served tier's). The route's declarations land with dsv41-engram-prefetch:
+/// a tree without them posts nothing, and the term comes on with the route, no bill change.
+fn engramPostedRoute(config: *const model.ModelConfig, c: *const v41.Config) bool {
+    if (!config.dsv41LayerMajor() or c.engram.n_layers == 0) return false;
+    if (comptime !(@hasField(graph.Routes, "engram_posted") and @hasField(model.ModelConfig, "engram_posted"))) return false;
+    return config.engram_posted orelse module.numericTier(.served).routes.engram_posted;
 }
 
 /// The fill for `config`'s routes: the bill at the floor rows (both phases' rows-free totals by
@@ -304,13 +331,18 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
 /// `wired_bytes` as `billAt`.
 pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64) !arm_mod.NativeRows {
     const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes);
-    const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
-    const per_row = @as(u64, b0.layers) * rec;
-    return fillRows(.{
-        .prefill_fixed = b0.prefillTotal() - b0.prefill_rows * per_row,
-        .decode_fixed = b0.decodeTotal() - b0.decode_rows * per_row,
+    return fillRows(fillBillOf(b0), target, b0.n_experts);
+}
+
+/// A bill in the fill's shape: its phases' totals less their slot rows, and one row on every routed layer.
+pub fn fillBillOf(b: Bill) FillBill {
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
+    const per_row = @as(u64, b.layers) * rec;
+    return .{
+        .prefill_fixed = b.prefillTotal() - b.prefill_rows * per_row,
+        .decode_fixed = b.decodeTotal() - b.decode_rows * per_row,
         .per_row = per_row,
-    }, target, b0.n_experts);
+    };
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
@@ -434,6 +466,24 @@ test "dsv41 memory: with the embedding on its host rows no phase bills the devic
     try testing.expectEqual(r_dev.prefill + 2, r_host.prefill);
 }
 
+test "dsv41 memory: ENGRAM=prefetch's posted gathers are one slot's ids and records, billed in the prompt phase only" {
+    // The 3.0 bank's Engram geometry: 24 columns (n-gram orders 2..4 x 8 heads), 256 code bytes + 8 scale bytes.
+    const e: v41.Engram = .{ .n_layers = 2, .max_ngram_size = 4, .n_heads = 8, .head_dim = 256 };
+    try testing.expectEqual(@as(u32, 24), e.hashCols());
+    // 16,384 positions x 24 columns x (264 record + 8 id) bytes: 107 MB at the fill's request.
+    try testing.expectEqual(@as(u64, 106_954_752), engramPostedBytes(e, fill_prompt_tokens));
+    const off = cell4Bill();
+    var on = off;
+    on.engram_posted = engramPostedBytes(e, fill_prompt_tokens);
+    try testing.expectEqual(off.prefillTotal() + on.engram_posted, on.prefillTotal());
+    try testing.expectEqual(off.decodeTotal(), on.decodeTotal());
+    try testing.expectEqual(off.constructionTerms().sum(), on.constructionTerms().sum());
+    try testing.expectEqual(on.engram_posted, on.prefillTerms().engram_posted);
+    // The fill's shape carries it in the prompt phase alone.
+    try testing.expectEqual(fillBillOf(off).prefill_fixed + on.engram_posted, fillBillOf(on).prefill_fixed);
+    try testing.expectEqual(fillBillOf(off).decode_fixed, fillBillOf(on).decode_fixed);
+}
+
 test "dsv41 memory: the phase record's residuals: billed less the interval peak, billed device terms less MLX's peak" {
     const b = cell4Bill();
     // cell4's prompt boundary: footprint 83.03 GB now; MLX active 76.56, peak 91.35 GB.
@@ -492,6 +542,41 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000);
     try testing.expectEqual(b.prefillTotal(), b_live.prefillTotal());
     try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
+}
+
+// DSV41_BANK=<bank> (host): the rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB stop;
+// baselines 9.2 GB and pass3an's 9.55 GB), the Engram posted gathers off (SERVED9b) and on (SERVED10, the served
+// tier's route with dsv41-engram-prefetch): the posted slot costs the 9.2 GB box one prompt row, no decode row.
+test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's posted gathers off and on (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_ceiling_bytes = 120_259_084_288;
+    const target = config.memory_ceiling_bytes.? - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    try testing.expectEqual(@as(u64, 106_954_752), posted);
+    const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
+    for ([_]Want{
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 139, .decode = 166 }, .on = .{ .prefill = 138, .decode = 166 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 165 }, .on = .{ .prefill = 138, .decode = 165 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);
+        // This tree's own route decision: off without the route's declarations, the served tier's with them.
+        try testing.expectEqual(if (engramPostedRoute(&config, &c)) posted else 0, b0.engram_posted);
+        b0.engram_posted = 0;
+        const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        b0.engram_posted = posted;
+        const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        std.debug.print("\nrows at baseline {d:.2} GB (target {d:.3} GB): posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, @as(f64, @floatFromInt(target)) / 1e9, off.prefill, off.decode, on.prefill, on.decode });
+        try testing.expectEqual(w.off, off);
+        try testing.expectEqual(w.on, on);
+    }
+    std.debug.print("\n", .{});
 }
 
 /// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
