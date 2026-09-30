@@ -151,6 +151,19 @@ pub const Module = struct {
             log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ nr.prefill, nr.decode, fill_prompt_tokens, admitted.memory_baseline_bytes.?, ceiling_bytes -| ceiling_stop_bytes });
         }
         errdefer self.dropKernels();
+        // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
+        // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
+        // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
+        {
+            var cfg = admitted;
+            cfg.memory_ceiling_bytes = ceiling_bytes;
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            _ = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, arm_mod.wiredBytes()) catch |e| {
+                log.err("admission refused before construction: {s}", .{@errorName(e)});
+                return e;
+            };
+        }
         self.g.clearCache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
