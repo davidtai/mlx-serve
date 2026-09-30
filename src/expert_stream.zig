@@ -2189,6 +2189,40 @@ const ProbeBox = struct {
             std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
         }
     }
+    /// Marks every 50 ms until the footprint is at most `limit` above `ref`'s (a release measured by the process's own
+    /// ledger, not only by the growth outside it), at most `bound_ms` (ms: null when it never is).
+    fn settleFootprint(ref: Self, buf: []u8, bound_ms: u64, limit: i64) !Settled {
+        const t0 = std.Io.Timestamp.now(testing.io, .boot);
+        while (true) {
+            const b = try mark(buf);
+            const ms: u64 = @intCast(@divTrunc(t0.untilNow(testing.io, .boot).nanoseconds, std.time.ns_per_ms));
+            if (d(ref.fp, b.fp) <= limit) return .{ .b = b, .ms = ms };
+            if (ms >= bound_ms) return .{ .b = b, .ms = null };
+            std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+        }
+    }
+    /// A baseline once wired and physical hold still across two marks 100 ms apart (an earlier step's pages still being
+    /// retired would land inside the measured steps), at most `bound_ms` (ms: null when they never did).
+    fn settled(buf: []u8, bound_ms: u64) !Settled {
+        const t0 = std.Io.Timestamp.now(testing.io, .boot);
+        var prev = try mark(buf);
+        const stable: u64 = ar.box_mark_stable_bytes;
+        while (true) {
+            std.Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+            const b = try mark(buf);
+            const ms: u64 = @intCast(@divTrunc(t0.untilNow(testing.io, .boot).nanoseconds, std.time.ns_per_ms));
+            if (@abs(d(prev.pages.wired, b.pages.wired)) <= stable and @abs(d(prev.pages.physical(), b.pages.physical())) <= stable) return .{ .b = b, .ms = ms };
+            if (ms >= bound_ms) return .{ .b = b, .ms = null };
+            prev = b;
+        }
+    }
+    /// One more GPU command (a release the driver retires only at a later submission).
+    fn nextCommand(s: mlx.mlx_stream) !void {
+        var z = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{1}, 1, .float32, s));
+        try evalArrays(&.{z});
+        _ = mlx.mlx_array_free(z);
+    }
     fn msOf(x: ?u64, out: []u8) []const u8 {
         return if (x) |v| std.fmt.bufPrint(out, "{d}", .{v}) catch out[0..0] else "null";
     }
@@ -2223,7 +2257,8 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     const page = std.heap.pageSize();
     const Box = ProbeBox;
     var buf: [1 << 16]u8 = undefined;
-    const b0 = try Box.mark(&buf);
+    const base = try Box.settled(&buf, 3000);
+    const b0 = base.b;
     // The overlapped grow's mechanics: an untouched private anonymous mapping, a helper's touch of every page.
     const m = try std.posix.mmap(null, bytes, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     const helper = try std.Thread.spawn(.{}, Box.touch, .{ @as([]u8, m), page });
@@ -2243,34 +2278,35 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     try mlx.check(mlx.mlx_sum(&sum, view, false, s));
     try evalArrays(&.{sum});
     const b3 = try Box.mark(&buf);
-    // Released: the arrays freed (the wrap's deleter unmaps), MLX's cache cleared, the box settled (2 s bound). Else one
-    // more GPU command and a second settle (1 s): a release the driver retires only at a later submission.
+    // Released: the arrays freed (the wrap's deleter unmaps), synchronize, MLX's cache cleared, the box settled from the
+    // post-touch state (2 s bound). Else one more GPU command and a second settle (1 s): a release the driver retires only
+    // at a later submission. The first GPU read is judged from the post-touch state too.
     _ = mlx.mlx_array_free(sum);
     _ = mlx.mlx_array_free(view);
     _ = mlx.mlx_array_free(arr);
+    _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
     const limit: i64 = @intCast(bytes / 10);
-    const r1 = try Box.settle(b0, &buf, 2000, limit);
+    const r1 = try Box.settle(b1, &buf, 2000, limit);
     var r2: ?Box.Settled = null;
     if (r1.ms == null) {
-        var z = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{1}, 1, .float32, s));
-        try evalArrays(&.{z});
-        _ = mlx.mlx_array_free(z);
-        r2 = try Box.settle(b0, &buf, 1000, limit);
+        try Box.nextCommand(s);
+        r2 = try Box.settle(b1, &buf, 1000, limit);
     }
     const released = r1.ms != null or (r2 != null and r2.?.ms != null);
-    const out3 = Box.outside(b0, b3);
+    const out3 = Box.outside(b1, b3);
     const verdict = if (out3 > limit) "GrowWrapOutsideFootprint" else if (!released) "GrowWrapReleaseOutsideFootprint" else "inside";
-    var l: [5][320]u8 = undefined;
-    var ms: [2][24]u8 = undefined;
-    std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"release\": {s}, \"release_settle_ms\": {s}, \"after_next_command\": {s}, \"after_next_command_settle_ms\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        bytes, no_copy, Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b0, r1.b, &l[3]), Box.msOf(r1.ms, &ms[0]),
-        if (r2) |x| Box.line(b0, x.b, &l[4]) else "null", if (r2) |x| Box.msOf(x.ms, &ms[1]) else "null", limit, verdict,
+    var l: [6][320]u8 = undefined;
+    var ms: [3][24]u8 = undefined;
+    std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"baseline_settle_ms\": {s}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"first_gpu_read_from_touch\": {s}, \"release_from_touch\": {s}, \"release_settle_ms\": {s}, \"after_next_command_from_touch\": {s}, \"after_next_command_settle_ms\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
+        bytes, no_copy, Box.msOf(base.ms, &ms[2]), Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b1, b3, &l[5]), Box.line(b1, r1.b, &l[3]), Box.msOf(r1.ms, &ms[0]),
+        if (r2) |x| Box.line(b1, x.b, &l[4]) else "null", if (r2) |x| Box.msOf(x.ms, &ms[1]) else "null", limit, verdict,
     });
     // Control (the growth's way back): an MLX-allocated array of the same bytes, written and read in full on the GPU,
-    // released through the allocator (cache cleared), marked from here; reported beside the wrap's, not judged.
-    const c0 = try Box.mark(&buf);
+    // released through the allocator (synchronize, cache cleared) from its own settled baseline; its release is the
+    // footprint back within the limit of that baseline (reported beside the wrap's, not judged).
+    const cbase = try Box.settled(&buf, 3000);
+    const c0 = cbase.b;
     var za = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_zeros(&za, &[_]c_int{elems}, 1, .int16, s));
     var zs = mlx.mlx_array_new();
@@ -2279,12 +2315,20 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     const c1 = try Box.mark(&buf);
     _ = mlx.mlx_array_free(zs);
     _ = mlx.mlx_array_free(za);
+    _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
-    const cr = try Box.settle(c0, &buf, 2000, limit);
-    var cl: [2][320]u8 = undefined;
-    var cms: [24]u8 = undefined;
-    std.debug.print("\nGROWTH_BOX_PROBE_CONTROL {{\"bytes\": {d}, \"written_read\": {s}, \"release\": {s}, \"release_settle_ms\": {s}}}\n", .{
-        bytes, Box.line(c0, c1, &cl[0]), Box.line(c0, cr.b, &cl[1]), Box.msOf(cr.ms, &cms),
+    const cr = try Box.settleFootprint(c0, &buf, 2000, limit);
+    var cr2: ?Box.Settled = null;
+    if (cr.ms == null) {
+        try Box.nextCommand(s);
+        cr2 = try Box.settleFootprint(c0, &buf, 1000, limit);
+    }
+    const c_released = cr.ms != null or (cr2 != null and cr2.?.ms != null);
+    var cl: [3][320]u8 = undefined;
+    var cms: [3][24]u8 = undefined;
+    std.debug.print("\nGROWTH_BOX_PROBE_CONTROL {{\"bytes\": {d}, \"baseline_settle_ms\": {s}, \"written_read\": {s}, \"release\": {s}, \"release_footprint_settle_ms\": {s}, \"after_next_command\": {s}, \"after_next_command_footprint_settle_ms\": {s}, \"footprint_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
+        bytes, Box.msOf(cbase.ms, &cms[2]), Box.line(c0, c1, &cl[0]), Box.line(c0, cr.b, &cl[1]), Box.msOf(cr.ms, &cms[0]),
+        if (cr2) |x| Box.line(c0, x.b, &cl[2]) else "null", if (cr2) |x| Box.msOf(x.ms, &cms[1]) else "null", limit, if (c_released) "released" else "ControlReleaseKeptFootprint",
     });
     try testing.expect(no_copy);
     if (out3 > limit) return error.GrowWrapOutsideFootprint;
@@ -2314,7 +2358,8 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     defer a.free(rows);
     @memset(rows, 0);
     var buf: [1 << 16]u8 = undefined;
-    const b0 = try ProbeBox.mark(&buf);
+    const base = try ProbeBox.settled(&buf, 3000);
+    const b0 = base.b;
     const s = try Stream.init(a, &bank, .{ .rows = rows, .transient_rows = depth * max_route_ids, .wide_depth = depth, .slot_memory = .{ .mlx = stream } });
     defer s.deinit();
     // The prompt's wide reads: five live routes of layer L fill every window with records (no persistent rows).
@@ -2336,28 +2381,29 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     for (live) |r| s.release(r);
     _ = mlx.mlx_synchronize(stream);
     const b1 = try ProbeBox.mark(&buf);
-    // The release (its allocator check), MLX's cache cleared, the box settled (2 s bound; else one more GPU command
-    // and 1 s): the growth outside the footprint since before the scratch back within 10 % of the freed bytes.
+    // The release (its allocator check), synchronize, MLX's cache cleared; from the post-fill state (2 s bounds; else one
+    // more GPU command and 1 s): the footprint falls by the freed scratch (to within 10 %), and the growth outside the
+    // footprint does not rise past 10 % of it.
     var active: [2]usize = .{ 0, 0 };
     _ = mlx.mlx_get_active_memory(&active[0]);
     const freed = try s.releaseTransient();
     _ = mlx.mlx_get_active_memory(&active[1]);
     try testing.expectEqual(transientBytes(s, depth * max_route_ids), freed);
+    _ = mlx.mlx_synchronize(stream);
     _ = mlx.mlx_clear_cache();
     const limit: i64 = @intCast(freed / 10);
-    const r1 = try ProbeBox.settle(b0, &buf, 2000, limit);
+    const fp_limit: i64 = limit - @as(i64, @intCast(freed));
+    const f1 = try ProbeBox.settleFootprint(b1, &buf, 2000, fp_limit);
+    const r1 = try ProbeBox.settle(b1, &buf, 2000, limit);
     var r2: ?ProbeBox.Settled = null;
-    if (r1.ms == null) {
-        var z = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{1}, 1, .float32, stream));
-        try evalArrays(&.{z});
-        _ = mlx.mlx_array_free(z);
-        r2 = try ProbeBox.settle(b0, &buf, 1000, limit);
+    var f2: ?ProbeBox.Settled = null;
+    if (f1.ms == null or r1.ms == null) {
+        try ProbeBox.nextCommand(stream);
+        f2 = try ProbeBox.settleFootprint(b1, &buf, 1000, fp_limit);
+        r2 = try ProbeBox.settle(b1, &buf, 1000, limit);
     }
     const released = r1.ms != null or (r2 != null and r2.?.ms != null);
-    const after = if (r2) |x| x.b else r1.b;
-    // The footprint must drop by at least 90 % of the freed bytes.
-    const kept = ProbeBox.d(after.fp, b1.fp) < @as(i64, @intCast(freed / 10 * 9));
+    const kept = !(f1.ms != null or (f2 != null and f2.?.ms != null));
     // Decode: window 0 and layer L's four rows; the route's misses past them land in window 0 and hold their records.
     rows[L] = 4;
     try s.grow(rows);
@@ -2375,16 +2421,16 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     }
     s.release(r);
     try s.flush();
-    const verdict = if (!released) "TransientReleaseOutsideFootprint" else if (kept) "TransientReleaseKeptFootprint" else "inside";
-    var l: [4][320]u8 = undefined;
-    var ms: [2][24]u8 = undefined;
-    std.debug.print("\nTRANSIENT_RELEASE_PROBE {{\"transient_rows\": {d}, \"freed_bytes\": {d}, \"d_active\": {d}, \"window0_rows\": {d}, \"filled\": {s}, \"release\": {s}, \"release_settle_ms\": {s}, \"after_next_command\": {s}, \"after_next_command_settle_ms\": {s}, \"grown\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        depth * max_route_ids, freed, active[0] -| active[1], s.transient.rows, ProbeBox.line(b0, b1, &l[0]), ProbeBox.line(b0, r1.b, &l[1]), ProbeBox.msOf(r1.ms, &ms[0]),
-        if (r2) |x| ProbeBox.line(b0, x.b, &l[2]) else "null", if (r2) |x| ProbeBox.msOf(x.ms, &ms[1]) else "null", ProbeBox.line(b0, b2, &l[3]), limit, verdict,
+    const verdict = if (kept) "TransientReleaseKeptFootprint" else if (!released) "TransientReleaseOutsideFootprint" else "inside";
+    var l: [5][320]u8 = undefined;
+    var ms: [5][24]u8 = undefined;
+    std.debug.print("\nTRANSIENT_RELEASE_PROBE {{\"transient_rows\": {d}, \"freed_bytes\": {d}, \"d_active\": {d}, \"window0_rows\": {d}, \"baseline_settle_ms\": {s}, \"filled\": {s}, \"release_from_fill\": {s}, \"footprint_settle_ms\": {s}, \"outside_settle_ms\": {s}, \"after_next_command_from_fill\": {s}, \"after_next_command_footprint_settle_ms\": {s}, \"after_next_command_outside_settle_ms\": {s}, \"grown\": {s}, \"limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
+        depth * max_route_ids, freed, active[0] -| active[1], s.transient.rows, ProbeBox.msOf(base.ms, &ms[4]), ProbeBox.line(b0, b1, &l[0]), ProbeBox.line(b1, r1.b, &l[1]), ProbeBox.msOf(f1.ms, &ms[0]), ProbeBox.msOf(r1.ms, &ms[1]),
+        if (r2) |x| ProbeBox.line(b1, x.b, &l[2]) else "null", if (f2) |x| ProbeBox.msOf(x.ms, &ms[2]) else "null", if (r2) |x| ProbeBox.msOf(x.ms, &ms[3]) else "null", ProbeBox.line(b0, b2, &l[3]), limit, verdict,
     });
     try testing.expect(in_window0);
-    if (!released) return error.TransientReleaseOutsideFootprint;
     if (kept) return error.TransientReleaseKeptFootprint;
+    if (!released) return error.TransientReleaseOutsideFootprint;
 }
 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.

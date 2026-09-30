@@ -596,14 +596,21 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
-    for ([_]Want{
-        // Wide depth 5 (P1c, 240 transient rows), the minimal copy's bound at the most outputs a call can make (63 / 86
-        // of the routed rows at 16K), and the frontier as rings (3ebd8a7: -0.191 GB in the prompt, -0.211 GB in decode;
-        // before it 8.99 GB 135 / 164 off, 134 / 164 on; 9.20 GB 134 / 163 both; 9.55 GB 134 / 163 off, 133 / 163 on).
+    // Wide depth 5 (P1c, 240 transient rows), the minimal copy's bound at the most outputs a call can make (63 / 86
+    // of the routed rows at 16K), and the frontier as rings (3ebd8a7: -0.191 GB in the prompt, -0.211 GB in decode;
+    // before it 8.99 GB 135 / 164 off, 134 / 164 on; 9.20 GB 134 / 163 both; 9.55 GB 134 / 163 off, 133 / 163 on).
+    const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 135, .decode = 164 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 134, .decode = 164 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
-    }) |w| {
+    };
+    // With the stream's release declared (SERVED16), decode bills window 0 only: +5 decode rows at each baseline.
+    const window_0 = [_]Want{
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 134, .decode = 169 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+    };
+    for (if (stream_releases_wide_windows) window_0 else every_window) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         // This tree's own route decision: off without the route's declarations, the served tier's with them.
@@ -677,7 +684,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     const opts = module.armOptions(&config, module.boxCeiling(ceiling, c.n_routed_experts), .host);
     try testing.expectEqual(@as(u8, 5), opts.wide_depth);
     try testing.expectEqual(@as(u64, opts.wide_depth) * xp.max_route_ids, b.transient_rows);
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
     try testing.expectEqual(@as(u64, 13_315_584), rec);
     try testing.expectEqual(xp.max_route_ids * rec + arm_mod.wideWindowBytes(opts.wide_depth, rec), b.transient_rows * rec);
     try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + @as(u64, opts.wide_depth) * xp.max_route_ids) * rec, b.slot_prefill);

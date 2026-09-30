@@ -1129,7 +1129,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         /// The phase change's first free: every layer's transient binding nulled (from here to `grow` a stray use
-        /// fails on null, never on freed arrays), then the source frees the scratch. Returns the bytes freed.
+        /// fails on null, never on freed arrays), then the source frees the scratch. Returns the bytes freed. A
+        /// refusal leaves the bindings null (fails closed; the Module refuses every later request).
         pub fn releaseTransient(self: *Self) !u64 {
             for (self.banks) |*b| b[@backingInt(BankKind.transient)] = null;
             self.transient_released = true;
