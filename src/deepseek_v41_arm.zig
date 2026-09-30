@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const status = @import("status.zig");
 const mlx = @import("mlx.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -145,7 +146,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     for (bank.layers) |l| record = @max(record, l.logical_bytes);
     const inputs: expert_admission.Inputs = .{
         .baseline_bytes = baseline,
-        .wired_bytes = opt.wired_bytes orelse wiredBytes(),
+        .wired_bytes = opt.wired_bytes orelse status.vmBytes().wired,
         .record_bytes = record,
         .fixed_rows = opt.fixed_rows,
         .allocation = opt.allocation,
@@ -638,217 +639,9 @@ pub fn StandIn(comptime A: type) type {
     };
 }
 
-// ── Memory probes (Mach) ──
-
-extern "c" var mach_task_self_: u32;
-extern "c" fn mach_host_self() u32;
-extern "c" fn task_info(task: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
-extern "c" fn host_statistics64(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
-extern "c" fn host_page_size(host: u32, out: *usize) i32;
-
-/// task_vm_info through the rev3 ledger block (<mach/task_info.h> order, every field named).
-const TaskVmInfo = extern struct {
-    virtual_size: u64,
-    region_count: i32,
-    page_size: i32,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-    min_address: u64,
-    max_address: u64,
-    ledger_phys_footprint_peak: i64,
-    ledger_purgeable_nonvolatile: i64,
-    ledger_purgeable_novolatile_compressed: i64,
-    ledger_purgeable_volatile: i64,
-    ledger_purgeable_volatile_compressed: i64,
-    ledger_tag_network_nonvolatile: i64,
-    ledger_tag_network_nonvolatile_compressed: i64,
-    ledger_tag_network_volatile: i64,
-    ledger_tag_network_volatile_compressed: i64,
-    ledger_tag_media_footprint: i64,
-    ledger_tag_media_footprint_compressed: i64,
-    ledger_tag_media_nofootprint: i64,
-    ledger_tag_media_nofootprint_compressed: i64,
-    ledger_tag_graphics_footprint: i64,
-    ledger_tag_graphics_footprint_compressed: i64,
-    ledger_tag_graphics_nofootprint: i64,
-    ledger_tag_graphics_nofootprint_compressed: i64,
-    ledger_tag_neural_footprint: i64,
-    ledger_tag_neural_footprint_compressed: i64,
-    ledger_tag_neural_nofootprint: i64,
-    ledger_tag_neural_nofootprint_compressed: i64,
-};
-
-comptime {
-    // TASK_VM_INFO_REV3_COUNT (rev1 38 + rev2 4 + the rev3 ledger block 42) in natural_t units.
-    std.debug.assert(@sizeOf(TaskVmInfo) / @sizeOf(i32) == 84);
-}
-
-fn taskVmInfo() ?TaskVmInfo {
-    if (comptime !builtin.os.tag.isDarwin()) return null;
-    var info = std.mem.zeroes(TaskVmInfo);
-    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32);
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return null;
-    // A kernel below rev3 leaves the ledger block zero (the reads below then report 0, never garbage).
-    return info;
-}
-
-pub const Footprint = struct { now: u64, peak: u64 };
-
-/// The process phys_footprint (Metal included) and its lifetime peak.
-pub fn footprint() Footprint {
-    const info = taskVmInfo() orelse return .{ .now = 0, .peak = 0 };
-    return .{ .now = info.phys_footprint, .peak = if (info.ledger_phys_footprint_peak > 0) @intCast(info.ledger_phys_footprint_peak) else info.phys_footprint };
-}
-
-/// rusage_info_v4 (<sys/resource.h>): the footprint's interval high-water mark, which
-/// `proc_reset_footprint_interval` restarts (libsystem_kernel; the kernel's own ledger, no sampling).
-const RusageInfoV4 = extern struct {
-    uuid: [16]u8,
-    f: [35]u64,
-    const phys_footprint = 7;
-    const lifetime_max_phys_footprint = 28;
-    const interval_max_phys_footprint = 33;
-};
-extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *RusageInfoV4) c_int;
-extern "c" fn proc_reset_footprint_interval(pid: c_int) c_int;
-extern "c" fn getpid() c_int;
-
-/// This process's memory at a phase boundary, from the kernel's ledgers (task_vm_info rev3 and
-/// rusage v4): what the guard's footprint reads and how it splits. Bytes.
-pub const ProcessMemory = struct {
-    /// phys_footprint now: the guard's per-process number (Metal / IOAccelerator included).
-    footprint: u64 = 0,
-    /// The footprint's high-water mark since the previous `startInterval` (the phase's peak).
-    footprint_interval_peak: u64 = 0,
-    footprint_lifetime_peak: u64 = 0,
-    /// Anonymous (malloc, MLX host) pages resident; compressed pages this task owns.
-    internal: u64 = 0,
-    compressed: u64 = 0,
-    /// File-backed pages this task maps resident (not in the footprint; in the box's file cache).
-    external: u64 = 0,
-    /// IOKit graphics memory (Metal buffers): in the footprint / outside it.
-    graphics_footprint: u64 = 0,
-    graphics_nofootprint: u64 = 0,
-    /// Volatile purgeable memory (outside the footprint).
-    purgeable_volatile: u64 = 0,
-};
-
-pub fn processMemory() ProcessMemory {
-    const info = taskVmInfo() orelse return .{};
-    const pos = struct {
-        fn f(x: i64) u64 {
-            return if (x > 0) @intCast(x) else 0;
-        }
-    }.f;
-    var m: ProcessMemory = .{
-        .footprint = info.phys_footprint,
-        .footprint_lifetime_peak = pos(info.ledger_phys_footprint_peak),
-        .internal = info.internal,
-        .compressed = info.compressed,
-        .external = info.external,
-        .graphics_footprint = pos(info.ledger_tag_graphics_footprint),
-        .graphics_nofootprint = pos(info.ledger_tag_graphics_nofootprint),
-        .purgeable_volatile = pos(info.ledger_purgeable_volatile),
-    };
-    var ru = std.mem.zeroes(RusageInfoV4);
-    if (proc_pid_rusage(getpid(), 4, &ru) == 0) {
-        m.footprint_interval_peak = ru.f[RusageInfoV4.interval_max_phys_footprint];
-        m.footprint_lifetime_peak = @max(m.footprint_lifetime_peak, ru.f[RusageInfoV4.lifetime_max_phys_footprint]);
-    }
-    return m;
-}
-
-/// Restarts the footprint's interval high-water mark (one call per phase boundary, never in a phase).
-pub fn startInterval() void {
-    if (comptime !builtin.os.tag.isDarwin()) return;
-    _ = proc_reset_footprint_interval(getpid());
-}
-
-/// vm_stat's "Pages wired down", in bytes.
-pub fn wiredBytes() u64 {
-    if (comptime !builtin.os.tag.isDarwin()) return 0;
-    var stats: [40]i32 = @splat(0);
-    var count: u32 = stats.len;
-    if (host_statistics64(mach_host_self(), 4, &stats, &count) != 0) return 0;
-    var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
-    const wire_count: u32 = @bitCast(stats[3]);
-    return @as(u64, wire_count) * page;
-}
-
-/// The box's physical pages as the guard reads them (vm_stat), in bytes: physical used = wired + active +
-/// inactive + compressor-occupied (the guard's metric, file cache included); the purgeable, speculative and
-/// file-backed (external) parts named, to attribute what is outside a process's footprint.
-pub const VmBytes = struct { wired: u64 = 0, active: u64 = 0, inactive: u64 = 0, compressor: u64 = 0, purgeable: u64 = 0, speculative: u64 = 0, external: u64 = 0, free: u64 = 0 };
-
-pub fn vmBytes() VmBytes {
-    if (comptime !builtin.os.tag.isDarwin()) return .{};
-    var stats: [40]i32 = @splat(0);
-    var count: u32 = stats.len;
-    if (host_statistics64(mach_host_self(), 4, &stats, &count) != 0) return .{};
-    var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return .{};
-    const at = struct {
-        fn f(st: []const i32, i: usize, pg: usize) u64 {
-            return @as(u64, @as(u32, @bitCast(st[i]))) * pg;
-        }
-    }.f;
-    // vm_statistics64: free, active, inactive, wire; 9 x u64; purgeable, speculative; 4 x u64; compressor, throttled, external.
-    return .{ .free = at(&stats, 0, page), .active = at(&stats, 1, page), .inactive = at(&stats, 2, page), .wired = at(&stats, 3, page), .purgeable = at(&stats, 22, page), .speculative = at(&stats, 23, page), .compressor = at(&stats, 32, page), .external = at(&stats, 34, page) };
-}
-
-pub fn physicalUsed(v: VmBytes) u64 {
-    return v.wired + v.active + v.inactive + v.compressor;
-}
-
 // ── Tests ──
 
 const testing = std.testing;
-
-test "dsv41 arm: the box's physical pages read as the guard reads them, and hold this process's footprint" {
-    const v = vmBytes();
-    const fp = footprint().now;
-    try testing.expect(physicalUsed(v) > fp);
-    try testing.expect(v.wired > 0 and v.active > 0 and v.free > 0);
-    // Every page of the box is in one of the counted states or free (within the uncounted ones).
-    try testing.expect(physicalUsed(v) + v.free <= @as(u64, 1) << 40);
-}
-
-test "dsv41 memory: the process ledgers read at a boundary, and the interval peak restarts and then tracks a touched allocation" {
-    const m0 = processMemory();
-    try testing.expect(m0.footprint > 0 and m0.internal > 0);
-    try testing.expect(m0.footprint_lifetime_peak >= m0.footprint);
-    try testing.expectEqual(footprint().now > 0, true);
-    startInterval();
-    const m1 = processMemory();
-    // Restarted: the interval peak is the footprint at the restart (within this process's small drift).
-    try testing.expect(m1.footprint_interval_peak <= m1.footprint_lifetime_peak);
-    try testing.expect(m1.footprint_interval_peak + (8 << 20) >= m1.footprint);
-    // 64 MiB touched then freed: the interval peak holds it after the free.
-    const buf = try std.heap.page_allocator.alloc(u8, 64 << 20);
-    @memset(buf, 1);
-    const touched = processMemory().footprint;
-    std.heap.page_allocator.free(buf);
-    const m2 = processMemory();
-    try testing.expect(touched >= m1.footprint + (60 << 20));
-    try testing.expect(m2.footprint_interval_peak >= touched);
-    try testing.expect(m2.footprint + (60 << 20) <= m2.footprint_interval_peak);
-}
 
 /// A mini deepseek_v41 directory for host tests: the model lane's mini config
 /// (5 layers, hidden 64, inter 32, 4 experts, top-2) over a synthetic bank of

@@ -25,6 +25,7 @@ const xq = @import("exl3_quant.zig");
 const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
+const status = @import("status.zig");
 const ar_bill = @import("deepseek_v41_ar.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -168,7 +169,7 @@ pub const Module = struct {
             cfg.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, arm_mod.wiredBytes()) catch |e| {
+            const b = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -287,7 +288,7 @@ pub const Module = struct {
             return error.BillRowsMismatch;
         }
         self.bill = b;
-        const measured = arm_mod.footprint().now;
+        const measured = status.footprint().now;
         const billed = b.constructionTerms().sum();
         log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
         checkConstructionBytes(billed, measured) catch |e| {
@@ -593,8 +594,8 @@ const VmMark = struct {
     external: u64,
 
     fn now() VmMark {
-        const v = arm_mod.vmBytes();
-        return .{ .physical = arm_mod.physicalUsed(v), .footprint = arm_mod.footprint().now, .purgeable = v.purgeable, .external = v.external };
+        const v = status.vmBytes();
+        return .{ .physical = status.physicalUsedBytes(v), .footprint = status.footprint().now, .purgeable = v.purgeable, .external = v.external };
     }
 };
 
@@ -683,7 +684,7 @@ pub const BoundaryMemory = struct {
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
-        return .{ .active = active, .cache = cache, .footprint = arm_mod.footprint().now, .physical = arm_mod.physicalUsed(arm_mod.vmBytes()) };
+        return .{ .active = active, .cache = cache, .footprint = status.footprint().now, .physical = status.physicalUsedBytes(status.vmBytes()) };
     }
 };
 

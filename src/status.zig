@@ -38,10 +38,9 @@ const TaskBasicInfo = extern struct {
     suspend_count: i32,
 };
 
-/// task_vm_info truncated through phys_footprint (rev1). Field order matches
-/// <mach/task_info.h> exactly; @sizeOf(TaskVmInfo)/@sizeOf(i32) == 38 ==
-/// TASK_VM_INFO_REV1_COUNT, so the kernel fills through phys_footprint without
-/// overrunning the buffer.
+/// task_vm_info through the rev3 ledger block. Field order matches <mach/task_info.h>
+/// exactly; @sizeOf(TaskVmInfo)/@sizeOf(i32) == 84 == TASK_VM_INFO_REV3_COUNT. The count
+/// is in/out: a kernel below rev3 fills fewer fields and leaves the rest zero.
 const TaskVmInfo = extern struct {
     virtual_size: u64,
     region_count: i32,
@@ -63,7 +62,36 @@ const TaskVmInfo = extern struct {
     compressed_peak: u64,
     compressed_lifetime: u64,
     phys_footprint: u64,
+    // rev2
+    min_address: u64,
+    max_address: u64,
+    // rev3: the ledger block
+    ledger_phys_footprint_peak: i64,
+    ledger_purgeable_nonvolatile: i64,
+    ledger_purgeable_novolatile_compressed: i64,
+    ledger_purgeable_volatile: i64,
+    ledger_purgeable_volatile_compressed: i64,
+    ledger_tag_network_nonvolatile: i64,
+    ledger_tag_network_nonvolatile_compressed: i64,
+    ledger_tag_network_volatile: i64,
+    ledger_tag_network_volatile_compressed: i64,
+    ledger_tag_media_footprint: i64,
+    ledger_tag_media_footprint_compressed: i64,
+    ledger_tag_media_nofootprint: i64,
+    ledger_tag_media_nofootprint_compressed: i64,
+    ledger_tag_graphics_footprint: i64,
+    ledger_tag_graphics_footprint_compressed: i64,
+    ledger_tag_graphics_nofootprint: i64,
+    ledger_tag_graphics_nofootprint_compressed: i64,
+    ledger_tag_neural_footprint: i64,
+    ledger_tag_neural_footprint_compressed: i64,
+    ledger_tag_neural_nofootprint: i64,
+    ledger_tag_neural_nofootprint_compressed: i64,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(TaskVmInfo) / @sizeOf(i32) == 84); // TASK_VM_INFO_REV3_COUNT
+}
 
 const CpuLoadInfo = extern struct {
     ticks: [4]u32, // user, system, idle, nice
@@ -118,10 +146,117 @@ pub fn getAppRssMb() u32 {
 pub fn getAppMemFootprintMb() u32 {
     if (comptime !builtin.os.tag.isDarwin())
         return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
-    var info = std.mem.zeroes(TaskVmInfo);
-    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    const info = taskVmInfo() orelse return 0;
     return @intCast(info.phys_footprint / (1024 * 1024));
+}
+
+fn taskVmInfo() ?TaskVmInfo {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
+    var info = std.mem.zeroes(TaskVmInfo);
+    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 84 = TASK_VM_INFO_REV3_COUNT (in/out)
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return null;
+    return info;
+}
+
+/// This process's phys_footprint (MLX's Metal / IOKit memory included) and its lifetime peak, in bytes.
+pub const Footprint = struct { now: u64, peak: u64 };
+
+pub fn footprint() Footprint {
+    const info = taskVmInfo() orelse return .{ .now = 0, .peak = 0 };
+    return .{ .now = info.phys_footprint, .peak = if (info.ledger_phys_footprint_peak > 0) @intCast(info.ledger_phys_footprint_peak) else info.phys_footprint };
+}
+
+/// rusage_info_v4 (<sys/resource.h>): the footprint's interval high-water mark, which
+/// `proc_reset_footprint_interval` (libsystem_kernel) restarts: the kernel's own ledger, no sampling.
+const RusageInfoV4 = extern struct {
+    uuid: [16]u8,
+    f: [35]u64,
+    const lifetime_max_phys_footprint = 28;
+    const interval_max_phys_footprint = 33;
+};
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *RusageInfoV4) c_int;
+extern "c" fn proc_reset_footprint_interval(pid: c_int) c_int;
+extern "c" fn getpid() c_int;
+
+/// This process's memory from the kernel's ledgers (task_vm_info rev3 and rusage v4), in bytes: the
+/// footprint, its interval and lifetime peaks, and how it splits. Zero where the platform has no ledger.
+pub const ProcessMemory = struct {
+    /// phys_footprint now (Metal / IOAccelerator included).
+    footprint: u64 = 0,
+    /// The footprint's high-water mark since the previous `startFootprintInterval`.
+    footprint_interval_peak: u64 = 0,
+    footprint_lifetime_peak: u64 = 0,
+    /// Anonymous pages resident; compressed pages this task owns.
+    internal: u64 = 0,
+    compressed: u64 = 0,
+    /// File-backed pages this task maps resident (outside the footprint).
+    external: u64 = 0,
+    /// IOKit graphics memory (Metal buffers): in the footprint / outside it.
+    graphics_footprint: u64 = 0,
+    graphics_nofootprint: u64 = 0,
+    /// Volatile purgeable memory (outside the footprint).
+    purgeable_volatile: u64 = 0,
+};
+
+pub fn processMemory() ProcessMemory {
+    const info = taskVmInfo() orelse return .{};
+    const pos = struct {
+        fn f(x: i64) u64 {
+            return if (x > 0) @intCast(x) else 0;
+        }
+    }.f;
+    var m: ProcessMemory = .{
+        .footprint = info.phys_footprint,
+        .footprint_lifetime_peak = pos(info.ledger_phys_footprint_peak),
+        .internal = info.internal,
+        .compressed = info.compressed,
+        .external = info.external,
+        .graphics_footprint = pos(info.ledger_tag_graphics_footprint),
+        .graphics_nofootprint = pos(info.ledger_tag_graphics_nofootprint),
+        .purgeable_volatile = pos(info.ledger_purgeable_volatile),
+    };
+    var ru = std.mem.zeroes(RusageInfoV4);
+    if (proc_pid_rusage(getpid(), 4, &ru) == 0) {
+        m.footprint_interval_peak = ru.f[RusageInfoV4.interval_max_phys_footprint];
+        m.footprint_lifetime_peak = @max(m.footprint_lifetime_peak, ru.f[RusageInfoV4.lifetime_max_phys_footprint]);
+    }
+    return m;
+}
+
+/// Restarts the footprint's interval high-water mark (`ProcessMemory.footprint_interval_peak`).
+pub fn startFootprintInterval() void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    _ = proc_reset_footprint_interval(getpid());
+}
+
+/// The box's page counts (`VmStats64`), in bytes. Zero off Darwin.
+pub const VmBytes = struct { free: u64 = 0, active: u64 = 0, inactive: u64 = 0, wired: u64 = 0, purgeable: u64 = 0, speculative: u64 = 0, compressor: u64 = 0, external: u64 = 0, internal: u64 = 0 };
+
+pub fn vmBytes() VmBytes {
+    if (comptime !builtin.os.tag.isDarwin()) return .{};
+    var page: usize = 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return .{};
+    var vm = std.mem.zeroes(VmStats64);
+    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return .{};
+    const pg: u64 = page;
+    return .{
+        .free = vm.free_count * pg,
+        .active = vm.active_count * pg,
+        .inactive = vm.inactive_count * pg,
+        .wired = vm.wire_count * pg,
+        .purgeable = vm.purgeable_count * pg,
+        .speculative = vm.speculative_count * pg,
+        .compressor = vm.compressor_page_count * pg,
+        .external = vm.external_page_count * pg,
+        .internal = vm.internal_page_count * pg,
+    };
+}
+
+/// vm_stat's wired + active + inactive + compressor-occupied pages: the "physical used" an external
+/// memory guard reads (file cache included; free and speculative pages excluded).
+pub fn physicalUsedBytes(v: VmBytes) u64 {
+    return v.wired + v.active + v.inactive + v.compressor;
 }
 
 /// Bytes of physical memory available for new allocation without heavy
@@ -375,4 +510,35 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
     // would yield 0 or absurd garbage.
     try std.testing.expect(fp > 0);
     try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
+}
+
+test "status: the process ledgers, and the footprint's interval peak restarts and then holds a touched allocation" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const m0 = processMemory();
+    try std.testing.expect(m0.footprint > 0 and m0.internal > 0);
+    try std.testing.expect(m0.footprint_lifetime_peak >= m0.footprint);
+    try std.testing.expect(footprint().now > 0);
+    startFootprintInterval();
+    const m1 = processMemory();
+    try std.testing.expect(m1.footprint_interval_peak <= m1.footprint_lifetime_peak);
+    try std.testing.expect(m1.footprint_interval_peak + (8 << 20) >= m1.footprint);
+    // 64 MiB touched then freed: the interval peak holds it after the free.
+    const buf = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    @memset(buf, 1);
+    const touched = processMemory().footprint;
+    std.heap.page_allocator.free(buf);
+    const m2 = processMemory();
+    try std.testing.expect(touched >= m1.footprint + (60 << 20));
+    try std.testing.expect(m2.footprint_interval_peak >= touched);
+    try std.testing.expect(m2.footprint + (60 << 20) <= m2.footprint_interval_peak);
+    // The megabyte reader agrees with the byte ledger.
+    try std.testing.expect(@as(u64, getAppMemFootprintMb()) * (1 << 20) <= footprint().now + (16 << 20));
+}
+
+test "status: the box's typed page counts hold this process's footprint" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const v = vmBytes();
+    try std.testing.expect(v.wired > 0 and v.active > 0 and v.free > 0);
+    try std.testing.expect(physicalUsedBytes(v) > footprint().now);
+    try std.testing.expect(physicalUsedBytes(v) + v.free <= getTotalMemBytes() + (1 << 30));
 }
