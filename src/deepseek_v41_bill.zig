@@ -14,6 +14,7 @@ const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
 const gpu_ceiling = @import("gpu_ceiling.zig");
 const graph = @import("deepseek_v41_graph.zig");
+const dsl = @import("deepseek_v41_dspark_loop.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -73,11 +74,10 @@ pub const Bill = struct {
     /// The input embedding reads its host rows from construction (`embedding_host_rows`, default on): the
     /// device table is freed after the install warm-up, so no phase holds it.
     embedding_host_rows: bool = false,
-    /// What the prompt pass leaves alive through decode beyond the KV: the DSpark seed keeps a view of
-    /// the whole prompt's main taps (`main_h` slices the concat of every row's `main_hidden`, f32
-    /// [seq, n_main x hidden]) and each draft stage's window a view of its whole-prompt main KV
-    /// ([seq, head_dim] f32); a view keeps its parent's buffer (v6b: +1.30 GB persistent after the prompt,
-    /// 1.11 GB of it these). Decode phase only (inside the prompt wave's kept state during the pass).
+    /// What the prompt pass leaves alive through decode beyond the KV: the DSpark seed's retained state, as
+    /// the loop states it (`dsl.seedRetainedBytes`; today a view of the whole prompt's main taps and each draft
+    /// stage's window a view of its whole-prompt main KV, 1.11 GB at 16K; v6b measured +1.30 GB persistent
+    /// after the prompt). Decode phase only (inside the prompt wave's kept state during the pass).
     prompt_state: u64 = 0,
     /// ENGRAM=prefetch's posted gathers (`engramPostedBytes`: one Engram slot's ids and records, host), prompt
     /// phase only; 0 when the route is off.
@@ -301,7 +301,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .wide_window = 0,
         .unbilled_overhead = 0,
         .embedding_host_rows = config.embedding_host_rows orelse true,
-        .prompt_state = prompt_tokens * (bill.n_main * bill.hidden * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4),
+        .prompt_state = dsl.seedRetainedBytes(&c, prompt_tokens),
         .engram_posted = if (engramPostedRoute(config, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
     };
 }

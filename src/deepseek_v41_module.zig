@@ -240,7 +240,7 @@ pub const Module = struct {
         const c = switch (self.arm) {
             inline else => |t| t.arm.config,
         };
-        if (c.engram.n_layers > 0) try loadEngramResidents(gpa, weights, dir);
+        if (c.engram.n_layers > 0) try loadEngramResidents(gpa, weights, dir, config);
         self.engram = try eng.RowSource.open(gpa, io, dir, map, &c, &vd);
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
@@ -747,7 +747,7 @@ pub const Module = struct {
         self.phase_change.?.grown = BoundaryMemory.now();
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (settled)", "after the banks grew" }) |m, name|
-            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d})", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
+            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
     /// One `NATIVE DSV41_PHASE_CHANGE {json}` line of the record (success or refusal): the server log carries
@@ -806,7 +806,9 @@ pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockT
     return true;
 }
 
-/// One reading of the box's pages (the guard's physical-used metric) beside this process's footprint.
+/// One coarse reading of the box's pages (the guard's physical-used metric) beside this process's footprint,
+/// for the log only, never judged: host_statistics64 is rate-limited box-wide, so marks within a second may
+/// repeat one cached reading (the harnesses read vm_stat for their proofs).
 const VmMark = struct {
     physical: u64,
     footprint: u64,
@@ -896,20 +898,21 @@ pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
 /// residual threshold; cell4 measured 0.59 GB UNDER them).
 pub const construction_tolerance_bytes: u64 = 250_000_000;
 
-/// MLX's allocator, the process footprint and the box's physical pages (vm_stat's wired + active + inactive
-/// + compressor: the guard's own metric, the source it samples) at the phase boundary: existing counters only.
+/// MLX's allocator and this process's footprint at a phase boundary: this process's own ledgers, which the
+/// boundary judges. The box's pages are not read here: host_statistics64 is rate-limited box-wide for
+/// non-platform binaries (2-10 fresh calls a second, then the last reading; pass3an2's phase change read one
+/// value five times), so the harnesses read them fresh through vm_stat (`ar.boxMark`).
 pub const BoundaryMemory = struct {
     active: u64,
     cache: u64,
     footprint: u64,
-    physical: u64,
 
     pub fn now() BoundaryMemory {
         var active: usize = 0;
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
-        return .{ .active = active, .cache = cache, .footprint = status.footprint().now, .physical = status.physicalUsedBytes(status.vmBytes()) };
+        return .{ .active = active, .cache = cache, .footprint = status.footprint().now };
     }
 };
 
@@ -942,11 +945,6 @@ pub const PhaseGate = struct {
     }
 };
 
-/// The box's physical pages outside this process's footprint (vm_stat's used less the footprint): recorded
-/// for the harness and the guard, never judged by the served path.
-pub fn outsideOf(m: BoundaryMemory) u64 {
-    return m.physical -| m.footprint;
-}
 
 /// The live boundary reader: MLX's counters, the footprint, vm_stat; waits on the shell's io.
 const LiveReader = struct {
@@ -1064,7 +1062,7 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
 /// rose 37.64 -> 39.14 s, the allocator churning in the prompt pass. The stock tier the envelope's own.
 pub fn prefillCacheLimit(t: @import("model_settings.zig").NumericTier) usize {
     return switch (t) {
-        .served => 2 << 30,
+        .served => v41.served_prefill_cache_bytes,
         .stock => envelope.prefill_cache_bytes,
     };
 }
@@ -1074,13 +1072,16 @@ fn setCacheLimit(limit: usize) void {
     _ = mlx.mlx_set_cache_limit(&prev, limit);
 }
 
-/// The Engram residents' sidecar joins the loaded shards (the index names none of them).
-fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8) !void {
+/// The Engram residents' sidecar joins the loaded shards (the index names none of them), read as the residents
+/// are: past the page cache (the aligned uncached reader) under the model's `nocache_weights` setting.
+fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8, config: *const model_io.ModelConfig) !void {
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/" ++ dsp.engram_residents_file, .{dir}, 0);
     defer gpa.free(path);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    try model_io.loadSafetensorsFile(gpa, weights, path.ptr, cpu, dsp.resident_load_opts);
+    var opts = dsp.resident_load_opts;
+    opts.nocache = config.nocache_weights orelse opts.nocache;
+    try model_io.loadSafetensorsFile(gpa, weights, path.ptr, cpu, opts);
 }
 
 fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
@@ -1552,12 +1553,12 @@ test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, b
     const gb: u64 = 1_000_000_000;
     const emb: u64 = 1_323_827_200;
     // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92 GB.
-    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
-    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
+    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache };
     // Released: cache empty, footprint down by the cache.
     try checkFreed(before, freed, 0);
     // The embedding freed at the boundary: active and footprint down by it too.
-    try checkFreed(before, .{ .active = before.active - emb, .cache = 0, .footprint = freed.footprint - emb, .physical = freed.physical - emb }, emb);
+    try checkFreed(before, .{ .active = before.active - emb, .cache = 0, .footprint = freed.footprint - emb }, emb);
     // Cache bytes left: refused.
     var left = freed;
     left.cache = 16384;
@@ -1567,12 +1568,10 @@ test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, b
     var v6b = freed;
     v6b.footprint = 91_065_000_000;
     try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, v6b, 0));
-    // The box's pages are not the served path's to judge: other processes' growth never refuses the grow.
-    var busy_box = freed;
-    busy_box.physical = before.physical + 5 * gb;
-    try checkFreed(before, busy_box, 0);
+    // The box's pages are not the served path's to judge: the boundary reads none (other processes' growth
+    // cannot refuse the grow by construction).
     // Active not down by the embedding: refused.
-    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb, .physical = before.physical - before.cache - 2 * gb }, emb));
+    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb }, emb));
 }
 
 /// A scripted boundary reader: `readings[i]` at the i-th read (the last one repeats), no real sleep.
@@ -1593,9 +1592,9 @@ const FakeReader = struct {
 };
 
 test "dsv41 memory: the settle waits for the footprint to show the frees, then the one check judges the last reading" {
-    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
-    const lagging: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint, .physical = before.physical };
-    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
+    const lagging: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint };
+    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache };
     // The footprint never shows the frees: the full wait, then refused by name.
     {
         var i: usize = 0;
@@ -1635,9 +1634,9 @@ test "dsv41 memory: a refused boundary refuses every later request by name (no r
 test "dsv41 memory: the return to the prompt rows (shrink) is judged like the phase change" {
     // v6b-scale decode state: the grown rows (31 x 40 x 13.3 MB = 16.5 GB) resident, a 0.27 GB decode cache.
     const grown_rows: u64 = 31 * 40 * 13_315_584;
-    const before: BoundaryMemory = .{ .active = 101_000_000_000, .cache = 268_000_000, .footprint = 102_900_000_000, .physical = 116_800_000_000 };
+    const before: BoundaryMemory = .{ .active = 101_000_000_000, .cache = 268_000_000, .footprint = 102_900_000_000 };
     // The rows and the cache released: passes.
-    const freed: BoundaryMemory = .{ .active = before.active - grown_rows, .cache = 0, .footprint = before.footprint - before.cache - grown_rows, .physical = before.physical - before.cache - grown_rows };
+    const freed: BoundaryMemory = .{ .active = before.active - grown_rows, .cache = 0, .footprint = before.footprint - before.cache - grown_rows };
     try checkFreed(before, freed, grown_rows);
     // The rows' buffers parked in MLX's cache instead of released: refused (the cache is cleared first by design).
     var parked = freed;

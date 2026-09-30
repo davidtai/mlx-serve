@@ -14,6 +14,10 @@ const expert_admission = @import("expert_admission.zig");
 pub const max_layers = 64;
 pub const max_rank = 6;
 
+/// The served tier's prefill allocator cache limit (the module sets it for the prompt pass, the native bill and the
+/// per-request prefill bill charge it): 2 GiB (pass3am: 1 GiB cost TTFT).
+pub const served_prefill_cache_bytes: u64 = 2 << 30;
+
 /// The prompt pass's bill for mlx-serve's prefill admission (the arch's own estimator, as deepseek_v4 has one): what
 /// one request allocates beyond the loaded model and its slot banks while the model forwards its prompt in its own
 /// chunks, one wave per layer. The wave's terms are pinned by the bank trace test of the served prompt forwards.
@@ -31,8 +35,10 @@ pub const PrefillBill = struct {
     window_ring_bytes: u64,
     /// The stock head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
     head_promotion_bytes: u64,
-    /// The allocator cache the module holds MLX to during the prefill.
+    /// The allocator cache the module holds MLX to during the prefill: the stock tier's (the envelope's
+    /// calibration) and the served tier's (`served_prefill_cache_bytes`, the limit the module sets); `cacheBytes`.
     cache_bytes: u64,
+    served_cache_bytes: u64 = 0,
     /// K16's kept state (`layerMajorBytes`): the hidden width, hc copies, routed top-k, the DSpark
     /// target taps, the indexer's top-k.
     hidden: u64 = 0,
@@ -43,6 +49,14 @@ pub const PrefillBill = struct {
     /// The served prefill indexer route (idxscore + INDEX_TOPK): an index source's score chain is one
     /// [rows, positions] f32 score (and the select's mask), not the per-head [rows, heads, positions].
     index_launch: bool = false,
+
+    /// The tier's prefill allocator cache: what the module holds MLX's cache to through the prompt pass.
+    pub fn cacheBytes(b: PrefillBill, tier: Tier) u64 {
+        return switch (tier) {
+            .stock => b.cache_bytes,
+            .served => b.served_cache_bytes,
+        };
+    }
 
     pub fn withIndexLaunch(b: PrefillBill, on: bool) PrefillBill {
         var x = b;
@@ -85,6 +99,7 @@ pub const PrefillBill = struct {
             .window_ring_bytes = @as(u64, c.n_layers) * c.window * c.head_dim * 4,
             .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
             .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
+            .served_cache_bytes = served_prefill_cache_bytes,
             .hidden = c.hidden_size,
             .hc = c.hc_mult,
             .top_k = c.n_experts_per_tok,
@@ -165,7 +180,7 @@ pub const PrefillBill = struct {
             .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
         };
         const head = if (tier == .stock) b.head_promotion_bytes else 0;
-        return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cache_bytes;
+        return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cacheBytes(tier);
     }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
@@ -178,7 +193,7 @@ pub const PrefillBill = struct {
             .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
         };
         const head = if (tier == .stock) b.head_promotion_bytes else 0;
-        return wave / 4 * 5 + kv + head + b.cache_bytes;
+        return wave / 4 * 5 + kv + head + b.cacheBytes(tier);
     }
 };
 

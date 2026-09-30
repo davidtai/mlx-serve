@@ -35,6 +35,17 @@ pub const Finish = enum { length, stop };
 /// `Config.prompt_chunk`: the whole prompt in one forward.
 pub const whole_prompt: u32 = std.math.maxInt(u32);
 
+/// What a request's strategy keeps alive from its prompt pass into decode (the native bill's `prompt_state`,
+/// decode phase), as `Loop.prefillImpl` leaves it: the next draft's main row (`main_h`) is a 1-row view of the
+/// whole prompt's main taps (f32 `[P, n_main x hidden]`) and keeps them alive, and each stage's window is a view
+/// of its whole-prompt main KV (f32 `[P, head_dim]`) until the first round's `setMain` and `seedMain` replace
+/// both. Stated here, beside the code that retains it, so a change to the seed changes the bill with it.
+pub fn seedRetainedBytes(c: *const v41.Config, prompt_tokens: u64) u64 {
+    var n_main: u64 = 0;
+    for (c.layers[0..c.n_layers]) |li| n_main += @intFromBool(li.dspark_target);
+    return prompt_tokens * (n_main * c.hidden_size * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4);
+}
+
 /// One cycle's decisions, as the Python oracle fixture records them.
 pub const CycleLog = struct {
     primary: u32,
