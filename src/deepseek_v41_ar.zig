@@ -1223,6 +1223,10 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
 /// construction, 7.7 GB aged in at the grow). `Module.init` enforces it (ConstructionLeftPageCache), and each
 /// phase record carries `file_cache_created_bytes` and `box_speculative_bytes`.
 ///
+/// Every prompt pass is billed at the prompt rows: the first one before the phase change grows the banks,
+/// every later one after the served path returned them to the prompt rows (the arm's shrink, proven by
+/// `Module.reclaimShrink` before the prompt allocates), so max(prompt total, decode total) bounds every request.
+///
 /// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
 /// admission the module builds with (`Module.armOptions` at the same config) and the arch's prefill
 /// bill (`v41.PrefillBill`, its wave pinned by the served 16K trace test): the prompt phase and the
