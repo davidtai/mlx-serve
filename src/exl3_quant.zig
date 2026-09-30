@@ -220,6 +220,12 @@ pub fn Accepted(comptime G: type) type {
             return self.waves[layer].call(g, x, rows, bank);
         }
 
+        /// `prefill` unjoined: the waves' KEPT outputs (wave order) and each wave-ordered row's
+        /// assignment row (`DigXPrefill.callParts`).
+        pub fn prefillParts(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: quant.BankArrays(A), alloc: Allocator, outs: *std.ArrayList(G.T), pos: *std.ArrayList(u32)) !void {
+            return self.waves[layer].callParts(g, x, rows, bank, alloc, outs, pos);
+        }
+
         /// The prefill boundary: every layer's waves still in flight evaluated, oldest first.
         pub fn finishPrefill(self: *Self, g: *G) !void {
             for (self.waves) |*w| try w.finish(g);
@@ -692,7 +698,9 @@ pub fn DigXPrefill(comptime G: type) type {
         /// [A, 5120] in assignment-row order (the lane's `result`; release it). Refused: A outside 1..the kernels' row
         /// bound (RowsOutOfPlan), a slot outside the bank (SlotOutOfBank), act rows that are not
         /// A (no act_row) or an act_row outside act (RouteInput).
-        pub fn call(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !G.T {
+        /// The call's waves (every wave's output KEPT in `parts`, wave order; `pos` maps each wave-ordered
+        /// row to its assignment row): true when the call is carried (its last waves left in flight).
+        fn runWaves(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !bool {
             const n_rows = rows.slot.len;
             if (n_rows == 0 or n_rows > self.rows_hi) return refuse(self.diag, error.RowsOutOfPlan, "exl3 kernel ops: a prefill call of {d} rows (1..{d})", .{ n_rows, self.rows_hi });
             const a_rows = rowsOf(G, g, act, 0);
@@ -735,6 +743,12 @@ pub fn DigXPrefill(comptime G: type) type {
                 }
                 g.resetTo(m);
             }
+            return carried;
+        }
+
+        pub fn call(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !G.T {
+            const n_rows = rows.slot.len;
+            const carried = try self.runWaves(g, act, rows, bank);
             if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
             const m = g.mark();
             const joined = try g.concat(self.parts.items, 0);
@@ -749,6 +763,19 @@ pub fn DigXPrefill(comptime G: type) type {
             if (carried) try g.asyncEval(&.{result}) else try g.evalAll(&.{result});
             g.resetTo(m);
             return kept;
+        }
+
+        /// `call` without its join (the CALLFEED scatter join's counterpart for a caller that reads
+        /// unjoined outputs, JOINLESS): the waves' KEPT outputs are appended to `outs` in wave order
+        /// (the caller releases them) and, per wave-ordered row, its assignment row to `pos`. The
+        /// values are `call`'s: the same wave arrays, no concatenate or take.
+        pub fn callParts(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T), alloc: Allocator, outs: *std.ArrayList(G.T), pos: *std.ArrayList(u32)) !void {
+            const carried = try self.runWaves(g, act, rows, bank);
+            if (!carried) while (self.flight.items.len > 0) try self.drainOne(g);
+            try outs.ensureUnusedCapacity(alloc, self.parts.items.len);
+            try pos.appendSlice(alloc, self.pos.items);
+            outs.appendSliceAssumeCapacity(self.parts.items);
+            self.parts.clearRetainingCapacity();
         }
 
         /// One wave's five launches -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
