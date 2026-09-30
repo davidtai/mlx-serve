@@ -102,6 +102,12 @@ pub const Module = struct {
     fenced: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
+    /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
+    /// windows). The construction log line and the receipts read these, never the settings.
+    installed: Installed = .{},
+    /// The stream's counters at the request's start; reported once, at its first later forward.
+    prompt_stats0: ?expert_stream.Stats = null,
+    prompt_tokens: usize = 0,
     /// The inference thread that owns `g.s` (MLX streams are per thread).
     owner: std.Thread.Id = 0,
 
@@ -127,16 +133,29 @@ pub const Module = struct {
         };
         try self.acceptKernels(gpa, &c0, s, &diag);
         // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
-        const ceiling = boxCeiling(config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet(), c0.n_routed_experts);
+        const ceiling_bytes = config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet();
+        const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
+        // The served admission: rows filled by the native bill (the standard request's) up to the stop's
+        // target, unless the shell forced them.
+        var admitted = config.*;
+        if (admitted.expert_rows == null and admitted.expert_prefill_rows == null and admitted.memory_baseline_bytes != null) {
+            admitted.memory_ceiling_bytes = ceiling_bytes;
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const nr = try @import("deepseek_v41_ar.zig").fillAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens);
+            admitted.expert_rows = nr.decode;
+            admitted.expert_prefill_rows = nr.prefill;
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ nr.prefill, nr.decode, fill_prompt_tokens, admitted.memory_baseline_bytes.?, ceiling_bytes -| ceiling_stop_bytes });
+        }
         errdefer self.dropKernels();
         self.g.clearCache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
         errdefer setCacheLimit(self.prev_cache_limit);
         self.arm = if (config.expert_event_gates orelse false)
-            .{ .event_gates = try self.buildArm(AGated, io, config, weights, s, ceiling, try expert_event.createMetal(), &diag) }
+            .{ .event_gates = try self.buildArm(AGated, io, &admitted, weights, s, ceiling, try expert_event.createMetal(), &diag) }
         else
-            .{ .host_waits = try self.buildArm(A, io, config, weights, s, ceiling, null, &diag) };
+            .{ .host_waits = try self.buildArm(A, io, &admitted, weights, s, ceiling, null, &diag) };
         errdefer self.dropArm();
         var vd: v41.Diag = .{};
         errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
@@ -150,10 +169,15 @@ pub const Module = struct {
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
         tier.layer_major = layer_major;
-        log.info("numeric tier: {t}; prefill layer-major {}, wide feed {}, wide depth {d}, cold rows {d}", .{ config.numeric_tier orelse .served, tier.layer_major, config.expert_wide_feed orelse false, config.expert_wide_depth orelse 1, config.expert_wide_cold_rows orelse 0 });
+        log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         if (tier.routes.prefill_attn) try self.checkPrefillRoutes();
+        self.installed = switch (self.arm) {
+            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth },
+        };
+        var line_buf: [192]u8 = undefined;
+        log.info("{s}", .{self.installed.line(&line_buf)});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -285,7 +309,25 @@ pub const Module = struct {
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
         self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
+        self.prompt_stats0 = self.streamStats();
+        self.prompt_tokens = ids.len;
         return self.forward(ids);
+    }
+
+    fn streamStats(self: *Module) expert_stream.Stats {
+        return switch (self.arm) {
+            inline else => |t| t.arm.stream.stats(),
+        };
+    }
+
+    /// The prompt pass's reads from the stream's own counters, once per request (end of the phase).
+    fn reportPrompt(self: *Module) void {
+        const s0 = self.prompt_stats0 orelse return;
+        self.prompt_stats0 = null;
+        const s1 = self.streamStats();
+        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes", .{
+            self.prompt_tokens, s1.expert_bytes_read - s0.expert_bytes_read, s1.preadv_calls - s0.preadv_calls, s1.expert_cache_misses - s0.expert_cache_misses, s1.route_calls - s0.route_calls,
+        });
     }
 
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
@@ -297,6 +339,7 @@ pub const Module = struct {
 
     /// Later positions of the request: a decode-width forward runs the phase change first, once.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
+        self.reportPrompt();
         if (phaseChangeDue(ids.len, self.grown())) try self.phaseChange();
         return self.forward(ids);
     }
@@ -339,15 +382,29 @@ pub const layer_major_billed = true;
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
 pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockTier, LayerMajorNotBilled }!bool {
-    if (!(config.layer_major_prefill orelse false)) return false;
+    if (!config.dsv41LayerMajor()) return false;
     if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
     if (!layer_major_billed) return error.LayerMajorNotBilled;
     return true;
 }
 
-/// The wide prefill calls' read schedule from the model settings (off by default).
+/// The prefill routes a module installed (read back from the trunk's tier and the arm's hook and stream).
+pub const Installed = struct {
+    layer_major: bool = false,
+    wide: xp.Wide = .{},
+    stream_windows: u8 = 1,
+
+    /// The construction log line the gates assert.
+    pub fn line(self: Installed, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}", .{
+            self.layer_major, self.wide.feed, self.wide.depth, self.stream_windows, self.wide.cold_rows,
+        }) catch buf[0..0];
+    }
+};
+
+/// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .feed = config.expert_wide_feed orelse false, .depth = config.expert_wide_depth orelse 1, .cold_rows = config.expert_wide_cold_rows orelse 0 };
+    return .{ .feed = config.dsv41WideFeed(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0 };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -382,7 +439,7 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .draft_pruned_bytes = 0,
         .lookahead = lookahead,
         .ceiling = ceiling,
-        .wide_depth = config.expert_wide_depth orelse 1,
+        .wide_depth = config.dsv41WideDepth(),
     };
 }
 
@@ -406,6 +463,11 @@ pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBil
     if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
     return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
 }
+
+/// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
+/// request is admitted, or refused by name, by the server's per-request prefill bill at its time).
+pub const fill_prompt_tokens: u64 = 16384;
+pub const fill_max_tokens: u64 = 1024;
 
 /// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
 pub const min_fill_rows = 16;
@@ -519,24 +581,27 @@ test "dsv41 module: a request's bounded lanes hold its reservation, else the pro
     try std.testing.expectEqual(@as(u32, 40000 + 8), Module.maxPositions(32768, 40000));
 }
 
-test "dsv41 module: the prefill routes are off by default; layer-major is refused on the stock tier and until billed" {
+test "dsv41 module: the served tier's prefill routes are on by default, the stock tier's off; a setting overrides; layer-major refused on stock" {
     var c: model_io.ModelConfig = undefined;
     c.layer_major_prefill = null;
     c.numeric_tier = null;
     c.expert_wide_feed = null;
     c.expert_wide_depth = null;
     c.expert_wide_cold_rows = null;
+    try std.testing.expect(try layerMajor(&c));
+    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2 }, wideRoute(&c));
+    c.numeric_tier = .stock;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));
     c.layer_major_prefill = true;
-    c.numeric_tier = .stock;
     try std.testing.expectError(error.LayerMajorOnStockTier, layerMajor(&c));
     c.numeric_tier = .served;
-    if (layer_major_billed) try std.testing.expect(try layerMajor(&c)) else try std.testing.expectError(error.LayerMajorNotBilled, layerMajor(&c));
-    c.expert_wide_feed = true;
-    c.expert_wide_depth = 2;
+    c.layer_major_prefill = false;
+    c.expert_wide_feed = false;
+    c.expert_wide_depth = 1;
     c.expert_wide_cold_rows = 2;
-    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2, .cold_rows = 2 }, wideRoute(&c));
+    try std.testing.expect(!try layerMajor(&c));
+    try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
 }
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
@@ -950,4 +1015,12 @@ test "dsv41 module: the envelope admission (the old rule) admits today's 154 dec
     std.debug.print("old rule: {d} prefill capacity / {d} decode rows\n", .{ p.admission.prefill_capacity, p.admission.decode_rows });
     try std.testing.expectEqual(@as(u32, 154), p.admission.decode_rows);
     try std.testing.expectEqual(@as(u32, 112), p.admission.prefill_capacity);
+}
+
+test "dsv41 module: the installed-routes line reads the routes as built, on and off (the gates' assert can fail)" {
+    var buf: [192]u8 = undefined;
+    const on: Installed = .{ .layer_major = true, .wide = .{ .feed = true, .depth = 2 }, .stream_windows = 2 };
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0", on.line(&buf));
+    const off: Installed = .{};
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0", off.line(&buf));
 }

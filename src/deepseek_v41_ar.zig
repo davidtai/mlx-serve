@@ -91,6 +91,8 @@ fn checkBanks(g: *ops.MlxOps, k: Kernels, ex: anytype) !void {
 }
 
 pub const reference_format = "mlx-serve-dsv41-ar-ref-v1";
+/// Every native receipt's runtime label (the Python lanes' receipts carry "python-mtplx").
+pub const runtime_native = "native-mlx-serve";
 
 pub const Step = struct { logits_sha256: []const u8, top2: [2]u32, margin: f64 };
 
@@ -317,6 +319,9 @@ pub fn promptOverride(a: std.mem.Allocator, io: std.Io, path: ?[]const u8, token
 
 /// What the served-schedule run records (the ar-ref-v1 fields plus the schedule; chunk 0 = the model's own rule).
 const ServedRecord = struct {
+    runtime: []const u8 = runtime_native,
+    /// The prefill routes the module installed (read back from the module, not the settings).
+    prefill_routes: module.Installed,
     /// "ref" (the reference's prompt) or "p16" (the override's first `prompt_tokens` ids).
     prompt: []const u8,
     prompt_tokens: u32,
@@ -452,6 +457,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
         break;
     };
     const rec: ServedRecord = .{
+        .prefill_routes = m.installed,
         .prompt = if (override != null) "p16" else "ref",
         .prompt_tokens = n,
         .state = state.items,
@@ -471,7 +477,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     };
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
-    std.debug.print("\ndsv41 ar served: split {d}+{d}, phase {t}, tier {t}; {d} prompt tokens in {d} calls, {d} generated; ids sha256 {s}; step 0 top-2 {any} margin {d}, step 1 top-2 {any} margin {d}; vs the reference's ids (harness schedule): {s}, first difference {?d}; {d} ms; wrote {s}\n", .{
+    std.debug.print("\nNATIVE dsv41 ar served: split {d}+{d}, phase {t}, tier {t}; {d} prompt tokens in {d} calls, {d} generated; ids sha256 {s}; step 0 top-2 {any} margin {d}, step 1 top-2 {any} margin {d}; vs the reference's ids (harness schedule): {s}, first difference {?d}; {d} ms; wrote {s}\n", .{
         run.split,     n - run.split,  run.phase,     run.tier,       n,         calls.len, out.len, &ids_sha,
         steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (override != null) "ref: prompt differs" else if (first == null) "IDENTICAL" else "DIFFER", first, wall_ms, out_path,
     });
@@ -746,6 +752,7 @@ const Stamper = struct {
     }
 };
 const CellReceipt = struct {
+    runtime: []const u8 = runtime_native,
     format: []const u8 = served_cell_format,
     tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
     typical_delta: f64,
@@ -977,16 +984,17 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         // The decode window starts at the prompt's end: it includes the phase change's grow.
         .decode_stream = StreamPhase.of(s_prompt, s_end),
         .decode_profile = if (profile) prof.items else null,
-        .layer_major = config.layer_major_prefill,
+        // The routes the module installed (read back from it, not from the settings).
+        .layer_major = md.installed.layer_major,
         .event_gates = config.expert_event_gates,
-        .wide_feed = config.expert_wide_feed,
-        .wide_depth = config.expert_wide_depth,
-        .wide_cold_rows = config.expert_wide_cold_rows,
+        .wide_feed = md.installed.wide.feed,
+        .wide_depth = md.installed.wide.depth,
+        .wide_cold_rows = md.installed.wide.cold_rows,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
-    std.debug.print("\ndsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
+    std.debug.print("\nNATIVE dsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
         delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
         ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
         cycles.items.len,           decode_s,               rec.decode_tok_s,           rec.decode_tok_s_with_phase_change,
@@ -1079,7 +1087,7 @@ fn gbOf(x: u64) f64 {
 }
 
 /// The fill for `config`'s routes (its bill at the envelope's rows).
-fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     var c = config;
     c.expert_rows = null;
     c.expert_prefill_rows = null;
@@ -1207,7 +1215,7 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes() + engram.row_cache_host_bytes,
         // K16 (the layer-major route) bills its own wave: every chunk's kept state + one sub-wave.
-        .prefill_wave = (if (config.layer_major_prefill orelse false) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served)) / 4 * 5,
+        .prefill_wave = (if (config.dsv41LayerMajor()) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served)) / 4 * 5,
         .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,

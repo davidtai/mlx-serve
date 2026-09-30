@@ -5710,7 +5710,7 @@ pub fn prefillNeededAtChunk(
     if (config.dsv41_prefill) |bill| {
         // The module's numeric tier and pass (K16 layer-major is refused on the stock tier at construction).
         const tier: @TypeOf(bill).Tier = if ((config.numeric_tier orelse .served) == .stock) .stock else .served;
-        return if (config.layer_major_prefill orelse false) bill.layerMajorBytes(seq, max_tokens, tier) else bill.bytes(seq, max_tokens, tier);
+        return if (config.dsv41LayerMajor()) bill.layerMajorBytes(seq, max_tokens, tier) else bill.bytes(seq, max_tokens, tier);
     }
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
@@ -21812,7 +21812,11 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     defer cfg.deinit(t.allocator);
     const bill = cfg.dsv41_prefill.?;
     // The whole prompt reaches the arch (chunk = seq); the bill is the arch's, at the model's own chunk.
+    // The served tier's default pass is K16 layer-major; the chunk-major bill when the setting turns it off.
+    try t.expectEqual(bill.layerMajorBytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    cfg.layer_major_prefill = false;
     try t.expectEqual(bill.bytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    cfg.layer_major_prefill = null;
     try t.expectEqual(@as(u64, 953), bill.chunkRows(16384));
     try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
     // The served gate's 64-token prompt: a small bill.
@@ -21821,9 +21825,6 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     cfg.numeric_tier = .stock;
     try t.expectEqual(bill.bytes(16384, 1024, .stock), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
     cfg.numeric_tier = null;
-    cfg.layer_major_prefill = true;
-    try t.expectEqual(bill.layerMajorBytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
-    cfg.layer_major_prefill = null;
     try t.expect(!scheduler_mod.configBatchesDecode(&cfg));
 }
 
