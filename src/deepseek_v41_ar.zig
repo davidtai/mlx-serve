@@ -1627,6 +1627,11 @@ const PrefillProbe = struct {
     layers_done: u64 = 0,
     /// K16's chunk of the stages that follow (set by the layer-major pass), else the chunk-major count.
     cur_chunk: ?usize = null,
+    /// The wide calls' merges (`merge`): how many, and the bytes they took beyond what MLX's cache gave back
+    /// (fresh) against the bytes the cache gave back (reused).
+    merges: u64 = 0,
+    merge_fresh: u64 = 0,
+    merge_reused: u64 = 0,
     chunk_ns: [64]u64 = @splat(0),
     chunk_rows: [64]u32 = @splat(0),
     read_wall_ns: u64 = 0,
@@ -1636,6 +1641,35 @@ const PrefillProbe = struct {
 
     pub fn atChunk(self: *PrefillProbe, i: usize) void {
         self.cur_chunk = i;
+    }
+
+    /// The wide call's merged sources evaluated on their own stage ("moe.merge"), MLX's active and cache read around
+    /// them: active growth the cache did not give back is fresh allocation.
+    pub fn merge(self: *PrefillProbe, outs: []const ops.MlxOps.T) !void {
+        var a0: usize = 0;
+        var c0: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a0);
+        _ = mlx.mlx_get_cache_memory(&c0);
+        try self.g.evalAll(outs);
+        var a1: usize = 0;
+        var c1: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a1);
+        _ = mlx.mlx_get_cache_memory(&c1);
+        const grew: u64 = a1 -| a0;
+        const reused: u64 = @min(grew, c0 -| c1);
+        self.merges += 1;
+        self.merge_reused += reused;
+        self.merge_fresh += grew - reused;
+        try self.charge("moe.merge");
+    }
+
+    /// The time since the last stage, charged to `name` and to the current chunk.
+    fn charge(self: *PrefillProbe, name: []const u8) !void {
+        const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+        self.ns[try self.slot(name)] += d;
+        const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        self.chunk_ns[chunk] += d;
     }
 
     fn slot(self: *PrefillProbe, name: []const u8) !usize {
@@ -1746,6 +1780,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+    // The wide calls' merges (K16 JOINLESS): the bytes they allocated fresh against those MLX's cache gave back.
+    if (probe.merges > 0) std.debug.print("PREFILL_PROFILE_MERGE {{\"merges\": {d}, \"fresh_gb\": {d:.3}, \"reused_gb\": {d:.3}}}\n", .{ probe.merges, @as(f64, @floatFromInt(probe.merge_fresh)) / 1e9, @as(f64, @floatFromInt(probe.merge_reused)) / 1e9 });
     // A profile build (-Ddsv41-prefill-timers=true): the routed calls' host time by step, the waves and launches.
     if (dsv41_prof.enabled) std.debug.print("PREFILL_PROFILE_ROUTED {{\"barrier_s\": {d:.3}, \"route_s\": {d:.3}, \"read_wait_s\": {d:.3}, \"encode_s\": {d:.3}, \"drain_s\": {d:.3}, \"join_s\": {d:.3}, \"dig_calls\": {d}, \"waves\": {d}, \"launches\": {d}}}\n", .{
         dsv41_prof.seconds(.barrier), dsv41_prof.seconds(.route), dsv41_prof.seconds(.read_wait), dsv41_prof.seconds(.encode), dsv41_prof.seconds(.drain), dsv41_prof.seconds(.join), dsv41_prof.calls, dsv41_prof.waves, dsv41_prof.launches,
