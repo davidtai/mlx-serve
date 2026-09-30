@@ -1049,6 +1049,69 @@ pub fn Trunk(comptime G: type) type {
             return qlinear(g, try g.reshape(o2, &.{ s0.d[0], s0.d[1], -1 }), wo_b);
         }
 
+        /// The prefill attention core's construction self-check against the stock chain: per installed
+        /// kind, on its first layer's weights, 64 prompt rows over a 64-row window (and 32 compressed
+        /// rows, each row selecting the ones its position reaches), deterministic host data. The stock
+        /// o (roped q, K30 gather, eager core, the inverse RoPE) and the core's grouped o are compared
+        /// elementwise: |core - stock| <= tol x (1 + |stock|), tol 2e-3 on the f32 kinds and 3e-2 on
+        /// layer 0's bf16 one (its stock chain rounds q / window rows to bf16 too). Returns one bool
+        /// scalar per installed kind (null: not installed); the caller evaluates and reads them once.
+        pub fn prefillAttnCheck(g: *G, c: *const v41.Config, kx: *const Kernels, layers: []const W, scratch: []f32) ![3]?T {
+            const S: c_int = 64;
+            const Nc: c_int = 32;
+            const H: c_int = @intCast(c.n_heads);
+            const hd: c_int = @intCast(c.head_dim);
+            const n_q: usize = @intCast(S * H * hd);
+            if (scratch.len < n_q) return error.PrefillAttnCheckScratch;
+            var out: [3]?T = .{ null, null, null };
+            var rng = std.Random.DefaultPrng.init(0x5eed_d541);
+            const r = rng.random();
+            const stock_rt: Routes = .{};
+            const positions = try g.arange(0, @floatFromInt(S), 1, .int32);
+            for (0..3) |kind| {
+                const core = if (kx.prefill_attn[kind]) |*x| x else continue;
+                var l: usize = 0;
+                while (l < c.n_layers and kx.prefill_attn_kind[l] != kind) l += 1;
+                if (l == c.n_layers) continue;
+                const li = c.layers[l];
+                const w = &layers[l];
+                const dt: Dtype = if (kind == 0) .bfloat16 else .float32;
+                const fill = struct {
+                    fn f(g_: *G, rr: std.Random, buf: []f32, shape: []const c_int, amp: f32, d: Dtype) !T {
+                        var n: usize = 1;
+                        for (shape) |x| n *= @intCast(x);
+                        for (buf[0..n]) |*v| v.* = (rr.float(f32) * 2 - 1) * amp;
+                        return g_.astype(try g_.hostArray(std.mem.sliceAsBytes(buf[0..n]), shape, .float32), d);
+                    }
+                }.f;
+                const q = try fill(g, r, scratch, &.{ 1, S, H, hd }, 4.0, dt);
+                const window = try fill(g, r, scratch, &.{ 1, S, hd }, 1.0, dt);
+                var cmp: ?[2]T = null;
+                if (kind == 2) {
+                    const ckv = try fill(g, r, scratch, &.{ 1, Nc, hd }, 1.0, .float32);
+                    var idx: [64 * 32]i32 = undefined;
+                    for (0..64) |si| for (0..32) |j| {
+                        idx[si * 32 + j] = if (j < (si + 1) / 2) @intCast(j) else -1;
+                    };
+                    cmp = .{ ckv, try g.hostArray(std.mem.sliceAsBytes(&idx), &.{ 1, S, Nc }, .int32) };
+                }
+                const inv = if (li.ratio > 0) try yarnInvFreq(g, c) else try swaInvFreq(g, c);
+                const cs = try cosSin(g, inv, positions);
+                // Stock: the roped query, K30's gathered keys, the eager core, the inverse RoPE.
+                const o0 = try sparseAttendSelected(g, c, &stock_rt, w, try ropeLast(g, q, cs, false), window, 0, if (cmp) |x| x[0] else null, if (cmp) |x| x[1] else null, positions);
+                const o1 = try g.astype(try ropeLast(g, o0, cs, true), .float32);
+                const want = try g.transposeAxes(try g.reshape(o1, &.{ S, @intCast(c.o_groups), -1 }), &.{ 1, 0, 2 });
+                // The core: the un-roped query, the window rows as view indices.
+                const sel = try windowSelectedIdx(g, c, positions, S, 0);
+                const sink = try g.reshape(try g.astype(w.attn_sink, .float32), &.{ 1, 1, H, 1 });
+                const got = try core.attend(g, q, window, sel.idx, sel.valid, cmp, sink, .{ cs.cos, cs.sin });
+                const tol: f64 = if (kind == 0) 3e-2 else 2e-3;
+                const err = try g.sub(try g.abs(try g.sub(got, want)), try g.mul(try g.add(try g.abs(want), try sf(g, 1.0, want)), try sf(g, tol, want)));
+                out[kind] = try g.lessEqual(try g.max(try g.reshape(err, &.{-1}), 0, false), try sf(g, 0.0, want));
+            }
+            return out;
+        }
+
         /// The model's prefill geometry, as the kernel lane's routes compare it.
         fn prefillGeometry(c: *const v41.Config) kr.PrefillGeometry {
             return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size };
@@ -2061,6 +2124,17 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
         const n1 = g.nodes.items.len;
         _ = try Tr.attention(&g, &p, &c, &rt, k.at(cs.l), li, &w, inv, try g.input(&.{ 1, 8, 5120 }, cs.dt), try g.arange(64, 72, 1, .int32), &cache, &shared);
         try testing.expect(noneOf(&g, n1, .kernel));
+    }
+    // The construction self-check builds for every installed kind (one bool scalar each).
+    var ws: [v41.max_layers]LayerW(u32) = undefined;
+    for (0..c.n_layers) |l| ws[l] = try traceLayerW(&g, &c, c.layers[l]);
+    const scratch = try testing.allocator.alloc(f32, 64 * 64 * 512);
+    defer testing.allocator.free(scratch);
+    const oks = try Tr.prefillAttnCheck(&g, &c, &k, ws[0..c.n_layers], scratch);
+    for (oks) |o| {
+        try testing.expect(o != null);
+        try testing.expectEqual(Dtype.bool_, g.dtypeOf(o.?));
+        try testing.expectEqual(@as(u8, 0), g.shapeOf(o.?).n);
     }
     var bad = c;
     bad.window = 64;

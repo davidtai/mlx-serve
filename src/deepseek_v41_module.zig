@@ -153,6 +153,7 @@ pub const Module = struct {
         log.info("numeric tier: {t}; prefill layer-major {}, wide feed {}, wide depth {d}, cold rows {d}", .{ config.numeric_tier orelse .served, tier.layer_major, config.expert_wide_feed orelse false, config.expert_wide_depth orelse 1, config.expert_wide_cold_rows orelse 0 });
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
+        if (tier.routes.prefill_attn) try self.checkPrefillRoutes();
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -237,6 +238,28 @@ pub const Module = struct {
         trunk_routes.accept(gpa, self.set, &self.trunk_report, &kd) catch |e| {
             self.trunk_report.deinit(gpa);
             return refuse(diag, e, "trunk routes: {s}", .{kd.message()});
+        };
+    }
+
+    /// The prefill call sites' construction self-checks against the stock chain: once, before the
+    /// served lane is used, on the model's own layer weights; a route that does not pass refuses the
+    /// Module by name (there is no stock branch inside an installed route).
+    fn checkPrefillRoutes(self: *Module) !void {
+        const Tr = graph.Trunk(G);
+        const c = &self.model.c;
+        const scratch = try self.gpa.alloc(f32, @as(usize, 64) * c.n_heads * c.head_dim);
+        defer self.gpa.free(scratch);
+        const m = self.g.mark();
+        defer self.g.resetTo(m);
+        const oks = try Tr.prefillAttnCheck(&self.g, c, &self.model.kx, self.model.layers, scratch);
+        for (oks, 0..) |ok, kind| if (ok) |x| {
+            var b: [1]bool = undefined;
+            _ = try self.g.hostBool(x, &b);
+            if (!b[0]) {
+                log.err("prefill attention core, kind {d}: the construction self-check against the stock chain failed", .{kind});
+                return error.PrefillAttnSelfCheck;
+            }
+            log.info("prefill attention core, kind {d}: construction self-check against the stock chain passed", .{kind});
         };
     }
 
