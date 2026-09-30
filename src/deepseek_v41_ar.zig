@@ -1094,7 +1094,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_profile = if (profile) prof.items else null,
         // The routes the module installed (read back from it, not from the settings).
         .layer_major = md.installed.layer_major,
-        .event_gates = config.expert_event_gates,
+        .event_gates = md.arm == .event_gates,
         .wide_feed = md.installed.wide.seed and md.installed.wide.hot_first,
         .wide_seed = md.installed.wide.seed,
         .wide_hot_first = md.installed.wide.hot_first,
@@ -1830,6 +1830,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     try cellConfig(&config);
+    // The prompt pass reads through no gate: the profile keeps the host-waits arm unless the line sets one.
+    if (config.expert_event_gates == null) config.expert_event_gates = false;
     try cellFill(a, io, &config, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);

@@ -50,7 +50,7 @@ comptime {
 }
 /// The expert source: the EXL3 quant's math (C2), the wide (prefill) routed calls on its DIG-X route, the
 /// next layer's reads started from the predictor. `A` waits on the host (LOOKAHEAD3, the exact tier);
-/// `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier).
+/// `AGated` builds every wave over event gates (LOOKAHEAD4, the typical tier: the served tier's default).
 pub const A = arm_mod.ArmWith(G, Math, .{ .prefill = true, .lookahead = true });
 pub const AGated = arm_mod.ArmWith(G, Math, .{ .prefill = true, .lookahead = true, .gated = true });
 
@@ -58,8 +58,14 @@ pub const AGated = arm_mod.ArmWith(G, Math, .{ .prefill = true, .lookahead = tru
 fn Tiered(comptime AT: type) type {
     return struct { arm: *AT, gates: []AT.Hook.Gate };
 }
-/// Built once, by the `expert_event_gates` setting.
+/// Built once, by the `expert_event_gates` setting (`eventGates`).
 pub const Arm = union(enum) { host_waits: Tiered(A), event_gates: Tiered(AGated) };
+
+/// The arm a config builds: event gates unless the setting says otherwise on the served tier (the
+/// Python typical tier of record's LOOKAHEAD4), host waits on the stock tier.
+pub fn eventGates(config: *const model_io.ModelConfig) bool {
+    return config.expert_event_gates orelse ((config.numeric_tier orelse .served) == .served);
+}
 
 /// The served tier's DSpark acceptance (the tier of record: typical 0.3 with the greedy correction).
 pub const dspark_typical_delta: f32 = 0.3;
@@ -220,7 +226,7 @@ pub const Module = struct {
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
         _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
         errdefer setCacheLimit(self.prev_cache_limit);
-        self.arm = if (config.expert_event_gates orelse false)
+        self.arm = if (eventGates(config))
             .{ .event_gates = try self.buildArm(AGated, io, &admitted, weights, s, ceiling, try expert_event.createMetal(), &diag) }
         else
             .{ .host_waits = try self.buildArm(A, io, &admitted, weights, s, ceiling, null, &diag) };
@@ -279,7 +285,7 @@ pub const Module = struct {
         errdefer self.head.deinit(&self.g);
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
-        log.info("NATIVE decode lane installed: {s} (draft block {d})", .{ self.decodeLane(), self.draftBlockSize() });
+        log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
         // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
         // shape's MLX peak is kept for the bill (C4).
@@ -371,6 +377,12 @@ pub const Module = struct {
         const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wideRoute(config) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
+        // LOOKAHEAD4, once before any request: a gated call's waves against the same slots waited.
+        if (comptime AT == AGated) {
+            arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
+                return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
+            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)", .{arm.config.n_experts_per_tok});
+        }
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -1142,6 +1154,20 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_cold_rows = 2;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
+}
+
+test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {
+    var c: model_io.ModelConfig = undefined;
+    c.numeric_tier = null;
+    c.expert_event_gates = null;
+    try std.testing.expect(eventGates(&c));
+    c.numeric_tier = .stock;
+    try std.testing.expect(!eventGates(&c));
+    c.expert_event_gates = true;
+    try std.testing.expect(eventGates(&c));
+    c.numeric_tier = .served;
+    c.expert_event_gates = false;
+    try std.testing.expect(!eventGates(&c));
 }
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {

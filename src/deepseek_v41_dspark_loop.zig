@@ -744,6 +744,61 @@ test "dsv41 dspark loop: CYCLE_TRIM: one eval per draft with its sigmoid, the co
     try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
 }
 
+test "dsv41 dspark loop: VERIFY_ENCODE hoist: a verify forward hands each routed call its shared expert, gate weights and HC tail" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3, .u32s = &.{}, .f32s = &.{} };
+    rig.g.host_values = script.values();
+    // Each routed call's hoist, as the hook receives it: its length, and whether its first array is
+    // the shared expert's output (f32, the call's rows x hidden) and its second the gate weights.
+    const Recorder = struct {
+        ex: @TypeOf(&rig.ex),
+        lens: std.ArrayList(usize) = .empty,
+        shaped: bool = true,
+        const Rec = @This();
+        pub fn at(r: *Rec, l: u32) Hook {
+            return .{ .r = r, .l = l };
+        }
+        const Hook = struct {
+            r: *Rec,
+            l: u32,
+            pub fn routed(h: Hook, g: *TraceOps, xf: u32, idx: u32) !u32 {
+                try h.r.lens.append(testing.allocator, std.math.maxInt(usize));
+                return h.r.ex.at(h.l).routed(g, xf, idx);
+            }
+            pub fn routedHoist(h: Hook, g: *TraceOps, xf: u32, idx: u32, hoist: []const u32) !u32 {
+                try h.r.lens.append(testing.allocator, hoist.len);
+                if (hoist.len > 0) {
+                    const rows = g.shapeOf(xf).dim(0);
+                    const s = g.shapeOf(hoist[0]);
+                    h.r.shaped = h.r.shaped and g.dtypeOf(hoist[0]) == .float32 and s.dim(0) == rows and s.dim(1) == g.shapeOf(xf).dim(1);
+                    h.r.shaped = h.r.shaped and g.shapeOf(hoist[1]).eql(g.shapeOf(idx));
+                }
+                return h.r.ex.at(h.l).routedHoist(g, xf, idx, hoist);
+            }
+        };
+    };
+    var rec: Recorder = .{ .ex = &rig.ex };
+    defer rec.lens.deinit(a);
+    var ids: [12]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    // A verify-width forward (3 rows): every layer hands 4 arrays (shared, weights, post, comb).
+    _ = try rig.model.forward(&rig.g, &rig.st, ids[0..3], .{ .logits = .all, .main_hidden = true }, &rec, graph.NoProbe{});
+    try rig.ex.flush();
+    const n_layers = rig.m.c.n_layers;
+    try testing.expectEqual(@as(usize, n_layers), rec.lens.items.len);
+    for (rec.lens.items) |n| try testing.expectEqual(@as(usize, 4), n);
+    try testing.expect(rec.shaped);
+    // Wider than the decode rows: nothing is handed over.
+    rec.lens.clearRetainingCapacity();
+    _ = try rig.model.forward(&rig.g, &rig.st, ids[0..9], .{ .logits = .last }, &rec, graph.NoProbe{});
+    try rig.ex.flush();
+    try testing.expectEqual(@as(usize, n_layers), rec.lens.items.len);
+    for (rec.lens.items) |n| try testing.expectEqual(@as(usize, 0), n);
+}
+
 test "dsv41 dspark loop: the shell's prompt (all but the last token, then the last) and its rounds give the cell's tokens" {
     // The cell: `prefill` over the whole prompt, then `cycle`s (the mini model's script above).
     // The shell: `prefillLogits` over all but the last prompt token, `extendLogits` over the last,
