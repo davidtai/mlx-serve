@@ -9881,7 +9881,7 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     }
 }
 
-test "the native draft lane is read from the transformer's readiness signal, never one hardcoded arch" {
+test "native draft lane: has_native_draft reads the transformer's readiness signal, never one hardcoded arch" {
     // `has_native_draft` once read `transformer.?.dsv4 != null`, so deepseek_v41's draft head never reached
     // the chokepoint and served plain AR. Needles are ++-split so this test's source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");

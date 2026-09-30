@@ -18535,7 +18535,7 @@ test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill swit
     try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
 }
 
-test "dsparkArmTypical: deepseek_v41's draft head takes clean greedy requests; sampled and shaped ones stay serial" {
+test "native draft lane: deepseek_v41's head takes clean greedy requests (dsparkArmTypical); sampled and shaped ones stay serial" {
     try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.0 }, 0));
     try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.6, .top_k = 1 }, 0));
     // Sampled requests stay serial this round (no stochastic arm on this head yet).
@@ -18547,7 +18547,7 @@ test "dsparkArmTypical: deepseek_v41's draft head takes clean greedy requests; s
     try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0, .constraint = &c }, 0));
 }
 
-test "the DSpark chokepoint arms every module arch through NativeDraft, never one hardcoded arch" {
+test "native draft lane: the chokepoint arms every module arch through NativeDraft, never one hardcoded arch" {
     // It once read `xfm.dsv4 != null` and `self.xfm.dsv4.?`, so deepseek_v41's draft head was never armed
     // and never dispatched. Needles are ++-split so this test's source can't satisfy the scan.
     const src = @embedFile("generate.zig");
