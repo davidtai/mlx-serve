@@ -780,6 +780,8 @@ const CellReceipt = struct {
     format: []const u8 = served_cell_format,
     tier: []const u8 = "typical (routes.served: C12-C16, A9, C11, C14 woarc; DSpark typical)",
     typical_delta: f64,
+    /// The decode lane the Module installed (`Module.decodeLane`: "dspark typical 0.3").
+    decode_lane: []const u8 = "",
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -940,23 +942,18 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const prompt_path = cx.prompt_path;
     const out_path = cx.out_path;
     const g = &md.g;
-    const L = dsl.Loop(ops.MlxOps);
-    // The request's bounded lanes: the prompt, the token cap, one verify block (Module.prefill's rule).
-    var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(prompt.len, prompt.len + max_tokens)));
-    defer st.deinit(g, gpa);
-    const caches = try a.alloc(L.H.Cache, md.head.nStages());
-    for (caches) |*x| x.* = .{};
-    defer for (caches) |*x| x.deinit(g);
+    // The served decode lane (the Module's DSpark strategy): the shell's calls, in the shell's order.
+    if (md.draftBlockSize() == 0) return error.CellNeedsDspark;
     var stops: [8]u32 = undefined;
     const n_stop = config.num_eos_tokens;
     @memcpy(stops[0..n_stop], config.eos_token_ids[0..n_stop]);
-    var lp = L.init(g, md.model, md.head, &st, caches, .{
-        .acceptance = .{ .typical = .{ .delta = @floatCast(delta) } },
-        .prompt_chunk = dsl.whole_prompt,
-        .max_tokens = max_tokens - 1,
-        .stop_ids = stops[0..n_stop],
-    });
-    defer lp.deinit();
+    const isStop = struct {
+        fn f(ss: []const u32, t: u32) bool {
+            return std.mem.indexOfScalar(u32, ss, t) != null;
+        }
+    }.f;
+    // The Module's strategy carries the tier's delta; a cell asking for another one is refused.
+    if (@as(f32, @floatCast(delta)) != module.dspark_typical_delta) return error.CellDeltaNotTheModules;
 
     const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
     const s_start = arm.hook.source.stats();
@@ -964,7 +961,13 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // The prompt's start: the phase change's reclaim reference (the loop drives the prompt itself).
     const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     const t0 = std.Io.Timestamp.now(io, .boot);
-    const primary = try lp.prefill(gpa, &arm.hook, prompt);
+    // The whole prompt in one Module.prefill (the request's bounded lanes: the prompt, the token cap,
+    // one verify block; the strategy seeded from every prompt row); its argmax is the primary (the
+    // Generator's greedy pick). A shell that sends the prompt this way (dsv41 prefills unchunked)
+    // decodes the cell's ids.
+    const pl = try md.prefill(prompt, prompt.len + max_tokens);
+    const primary = try g.hostArgmax(pl);
+    _ = mlx.mlx_array_free(pl);
     const ttft_s = secondsSince(io, t0);
     const s_prompt = arm.hook.source.stats();
     // The phase records (outside the timed spans' hot paths: at their boundaries).
@@ -989,33 +992,51 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
     var prof: std.ArrayList(ProfCycle) = .empty;
-    const primary_stops = std.mem.indexOfScalar(u32, stops[0..n_stop], primary) != null;
-    if (!primary_stops and !profile) while (true) {
-        // The timed cell: no stamps in the loop.
-        var lg: dsl.CycleLog = .{ .primary = 0 };
-        const f = try lp.cycle(&arm.hook, &out, gpa, &lg);
-        try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
-        if (f) |x| {
-            finish = x;
+    // `out` holds the tokens after the primary (the cycles'); `next` is the token not yet emitted.
+    var next = primary;
+    const budget = max_tokens - 1;
+    var ended = isStop(stops[0..n_stop], primary);
+    var n_rounds: usize = 0;
+    while (!ended) {
+        if (out.items.len >= budget) {
+            finish = .length;
             break;
         }
-    };
-    if (!primary_stops and profile) while (true) {
-        // The decode profile: the loop's phase stamps and the stream's counters per cycle.
         var lg: dsl.CycleLog = .{ .primary = 0 };
-        var sp: Stamper = .{ .io = io, .last = undefined };
-        const c0 = arm.hook.source.stats();
-        sp.begin();
-        const f = try lp.cycleStamped(&arm.hook, &out, gpa, &lg, &sp);
-        const c1 = arm.hook.source.stats();
+        // The first token of a round is the previous round's next token (the primary emitted apart).
+        const first = n_rounds == 0;
+        n_rounds += 1;
+        const cap: u32 = @intCast(budget - out.items.len - @intFromBool(!first));
+        var r = if (!profile) try md.dsparkRoundLogged(gpa, next, cap, &lg, {}) else blk: {
+            var sp: Stamper = .{ .io = io, .last = undefined };
+            const c0 = arm.hook.source.stats();
+            sp.begin();
+            const rr = try md.dsparkRoundLogged(gpa, next, cap, &lg, &sp);
+            const c1 = arm.hook.source.stats();
+            const sph = StreamPhase.of(c0, c1);
+            try prof.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .draft_ms = sp.ms(.draft), .verify_ms = sp.ms(.verify), .decide_ms = sp.ms(.decide), .commit_ms = sp.ms(.commit), .tail_ms = sp.ms(.tail), .misses = sph.misses, .bytes_read = sph.bytes_read, .read_busy_ms = sph.read_busy_s * 1e3 });
+            break :blk rr;
+        };
+        defer r.deinit(gpa);
         try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
-        const sph = StreamPhase.of(c0, c1);
-        try prof.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .draft_ms = sp.ms(.draft), .verify_ms = sp.ms(.verify), .decide_ms = sp.ms(.decide), .commit_ms = sp.ms(.commit), .tail_ms = sp.ms(.tail), .misses = sph.misses, .bytes_read = sph.bytes_read, .read_busy_ms = sph.read_busy_s * 1e3 });
-        if (f) |x| {
-            finish = x;
-            break;
+        // The round's tokens: [t1, kept drafts]; t1 of the first round is the primary (already counted).
+        for (r.tokens[@intFromBool(first)..]) |tok| {
+            if (out.items.len >= budget) break;
+            try out.append(gpa, tok);
+            if (isStop(stops[0..n_stop], tok)) {
+                ended = true;
+                finish = .stop;
+                break;
+            }
         }
-    };
+        next = r.next_token;
+        if (!ended and out.items.len < budget and out.items.len + 1 == budget) {
+            // One token left: the next token is known without another round.
+            try out.append(gpa, next);
+            ended = true;
+            finish = if (isStop(stops[0..n_stop], next)) .stop else .length;
+        }
+    }
     const decode_s = secondsSince(io, t2);
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
@@ -1027,11 +1048,12 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     ids[0] = primary;
     @memcpy(ids[1..], out.items);
     const fp = status.footprint();
-    const stt = lp.stats;
+    const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
     const rec: CellReceipt = .{
-        .typical_delta = delta,
+        .typical_delta = module.dspark_typical_delta,
+        .decode_lane = md.decodeLane(),
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,

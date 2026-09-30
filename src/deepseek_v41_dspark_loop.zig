@@ -91,6 +91,9 @@ pub fn Loop(comptime G: type) type {
         /// `main_hidden` of the next draft's main token (kept across resets).
         main_h: ?T = null,
         primary: u32 = 0,
+        /// The lookup's history already ends with `primary` (the cell's prefill and every cycle
+        /// append it); the shell's prompt pass and serial steps commit only forwarded tokens.
+        lookup_has_primary: bool = false,
 
         /// The draft depth and the widest verify a request under `cfg` reaches with `head`.
         pub const Shapes = struct { k_cap: u32, max_rows: u32 };
@@ -140,7 +143,48 @@ pub fn Loop(comptime G: type) type {
         /// `dspark_generate`'s prompt pass: the forwards, the primary pick,
         /// `_seed_prefill_state` (one seed over every prompt row).
         pub fn prefill(self: *Self, a: std.mem.Allocator, ex: anytype, prompt: []const u32) !u32 {
+            return (try self.prefillImpl(a, ex, prompt, false)).primary;
+        }
+
+        /// `prefill` for the shell (its Generator picks every token itself): the same seed, the last
+        /// row's logits handed back (kept; the caller releases them), the lookup's history the
+        /// forwarded prompt only.
+        pub fn prefillLogits(self: *Self, a: std.mem.Allocator, ex: anytype, prompt: []const u32) !T {
+            return (try self.prefillImpl(a, ex, prompt, true)).logits.?;
+        }
+
+        /// A serial forward of committed `ids` that keeps the strategy in step: their main taps
+        /// append to the draft windows (`seedMain`, as the prompt's did), the last one is the next
+        /// draft's main row, the lookup commits them. The shell's prompt is `prefillLogits` over all
+        /// but its last token and this over the last: the seed equals `prefill`'s over the whole
+        /// prompt (the windows append per row). The last row's logits, kept.
+        pub fn extendLogits(self: *Self, a: std.mem.Allocator, ex: anytype, ids: []const u32) !T {
+            _ = a;
             const g = self.g;
+            const r = try self.model.forward(g, self.st, ids, .{ .logits = .last, .main_hidden = true }, ex, graph.NoProbe{});
+            try M.fence(g, self.st, &.{ r.logits.?, r.main_hidden.? });
+            try ex.flush();
+            const logits = g.keep(r.logits.?);
+            errdefer g.release(logits);
+            const mains = r.main_hidden.?;
+            try self.head.seedMain(g, mains, self.caches);
+            const n: c_int = @intCast(ids.len);
+            self.setMain(try sliceRows(g, mains, n - 1, n));
+            try self.evalWindows();
+            try g.evalAll(&.{self.main_h.?});
+            if (self.lookup) |*l| try l.appendCommitted(if (self.lookup_has_primary) ids[1..] else ids);
+            self.lookup_has_primary = false;
+            g.reset();
+            return logits;
+        }
+
+        const Prefilled = struct { primary: u32, logits: ?T };
+
+        fn prefillImpl(self: *Self, a: std.mem.Allocator, ex: anytype, prompt: []const u32, shell: bool) !Prefilled {
+            const keep_logits = shell;
+            const g = self.g;
+            var kept: ?T = null;
+            errdefer if (kept) |x| g.release(x);
             const chunk = self.cfg.prompt_chunk;
             var mains: std.ArrayList(T) = .empty;
             defer {
@@ -155,7 +199,10 @@ pub fn Loop(comptime G: type) type {
                 try M.fence(g, self.st, &.{ if (last) r.logits.? else r.hidden, r.main_hidden.? });
                 try ex.flush();
                 try mains.append(a, g.keep(r.main_hidden.?));
-                if (last) self.primary = try g.hostArgmax(r.logits.?);
+                if (last) {
+                    self.primary = try g.hostArgmax(r.logits.?);
+                    if (keep_logits) kept = g.keep(r.logits.?);
+                }
                 g.reset();
                 i = end;
             }
@@ -169,9 +216,11 @@ pub fn Loop(comptime G: type) type {
             if (self.cfg.lookup) |l| {
                 // Reserved to the state's admitted length when bounded (the request's positions).
                 self.lookup = try ds.Lookup.init(a, prompt, l.minimum_context, l.extra_tokens, self.st.max_len orelse 0);
-                try self.lookup.?.appendCommitted(&.{self.primary});
+                // The cell's run commits its own primary; the shell's Generator commits the tokens it picks.
+                if (!shell) try self.lookup.?.appendCommitted(&.{self.primary});
             }
-            return self.primary;
+            self.lookup_has_primary = !shell;
+            return .{ .primary = self.primary, .logits = kept };
         }
 
         /// The target's decision on a verify chunk: its rows' argmax and, for the
@@ -318,7 +367,15 @@ pub fn Loop(comptime G: type) type {
 
         /// `cycle` with a stamper's marks at its phase ends (a decode-profile run only; `{}` compiles
         /// them out, as `cycle` passes).
-        pub fn cycleStamped(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog, stamp: anytype) !?Finish {
+        /// One cycle's commit, the part every driver shares: the drafts (the head's, the lookup's
+        /// extension), the verify of [primary, drafts] in chunks of `max_rows`, the decision
+        /// (greedy or typical, the correction), the target trimmed to [primary, the first `kept`
+        /// accepted drafts] (`kept` = min(accepted, `accepted_cap`)), the draft windows seeded.
+        /// `next` is the token after the kept run: the correction, or past a cap the next accepted
+        /// draft. Neither is in the state.
+        const Core = struct { drafts: [ds.max_block]u32, n_drafts: u32, kept: u32, next: u32, verify_hidden: T };
+
+        fn core(self: *Self, ex: anytype, log: ?*CycleLog, stamp: anytype, accepted_cap: u32) !Core {
             const g = self.g;
             const st = &self.stats;
             var drafts_buf: [ds.max_block]u32 = undefined;
@@ -385,9 +442,12 @@ pub fn Loop(comptime G: type) type {
             const correction = o.correction.?; // acceptChunk sets it on the chunk that ends the verify
             st.endCycle(o, k_eff);
             const verify_hidden = if (n_hidden == 1) hiddens[0] else try g.concat(hiddens[0..n_hidden], 1);
-            // Commit: keep [primary, d1 .. d_accepted] in the target, seed the draft windows.
-            try self.model.trim(g, self.st, o.trimRows());
-            try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(o.accepted + 1)), self.caches);
+            const kept = @min(o.accepted, accepted_cap);
+            const next = if (kept < o.accepted) drafts[kept] else correction;
+            const trimmed = o.verified - (kept + 1);
+            // Commit: keep [primary, d1 .. d_kept] in the target, seed the draft windows.
+            try self.model.trim(g, self.st, trimmed);
+            try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(kept + 1)), self.caches);
             try self.evalWindows();
             mark(stamp, .commit);
             if (log) |lg| {
@@ -396,16 +456,26 @@ pub fn Loop(comptime G: type) type {
                 lg.accepted = o.accepted;
                 lg.correction = correction;
                 lg.verified = o.verified;
-                lg.trimmed = o.trimRows();
+                lg.trimmed = trimmed;
                 @memcpy(lg.drafts[0..drafts.len], drafts);
             }
-            // Emit up to max_tokens; the stop token is emitted, then the run ends.
+            var c: Core = .{ .drafts = undefined, .n_drafts = @intCast(drafts.len), .kept = kept, .next = next, .verify_hidden = verify_hidden };
+            @memcpy(c.drafts[0..drafts.len], drafts);
+            return c;
+        }
+
+        /// The cell's emitter over `core`: emit the accepted drafts and the correction up to
+        /// `cfg.max_tokens`; a stop id is emitted, then the run ends.
+        pub fn cycleStamped(self: *Self, ex: anytype, out: *std.ArrayList(u32), a: std.mem.Allocator, log: ?*CycleLog, stamp: anytype) !?Finish {
+            const g = self.g;
+            const st = &self.stats;
+            const c = try self.core(ex, log, stamp, std.math.maxInt(u32));
             var emitted: [ds.max_block + 1]u32 = undefined;
-            @memcpy(emitted[0..o.accepted], drafts[0..o.accepted]);
-            emitted[o.accepted] = correction;
+            @memcpy(emitted[0..c.kept], c.drafts[0..c.kept]);
+            emitted[c.kept] = c.next;
             const base = out.items.len;
             var finish: ?Finish = null;
-            for (emitted[0 .. o.accepted + 1]) |tok| {
+            for (emitted[0 .. c.kept + 1]) |tok| {
                 if (out.items.len >= self.cfg.max_tokens) break;
                 try out.append(a, tok);
                 if (self.isStop(tok)) {
@@ -417,14 +487,45 @@ pub fn Loop(comptime G: type) type {
             if (self.lookup) |*l| try l.appendCommitted(out.items[base..]);
             if (finish == null and out.items.len >= self.cfg.max_tokens) finish = .length;
             if (finish == null) {
-                self.primary = correction;
-                self.setMain(try sliceRows(g, verify_hidden, @intCast(o.accepted), @intCast(o.accepted + 1)));
+                self.primary = c.next;
+                self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
                 try g.evalAll(&.{self.main_h.?});
             }
             try ex.flush();
             g.reset();
             mark(stamp, .tail);
             return finish;
+        }
+
+        /// The shell's round over `core` (the Generator's v2 spec invariant: the state holds the
+        /// prompt and every emitted token; `t1`, the next token, is not in it). Verifies [t1,
+        /// drafts], keeps at most `accepted_cap` accepted drafts, and returns [t1, the kept drafts]
+        /// (owned by `a`) with the next token (the correction; not in the state). It never stops:
+        /// EOS, stop strings and the token budget are the caller's.
+        pub const Round = struct { tokens: []u32, accepted: u32, next_token: u32 };
+
+        pub fn round(self: *Self, ex: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, log: ?*CycleLog, stamp: anytype) !Round {
+            const g = self.g;
+            if (self.lookup) |*l| if (!self.lookup_has_primary) try l.appendCommitted(&.{t1});
+            self.lookup_has_primary = true;
+            self.primary = t1;
+            const c = try self.core(ex, log, stamp, accepted_cap);
+            const tokens = try a.alloc(u32, c.kept + 1);
+            errdefer a.free(tokens);
+            tokens[0] = t1;
+            @memcpy(tokens[1..], c.drafts[0..c.kept]);
+            self.stats.generated_tokens += c.kept + 1;
+            if (self.lookup) |*l| {
+                try l.appendCommitted(c.drafts[0..c.kept]);
+                try l.appendCommitted(&.{c.next});
+            }
+            self.primary = c.next;
+            self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
+            try g.evalAll(&.{self.main_h.?});
+            try ex.flush();
+            g.reset();
+            mark(stamp, .tail);
+            return .{ .tokens = tokens, .accepted = c.kept, .next_token = c.next };
         }
 
         /// The run after `prefill`: cycles until the token cap or a stop id.
@@ -584,6 +685,79 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(script.f32s.len, script.nf);
     // Every verify forward routed through the source: 3 prompt forwards + 4 verifies per layer.
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
+}
+
+test "dsv41 dspark loop: the shell's prompt (all but the last token, then the last) and its rounds give the cell's tokens" {
+    // The cell: `prefill` over the whole prompt, then `cycle`s (the mini model's script above).
+    // The shell: `prefillLogits` over all but the last prompt token, `extendLogits` over the last,
+    // the Generator's pick (its argmax), then `round`s under the v2 invariant with the budget cap.
+    const a = testing.allocator;
+    const script_of = struct {
+        fn f(n_experts: u16) Script {
+            return .{
+                .n_experts = n_experts,
+                .pick = 3,
+                .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+                .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+            };
+        }
+    }.f;
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    const budget: usize = 6;
+
+    var cell: Rig = undefined;
+    try cell.init();
+    defer cell.deinit();
+    var cs = script_of(@intCast(cell.m.c.n_routed_experts));
+    cell.g.host_values = cs.values();
+    var lc = Loop(TraceOps).init(&cell.g, cell.model, cell.head, &cell.st, cell.caches[0..cell.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = budget });
+    defer lc.deinit();
+    const primary = try lc.prefill(a, &cell.ex, &prompt);
+    var cell_out: std.ArrayList(u32) = .empty;
+    defer cell_out.deinit(a);
+    try testing.expectEqual(Finish.length, try lc.run(&cell.ex, &cell_out, a));
+
+    var sh: Rig = undefined;
+    try sh.init();
+    defer sh.deinit();
+    var ss = script_of(@intCast(sh.m.c.n_routed_experts));
+    sh.g.host_values = ss.values();
+    var ls = Loop(TraceOps).init(&sh.g, sh.model, sh.head, &sh.st, sh.caches[0..sh.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = std.math.maxInt(u32) });
+    defer ls.deinit();
+    const l0 = try ls.prefillLogits(a, &sh.ex, prompt[0 .. prompt.len - 1]);
+    sh.g.release(l0);
+    const l1 = try ls.extendLogits(a, &sh.ex, prompt[prompt.len - 1 ..]);
+    const t1 = try sh.g.hostArgmax(l1);
+    sh.g.release(l1);
+    // The shell's prompt seeds as the whole prompt does: the target and every draft window at 20 rows.
+    try testing.expectEqual(primary, t1);
+    try testing.expectEqual(@as(u32, 20), sh.st.offset);
+    for (sh.caches[0..sh.head.nStages()]) |c| try testing.expectEqual(@as(u32, 20), c.offset);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var next = t1;
+    var rounds: usize = 0;
+    while (out.items.len < budget) {
+        const first = rounds == 0;
+        const cap: u32 = @intCast(budget - out.items.len - @intFromBool(!first));
+        const r = try ls.round(&sh.ex, a, next, cap, null, {});
+        defer a.free(r.tokens);
+        try testing.expectEqual(next, r.tokens[0]);
+        for (r.tokens[@intFromBool(first)..]) |tok| if (out.items.len < budget) try out.append(a, tok);
+        next = r.next_token;
+        rounds += 1;
+        if (out.items.len + 1 == budget) try out.append(a, next);
+    }
+    try testing.expectEqualSlices(u32, cell_out.items, out.items);
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
+    try testing.expectEqual(@as(usize, 4), rounds);
+    // The last round kept one of its two accepted drafts (the budget cap): one row fewer than the
+    // cell's uncapped cycle (28), in the target and in every draft window.
+    try testing.expectEqual(@as(u32, 27), sh.st.offset);
+    for (sh.caches[0..sh.head.nStages()]) |c| try testing.expectEqual(@as(u32, 27), c.offset);
+    try testing.expectEqual(cs.nu, ss.nu);
+    try testing.expectEqual(cs.nf, ss.nf);
 }
 
 test "dsv41 dspark loop: the K33 draft block replays the eager one from regions built at construction" {

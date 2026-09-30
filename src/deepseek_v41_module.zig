@@ -61,6 +61,38 @@ fn Tiered(comptime AT: type) type {
 /// Built once, by the `expert_event_gates` setting.
 pub const Arm = union(enum) { host_waits: Tiered(A), event_gates: Tiered(AGated) };
 
+/// The served tier's DSpark acceptance (the tier of record: typical 0.3 with the greedy correction).
+pub const dspark_typical_delta: f32 = 0.3;
+const dspark_lane = "dspark typical 0.3";
+comptime {
+    std.debug.assert(dspark_typical_delta == 0.3); // the lane string states it
+}
+/// The strategy's settings on the served path: the cell's (draft depth 5, the confidence stop 0.5, the
+/// hybrid lookup), the whole prompt in one forward, no internal stop (the shell owns EOS and the budget).
+pub const dspark_config: dsl.Config = .{
+    .acceptance = .{ .typical = .{ .delta = dspark_typical_delta } },
+    .prompt_chunk = dsl.whole_prompt,
+    .max_tokens = std.math.maxInt(u32),
+};
+
+/// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
+const Dspark = struct {
+    lp: dsl.Loop(G),
+    caches: []H.Cache,
+};
+
+/// One DSpark round's result (the shell's `DsparkRound` shape, as `deepseek_v4.DsparkRound`).
+pub const DsparkRound = struct {
+    tokens: []u32,
+    accepted: u32,
+    next_token: u32,
+
+    pub fn deinit(self: *DsparkRound, a: std.mem.Allocator) void {
+        a.free(self.tokens);
+        self.tokens = &.{};
+    }
+};
+
 /// The read-ahead of both tiers (`DSV41_LOOKAHEAD3` / `DSV41_LOOKAHEAD4` `=8:inf:2`): top 8 by the predictor,
 /// no threshold, 2 records per call.
 pub const lookahead: expert_stream.Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2 };
@@ -100,6 +132,10 @@ pub const Module = struct {
     head: *H,
     /// The request in flight (rebuilt at `cache.step == 0`).
     state: ?M.State = null,
+    /// The DSpark strategy's settings (the served tier with a draft head); null: serial decode only.
+    dspark_cfg: ?dsl.Config = null,
+    /// The request's DSpark strategy, seeded by `prefill` when `dspark_cfg` is set.
+    dspark: ?Dspark = null,
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
     fenced: bool = false,
     /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
@@ -241,6 +277,9 @@ pub const Module = struct {
         };
         self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg });
         errdefer self.head.deinit(&self.g);
+        // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
+        if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
+        log.info("NATIVE decode lane installed: {s} (draft block {d})", .{ self.decodeLane(), self.draftBlockSize() });
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here,
         // never in a request (the draft block joins once the draft round, P5, serves its depth). Each
         // shape's MLX peak is kept for the bill (C4).
@@ -332,6 +371,7 @@ pub const Module = struct {
 
     pub fn deinit(self: *Module) void {
         const gpa = self.gpa;
+        self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
         self.model.deinit(&self.g);
@@ -424,11 +464,13 @@ pub const Module = struct {
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
         try self.gate.request();
+        self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
         self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
         self.prompt_stats0 = self.streamStats();
         self.prompt_tokens = ids.len;
+        if (self.dspark_cfg) |cfg| return self.prefillSeeded(ids, cfg);
         return self.forward(ids);
     }
 
@@ -460,6 +502,81 @@ pub const Module = struct {
         }
     }
 
+    /// The prompt pass with the DSpark seed (`Loop.prefill`'s: the main taps of every prompt row seed
+    /// the draft head, the lookup takes the prompt); the last row's logits, as `forward`'s.
+    fn prefillSeeded(self: *Module, ids: []const u32, cfg: dsl.Config) !mlx.mlx_array {
+        const caches = try self.gpa.alloc(H.Cache, self.head.nStages());
+        for (caches) |*x| x.* = .{};
+        self.dspark = .{ .lp = dsl.Loop(G).init(&self.g, self.model, self.head, &self.state.?, caches, cfg), .caches = caches };
+        errdefer self.dropDspark();
+        switch (self.arm) {
+            inline else => |t| return self.dspark.?.lp.prefillLogits(self.gpa, &t.arm.hook, ids),
+        }
+    }
+
+    fn dropDspark(self: *Module) void {
+        if (self.dspark) |*d| {
+            d.lp.deinit();
+            for (d.caches) |*x| x.deinit(&self.g);
+            self.gpa.free(d.caches);
+        }
+        self.dspark = null;
+    }
+
+    /// The draft block this Module serves (the shell's readiness signal): the head's depth under the
+    /// strategy's settings, 0 when it decodes serially.
+    pub fn draftBlockSize(self: *const Module) u32 {
+        const cfg = self.dspark_cfg orelse return 0;
+        return dsl.Loop(G).shapesOf(self.head, cfg).k_cap;
+    }
+
+    /// The decode lane as installed (the server log and the receipts stamp it).
+    pub fn decodeLane(self: *const Module) []const u8 {
+        return if (self.dspark_cfg != null) dspark_lane else "serial";
+    }
+
+    /// The request's committed length (the Generator mirrors its cache step from it).
+    pub fn position(self: *const Module) u64 {
+        return if (self.state) |st| st.offset else 0;
+    }
+
+    /// The strategy's counters over the request (null: no strategy seeded).
+    pub fn dsparkStats(self: *const Module) ?@import("deepseek_v41_dspark.zig").Stats {
+        return if (self.dspark) |d| d.lp.stats else null;
+    }
+
+    /// One DSpark round at the shell's v2 spec invariant (the state holds the prompt and every
+    /// emitted token; `t1`, the next token, is not in it): the head drafts, [t1, drafts] verifies at
+    /// the draft rows, typical acceptance (the tier's delta) with the greedy correction decides, the
+    /// target keeps [t1, at most `accepted_cap` accepted drafts] (the rejected rows trimmed: the KV
+    /// rollback) and the draft windows take them. Returns [t1, the kept drafts] (owned by `a`) and the
+    /// next token (the correction; not in the state). It never stops: EOS, stop strings and the token
+    /// budget are the caller's. The phase change runs before the first verify. Without a strategy (a
+    /// Module that decodes serially) it serves one serial step instead: [t1], its argmax next.
+    pub fn dsparkRound(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !DsparkRound {
+        return self.dsparkRoundLogged(a, t1, accepted_cap, null, {});
+    }
+
+    /// `dsparkRound` with the loop's cycle log and a stamper (the cell's receipts; `{}` compiles them out).
+    pub fn dsparkRoundLogged(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, cycle_log: ?*dsl.CycleLog, stamp: anytype) !DsparkRound {
+        self.reportPrompt();
+        if (!self.grown()) try self.phaseChange();
+        const d: *Dspark = if (self.dspark) |*x| x else {
+            const logits = try self.forward(&.{t1});
+            defer _ = mlx.mlx_array_free(logits);
+            const next = try self.g.hostArgmax(logits);
+            const tokens = try a.alloc(u32, 1);
+            tokens[0] = t1;
+            return .{ .tokens = tokens, .accepted = 0, .next_token = next };
+        };
+        switch (self.arm) {
+            inline else => |t| {
+                const r = try d.lp.round(&t.arm.hook, a, t1, accepted_cap, cycle_log, stamp);
+                return .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token };
+            },
+        }
+    }
+
     fn streamStats(self: *Module) expert_stream.Stats {
         return switch (self.arm) {
             inline else => |t| t.arm.stream.stats(),
@@ -488,6 +605,12 @@ pub const Module = struct {
         try self.gate.request();
         self.reportPrompt();
         if (phaseChangeDue(ids.len, self.grown())) try self.phaseChange();
+        // With a strategy the serial rows keep it in step (their main taps into the draft windows,
+        // the lookup): the shell's prompt (prefill of all but the last token, then this) seeds as the
+        // whole prompt does, and a serial step mid-request leaves the next round valid.
+        if (self.dspark) |*d| switch (self.arm) {
+            inline else => |t| return d.lp.extendLogits(self.gpa, &t.arm.hook, ids),
+        };
         return self.forward(ids);
     }
 
