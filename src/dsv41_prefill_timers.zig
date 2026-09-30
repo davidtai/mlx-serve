@@ -19,6 +19,25 @@ pub var waves: u64 = 0;
 pub var calls: u64 = 0;
 pub var launches: u64 = 0;
 
+/// Whose time a charge is (PREFILL_PROFILE_ROUTED_SPLIT): the stream groups', or the deferred base call's at the seed
+/// (P1b) or at the call's end. The wide lane sets it around the base call; the dispatcher's charges follow it.
+pub const Mode = enum { stream, base_seed, base_end };
+const n_modes = @typeInfo(Mode).@"enum".field_names.len;
+pub var mode: Mode = .stream;
+pub var ns_mode: [n_modes][n_buckets]u64 = @splat(@splat(0));
+pub var mode_calls: [n_modes]u64 = @splat(0);
+pub var wide_calls: u64 = 0;
+
+/// P1's read-ahead, one record per layer (PREFILL_PROFILE_READAHEAD): the predictor's counts, the predicted seed
+/// (the top of its ranking the layer's empty rows hold), the admissions and reads, the predicted experts no empty row
+/// took (blocked: every row held by a resident), and at the barrier the hits, the seed's demand records and their
+/// predicted counts against the cut (the last predicted rank's count): within x0.8-1.25 (near) or beyond (far).
+pub const max_layers = 64;
+pub const max_experts = 512;
+pub const ReadAheadLayer = struct { predicted: u32 = 0, admitted: u32 = 0, posted: u32 = 0, blocked: u32 = 0, cut: u32 = 0, hits: u32 = 0, demand: u32 = 0, near: u32 = 0, far: u32 = 0 };
+pub var ra: [max_layers]ReadAheadLayer = @splat(.{});
+pub var ra_counts: [max_layers][max_experts]u32 = @splat(@splat(0));
+
 pub const Stamp = if (enabled) u64 else void;
 
 pub inline fn now() Stamp {
@@ -28,10 +47,68 @@ pub inline fn now() Stamp {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-/// Charge the time since `t0` to `b`.
+/// Charge the time since `t0` to `b` (and to the current mode's split).
 pub inline fn charge(b: Bucket, t0: Stamp) void {
     if (comptime !enabled) return;
-    ns[@intFromEnum(b)] += now() - t0;
+    const d = now() - t0;
+    ns[@intFromEnum(b)] += d;
+    ns_mode[@intFromEnum(mode)][@intFromEnum(b)] += d;
+}
+
+/// The charges that follow are `m`'s (the wide lane's base call sets it and restores `.stream`).
+pub inline fn setMode(m: Mode) void {
+    if (comptime !enabled) return;
+    mode = m;
+    if (m != .stream) mode_calls[@intFromEnum(m)] += 1;
+}
+
+pub inline fn countWideCall() void {
+    if (comptime !enabled) return;
+    wide_calls += 1;
+}
+
+pub fn modeSeconds(m: Mode, b: Bucket) f64 {
+    return @as(f64, @floatFromInt(ns_mode[@intFromEnum(m)][@intFromEnum(b)])) / 1e9;
+}
+
+/// The predictor's counts for `layer` (before its read-ahead is posted).
+pub inline fn recordPrediction(layer: usize, counts: []const u32) void {
+    if (comptime !enabled) return;
+    if (layer >= max_layers) return;
+    const n = @min(counts.len, max_experts);
+    @memcpy(ra_counts[layer][0..n], counts[0..n]);
+}
+
+pub inline fn recordAdmission(layer: usize, predicted: u32, admitted: u32, blocked: u32, cut: u32) void {
+    if (comptime !enabled) return;
+    if (layer >= max_layers) return;
+    const r = &ra[layer];
+    r.predicted = predicted;
+    r.admitted = admitted;
+    r.blocked = blocked;
+    r.cut = cut;
+    r.posted = 0;
+}
+
+pub inline fn addPosted(layer: usize, n: u32) void {
+    if (comptime !enabled) return;
+    if (layer >= max_layers) return;
+    ra[layer].posted += n;
+}
+
+pub inline fn recordBarrier(layer: usize, hits: u32, demand: u32, near: u32, far: u32) void {
+    if (comptime !enabled) return;
+    if (layer >= max_layers) return;
+    const r = &ra[layer];
+    r.hits = hits;
+    r.demand = demand;
+    r.near = near;
+    r.far = far;
+}
+
+/// A demand record's band: its predicted count within x0.8-1.25 of the cut (near), else far.
+pub fn nearCut(predicted: u32, cut: u32) bool {
+    return cut > 0 and @as(u64, predicted) * 5 >= @as(u64, cut) * 4 and @as(u64, predicted) * 4 <= @as(u64, cut) * 5;
 }
 
 pub inline fn count(w: u64, l: u64) void {
@@ -50,8 +127,27 @@ pub fn reset() void {
     waves = 0;
     calls = 0;
     launches = 0;
+    mode = .stream;
+    ns_mode = @splat(@splat(0));
+    mode_calls = @splat(0);
+    wide_calls = 0;
+    ra = @splat(.{});
 }
 
 pub fn seconds(b: Bucket) f64 {
     return @as(f64, @floatFromInt(ns[@intFromEnum(b)])) / 1e9;
+}
+
+test "dsv41 prefill timers: a demand record's band against the read-ahead's cut (x0.8-1.25 near, beyond far)" {
+    const t = @import("std").testing;
+    try t.expect(nearCut(100, 100) and nearCut(80, 100) and nearCut(125, 100));
+    try t.expect(!nearCut(79, 100) and !nearCut(126, 100) and !nearCut(0, 100));
+    // No cut (nothing predicted): every demand record is far.
+    try t.expect(!nearCut(5, 0));
+    // Every call compiles to nothing in a timed build: the records stay empty.
+    if (!enabled) {
+        recordAdmission(0, 5, 4, 1, 10);
+        recordBarrier(0, 3, 2, 1, 1);
+        try t.expectEqual(@as(u32, 0), ra[0].predicted);
+    }
 }

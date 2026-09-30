@@ -6,6 +6,8 @@
 //! routes, deferred release, growth, lookahead and event gates.
 
 const std = @import("std");
+/// PROFILE builds only (`-Ddsv41-prefill-timers=true`): P1's read-ahead record; every call compiles to nothing otherwise.
+const prof = @import("dsv41_prefill_timers.zig");
 const mlx = @import("mlx.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
@@ -695,6 +697,22 @@ pub const Stream = struct {
         ah.tallied = true;
         for (ah.loads[0..ah.n]) |l| self.counters.ahead_hits += @intFromBool(policy.call_counts[l.expert] > 0);
         self.counters.ahead_demand += policy.seed.count();
+        if (comptime prof.enabled) {
+            // The layer's barrier record: hits, and each demand record's predicted count against the cut.
+            var hits: u32 = 0;
+            for (ah.loads[0..ah.n]) |l| hits += @intFromBool(policy.call_counts[l.expert] > 0);
+            var near: u32 = 0;
+            var far: u32 = 0;
+            if (layer < prof.max_layers) {
+                const cut = prof.ra[layer].cut;
+                var it = policy.seed.iterator(.{});
+                while (it.next()) |e| {
+                    const pc = if (e < prof.max_experts) prof.ra_counts[layer][e] else 0;
+                    if (prof.nearCut(pc, cut)) near += 1 else far += 1;
+                }
+            }
+            prof.recordBarrier(layer, hits, @intCast(policy.seed.count()), near, far);
+        }
     }
 
     /// Resolves `ids` (the router's top-k of one layer call, host values read
@@ -967,6 +985,17 @@ pub const Stream = struct {
         const ah = &self.ahead;
         const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / 2);
         const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
+        if (comptime prof.enabled) {
+            // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
+            // those neither resident nor admitted (no empty row: every row held by a resident, the read-ahead never evicts).
+            const pol = &self.layers[layer].policy;
+            const room: usize = pol.capacity -| @as(u32, @intCast(pol.protected.count()));
+            const top = experts[0..@min(experts.len, room)];
+            var blocked: u32 = 0;
+            for (top) |e| blocked += @intFromBool(pol.slotOf(e) == null);
+            const cut: u32 = if (top.len > 0 and layer < prof.max_layers and top[top.len - 1] < prof.max_experts) prof.ra_counts[layer][top[top.len - 1]] else 0;
+            prof.recordAdmission(layer, @intCast(top.len), @intCast(admitted.len), blocked, cut);
+        }
         const n: u32 = @intCast(admitted.len);
         ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts };
         if (n == 0) return;
@@ -1004,6 +1033,7 @@ pub const Stream = struct {
                 part.ticket = self.pool.submit(self.bank.sidecar_fd, self.bank.sidecar_file_size, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                 part.n_reads = nr;
                 self.counters.ahead_posted += nr;
+                prof.addPosted(layer, nr);
             } else part.settled = true;
             ah.parts[ah.n_parts] = part;
             ah.n_parts += 1;

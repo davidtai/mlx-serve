@@ -2212,6 +2212,24 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
     // The wide calls' merges (K16 JOINLESS): the bytes they allocated fresh against those MLX's cache gave back.
     if (probe.merges > 0) std.debug.print("PREFILL_PROFILE_MERGE {{\"merges\": {d}, \"fresh_gb\": {d:.3}, \"reused_gb\": {d:.3}}}\n", .{ probe.merges, @as(f64, @floatFromInt(probe.merge_fresh)) / 1e9, @as(f64, @floatFromInt(probe.merge_reused)) / 1e9 });
+    // A profile build: the routed split (stream groups against the deferred base call at the seed and at the end) and
+    // P1's read-ahead per layer.
+    if (dsv41_prof.enabled) {
+        const M = dsv41_prof.Mode;
+        std.debug.print("PREFILL_PROFILE_ROUTED_SPLIT {{\"wide_calls\": {d}, \"stream_read_wait_s\": {d:.3}, \"stream_encode_s\": {d:.3}, \"stream_drain_s\": {d:.3}, \"stream_join_s\": {d:.3}, \"base_seed_calls\": {d}, \"base_seed_encode_s\": {d:.3}, \"base_seed_drain_s\": {d:.3}, \"base_end_calls\": {d}, \"base_end_encode_s\": {d:.3}, \"base_end_drain_s\": {d:.3}}}\n", .{
+            dsv41_prof.wide_calls,                              dsv41_prof.modeSeconds(M.stream, .read_wait),   dsv41_prof.modeSeconds(M.stream, .encode),
+            dsv41_prof.modeSeconds(M.stream, .drain),           dsv41_prof.modeSeconds(M.stream, .join),        dsv41_prof.mode_calls[@intFromEnum(M.base_seed)],
+            dsv41_prof.modeSeconds(M.base_seed, .encode),       dsv41_prof.modeSeconds(M.base_seed, .drain),    dsv41_prof.mode_calls[@intFromEnum(M.base_end)],
+            dsv41_prof.modeSeconds(M.base_end, .encode),        dsv41_prof.modeSeconds(M.base_end, .drain),
+        });
+        var tot: dsv41_prof.ReadAheadLayer = .{};
+        for (dsv41_prof.ra[0..@min(md.model.c.n_layers, dsv41_prof.max_layers)], 0..) |rec, l| {
+            if (rec.predicted == 0 and rec.posted == 0 and rec.demand == 0) continue;
+            std.debug.print("PREFILL_PROFILE_READAHEAD {{\"layer\": {d}, \"predicted\": {d}, \"admitted\": {d}, \"posted\": {d}, \"blocked\": {d}, \"hits\": {d}, \"demand\": {d}, \"demand_near\": {d}, \"demand_far\": {d}, \"cut\": {d}}}\n", .{ l, rec.predicted, rec.admitted, rec.posted, rec.blocked, rec.hits, rec.demand, rec.near, rec.far, rec.cut });
+            inline for (.{ "predicted", "admitted", "posted", "blocked", "hits", "demand", "near", "far" }) |f| @field(tot, f) += @field(rec, f);
+        }
+        std.debug.print("PREFILL_PROFILE_READAHEAD {{\"layer\": \"all\", \"predicted\": {d}, \"admitted\": {d}, \"posted\": {d}, \"blocked\": {d}, \"hits\": {d}, \"demand\": {d}, \"demand_near\": {d}, \"demand_far\": {d}}}\n", .{ tot.predicted, tot.admitted, tot.posted, tot.blocked, tot.hits, tot.demand, tot.near, tot.far });
+    }
     // A profile build (-Ddsv41-prefill-timers=true): the routed calls' host time by step, the waves and launches.
     if (dsv41_prof.enabled) std.debug.print("PREFILL_PROFILE_ROUTED {{\"barrier_s\": {d:.3}, \"route_s\": {d:.3}, \"read_wait_s\": {d:.3}, \"encode_s\": {d:.3}, \"drain_s\": {d:.3}, \"join_s\": {d:.3}, \"dig_calls\": {d}, \"waves\": {d}, \"launches\": {d}}}\n", .{
         dsv41_prof.seconds(.barrier), dsv41_prof.seconds(.route), dsv41_prof.seconds(.read_wait), dsv41_prof.seconds(.encode), dsv41_prof.seconds(.drain), dsv41_prof.seconds(.join), dsv41_prof.calls, dsv41_prof.waves, dsv41_prof.launches,

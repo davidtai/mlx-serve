@@ -19,6 +19,8 @@ const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
 const routes = @import("deepseek_v41_routes.zig");
 const expert_policy = @import("expert_policy.zig");
+/// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
+const prof = @import("dsv41_prefill_timers.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
 pub const Want = struct {
@@ -645,6 +647,7 @@ pub fn Model(comptime G: type) type {
                 const n: usize = @intCast(g.shapeOf(idx).numel());
                 for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
             }
+            prof.recordPrediction(l, counts);
             try hook.readAheadSeed(expert_policy.rankHottest(counts, ranked));
             try probe.put("moe.predict", wf);
         }
