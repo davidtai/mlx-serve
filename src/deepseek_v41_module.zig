@@ -305,16 +305,15 @@ pub const Module = struct {
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
         log.info("NATIVE decode lane installed: {s} (draft block {d})", .{ self.decodeLane(), self.draftBlockSize() });
-        // The install warm-up (P4.3): the shapes a request issues trace here, never in a request. With the
-        // DSpark strategy those are its own: the verify widths 1..max_rows (8: draft block 5 + the lookup's
-        // 2 + 1; seedMain at the same rows) and the 5-row draft block through every stage, so the first
-        // round no longer compiles its draft inside timed decode. Widths 9..32 (only a 9-32 token prompt
-        // or prompt tail) are left to trace on first use. Without a strategy (serial decode) every width up
-        // to the compiled regions' bound, as before. Each shape's MLX peak is kept for the bill (C4).
+        // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
+        // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
+        // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
+        // 1 9.41 GB (the residents' first use: MLX active then equals the billed device terms, so resident,
+        // not transient), widths 2-8 11-47 MB, widths 9-32 0.27-0.42 GB (a 9-32 token prompt or prompt tail):
+        // cheap, so they stay. Each shape's MLX peak is kept for the bill (C4).
         const warm_cfg: dsl.Config = self.dspark_cfg orelse .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) };
-        const warm_widths: u32 = if (self.dspark_cfg != null) 0 else graph.attn_compile_max_rows;
         self.warm_peaks = switch (self.arm) {
-            inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, warm_cfg, warm_widths),
+            inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, warm_cfg, graph.attn_compile_max_rows),
         };
         errdefer gpa.free(self.warm_peaks);
         // Every warm-up command retired before the clear: their completion handlers hand the buffers they
