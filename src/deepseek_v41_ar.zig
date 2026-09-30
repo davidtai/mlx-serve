@@ -779,6 +779,25 @@ const StreamPhase = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// The decode read-ahead's lookahead class (`Stats`): records claimed by the next call, speculative reads issued /
+    /// landed and their bytes, adopted ranges and bytes, certain-miss pre-reads issued / served / expired, event gates
+    /// and the forced ones. Read from the stream's counters outside the timed spans.
+    claimed: u64 = 0,
+    spec_issued: u64 = 0,
+    spec_landed: u64 = 0,
+    spec_bytes: u64 = 0,
+    adopt_ranges: u64 = 0,
+    adopt_bytes: u64 = 0,
+    pre_issued: u64 = 0,
+    pre_served: u64 = 0,
+    pre_expired: u64 = 0,
+    gates: u64 = 0,
+    gates_forced: u64 = 0,
+    /// Where the misses went (persistent / transient slots), loads whose slot still held the record (no read), evictions.
+    persistent_loads: u64 = 0,
+    transient_loads: u64 = 0,
+    loads_skipped: u64 = 0,
+    evictions: u64 = 0,
 
     fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
         return .{
@@ -793,13 +812,28 @@ const StreamPhase = struct {
             .ahead_hits = b.ahead_hits -| a.ahead_hits,
             .ahead_demand = b.ahead_demand -| a.ahead_demand,
             .ahead_bytes = b.ahead_bytes -| a.ahead_bytes,
+            .claimed = b.claimed -| a.claimed,
+            .spec_issued = b.spec_issued -| a.spec_issued,
+            .spec_landed = b.spec_landed -| a.spec_landed,
+            .spec_bytes = b.spec_bytes -| a.spec_bytes,
+            .adopt_ranges = b.adopt_ranges -| a.adopt_ranges,
+            .adopt_bytes = b.adopt_bytes -| a.adopt_bytes,
+            .pre_issued = b.pre_issued -| a.pre_issued,
+            .pre_served = b.pre_served -| a.pre_served,
+            .pre_expired = b.pre_expired -| a.pre_expired,
+            .gates = b.gates -| a.gates,
+            .gates_forced = b.gates_forced -| a.gates_forced,
+            .persistent_loads = b.persistent_loads -| a.persistent_loads,
+            .transient_loads = b.transient_loads -| a.transient_loads,
+            .loads_skipped = b.loads_skipped -| a.loads_skipped,
+            .evictions = b.expert_cache_evictions -| a.expert_cache_evictions,
         };
     }
 };
 
 /// A decode-profile run's cycle (DSV41_CELL_DECODE_PROFILE): the host time of each phase
 /// (`dsl.Phase`, exclusive, from the loop's stamps) and the stream's counters over the cycle.
-const ProfCycle = struct { k_eff: u32, accepted: u32, draft_ms: f64, verify_ms: f64, decide_ms: f64, commit_ms: f64, tail_ms: f64, misses: u64, bytes_read: u64, read_busy_ms: f64 };
+const ProfCycle = struct { k_eff: u32, accepted: u32, draft_ms: f64, verify_ms: f64, decide_ms: f64, commit_ms: f64, tail_ms: f64, misses: u64, bytes_read: u64, read_busy_ms: f64, claimed: u64 = 0, spec_issued: u64 = 0, spec_landed: u64 = 0 };
 
 /// The decode profile's stamper: `mark(p)` charges the host time since the previous mark to `p`.
 const Stamper = struct {
@@ -1079,7 +1113,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
             const rr = try md.dsparkRoundLogged(gpa, next, cap, &lg, &sp);
             const c1 = arm.hook.source.stats();
             const sph = StreamPhase.of(c0, c1);
-            try prof.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .draft_ms = sp.ms(.draft), .verify_ms = sp.ms(.verify), .decide_ms = sp.ms(.decide), .commit_ms = sp.ms(.commit), .tail_ms = sp.ms(.tail), .misses = sph.misses, .bytes_read = sph.bytes_read, .read_busy_ms = sph.read_busy_s * 1e3 });
+            try prof.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .draft_ms = sp.ms(.draft), .verify_ms = sp.ms(.verify), .decide_ms = sp.ms(.decide), .commit_ms = sp.ms(.commit), .tail_ms = sp.ms(.tail), .misses = sph.misses, .bytes_read = sph.bytes_read, .read_busy_ms = sph.read_busy_s * 1e3, .claimed = sph.claimed, .spec_issued = sph.spec_issued, .spec_landed = sph.spec_landed });
             break :blk rr;
         };
         defer r.deinit(gpa);
@@ -2257,13 +2291,17 @@ fn printDecodeProfile(p: []const ProfCycle) void {
         sum.misses += c.misses;
         sum.bytes_read += c.bytes_read;
         sum.read_busy_ms += c.read_busy_ms;
+        sum.claimed += c.claimed;
+        sum.spec_issued += c.spec_issued;
+        sum.spec_landed += c.spec_landed;
     }
     const n: f64 = @floatFromInt(p.len);
-    std.debug.print("\nDECODE_PROFILE {{\"cycles\": {d}, \"draft_ms\": {d:.2}, \"verify_ms\": {d:.2}, \"decide_ms\": {d:.2}, \"commit_ms\": {d:.2}, \"tail_ms\": {d:.2}, \"cycle_ms\": {d:.2}, \"misses_per_cycle\": {d:.1}, \"mb_read_per_cycle\": {d:.1}, \"read_busy_ms\": {d:.2}, \"k_eff\": {d:.2}, \"accepted\": {d:.2}}}\n", .{
+    std.debug.print("\nDECODE_PROFILE {{\"cycles\": {d}, \"draft_ms\": {d:.2}, \"verify_ms\": {d:.2}, \"decide_ms\": {d:.2}, \"commit_ms\": {d:.2}, \"tail_ms\": {d:.2}, \"cycle_ms\": {d:.2}, \"misses_per_cycle\": {d:.1}, \"mb_read_per_cycle\": {d:.1}, \"read_busy_ms\": {d:.2}, \"k_eff\": {d:.2}, \"accepted\": {d:.2}, \"claimed_per_cycle\": {d:.1}, \"spec_issued_per_cycle\": {d:.1}, \"spec_landed_per_cycle\": {d:.1}}}\n", .{
         p.len,                     sum.draft_ms / n,       sum.verify_ms / n,  sum.decide_ms / n,
         sum.commit_ms / n,         sum.tail_ms / n,        (sum.draft_ms + sum.verify_ms + sum.decide_ms + sum.commit_ms + sum.tail_ms) / n,
         @as(f64, @floatFromInt(sum.misses)) / n, @as(f64, @floatFromInt(sum.bytes_read)) / n / 1e6, sum.read_busy_ms / n,
         @as(f64, @floatFromInt(sum.k_eff)) / n, @as(f64, @floatFromInt(sum.accepted)) / n,
+        @as(f64, @floatFromInt(sum.claimed)) / n, @as(f64, @floatFromInt(sum.spec_issued)) / n, @as(f64, @floatFromInt(sum.spec_landed)) / n,
     });
 }
 
