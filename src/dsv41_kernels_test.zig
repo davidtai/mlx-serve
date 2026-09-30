@@ -113,18 +113,25 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), t.launcher.?);
     var plan: usize = 0;
     for (&set.reg.entries) |*e| plan += e.checks.count();
-    // the EXL3 quant: exactly its 63 checks (49 + the take2 retune's 3 + the 128-row GEMMs' 8 + the fused down GEMM's 3), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
+    // the EXL3 quant: exactly its 60 checks (49 + the take2 retune's 3 + the 128-row GEMMs' 8), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set }, v41_spec, &diag);
-    try testing.expectEqual(@as(usize, 63), acc.report.results.items.len);
+    try testing.expectEqual(@as(usize, 60), acc.report.results.items.len);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
     try testing.expectEqual(@as(usize, 40), acc.waves.len);
+    // the fused down GEMM's arm: its 3 checks join the report, and every layer's waves launch it
+    const fused_checks = set.reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1).checks.count();
+    try testing.expectEqual(@as(usize, 3), fused_checks);
+    try testing.expectEqual(@as(u32, 5), acc.waves[0].wave_launches);
+    try acc.routeFusedDown(set, &diag);
+    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    for (acc.waves) |*w| try testing.expectEqual(@as(u32, 4), w.wave_launches);
     // the trunk: the rest of the plan, none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
-    try testing.expectEqual(plan - 63, rep.results.items.len);
+    try testing.expectEqual(plan - 60 - fused_checks, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };

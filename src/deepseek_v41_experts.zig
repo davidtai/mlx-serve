@@ -2265,14 +2265,14 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
         const out = try ex.at(0).routed(&g, try g.input(&.{ @intCast(n), 5120 }, .bfloat16), try g.input(&.{ @intCast(n), @intCast(pk.k) }, .int32));
         try testing.expect(g.shapeOf(out).eql(ops.Shape.of(&.{ @intCast(n), @intCast(pk.k), 5120 })));
         try testing.expectEqual(calls_before + 1, src.counters.route_calls);
-        // The lane's waves: 5 launches each (take2, gate|up GEMM, onepass, down GEMM, widen1); the route's 4 have 6
-        // outputs (take2 2, gate|up GEMM 2, onepass, the fused down GEMM); a reset per wave plus the join's.
+        // The lane's waves: 5 launches each (7 outputs: take2 2, gate|up GEMM 2, onepass,
+        // down GEMM, widen1), a reset per wave plus the join's.
         var launches: usize = 0;
         for (cl.events) |e| launches += @intFromBool(std.mem.startsWith(u8, e, "launch "));
         const waves = launches / 5;
         var kernels: usize = 0;
         for (g.nodes.items[first_node..]) |nd| kernels += @intFromBool(nd.op == .kernel);
-        try testing.expectEqual(6 * waves, kernels);
+        try testing.expectEqual(7 * waves, kernels);
         try testing.expectEqual(waves + 1, g.freed.items.len - resets_before);
         // A prefill route builds each launch per call (its rows vary up to 2^20).
         try testing.expectEqual(@as(usize, 0), g.prepared_launches);

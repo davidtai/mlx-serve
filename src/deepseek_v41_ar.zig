@@ -884,6 +884,8 @@ const CellReceipt = struct {
     embedding_rows: ?bool = null,
     /// (v10) HCPOST, as installed (read back from the Module).
     prefill_hc_post: ?bool = null,
+    /// The DIG-X waves' fused down GEMM, as installed (read back from the Module).
+    prefill_fused_down: ?bool = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
     engram_posted: ?bool = null,
     deferred_base: ?bool = null,
@@ -1173,6 +1175,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_joinless = md.installed.prefill_joinless,
         .embedding_rows = md.installed.embedding_rows,
         .prefill_hc_post = md.installed.prefill_hc_post,
+        .prefill_fused_down = md.installed.prefill_fused_down,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
@@ -1267,6 +1270,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| ov.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
+    if (envStr("DSV41_CELL_PREFILL_FUSED_DOWN")) |v| ov.prefill_fused_down = try cellBool("DSV41_CELL_PREFILL_FUSED_DOWN", v);
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);

@@ -102,6 +102,8 @@ pub const RouteOverrides = struct {
     prefill_hc_post: ?bool = null,
     /// ENGRAM=prefetch: the prompt pass's Engram gathers posted ahead.
     engram_posted: ?bool = null,
+    /// The DIG-X prefill waves' fused down GEMM (the down GEMM and rot_widen1 in one launch; null / false: stock).
+    prefill_fused_down: ?bool = null,
     /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows).
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -248,6 +250,11 @@ pub const Module = struct {
             log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, fill_prompt_tokens, admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
+        // The fused down GEMM, when overridden: its self-checks on the set, then every layer's DIG-X waves launch it.
+        if (ov.prefill_fused_down orelse false) {
+            var kd: xk.Diag = .{};
+            self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
+        }
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
         // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
@@ -327,7 +334,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -930,6 +937,8 @@ pub const Installed = struct {
     embedding_rows: bool = false,
     /// JOINLESS reads the DIG-X waves' own outputs (no per-call concatenate + take).
     prefill_unjoined: bool = false,
+    /// The DIG-X waves launch the fused down GEMM (installed, past its self-checks).
+    prefill_fused_down: bool = false,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -958,7 +967,7 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
