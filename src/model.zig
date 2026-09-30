@@ -442,6 +442,11 @@ pub const ModelConfig = struct {
     /// deepseek_v41's prefill indexer (ATTNHALF idxscore + INDEX_TOPK) at prompt widths: null = the
     /// tier's route (served: on), false = the stock chain by construction.
     prefill_index: ?bool = null,
+    /// deepseek_v41's prefill HC norms, SMALLK combine, DENSE16 o-projection (after the prefill
+    /// core): null = the tier's route (served: on), false = the stock chain by construction.
+    prefill_hc: ?bool = null,
+    prefill_combine: ?bool = null,
+    prefill_oproj: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

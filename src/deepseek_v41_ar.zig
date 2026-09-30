@@ -806,6 +806,9 @@ const CellReceipt = struct {
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
     prefill_index: ?bool = null,
+    prefill_hc: ?bool = null,
+    prefill_combine: ?bool = null,
+    prefill_oproj: ?bool = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -1007,6 +1010,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_cold_rows = md.installed.wide.cold_rows,
         .prefill_attn = md.installed.prefill_attn,
         .prefill_index = md.installed.prefill_index,
+        .prefill_hc = md.installed.prefill_hc,
+        .prefill_combine = md.installed.prefill_combine,
+        .prefill_oproj = md.installed.prefill_oproj,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1053,6 +1059,9 @@ fn cellConfig(config: *model.ModelConfig) !void {
     // The attention call sites (the served tier's routes by default; 0 = the stock chain).
     if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
     if (envStr("DSV41_CELL_PREFILL_INDEX")) |v| config.prefill_index = try cellBool("DSV41_CELL_PREFILL_INDEX", v);
+    if (envStr("DSV41_CELL_PREFILL_HC")) |v| config.prefill_hc = try cellBool("DSV41_CELL_PREFILL_HC", v);
+    if (envStr("DSV41_CELL_PREFILL_COMBINE")) |v| config.prefill_combine = try cellBool("DSV41_CELL_PREFILL_COMBINE", v);
+    if (envStr("DSV41_CELL_PREFILL_OPROJ")) |v| config.prefill_oproj = try cellBool("DSV41_CELL_PREFILL_OPROJ", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;
