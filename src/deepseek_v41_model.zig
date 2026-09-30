@@ -30,6 +30,10 @@ const qwen4 = @import("qwen4_exp.zig");
 /// layer; without it, the DSpark target layers keep their input streams through the prompt pass.
 pub const main_taps_in_chunk_fence = true;
 
+/// K16's chunk timeline marks (`probeFence`): a chunk's host build starts, its fence starts (the build ends), its fence
+/// returns. The fence profile (D14's price) reads them without syncs of its own.
+pub const FenceAt = enum { build, wait, done };
+
 pub const Want = struct {
     /// Head rows: none, the last position (a prefill), or every row (decode, verify).
     logits: enum { none, last, all } = .all,
@@ -755,6 +759,7 @@ pub fn Model(comptime G: type) type {
                     // its Half and its shared runtime kept to the layer's routed call (as chunk-major
                     // keeps one chunk's layer at a time), so a layer never holds every chunk's arrays.
                     probeChunk(probe, i);
+                    probeFence(probe, .build);
                     const wave = g.mark();
                     var h = hs[i];
                     if (li.engram_slot) |slot| {
@@ -777,7 +782,9 @@ pub fn Model(comptime G: type) type {
                         settle[5] = t;
                         n_settle = 6;
                     }
+                    probeFence(probe, .wait);
                     try fence(g, st, settle[0..n_settle]);
+                    probeFence(probe, .done);
                     // The profile's split of the chunk's carry-over: the fence's evaluation, then the keeps and
                     // the wave's frees (each probe re-reads an evaluated kept array: its segment is the host work).
                     try probe.put("chunk.fence", hf.moe_in);
@@ -921,6 +928,13 @@ pub fn Model(comptime G: type) type {
         /// K16's per-chunk sub-wave keeps a chunk's Half past its reset (released after its HC post).
         /// A probe that attributes by chunk (the profile's) learns which K16 chunk the next stages belong to;
         /// compiled out for every other probe (NoProbe in timed builds).
+        /// A probe that marks K16's chunk timeline (the fence profile) gets each mark; compiled out for every other
+        /// probe (NoProbe in timed builds, the stage profile).
+        fn probeFence(probe: anytype, comptime at: FenceAt) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "fenceMark")) probe.fenceMark(at);
+        }
+
         fn probeChunk(probe: anytype, i: usize) void {
             const P = @TypeOf(probe);
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "atChunk")) probe.atChunk(i);
@@ -1189,6 +1203,41 @@ test "dsv41 model: K16 settles each chunk's DSpark main tap in its chunk fence (
     }
     try testing.expectEqual(@as(usize, 3), taps);
     try testing.expect(main_taps_in_chunk_fence);
+}
+
+test "dsv41 model: K16 marks each chunk's build, fence start and fence end for a fence probe (D14's timeline), in order" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    const Rec = struct {
+        marks: std.ArrayList(FenceAt) = .empty,
+        evals_at_wait: std.ArrayList(usize) = .empty,
+        g: *TraceOps,
+        pub fn put(_: *@This(), _: []const u8, _: anytype) !void {}
+        pub fn fenceMark(self: *@This(), at: FenceAt) void {
+            self.marks.append(testing.allocator, at) catch unreachable;
+            if (at != .build) self.evals_at_wait.append(testing.allocator, self.g.evals.items.len) catch unreachable;
+        }
+    };
+    var rec: Rec = .{ .g = &g };
+    defer rec.marks.deinit(testing.allocator);
+    defer rec.evals_at_wait.deinit(testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    _ = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, &rec);
+    // 5 layers x 3 chunks (8, 8, 4 rows), each build -> wait -> done.
+    const n = m.c.n_layers * 3;
+    try testing.expectEqual(n * 3, rec.marks.items.len);
+    for (0..n) |k| try testing.expectEqualSlices(FenceAt, &.{ .build, .wait, .done }, rec.marks.items[k * 3 ..][0..3]);
+    // The fence's eval falls between its wait and done marks (one eval: the fence).
+    for (0..n) |k| try testing.expectEqual(rec.evals_at_wait.items[k * 2] + 1, rec.evals_at_wait.items[k * 2 + 1]);
 }
 
 test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one compiled combine per chunk" {
