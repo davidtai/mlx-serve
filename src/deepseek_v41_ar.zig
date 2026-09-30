@@ -1395,14 +1395,56 @@ pub const BoxMark = struct {
     footprint: u64,
 };
 
+/// A mark's two footprint reads, on either side of its vm_stat child, agree within this, so its pair is one
+/// moment's. The process frees late after the prompt (MLX releases a command buffer's temporaries when the GPU
+/// completes it; P1's read-ahead drains its posts): SERVED11's and SERVED12's before marks read the footprint,
+/// then vm_stat after 0.74 / 0.77 GB of those frees had landed, and the proof counted them as physical growth
+/// beyond the footprint's (0.45 / 0.73 GB; SERVED12 refused).
+pub const box_mark_stable_bytes: u64 = 64 << 20;
+/// A mark is retried `box_mark_retry_ms` apart, at most `box_mark_attempts` times, then refused by name.
+pub const box_mark_attempts: u32 = 20;
+pub const box_mark_retry_ms: u32 = 25;
+
 pub fn boxMark(a: std.mem.Allocator, io: std.Io) !BoxMark {
-    const footprint = status.footprint().now;
-    const res = try std.process.run(a, io, .{ .argv = &.{"/usr/bin/vm_stat"}, .stdout_limit = .limited(1 << 16) });
-    defer a.free(res.stdout);
-    defer a.free(res.stderr);
-    if (res.term != .exited or res.term.exited != 0) return error.VmStatFailed;
-    return .{ .physical = try vmStatPhysical(res.stdout), .footprint = footprint };
+    return stableBoxMark(LiveBox{ .a = a, .io = io });
 }
+
+/// One moment's reading through `r` (`footprint()`, `physical()`, `sleep(ms)`): the footprint read before and after
+/// the box's pages, retried until the two agree within `box_mark_stable_bytes`; error.BoxMarkUnstable when the
+/// process never holds still for one vm_stat.
+pub fn stableBoxMark(r: anytype) !BoxMark {
+    var n: u32 = 0;
+    while (n < box_mark_attempts) : (n += 1) {
+        if (n > 0) r.sleep(box_mark_retry_ms);
+        const f0 = r.footprint();
+        const physical = try r.physical();
+        const f1 = r.footprint();
+        if (@max(f0, f1) - @min(f0, f1) <= box_mark_stable_bytes) return .{ .physical = physical, .footprint = f1 };
+    }
+    return error.BoxMarkUnstable;
+}
+
+/// The live readings: this process's footprint and a vm_stat child (see `BoxMark`).
+const LiveBox = struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+
+    fn footprint(_: LiveBox) u64 {
+        return status.footprint().now;
+    }
+
+    fn physical(self: LiveBox) !u64 {
+        const res = try std.process.run(self.a, self.io, .{ .argv = &.{"/usr/bin/vm_stat"}, .stdout_limit = .limited(1 << 16) });
+        defer self.a.free(res.stdout);
+        defer self.a.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0) return error.VmStatFailed;
+        return vmStatPhysical(res.stdout);
+    }
+
+    fn sleep(self: LiveBox, ms: u32) void {
+        std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
+    }
+};
 
 /// vm_stat's output: its header's page size times wired down + active + inactive + occupied by compressor.
 pub fn vmStatPhysical(out: []const u8) !u64 {
@@ -1482,6 +1524,79 @@ test "dsv41 memory: the harness's window proofs: page cache left by the load, th
     // Other processes' movement within the tolerance passes; beyond it, refused.
     try checkGrowResidency(before, .{ .physical = grown.physical + box_tolerance_bytes, .footprint = grown.footprint });
     try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(before, .{ .physical = grown.physical + box_tolerance_bytes + 1, .footprint = grown.footprint }));
+}
+
+/// Recorded readings in order: the footprint's, and vm_stat's (the last one repeats).
+const ReplayBox = struct {
+    footprints: []const u64,
+    physicals: []const u64,
+    n_footprint: usize = 0,
+    n_physical: usize = 0,
+
+    fn footprint(self: *ReplayBox) u64 {
+        defer self.n_footprint += 1;
+        return self.footprints[@min(self.n_footprint, self.footprints.len - 1)];
+    }
+
+    fn physical(self: *ReplayBox) !u64 {
+        defer self.n_physical += 1;
+        return self.physicals[@min(self.n_physical, self.physicals.len - 1)];
+    }
+
+    fn sleep(_: *ReplayBox, _: u32) void {}
+};
+
+// SERVED11 (pass3ar, served-cell-typical-fastest-20260930-124252) and SERVED12 (pass3at, -134710) as recorded. The
+// before mark paired the footprint read at the prompt record with a vm_stat taken after the process's late frees:
+// the phase change's first reading, moments later, sat 0.74 / 0.77 GB lower. The grown marks sit at the box's
+// outside-the-footprint of the other marks (11.38 / 12.57 GB). On that pairing SERVED12 was refused (0.728 GB of
+// physical growth beyond the footprint's) and SERVED11 passed by 45 MB. The stable mark rereads the footprint after
+// vm_stat, retries, and pairs vm_stat with the settled footprint (the retry's vm_stat replays the recorded one: the
+// frees had landed before it). Both then pass, their physical growth 0.28 / 0.04 GB under the footprint's.
+test "dsv41 memory: the box proof's before mark is one moment's (SERVED11 and SERVED12 replayed)" {
+    const W = struct { before: BoxMark, settled: u64, grown: BoxMark, old_excess: i64 };
+    const windows = [_]W{
+        .{ .before = .{ .physical = 108_606_652_416, .footprint = 97_684_961_536 }, .settled = 96_946_780_416, .grown = .{ .physical = 119_697_031_168, .footprint = 108_320_536_832 }, .old_excess = 454_803_456 },
+        .{ .before = .{ .physical = 108_103_581_696, .footprint = 96_266_122_728 }, .settled = 95_494_387_176, .grown = .{ .physical = 119_393_861_632, .footprint = 106_828_264_936 }, .old_excess = 728_137_728 },
+    };
+    const excess = struct {
+        fn f(before: BoxMark, grown: BoxMark) i64 {
+            return (@as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical))) - (@as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint)));
+        }
+    }.f;
+    for (windows, 0..) |w, i| {
+        // The recorded pairing: SERVED11 passes by 45 MB, SERVED12 is refused.
+        try testing.expectEqual(w.old_excess, excess(w.before, w.grown));
+        if (i == 0) try checkGrowResidency(w.before, w.grown) else try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(w.before, w.grown));
+        // The stable mark: the first attempt's reads disagree by the late frees, the retry's agree.
+        var r: ReplayBox = .{ .footprints = &.{ w.before.footprint, w.settled, w.settled, w.settled }, .physicals = &.{w.before.physical} };
+        const m = try stableBoxMark(&r);
+        try testing.expectEqual(@as(usize, 2), r.n_physical);
+        try testing.expectEqual(BoxMark{ .physical = w.before.physical, .footprint = w.settled }, m);
+        try checkGrowResidency(m, w.grown);
+        try testing.expect(excess(m, w.grown) < 0);
+    }
+    // A footprint that never holds still for one vm_stat (0.1 GB between reads) is refused by name, after every
+    // attempt.
+    const Moving = struct {
+        n_footprint: u64 = 0,
+        n_physical: u32 = 0,
+
+        fn footprint(self: *@This()) u64 {
+            defer self.n_footprint += 1;
+            return 90_000_000_000 + self.n_footprint * 100_000_000;
+        }
+
+        fn physical(self: *@This()) !u64 {
+            self.n_physical += 1;
+            return 100_000_000_000;
+        }
+
+        fn sleep(_: *@This(), _: u32) void {}
+    };
+    var moving: Moving = .{};
+    try testing.expectError(error.BoxMarkUnstable, stableBoxMark(&moving));
+    try testing.expectEqual(box_mark_attempts, moving.n_physical);
 }
 
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
