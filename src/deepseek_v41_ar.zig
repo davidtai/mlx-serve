@@ -245,15 +245,19 @@ pub const ArPhase = enum { late, early_grow, early_fence };
 pub const ArTier = enum { served, stock };
 
 /// The served schedule's variant (pass3ab): the prompt's first forward of `split` rows, then ONE extend of
-/// the rest; the phase change; the numeric tier.
+/// the rest (none when `split` is the whole prompt: the served shell's shape since dsv41 prefills
+/// unchunked, one Module.prefill whose logits yield the first id); the phase change; the numeric tier.
 pub const ServedRun = struct { split: u32, phase: ArPhase, tier: ArTier };
 
 /// DSV41_AR_SPLIT / DSV41_AR_PHASE / DSV41_AR_TIER for an `n`-token prompt (null = unset), refused by name.
 pub fn parseServedRun(n: u32, split_s: ?[]const u8, phase_s: ?[]const u8, tier_s: ?[]const u8) !ServedRun {
-    const split: u32 = if (split_s) |v| std.fmt.parseInt(u32, v, 10) catch return error.ArSplitNotANumber else n - 1;
-    if (split < 1 or split > n - 1) return error.ArSplitRange;
     const phase = if (phase_s) |v| std.meta.stringToEnum(ArPhase, v) orelse return error.ArPhaseUnknown else .late;
     const tier = if (tier_s) |v| std.meta.stringToEnum(ArTier, v) orelse return error.ArTierUnknown else .served;
+    // The default is the served shell's: the whole prompt in one prefill (the stock tier and the early
+    // grow keep the last token's own 1-row forward).
+    const whole = tier == .served and phase != .early_grow;
+    const split: u32 = if (split_s) |v| std.fmt.parseInt(u32, v, 10) catch return error.ArSplitNotANumber else if (whole) n else n - 1;
+    if (split < 1 or split > n) return error.ArSplitRange;
     // The grown stream refuses wide-lane calls: the early grow feeds the prompt in <= 8-row forwards, 63 + 1 only.
     if (phase == .early_grow and split != n - 1) return error.ArEarlyGrowSplit;
     // The stock tier's prompt runs in 8-row forwards anyway: only the last token's forward is positioned.
@@ -275,7 +279,7 @@ pub fn promptCalls(a: std.mem.Allocator, n: u32, run: ServedRun) ![]PromptCall {
         try calls.append(a, .{ .lo = n - 1, .hi = n });
     } else {
         try calls.append(a, .{ .lo = 0, .hi = run.split });
-        try calls.append(a, .{ .lo = run.split, .hi = n });
+        if (run.split < n) try calls.append(a, .{ .lo = run.split, .hi = n });
     }
     return calls.items;
 }
@@ -568,12 +572,15 @@ test "dsv41 ar: the served schedule's variants parse by name and plan their Modu
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Defaults: 63 + 1, late, served.
+    // Defaults: the whole prompt in one prefill (the served shell's shape), late, served.
     const d = try parseServedRun(64, null, null, null);
-    try testing.expectEqual(ServedRun{ .split = 63, .phase = .late, .tier = .served }, d);
+    try testing.expectEqual(ServedRun{ .split = 64, .phase = .late, .tier = .served }, d);
+    // The stock tier and the early grow keep 63 + 1.
+    try testing.expectEqual(@as(u32, 63), (try parseServedRun(64, null, null, "stock")).split);
+    try testing.expectEqual(@as(u32, 63), (try parseServedRun(64, null, "early_grow", null)).split);
     // Refusals by name.
     try testing.expectError(error.ArSplitNotANumber, parseServedRun(64, "x", null, null));
-    try testing.expectError(error.ArSplitRange, parseServedRun(64, "64", null, null));
+    try testing.expectError(error.ArSplitRange, parseServedRun(64, "65", null, null));
     try testing.expectError(error.ArSplitRange, parseServedRun(64, "0", null, null));
     try testing.expectError(error.ArPhaseUnknown, parseServedRun(64, null, "early", null));
     try testing.expectError(error.ArTierUnknown, parseServedRun(64, null, null, "exact"));
@@ -583,11 +590,12 @@ test "dsv41 ar: the served schedule's variants parse by name and plan their Modu
     const R = struct { split: ?[]const u8, phase: ?[]const u8, tier: ?[]const u8, want: []const u32 };
     const ones: [31]u32 = @splat(1);
     const runs = [_]R{
-        .{ .split = null, .phase = null, .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R1 served late 63
+        .{ .split = null, .phase = null, .tier = null, .want = &([_]u32{64} ++ ones) }, // R0 served: the whole prompt
+        .{ .split = "63", .phase = null, .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R1 served late 63
         .{ .split = "56", .phase = null, .tier = null, .want = &([_]u32{ 56, 8 } ++ ones) }, // R2
         .{ .split = "60", .phase = null, .tier = null, .want = &([_]u32{ 60, 4 } ++ ones) }, // R3
         .{ .split = null, .phase = null, .tier = "stock", .want = &([_]u32{ 63, 1 } ++ ones) }, // R4 (the model chunks 63 by 8)
-        .{ .split = null, .phase = "early_fence", .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R5
+        .{ .split = "63", .phase = "early_fence", .tier = null, .want = &([_]u32{ 63, 1 } ++ ones) }, // R5
         .{ .split = null, .phase = "early_grow", .tier = null, .want = &([_]u32{ 8, 8, 8, 8, 8, 8, 8, 7, 1 } ++ ones) }, // R6
     };
     for (runs) |r| {
@@ -613,12 +621,12 @@ test "dsv41 ar: the served schedule's variants parse by name and plan their Modu
     const path = try std.fmt.allocPrint(a, "{s}/p.json", .{rp});
     try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, (try promptOverride(a, testing.io, path, "3")).?);
     try testing.expectError(error.ArPromptTokensRange, promptOverride(a, testing.io, path, "6"));
-    // L1-L6: the long prompts' plans (late, split L-1).
+    // L1-L6: the long prompts' plans (late, the whole prompt in one call).
     for ([_]u32{ 64, 128, 256, 1024 }) |l| {
         const run = try parseServedRun(l, null, null, null);
         const calls = try promptCalls(a, l, run);
-        try testing.expectEqual(@as(usize, 2), calls.len);
-        try testing.expectEqual(l - 1, calls[0].hi - calls[0].lo);
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqual(l, calls[0].hi - calls[0].lo);
     }
     // The readout's layers on the real geometry: a ratio-4 and a ratio-128 kv source.
     const json = try v41.testConfigJson(a, .real);
