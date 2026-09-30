@@ -528,13 +528,15 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         const tbl_dn = in(ins, "tbl_dn");
         // the GEMMs over the fixture's tables at the routed M tile; the rot and onepass stages read their slot
         // column only
-        const gu = try routedTable(g, tbl_gu);
-        const dn = try routedTable(g, tbl_dn);
+        const gu = try routedTable(g, tbl_gu, null);
+        const dn = try routedTable(g, tbl_dn, null);
+        const dw = try routedTable(g, tbl_dn, r.widenTiles());
         const x = try r.take2(g, in(ins, "act"), in(ins, "ridx"), rhs, tbl_gu, gate.rin, up.rin);
         const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
         const hd = try r.onePass(g, z[0], z[1], rhs, tbl_gu, gate.rout, up.rout, down.rin);
+        // zd: the fused down GEMM's reference text; o: the route's down, the fused down GEMM (rot_widen1's words)
         const zd = try r.gemmDown(g, hd, down.code, dn.tbl, dn.tgs);
-        const o = try r.widen1(g, zd, rhs, tbl_dn, down.rout);
+        const o = try r.gemmDownWiden(g, hd, down.code, down.rout, dw.tbl, dw.tgs);
         const rx = try r.roundx(g, in(ins, "act_r"), rhs, tbl_gu, down.rin);
         const w2 = try r.widen2(g, in(ins, "act_g"), in(ins, "act_u"), rhs, tbl_gu, gate.rout, up.rout);
         outs[0..10].* = .{ x[0], x[1], z[0], z[1], hd, zd, o, rx, w2[0], w2[1] };
@@ -544,9 +546,9 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
 }
 
 /// A fixture's 64-row wave table at the routed GEMMs' M tile (`DigX.m_tile`): the same slot, first-row and row
-/// columns, the first-threadgroup column counting ceil(rows / m_tile) tiles; the tiles per M tile from its own
-/// threadgroup count (entry 65).
-fn routedTable(g: *MlxG, tbl: mlx.mlx_array) !xq.DigTableArray(MlxG) {
+/// columns, the first-threadgroup column counting ceil(rows / m_tile) tiles; `tiles` per M tile (the fused down
+/// GEMM's), else its own (its threadgroup count, entry 65).
+fn routedTable(g: *MlxG, tbl: mlx.mlx_array, tiles: ?u32) !xq.DigTableArray(MlxG) {
     const b = try g.hostBytes(tbl);
     defer g.a.free(b);
     var t: [80]i32 = undefined;
@@ -558,8 +560,7 @@ fn routedTable(g: *MlxG, tbl: mlx.mlx_array) !xq.DigTableArray(MlxG) {
         ex[j] = .{ .slot = @intCast(t[j]), .rows = @intCast(t[32 + j]) };
         t64 += (ex[j].rows + 63) / 64;
     }
-    const tiles = @divExact(@as(u32, @intCast(t[65])), t64);
-    const r = xq.digTableBm(ex[0..n], tiles, xq.DigX(MlxG).m_tile);
+    const r = xq.digTableBm(ex[0..n], tiles orelse @divExact(@as(u32, @intCast(t[65])), t64), xq.DigX(MlxG).m_tile);
     return .{ .tbl = try g.hostArray(std.mem.sliceAsBytes(&r.table), &.{80}, .int32), .tgs = r.tgs };
 }
 

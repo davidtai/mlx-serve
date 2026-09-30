@@ -258,17 +258,8 @@ pub fn Accepted(comptime G: type) type {
 /// prepares them through it.
 /// The 128-row DIG-X GEMM texts (their 0b smoke checks them by name).
 const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
-/// Registered, not routed: the fused down GEMM (its 0b smoke checks it by name; accept checks what the route runs).
-const unrouted_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
-const checked_at_accept = blk: {
-    var out: [kernels.len - unrouted_texts.len]Kernel = undefined;
-    var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &unrouted_texts, k) == null) {
-        out[n] = k;
-        n += 1;
-    };
-    break :blk out;
-};
+/// The fused down GEMM (its 0b smoke checks it by name).
+const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
 
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
     const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
@@ -279,7 +270,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
+    try set.selfCheck(a, &kernels, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -520,7 +511,9 @@ pub fn DigX(comptime G: type) type {
         /// launched by the route
         gemm_gu: *const Entry,
         gemm_dn: *const Entry,
-        /// the GEMMs the route launches: 128-row M tiles (one decoded B stage feeds 128 rows)
+        /// the 128-row GEMM texts (one decoded B stage feeds 128 rows): the route launches the gate|up text; the down
+        /// text and `widen1_e` are the fused down GEMM's reference (its device self-check `fused`, the gate, the 0b
+        /// smokes)
         gemm_gu128: *const Entry,
         gemm_dn128: *const Entry,
         /// the lane's take2 text: the retune's bitwise reference (its 0b smoke), not launched by the route
@@ -531,7 +524,7 @@ pub fn DigX(comptime G: type) type {
         onepass_e: *const Entry,
         widen2_e: *const Entry,
         widen1_e: *const Entry,
-        /// the 128-row down GEMM at BN 128 with rot_widen1 as its epilogue: registered, not launched by the route
+        /// the down GEMM the route launches: the 128-row down text at BN 128 with rot_widen1 as its epilogue
         gemm_dn_w1: *const Entry,
 
         pub fn init(reg: *const xk.Registry) Self {
@@ -672,7 +665,7 @@ pub const PrefillShape = struct {
     pub const record3: PrefillShape = .{ .wave = 4, .inflight = 2, .row_budget = 7168, .carry_rows = 8192 };
     /// The served tier: Record 3 with L1, 8 experts per wave. Under K16 a group call's experts carry about 256
     /// rows each (98,304 routed rows over 384 experts), so Record 3's four-expert cap bound, not the row budget:
-    /// eight halve the waves, and with them the per-wave host encode (five launches, four host arrays, one async
+    /// eight halve the waves, and with them the per-wave host encode (four launches, four host arrays, one async
     /// eval). Exact: a wave's rows are independent of its composition (each 64-row tile reads one expert's rows
     /// and weights; the join restores the assignment order).
     pub const tier: PrefillShape = .{ .wave = 8, .inflight = record3.inflight, .row_budget = record3.row_budget, .carry_rows = record3.carry_rows };
@@ -692,7 +685,9 @@ pub const PrefillRows = quant.PrefillRows;
 /// routed rows (one route per layer, as the lane has one dispatcher per layer): experts grouped
 /// by slot in first-appearance order, snake-ordered (largest, smallest, ...; stable), packed
 /// greedily into waves of <= `wave` experts and <= `row_budget` rows; per wave rot_take2 -> the
-/// gate|up GEMM (72-tile table) -> dig2 onepass -> the down GEMM (80-tile table) -> rot_widen1;
+/// gate|up GEMM (72-tile table) -> dig2 onepass -> the down GEMM (80-tile table) -> rot_widen1
+/// (the route: the take2 retune -> the 128-row gate|up GEMM -> dig2 onepass -> the fused down GEMM,
+/// the 128-row down text with rot_widen1 as its epilogue (40-tile table): four launches, the lane's words);
 /// then `take(concatenate(waves), argsort(positions))`, the permutation made on the host. The
 /// eval schedule is SHAPE's: a wave waits for all but `inflight - 1` older waves (a solo wave for
 /// all, and is evaluated at once); a call above `carry_rows` rows drains every wave and evaluates
@@ -712,10 +707,13 @@ pub fn DigXPrefill(comptime G: type) type {
     return struct {
         const Self = @This();
         const hidden = 5120;
+        /// One wave's launches: the take2 retune, the gate|up GEMM, onepass, the fused down GEMM.
+        pub const wave_launches = 4;
         dig: DigX(G),
         shape: PrefillShape,
         tiles_gu: u32,
-        tiles_dn: u32,
+        /// the fused down GEMM's threadgroups per M tile (`DigX.widenTiles`)
+        tiles_w: u32,
         rows_hi: u64,
         a: Allocator,
         diag: ?*xk.Diag,
@@ -740,7 +738,7 @@ pub fn DigXPrefill(comptime G: type) type {
             if (shape.wave < 1 or shape.wave > wave_max or shape.inflight < 2 or shape.row_budget < 1)
                 return refuse(diag, error.RouteInput, "exl3 kernel ops: prefill shape wave {d} (1..{d}), inflight {d} (>= 2: SHAPE's overlap route), row budget {d} (>= 1)", .{ shape.wave, wave_max, shape.inflight, shape.row_budget });
             const dig = DigX(G).init(reg);
-            return .{ .dig = dig, .shape = shape, .tiles_gu = dig.digTiles(.gate_up), .tiles_dn = dig.digTiles(.down), .rows_hi = dig.gemm_gu.bounds.get(.rows).?[1], .a = a, .diag = diag };
+            return .{ .dig = dig, .shape = shape, .tiles_gu = dig.digTiles(.gate_up), .tiles_w = dig.widenTiles(), .rows_hi = dig.gemm_gu.bounds.get(.rows).?[1], .a = a, .diag = diag };
         }
 
         /// Releases the waves still in flight (without evaluating them) and the scratch.
@@ -800,7 +798,7 @@ pub fn DigXPrefill(comptime G: type) type {
                 while (self.flight.items.len > keep) try self.drainOne(g);
                 prof.charge(.drain, tp);
                 tp = prof.now();
-                prof.count(1, 5);
+                prof.count(1, wave_launches);
                 var ex: [wave_max]WaveExpert = undefined;
                 for (order[first..i], 0..) |gi, j| {
                     ex[j] = .{ .slot = self.gslot.items[gi], .rows = cnt[gi] };
@@ -873,19 +871,19 @@ pub fn DigXPrefill(comptime G: type) type {
             self.parts.clearRetainingCapacity();
         }
 
-        /// One wave's five launches -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
+        /// One wave's four launches (`wave_launches`) -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
         fn submit(self: *Self, g: *G, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32) !G.T {
             const n: c_int = @intCast(ridx.len);
-            // at the routed GEMMs' M tile; take2, onepass and widen1 read the tables' slot column only
+            // at the routed GEMMs' M tile; take2 and onepass read the gate|up table's slot column only, the fused
+            // down GEMM's epilogue its own table's
             const tg = digTableBm(ex, self.tiles_gu, DigX(G).m_tile);
-            const td = digTableBm(ex, self.tiles_dn, DigX(G).m_tile);
+            const tw = digTableBm(ex, self.tiles_w, DigX(G).m_tile);
             const tgu = try g.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32);
-            const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
+            const tdw = try g.hostArray(std.mem.sliceAsBytes(&tw.table), &.{80}, .int32);
             const ridx_a = try g.hostArray(std.mem.sliceAsBytes(ridx), &.{n}, .int32);
             const rhs_a = try g.hostArray(std.mem.sliceAsBytes(rhs), &.{n}, .uint32);
             const hz = try self.dig.gateUpOnePass(g, act, ridx_a, rhs_a, .{ .tbl = tgu, .tgs = tg.tgs }, bank.gate, bank.up, bank.down.rin);
-            const zd = try self.dig.gemmDown(g, hz[0], bank.down.code, tdn, td.tgs);
-            const y = try self.dig.widen1(g, zd, rhs_a, tdn, bank.down.rout);
+            const y = try self.dig.gemmDownWiden(g, hz[0], bank.down.code, bank.down.rout, tdw, tw.tgs);
             return g.reshape(y, &.{ n, hidden });
         }
 
@@ -1165,24 +1163,41 @@ fn swapTake2(a: Allocator, line: []const u8, from: Take2Form, to: Take2Form) ![]
     return std.mem.concat(a, u8, &.{ to.prefix, rest[0..comma], &.{ ',', to.z }, rest[comma + 2 ..] });
 }
 
-/// The route's launch lines in the lane's text. The lane samples and the move's pinned log name the lane's take2 (grid
-/// z 2) and the 64-row GEMMs (grid 128 x tgs, t=128) over 64-row wave tables; the route launches the take2 retune (grid
-/// z 1) and the 128-row GEMMs (grid 256 x tgs', t=256) over 128-row tables, whose slot / first-row / row columns are
-/// the same and whose first-threadgroup column counts 128-row tiles. `init` takes, per 128-row table the trace holds
-/// (recomputed and compared word for word), its 64-row twin's reference and threadgroups; `lane` rewrites a rendered
-/// line: a take2 retune launch into the lane's, a 128-row GEMM launch's name, grid and threadgroup into the 64-row
-/// text's, and every 128-row table reference into its twin's. Nothing else changes.
+/// The route's lines in the lane's text. The lane samples and the move's pinned log name the lane's take2 (grid z 2),
+/// the 64-row GEMMs (grid 128 x tgs, t=128) over 64-row wave tables and rot_widen1 after the down GEMM: five launches
+/// per wave. The route launches four: the take2 retune (grid z 1), the 128-row gate|up GEMM (grid 256 x tgs', t=256),
+/// onepass, and the fused down GEMM (grid 512 x tgs'', t=512: the 128-row down text at its 40 column tiles with
+/// rot_widen1 as its epilogue, the two launches' output words) over 128-row tables, whose slot / first-row / row
+/// columns are the lane's and whose first-threadgroup column counts 128-row tiles. `init` takes, per 128-row table the
+/// trace holds (recomputed and compared word for word), its 64-row twin's reference and threadgroups (the fused down
+/// GEMM's twin: the lane's 80-tile down table); per route launch, its output's index in the lane's numbering (one
+/// more per fused down GEMM before it, a fused down GEMM's output its rot_widen1's); and per fused down GEMM, the
+/// rhs its lane rot_widen1 reads (onepass's). `lane` rewrites a rendered line: every launch reference renumbered, a
+/// take2 retune launch into the lane's, a 128-row gate|up GEMM launch's name, grid and threadgroup into the 64-row
+/// text's, a fused down GEMM launch into the lane's two (the 64-row down GEMM, then rot_widen1 over its output), and
+/// every 128-row table reference into its twin's. Nothing else changes.
 const LaneMap = struct {
     const table_ref = "host:int32:[80]:";
     const Twin = struct { ref: [16]u8, tgs: u32, tgs128: u32 };
-    const GemmForm = struct { m128: []const u8, lane: []const u8 };
-    const gemm_forms = [_]GemmForm{
-        .{ .m128 = "launch dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 g=", .lane = "launch q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 g=" },
-        .{ .m128 = "launch dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 g=", .lane = "launch q3_prefill_dig_gemm_2304x5120_xmul1hk3 g=" },
-    };
+    const gu_m128 = "launch " ++ @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128) ++ " g=";
+    const gu_lane = "launch " ++ @tagName(Kernel.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3) ++ " g=";
+    const w1_kernel: Kernel = .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1;
+    const w1_route = "launch " ++ @tagName(w1_kernel) ++ " g=";
+    const dn_lane = "launch " ++ @tagName(Kernel.q3_prefill_dig_gemm_2304x5120_xmul1hk3) ++ " g=";
+    const widen1_lane = "launch " ++ @tagName(Kernel.q3_prefill_dig_rot_widen1_5120) ++ " g=1280,";
+    /// A fused down GEMM's lane lines: the down GEMM's lane launch index (rot_widen1 reads its output) and the rhs.
+    const W1 = struct { down: u32, rhs: []const u8 };
+    /// the fused down GEMM's column tiles per M tile; the lane's down table's (its twin's)
+    w_tiles: u32,
+    dn_tiles: u32,
     twins: std.AutoHashMapUnmanaged([16]u8, Twin) = .empty,
+    /// per route launch, its output's launch index in the lane's text
+    lane_of: std.ArrayList(u32) = .empty,
+    /// per fused down GEMM, keyed by its input's (onepass's) lane launch index
+    w1s: std.AutoHashMapUnmanaged(u32, W1) = .empty,
     n_take2: usize = 0,
     n_gemm: usize = 0,
+    n_w1: usize = 0,
 
     fn refOf(tb: *const [80]i32) [16]u8 {
         var d: [32]u8 = undefined;
@@ -1191,8 +1206,9 @@ const LaneMap = struct {
         return hex[0..16].*;
     }
 
-    /// The 64-row twin of an 80-word table when it is a 128-row wave table (recomputed, word for word), else null.
-    fn twinOf(tb: *const [80]i32) ?Twin {
+    /// The 64-row twin of an 80-word table when it is a 128-row wave table (recomputed, word for word), else null: at
+    /// its own tiles per M tile, the lane's down table's for the fused down GEMM's.
+    fn twinOf(m: *const LaneMap, tb: *const [80]i32) ?Twin {
         const n: usize = @intCast(@max(tb[64], 0));
         if (n == 0 or n > wave_max or tb[65] <= 0) return null;
         var ex: [wave_max]WaveExpert = undefined;
@@ -1207,49 +1223,147 @@ const LaneMap = struct {
         const tiles: u32 = @intCast(total / t128);
         const as128 = digTableBm(ex[0..n], tiles, 128);
         if (!std.mem.eql(i32, &as128.table, tb)) return null;
-        const twin = digTableBm(ex[0..n], tiles, 64);
+        const twin = digTableBm(ex[0..n], if (tiles == m.w_tiles) m.dn_tiles else tiles, 64);
         return .{ .ref = refOf(&twin.table), .tgs = twin.tgs, .tgs128 = as128.tgs };
     }
 
-    fn init(a: Allocator, t: *const Trace) !LaneMap {
-        var m: LaneMap = .{};
+    fn init(a: Allocator, t: *const Trace, reg: *const xk.Registry) !LaneMap {
+        const dx = DigX(Trace).init(reg);
+        var m: LaneMap = .{ .w_tiles = dx.widenTiles(), .dn_tiles = dx.digTiles(.down) };
         errdefer m.deinit(a);
         for (t.nodes.items) |nd| {
             if (nd.origin != .host or nd.dtype != .int32 or nd.bytes.len != 80 * 4) continue;
             var tb: [80]i32 = undefined;
             @memcpy(std.mem.sliceAsBytes(&tb), nd.bytes);
-            if (twinOf(&tb)) |tw| try m.twins.put(a, refOf(&tb), tw);
+            if (m.twinOf(&tb)) |tw| try m.twins.put(a, refOf(&tb), tw);
+        }
+        try m.lane_of.resize(a, t.launches.items.len);
+        var shift: u32 = 0;
+        for (t.launches.items, m.lane_of.items, 0..) |*l, *lo, li| {
+            shift += @intFromBool(l.k == w1_kernel);
+            lo.* = @as(u32, @intCast(li)) + shift;
+        }
+        var rb: std.ArrayList(u8) = .empty;
+        defer rb.deinit(t.a);
+        for (t.launches.items, m.lane_of.items) |*l, lo| {
+            if (l.k != w1_kernel) continue;
+            // its input is onepass's output; the lane's rot_widen1 reads the wave's rhs (onepass's)
+            const op = switch (t.nodes.items[l.inputs[0]].origin) {
+                .out => |o| o[0],
+                else => return error.TestUnexpectedResult,
+            };
+            const opl = &t.launches.items[op];
+            if (opl.k != .q3_prefill_dig2_swiglu_2304_x) return error.TestUnexpectedResult;
+            rb.clearRetainingCapacity();
+            try traceRef(t, opl.inputs[2], &rb);
+            const rhs = try a.dupe(u8, rb.items);
+            errdefer a.free(rhs);
+            const gop = try m.w1s.getOrPut(a, m.lane_of.items[op]);
+            if (gop.found_existing) return error.TestUnexpectedResult;
+            gop.value_ptr.* = .{ .down = lo - 1, .rhs = rhs };
         }
         return m;
     }
 
     fn deinit(m: *LaneMap, a: Allocator) void {
+        var it = m.w1s.valueIterator();
+        while (it.next()) |w| a.free(w.rhs);
+        m.w1s.deinit(a);
+        m.lane_of.deinit(a);
         m.twins.deinit(a);
     }
 
-    /// `line` in the lane's text (allocated in `a` when rewritten).
+    /// `line` in the lane's text (allocated in `a` when rewritten): one line, or for a fused down GEMM the lane's two
+    /// joined by a newline.
     fn lane(m: *LaneMap, a: Allocator, line: []const u8) ![]const u8 {
-        var l = try swapTake2(a, line, take2_retune, take2_lane);
-        m.n_take2 += @intFromBool(l.ptr != line.ptr);
-        for (gemm_forms) |f| {
-            if (!std.mem.startsWith(u8, l, f.m128)) continue;
-            // the table is the GEMM's last input
-            const refs_at = (std.mem.indexOf(u8, l, " in=") orelse return error.TestUnexpectedResult) + " in=".len;
-            const refs_end = std.mem.indexOfPos(u8, l, refs_at, " out=") orelse return error.TestUnexpectedResult;
-            const refs = l[refs_at..refs_end];
-            const last = refs[(std.mem.lastIndexOfScalar(u8, refs, ';') orelse return error.TestUnexpectedResult) + 1 ..];
-            if (!std.mem.startsWith(u8, last, table_ref) or last.len != table_ref.len + 16) return error.TestUnexpectedResult;
-            const tw = m.twins.get(last[table_ref.len..][0..16].*) orelse return error.TestUnexpectedResult;
-            const geo = l[f.m128.len..];
-            const sp = std.mem.indexOfScalar(u8, geo, ' ') orelse return error.TestUnexpectedResult;
-            var gb: [32]u8 = undefined;
-            if (!std.mem.eql(u8, geo[0..sp], try std.fmt.bufPrint(&gb, "{d},1,1", .{256 * tw.tgs128}))) return error.TestUnexpectedResult;
-            const t256 = " t=256,1,1 ";
-            if (!std.mem.startsWith(u8, geo[sp..], t256)) return error.TestUnexpectedResult;
-            l = try std.fmt.allocPrint(a, "{s}{d},1,1 t=128,1,1 {s}", .{ f.lane, 128 * tw.tgs, geo[sp + t256.len ..] });
+        const r = try m.renumber(a, line);
+        var l = try swapTake2(a, r, take2_retune, take2_lane);
+        m.n_take2 += @intFromBool(l.ptr != r.ptr);
+        if (std.mem.startsWith(u8, l, gu_m128)) {
+            l = try m.gateUp(a, l);
             m.n_gemm += 1;
-            break;
+        } else if (std.mem.startsWith(u8, l, w1_route)) {
+            l = try m.fusedDown(a, l);
+            m.n_w1 += 1;
         }
+        return m.twinRefs(a, l);
+    }
+
+    /// `line` with every launch reference `L<i>.<o>` at its lane index.
+    fn renumber(m: *const LaneMap, a: Allocator, line: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var at: usize = 0;
+        var i: usize = 1;
+        while (i < line.len) : (i += 1) {
+            if (line[i] != 'L' or std.mem.indexOfScalar(u8, "=; ", line[i - 1]) == null) continue;
+            var j = i + 1;
+            while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+            if (j == i + 1 or j == line.len or line[j] != '.') continue;
+            const li = try std.fmt.parseInt(usize, line[i + 1 .. j], 10);
+            if (li >= m.lane_of.items.len) return error.TestUnexpectedResult;
+            try out.appendSlice(a, line[at .. i + 1]);
+            try out.print(a, "{d}", .{m.lane_of.items[li]});
+            at = j;
+            i = j;
+        }
+        if (at == 0) return line;
+        try out.appendSlice(a, line[at..]);
+        return out.items;
+    }
+
+    /// The twin of a 128-row table reference.
+    fn tableTwin(m: *const LaneMap, ref: []const u8) !Twin {
+        if (!std.mem.startsWith(u8, ref, table_ref) or ref.len != table_ref.len + 16) return error.TestUnexpectedResult;
+        return m.twins.get(ref[table_ref.len..][0..16].*) orelse error.TestUnexpectedResult;
+    }
+
+    /// A 128-row gate|up GEMM launch line with the 64-row text's name, grid and threadgroup (its table is its last input).
+    fn gateUp(m: *const LaneMap, a: Allocator, l: []const u8) ![]const u8 {
+        const refs_at = (std.mem.indexOf(u8, l, " in=") orelse return error.TestUnexpectedResult) + " in=".len;
+        const refs_end = std.mem.indexOfPos(u8, l, refs_at, " out=") orelse return error.TestUnexpectedResult;
+        const refs = l[refs_at..refs_end];
+        const tw = try m.tableTwin(refs[(std.mem.lastIndexOfScalar(u8, refs, ';') orelse return error.TestUnexpectedResult) + 1 ..]);
+        const geo = l[gu_m128.len..];
+        const sp = std.mem.indexOfScalar(u8, geo, ' ') orelse return error.TestUnexpectedResult;
+        var gb: [32]u8 = undefined;
+        if (!std.mem.eql(u8, geo[0..sp], try std.fmt.bufPrint(&gb, "{d},1,1", .{256 * tw.tgs128}))) return error.TestUnexpectedResult;
+        const t256 = " t=256,1,1 ";
+        if (!std.mem.startsWith(u8, geo[sp..], t256)) return error.TestUnexpectedResult;
+        return std.fmt.allocPrint(a, "{s}{d},1,1 t=128,1,1 {s}", .{ gu_lane, 128 * tw.tgs, geo[sp + t256.len ..] });
+    }
+
+    /// A fused down GEMM launch line (its references already the lane's) as the lane's two: the 64-row down GEMM over
+    /// onepass's output, then rot_widen1 over the down GEMM's output, the rhs, the down table and the down rout.
+    fn fusedDown(m: *const LaneMap, a: Allocator, l: []const u8) ![]const u8 {
+        const geo = l[w1_route.len..];
+        const sp = std.mem.indexOfScalar(u8, geo, ' ') orelse return error.TestUnexpectedResult;
+        const rest = geo[sp..];
+        const t512 = " t=512,1,1";
+        if (!std.mem.startsWith(u8, rest, t512)) return error.TestUnexpectedResult;
+        const in_at = std.mem.indexOf(u8, rest, " in=") orelse return error.TestUnexpectedResult;
+        // what lies between the threadgroup and the inputs (`renderLog`'s prepared flag and template), in both lines
+        const mid = rest[t512.len..in_at];
+        const out_at = std.mem.indexOfPos(u8, rest, in_at, " out=") orelse return error.TestUnexpectedResult;
+        var it = std.mem.splitScalar(u8, rest[in_at + " in=".len .. out_at], ';');
+        var ins: [4][]const u8 = undefined;
+        for (&ins) |*r| r.* = it.next() orelse return error.TestUnexpectedResult;
+        if (it.next() != null) return error.TestUnexpectedResult;
+        const x, const code, const rout, const tbl = ins;
+        const tw = try m.tableTwin(tbl);
+        var gb: [32]u8 = undefined;
+        if (!std.mem.eql(u8, geo[0..sp], try std.fmt.bufPrint(&gb, "{d},1,1", .{512 * tw.tgs128}))) return error.TestUnexpectedResult;
+        const out = rest[out_at + " out=".len ..];
+        const o0, const o1 = .{ "float32[", ",5120]" };
+        if (!std.mem.startsWith(u8, out, o0) or !std.mem.endsWith(u8, out, o1)) return error.TestUnexpectedResult;
+        const rows = out[o0.len .. out.len - o1.len];
+        // x: onepass's output, L<its lane index>.0
+        if (x.len < 4 or x[0] != 'L' or !std.mem.endsWith(u8, x, ".0")) return error.TestUnexpectedResult;
+        const w = m.w1s.get(try std.fmt.parseInt(u32, x[1 .. x.len - 2], 10)) orelse return error.TestUnexpectedResult;
+        return std.fmt.allocPrint(a, "{s}{d},1,1 t=128,1,1{s} in={s};{s};{s} out={s}\n{s}{s},1 t=256,1,1{s} in=L{d}.0;{s};{s};{s} out=float32[{s},1,5120]", .{ dn_lane, 128 * tw.tgs, mid, x, code, tbl, out, widen1_lane, rows, mid, w.down, w.rhs, tbl, rout, rows });
+    }
+
+    /// `l` with every 128-row table reference its twin's.
+    fn twinRefs(m: *const LaneMap, a: Allocator, l: []const u8) ![]const u8 {
         if (std.mem.indexOf(u8, l, table_ref) == null) return l;
         var out: std.ArrayList(u8) = .empty;
         var at: usize = 0;
@@ -1267,48 +1381,34 @@ const LaneMap = struct {
     }
 };
 
-/// `expectEvents` with the route's lines in the lane's text (`LaneMap.lane`).
+/// The trace's log from `from` on, in the lane's text (`LaneMap.lane`: a fused down GEMM's event is two lines), is the
+/// lane's `want`, line for line.
 fn expectEventsVia(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8, lm: *LaneMap) !void {
-    const got = t.log.items[from..];
     var arena = std.heap.ArenaAllocator.init(t.a);
     defer arena.deinit();
+    const aa = arena.allocator();
+    var got: std.ArrayList([]const u8) = .empty;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(t.a);
-    for (got[0..@min(got.len, want.len)], want[0..@min(got.len, want.len)], 0..) |e, w, i| {
+    for (t.log.items[from..]) |e| {
         buf.clearRetainingCapacity();
         try traceEvent(t, e, &buf);
-        const line = try lm.lane(arena.allocator(), buf.items);
+        var lines = std.mem.splitScalar(u8, try lm.lane(aa, buf.items), '\n');
+        while (lines.next()) |l| try got.append(aa, try aa.dupe(u8, l));
+    }
+    for (got.items[0..@min(got.items.len, want.len)], want[0..@min(got.items.len, want.len)], 0..) |line, w, i| {
         if (!std.mem.eql(u8, line, w)) {
-            std.debug.print("prefill {s} {s} event {d}:\n  route: {s}\n  lane:  {s}\n", .{ case, what, i, line, w });
+            std.debug.print("prefill {s} {s} line {d}:\n  route: {s}\n  lane:  {s}\n", .{ case, what, i, line, w });
             return error.TestExpectedEqual;
         }
     }
-    if (got.len != want.len) {
-        std.debug.print("prefill {s} {s}: {d} events, the lane {d}\n", .{ case, what, got.len, want.len });
+    if (got.items.len != want.len) {
+        std.debug.print("prefill {s} {s}: {d} lines, the lane {d}\n", .{ case, what, got.items.len, want.len });
         return error.TestExpectedEqual;
     }
 }
 
-/// The trace's log from `from` on is the lane's `want`, event for event.
-fn expectEvents(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8) !void {
-    const got = t.log.items[from..];
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(t.a);
-    for (got[0..@min(got.len, want.len)], want[0..@min(got.len, want.len)], 0..) |e, w, i| {
-        buf.clearRetainingCapacity();
-        try traceEvent(t, e, &buf);
-        if (!std.mem.eql(u8, buf.items, w)) {
-            std.debug.print("prefill {s} {s} event {d}:\n  route: {s}\n  lane:  {s}\n", .{ case, what, i, buf.items, w });
-            return error.TestExpectedEqual;
-        }
-    }
-    if (got.len != want.len) {
-        std.debug.print("prefill {s} {s}: {d} events, the lane {d}\n", .{ case, what, got.len, want.len });
-        return error.TestExpectedEqual;
-    }
-}
-
-/// Each wave's `resetTo` runs right after the wave's five launches and its eval / async_eval
+/// Each wave's `resetTo` runs right after the wave's four launches (`wave_launches`) and its eval / async_eval
 /// (only drains of older waves may come between) and frees those launches' outputs; the last
 /// `resetTo` of the call follows the join (concatenate, take, the result's eval) and frees the
 /// concatenation and the take.
@@ -1328,14 +1428,14 @@ fn expectLifecycle(t: *const Trace, log0: usize, resets0: usize, waves: usize, c
                     return error.TestUnexpectedResult;
                 };
             },
-            // the wave's own eval / async_eval: its rot_widen1 output (through the reshape)
-            .eval, .async_eval => |xs| own_eval = own_eval or (launches == 5 and xs.len == 1 and last_out != null and t.root(xs[0]) == last_out.?),
+            // the wave's own eval / async_eval: its fused down GEMM's output (through the reshape)
+            .eval, .async_eval => |xs| own_eval = own_eval or (launches == DigXPrefill(Trace).wave_launches and xs.len == 1 and last_out != null and t.root(xs[0]) == last_out.?),
             .concat, .take, .op => {
                 std.debug.print("prefill {s} {s} wave {d}: a join inside a wave's reset\n", .{ case, what, w });
                 return error.TestUnexpectedResult;
             },
         };
-        if (launches != 5 or !own_eval) {
+        if (launches != DigXPrefill(Trace).wave_launches or !own_eval) {
             std.debug.print("prefill {s} {s} wave {d}: {d} launches, own eval {} before its reset\n", .{ case, what, w, launches, own_eval });
             return error.TestUnexpectedResult;
         }
@@ -1386,6 +1486,7 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
     var n_waves: usize = 0;
     var n_take2: usize = 0;
     var n_gemm: usize = 0;
+    var n_w1: usize = 0;
     for (parsed.value.cases) |*cs| {
         var t: Trace = .{ .a = a };
         defer t.deinit();
@@ -1403,16 +1504,17 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             const nodes0 = t.nodes.items.len;
             const resets0 = t.freed.items.len;
             const res = try r.call(&t, act, .{ .slot = slots }, bank);
-            // the route's events in the lane's text (the take2 retune and the 128-row GEMMs mapped); every other
-            // byte as sampled
-            var lm = try LaneMap.init(a, &t);
+            // the route's events in the lane's text (the take2 retune, the 128-row gate|up GEMM and the fused down
+            // GEMM mapped, launch references renumbered); every other byte as sampled
+            var lm = try LaneMap.init(a, &t, &reg);
             defer lm.deinit(a);
             try expectEventsVia(&t, mark, cl.events, cs.case, cl.name, &lm);
             n_take2 += lm.n_take2;
             n_gemm += lm.n_gemm;
+            n_w1 += lm.n_w1;
             // the wave lifecycle: one mark / resetTo per wave and one around the join; nothing the
             // call built outlives it but the kept result and the waves still in flight
-            const waves = (t.launches.items.len - launches0) / 5;
+            const waves = (t.launches.items.len - launches0) / DigXPrefill(Trace).wave_launches;
             try testing.expectEqual(waves + 1, t.freed.items.len - resets0);
             try expectLifecycle(&t, mark, resets0, waves, cs.case, cl.name);
             for (nodes0..t.nodes.items.len) |x| {
@@ -1434,13 +1536,17 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             t.release(res);
         }
         try r.finish(&t);
-        try expectEvents(&t, mark, cs.finish, cs.case, "finish");
+        var lf = try LaneMap.init(a, &t, &reg);
+        defer lf.deinit(a);
+        try expectEventsVia(&t, mark, cs.finish, cs.case, "finish", &lf);
         try testing.expectEqual(@as(isize, 0), t.keeps);
     }
     try testing.expect(n_calls >= 10 and n_waves >= 60);
-    // every sampled wave's take2 went through the retune, and both its GEMMs through the 128-row texts
+    // every sampled wave's take2 went through the retune, its gate|up GEMM through the 128-row text, and its down
+    // GEMM and rot_widen1 through the fused down GEMM
     try testing.expectEqual(n_waves, n_take2);
-    try testing.expectEqual(2 * n_waves, n_gemm);
+    try testing.expectEqual(n_waves, n_gemm);
+    try testing.expectEqual(n_waves, n_w1);
 }
 
 test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wave, half of Record 3's waves, every row once" {
@@ -1466,10 +1572,10 @@ test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wav
         const act = try t.ext("act", &.{ @intCast(slots.len), 5120 }, .bfloat16);
         const l0 = t.launches.items.len;
         const res = try r.call(&t, act, .{ .slot = slots }, bank);
-        // five launches per wave, and one wave per `wave` experts
+        // four launches per wave, and one wave per `wave` experts
         const launches = t.launches.items.len - l0;
-        try testing.expectEqual(@as(usize, 0), launches % 5);
-        try testing.expectEqual(c.waves, launches / 5);
+        try testing.expectEqual(@as(usize, 0), launches % DigXPrefill(Trace).wave_launches);
+        try testing.expectEqual(c.waves, launches / DigXPrefill(Trace).wave_launches);
         // the result keeps every assignment row, in assignment order (the join), whatever the waves
         const rsh = t.shapeOf(res);
         const rs = rsh.slice();
@@ -2036,21 +2142,22 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     };
     try acc.finishPrefill(&tb);
     try renderLog(&tb, b0, &lb);
-    // The route launches the take2 retune and the 128-row GEMMs (same inputs and output words; names, grids and the
-    // wave tables' first-threadgroup column differ): their lines back in the lane's text, then every byte as pinned
-    // at the move.
+    // The route launches the take2 retune, the 128-row gate|up GEMM (same inputs and output words; names, grids and
+    // the wave tables' first-threadgroup column differ) and the fused down GEMM (the down GEMM's and rot_widen1's
+    // words in one launch; later launch indices one fewer per fused launch): their lines back in the lane's text,
+    // then every byte as pinned at the move.
     var lane_arena = std.heap.ArenaAllocator.init(a);
     defer lane_arena.deinit();
     var lane_log: std.ArrayList(u8) = .empty;
     defer lane_log.deinit(a);
-    var lm = try LaneMap.init(a, &tb);
+    var lm = try LaneMap.init(a, &tb, &set.reg);
     defer lm.deinit(a);
     var lines = std.mem.splitScalar(u8, lb.items, '\n');
     while (lines.next()) |line| {
         try lane_log.appendSlice(a, try lm.lane(lane_arena.allocator(), line));
         if (lines.index != null) try lane_log.append(a, '\n');
     }
-    try testing.expect(lm.n_take2 > 0 and lm.n_gemm == 2 * lm.n_take2);
+    try testing.expect(lm.n_take2 > 0 and lm.n_gemm == lm.n_take2 and lm.n_w1 == lm.n_take2);
     try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lane_log.items, "\n"));
     try testing.expectEqualStrings(moved_log_sha256, &digestOf(lane_log.items));
     // checkBank: the moved per-projection check's refusals, through the quant's entry
@@ -2561,7 +2668,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &unrouted_texts, &report, &kd) catch |e| {
+        set.selfCheck(a, &w1_texts, &report, &kd) catch |e| {
             std.debug.print("fused down self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
