@@ -443,8 +443,8 @@ pub fn Model(comptime G: type) type {
             const positions = try g.arange(@floatFromInt(st.offset), @floatFromInt(st.offset + n), 1, .int32);
             const e = try self.embedSpan(g, a, ids);
             const rows = try self.engramRowsFor(st, a, ids);
-            // ENGRAM=prefetch at decode width: every Engram slot's gather posted before the first layer (the
-            // poster runs them in slot order), each taken at its layer, so the layers before it cover the read.
+            // ENGRAM=prefetch at decode width: every Engram slot's gather posted before the first layer (each
+            // slot's table runs its own; per table the order is the blocking path's), each taken at its layer.
             var posts: [eng.max_layers]?*eng.RowSource.Posted = @splat(null);
             defer self.dropPosts(a, &posts);
             if (self.engram) |en| if (en.posted and n <= scratch_rows) {
