@@ -65,6 +65,7 @@ test {
     _ = @import("deepseek_v41_module.zig");
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("dsv41_decode_timers.zig");
+    _ = @import("dsv41_decode_first.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");

@@ -14,6 +14,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const xk = @import("exl3_kernels.zig");
+const first_cycle = @import("dsv41_decode_first.zig");
 
 pub const Dtype = mlx.mlx_dtype;
 pub const max_dims = 8;
@@ -234,6 +235,7 @@ pub const MlxOps = struct {
         const compiled = for (g.regions[@backingInt(Body.region)]) |sl| {
             if (sl.ctx == @as(*const anyopaque, ctx)) break sl.compiled;
         } else unreachable;
+        if (comptime first_cycle.enabled) first_cycle.region(@tagName(Body.region), @intFromPtr(ctx), inputs);
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
