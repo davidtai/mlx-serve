@@ -722,10 +722,13 @@ pub const Routes = struct {
 /// exact: the same rows, slots and kernels, only the order and timing of reads
 /// and evals change).
 pub const Wide = struct {
-        /// Each call seeds its layer's residency with its own ids (the most
-        /// routed experts protected in the persistent rows), feeds its groups
-        /// hottest first, and drains each group once (its banks' waves queued).
-        feed: bool = false,
+    /// Each call seeds its layer's residency with its own ids (the most routed
+    /// experts protected in the persistent rows) and drains each group once
+    /// (its banks' waves queued).
+    seed: bool = false,
+    /// Each call feeds its groups hottest first (routed rows descending, ties by
+    /// id) instead of in first appearance. `seed` + `hot_first` = the wide feed.
+    hot_first: bool = false,
     /// Groups in flight: 2 routes (reads) the next group before this
     /// group's waves (the source's `wideDepth` must allow it).
     depth: u8 = 1,
@@ -810,9 +813,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (routes.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
             const wr = opt.wide;
             if (wr.depth < 1 or wr.depth > expert_stream.max_wide_depth) return error.InvalidWideRoute;
-            if ((wr.feed or wr.depth > 1 or wr.cold_rows > 0) and !routes.prefill) return error.InvalidWideRoute;
+            if ((wr.seed or wr.hot_first or wr.depth > 1 or wr.cold_rows > 0) and !routes.prefill) return error.InvalidWideRoute;
             if (wr.cold_rows > Wide.max_cold_rows) return error.InvalidWideRoute;
-            if (wr.feed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
+            if (wr.seed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1059,8 +1062,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// next route may refill those slots); the outputs joined in the
         /// router's order, `[n, k, hidden]` f32. The DIG kernels read bf16
         /// activations (the lane of record's MoE input): another dtype is
-        /// rounded to bf16 once, here. `Options.wide.feed` seeds the layer from
-        /// the call, orders the groups hottest first and drains each group once;
+        /// rounded to bf16 once, here. `Options.wide.seed` seeds the layer from
+        /// the call and drains each group once; `.hot_first` orders the groups hottest first;
         /// `Options.wide.depth` 2 routes group g + 1 (its reads) before group g's waves.
         fn runWide(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
             const a = self.a;
@@ -1069,7 +1072,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
             if (n_ids < wide_min_ids) return error.WideLaneUnderMinIds;
-            const feed = self.wide_route.feed;
+            const feed = self.wide_route.seed;
+            const hot_first = self.wide_route.hot_first;
             const depth: usize = self.wide_route.depth;
             const cold: u32 = self.wide_route.cold_rows;
             const cold_chunk: usize = if (@hasDecl(M, "max_decode_rows")) M.max_decode_rows else max_route_ids;
@@ -1082,14 +1086,16 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 w.first.items[e] = @intCast(w.distinct.items.len);
                 try w.distinct.append(a, e);
             };
-            if (feed or cold > 0) {
+            if (feed or hot_first or cold > 0) {
                 try w.count.resize(a, self.n_experts);
                 @memset(w.count.items, 0);
                 for (w.ids.items) |e| w.count.items[e] += 1;
             }
+            // The call's residency seed (the seed route), then its experts hottest first (the order route).
             if (feed) {
-                // The call's residency seed, then its experts hottest first (ties by id).
                 if (comptime @hasDecl(S, "seedPrefill")) try self.source.seedPrefill(layer, w.ids.items) else unreachable;
+            }
+            if (hot_first) {
                 std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
                     fn lt(c: []const u32, x: u16, y: u16) bool {
                         return if (c[x] != c[y]) c[x] > c[y] else x < y;
@@ -2160,7 +2166,7 @@ test "dsv41 experts: the wide feed and read-ahead serve every routed row from it
     };
 
     const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
-    for ([_]Wide{ .{}, .{ .feed = true }, .{ .depth = 2 }, .{ .feed = true, .depth = 2 } }) |wide| {
+    for ([_]Wide{ .{}, .{ .seed = true, .hot_first = true }, .{ .depth = 2 }, .{ .seed = true, .hot_first = true, .depth = 2 }, .{ .seed = true, .depth = 2 }, .{ .hot_first = true } }) |wide| {
         const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = wide.depth, .transient_rows = @as(u32, wide.depth) * max_route_ids });
         defer s.deinit();
         StreamRec.stream = s;
@@ -2197,7 +2203,7 @@ test "dsv41 experts: the wide feed and read-ahead serve every routed row from it
         try testing.expectEqual(@as(u64, 2), s.stats().route_calls);
 
         // The groups: the first 48 of the feed order (hottest first) or of first appearance.
-        const order: []const u16 = if (wide.feed) hot[0..n_distinct] else appear[0..n_app];
+        const order: []const u16 = if (wide.hot_first) hot[0..n_distinct] else appear[0..n_app];
         var in_first: [128]bool = @splat(false);
         for (order[0..max_route_ids]) |e| in_first[e] = true;
         var second_started = false;
@@ -2210,10 +2216,10 @@ test "dsv41 experts: the wide feed and read-ahead serve every routed row from it
         }
         // Drains: one per group with the feed, else one per bank call.
         const drains = g.evals.items.len - evals0;
-        try testing.expectEqual(if (wide.feed) @as(usize, 2) else recs.len, drains);
-        try testing.expectEqual(@as(u32, @intCast(if (wide.feed) 2 else recs.len)), rrs[0].finishes);
+        try testing.expectEqual(if (wide.seed) @as(usize, 2) else recs.len, drains);
+        try testing.expectEqual(@as(u32, @intCast(if (wide.seed) 2 else recs.len)), rrs[0].finishes);
         // The feed's seed: the persistent rows hold the 16 hottest (protected), the rest transient.
-        if (wide.feed) {
+        if (wide.seed and wide.hot_first) {
             var in_top: [128]bool = @splat(false);
             for (hot[0..16]) |e| in_top[e] = true;
             for (recs) |r| for (r.experts) |e| try testing.expectEqual(in_top[e], r.base);
@@ -2237,7 +2243,8 @@ test "dsv41 experts: a read-ahead deeper than the source's windows is refused at
     try testing.expectError(error.WideDepthExceedsSource, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 2 } }));
     try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .depth = 3 } }));
     const Plain = ExpertsWith(TraceOps, StreamSource, Math, .{});
-    try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .feed = true } }));
+    try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true } }));
+    try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .hot_first = true } }));
 }
 
 /// Decode-lane math that records each gateUp call's bank, the expert whose record each slot
@@ -2295,7 +2302,7 @@ test "dsv41 experts: cold rows run the decode lane over their own records after 
     for (ids) |e| count[e] += 1;
     const Math = WithPrefillRoutes(TraceOps, ColdRec, StreamRec);
     try testing.expectEqual(@as(u32, 8), Math.max_decode_rows);
-    for ([_]Wide{ .{ .cold_rows = 3 }, .{ .cold_rows = 3, .feed = true, .depth = 2 } }) |wide| {
+    for ([_]Wide{ .{ .cold_rows = 3 }, .{ .cold_rows = 3, .seed = true, .hot_first = true, .depth = 2 } }) |wide| {
         const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = wide.depth, .transient_rows = @as(u32, wide.depth) * max_route_ids });
         defer s.deinit();
         StreamRec.stream = s;

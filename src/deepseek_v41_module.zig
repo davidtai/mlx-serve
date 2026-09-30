@@ -409,15 +409,15 @@ pub const Installed = struct {
 
     /// The construction log line the gates assert.
     pub fn line(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}", .{
-            self.layer_major, self.wide.feed, self.wide.depth, self.stream_windows, self.wide.cold_rows,
+        return std.fmt.bufPrint(buf, "NATIVE prefill routes installed: prefill layer-major {}, wide feed {}, wide depth {d}, stream windows {d}, cold rows {d}, seed {}, hot-first {}", .{
+            self.layer_major, self.wide.seed and self.wide.hot_first, self.wide.depth, self.stream_windows, self.wide.cold_rows, self.wide.seed, self.wide.hot_first,
         }) catch buf[0..0];
     }
 };
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .feed = config.dsv41WideFeed(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0 };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0 };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -599,10 +599,15 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.layer_major_prefill = null;
     c.numeric_tier = null;
     c.expert_wide_feed = null;
+    c.expert_wide_seed = null;
+    c.expert_wide_hot_first = null;
     c.expert_wide_depth = null;
     c.expert_wide_cold_rows = null;
     try std.testing.expect(try layerMajor(&c));
-    try std.testing.expectEqual(xp.Wide{ .feed = true, .depth = 2 }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2 }, wideRoute(&c));
+    c.expert_wide_hot_first = false;
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 2 }, wideRoute(&c));
+    c.expert_wide_hot_first = null;
     c.numeric_tier = .stock;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));
@@ -1032,8 +1037,10 @@ test "dsv41 module: the envelope admission (the old rule) admits today's 154 dec
 
 test "dsv41 module: the installed-routes line reads the routes as built, on and off (the gates' assert can fail)" {
     var buf: [192]u8 = undefined;
-    const on: Installed = .{ .layer_major = true, .wide = .{ .feed = true, .depth = 2 }, .stream_windows = 2 };
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0", on.line(&buf));
+    const on: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .hot_first = true, .depth = 2 }, .stream_windows = 2 };
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed true, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first true", on.line(&buf));
+    const seed_only: Installed = .{ .layer_major = true, .wide = .{ .seed = true, .depth = 2 }, .stream_windows = 2 };
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false", seed_only.line(&buf));
     const off: Installed = .{};
-    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0", off.line(&buf));
+    try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
 }

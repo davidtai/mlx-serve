@@ -30,6 +30,9 @@ pub const Override = struct {
     expert_wide_feed: ?bool = null,
     /// A streamed-expert model's wide prefill calls: groups in flight (1 or 2; null: 1).
     expert_wide_depth: ?u8 = null,
+    /// The wide feed's halves on their own: the residency seed (+ one drain per group), the hottest-first order.
+    expert_wide_seed: ?bool = null,
+    expert_wide_hot_first: ?bool = null,
     /// A streamed-expert model's wide prefill calls: experts of at most this many rows on the decode GEMV
     /// (rounding-class; 1..8; null: none).
     expert_wide_cold_rows: ?u8 = null,
@@ -47,7 +50,7 @@ pub const Override = struct {
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
             o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and o.numeric_tier == null and
-            o.layer_major_prefill == null and o.expert_wide_feed == null and o.expert_wide_depth == null and o.expert_wide_cold_rows == null and
+            o.layer_major_prefill == null and o.expert_wide_feed == null and o.expert_wide_depth == null and o.expert_wide_seed == null and o.expert_wide_hot_first == null and o.expert_wide_cold_rows == null and
             o.chat_template_kwargs == null and o.drafter == null;
     }
 
@@ -134,6 +137,14 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("expert_wide_feed")) |n| switch (n) {
         .bool => |b| o.expert_wide_feed = b,
+        else => {},
+    };
+    if (obj.get("expert_wide_seed")) |n| switch (n) {
+        .bool => |b| o.expert_wide_seed = b,
+        else => {},
+    };
+    if (obj.get("expert_wide_hot_first")) |n| switch (n) {
+        .bool => |b| o.expert_wide_hot_first = b,
         else => {},
     };
     if (obj.get("expert_wide_cold_rows")) |n| switch (n) {

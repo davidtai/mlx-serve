@@ -427,6 +427,9 @@ pub const ModelConfig = struct {
     layer_major_prefill: ?bool = null,
     /// A streamed-expert model's wide prefill read schedule (`expert_wide_feed` / `expert_wide_depth`; null = off / 1).
     expert_wide_feed: ?bool = null,
+    /// The wide feed's halves on their own (`expert_wide_seed` / `expert_wide_hot_first`; null = the feed's value).
+    expert_wide_seed: ?bool = null,
+    expert_wide_hot_first: ?bool = null,
     expert_wide_depth: ?u8 = null,
     /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
     expert_wide_cold_rows: ?u8 = null,
@@ -702,6 +705,15 @@ pub const ModelConfig = struct {
 
     pub fn dsv41WideFeed(self: *const ModelConfig) bool {
         return self.expert_wide_feed orelse self.dsv41ServedTier();
+    }
+
+    /// The feed's halves: each its own setting, else the feed's value (the feed = seed + hot-first).
+    pub fn dsv41WideSeed(self: *const ModelConfig) bool {
+        return self.expert_wide_seed orelse self.dsv41WideFeed();
+    }
+
+    pub fn dsv41WideHotFirst(self: *const ModelConfig) bool {
+        return self.expert_wide_hot_first orelse self.dsv41WideFeed();
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {
