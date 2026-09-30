@@ -488,6 +488,25 @@ pub const Module = struct {
         self.gate.startPrompt(self.grown(), outsideOf(BoundaryMemory.now()));
     }
 
+    /// The served path's return to the prompt phase before a later prompt, after the caller freed the grown
+    /// rows (the arm's shrink; `before` read just before it): the MLX cache cleared (the freed rows' buffers
+    /// go back to the driver, not into the cache), synchronize, then the same reclaim wait and one check as
+    /// the phase change (the footprint and the box's physical pages down by the freed bytes, nothing more
+    /// outside the footprint than at `before`), terminal on refusal. The proven reading becomes the next
+    /// prompt's reference, so its own phase change judges its reclaim from a clean start. Bill: every prompt
+    /// pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
+    pub fn reclaimShrink(self: *Module, before: BoundaryMemory, freed_bytes: u64) !void {
+        try self.gate.request();
+        self.g.clearCache();
+        _ = mlx.mlx_synchronize(self.g.s);
+        const outside_before = outsideOf(before);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes, outside_before);
+        self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .outside_ref = outside_before, .settle_ms = st.waited_ms };
+        checkFreed(before, st.after, freed_bytes, outside_before) catch |e| return self.refuseTerminally(e);
+        self.gate.outside_ref = outsideOf(st.after);
+        self.logPhaseChange();
+    }
+
     /// The phase change, once (a no-op after): the prompt's frees, proven reclaimed, then the grow.
     /// 1. Every GPU command of the prompt retires (synchronize): MLX's completion handlers hand the buffers
     ///    they held back to its allocator, and Metal keeps a released buffer's pages until its command
@@ -551,7 +570,7 @@ pub const Module = struct {
         self.gate.refuse(e);
         if (self.phase_change) |*r| r.refused = @errorName(e);
         self.logPhaseChange();
-        log.err("NATIVE phase change refused before the grow: {s}; the module is terminal, exiting {d}", .{ @errorName(e), phase_change_refused_exit });
+        log.err("NATIVE {s} refused: {s}; the module is terminal, exiting {d}", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e), phase_change_refused_exit });
         std.process.exit(phase_change_refused_exit);
     }
 
@@ -689,6 +708,8 @@ pub const BoundaryMemory = struct {
 /// them (settled), after the grow; the bytes freed (the MLX cache cleared + device bytes released); the
 /// reclaim time the driver took (the receipts carry it, so the windows learn its behaviour).
 pub const PhaseChangeRecord = struct {
+    /// "phase change" (the grow after a prompt) or "shrink" (the return to the prompt rows before a later one).
+    kind: []const u8 = "phase change",
     before: BoundaryMemory,
     after: BoundaryMemory,
     grown: ?BoundaryMemory = null,
@@ -1016,6 +1037,10 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
     try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);
+    // The served path's per-request pieces are analysed with the module (their wiring is the served path's).
+    const shrink_reclaim: *const fn (*Module, BoundaryMemory, u64) anyerror!void = &Module.reclaimShrink;
+    const prompt_start: *const fn (*Module) void = &Module.promptStart;
+    try std.testing.expect(@intFromPtr(shrink_reclaim) != 0 and @intFromPtr(prompt_start) != 0);
 }
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
@@ -1521,6 +1546,28 @@ test "dsv41 memory: the prompt-start reference catches releases older than the b
     g.refuse(error.PhaseChangeNotReclaimed);
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
+}
+
+test "dsv41 memory: the return to the prompt rows (shrink) is judged like the phase change" {
+    // v6b-scale decode state: the grown rows (31 x 40 x 13.3 MB = 16.5 GB) resident, a 0.27 GB decode cache.
+    const grown_rows: u64 = 31 * 40 * 13_315_584;
+    const before: BoundaryMemory = .{ .active = 101_000_000_000, .cache = 268_000_000, .footprint = 102_900_000_000, .physical = 116_800_000_000 };
+    const ref = outsideOf(before);
+    // The rows and the cache released and reclaimed: passes.
+    const freed: BoundaryMemory = .{ .active = before.active - grown_rows, .cache = 0, .footprint = before.footprint - before.cache - grown_rows, .physical = before.physical - before.cache - grown_rows };
+    try checkFreed(before, freed, grown_rows, ref);
+    // The rows' buffers parked in MLX's cache instead of released: refused (the cache is cleared first by design).
+    var parked = freed;
+    parked.cache = grown_rows;
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, parked, grown_rows, ref));
+    // Released from the footprint but still counted in vm_stat: waited out, then refused if it never clears.
+    var lagging = freed;
+    lagging.physical = before.physical;
+    var i: usize = 0;
+    var slept: u32 = 0;
+    const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, grown_rows, ref);
+    try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
+    try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, st.after, grown_rows, ref));
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {

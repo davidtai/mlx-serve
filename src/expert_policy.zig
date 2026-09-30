@@ -258,6 +258,20 @@ pub const LayerPolicy = struct {
         p.capacity = capacity;
     }
 
+    /// The return to the prompt phase before a later prompt (the served path's per-request cycle: the rows past
+    /// `capacity` are freed for the prompt pass's waves and grown back at its phase change): `capacity`
+    /// persistent slots from now on, and every expert resident in a slot at or past it forgotten, so no plan
+    /// serves from a freed row.
+    pub fn shrink(p: *LayerPolicy, capacity: u32) !void {
+        if (capacity > p.capacity) return error.InvalidCapacity;
+        var s: u32 = capacity;
+        while (s < p.capacity) : (s += 1) {
+            const e = p.slot_to_expert[s];
+            if (e != no_expert) p.invalidate(e);
+        }
+        p.capacity = capacity;
+    }
+
     /// Forgets a resident expert (its record failed to load).
     pub fn invalidate(p: *LayerPolicy, expert: u16) void {
         const s = p.expert_to_slot[expert];
@@ -715,6 +729,36 @@ test "dsv41 policy: growth adds empty slots used before any eviction" {
     }, out.loadsOf());
     try testing.expectEqual(@as(u32, 0), out.n_evictions);
     try testing.expectEqual(@as(?u32, 1), p.slotOf(2));
+}
+
+test "dsv41 policy: shrink forgets every expert past the new capacity; plans stay within it; it grows back" {
+    var p = try LayerPolicy.init(testing.allocator, 16, 2);
+    defer p.deinit(testing.allocator);
+    var out: Plan = .{};
+    p.plan(&.{ 1, 2 }, .prefill, &out);
+    try p.grow(4);
+    p.plan(&.{ 1, 3, 4 }, .decode, &out);
+    try testing.expectEqual(@as(?u32, 2), p.slotOf(3));
+    try testing.expectEqual(@as(?u32, 3), p.slotOf(4));
+    try testing.expectError(error.InvalidCapacity, p.shrink(5));
+    try p.shrink(2);
+    try testing.expectEqual(@as(u32, 2), p.capacity);
+    // The freed rows' experts are forgotten; the kept ones stay resident.
+    try testing.expectEqual(@as(?u32, null), p.slotOf(3));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(4));
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(1));
+    try testing.expectEqual(@as(?u32, 1), p.slotOf(2));
+    try testing.expectEqual(@as(u32, 2), p.occupancy);
+    for (p.slot_to_expert[2..4]) |e| try testing.expectEqual(no_expert, e);
+    // A later prompt plans within the kept slots (a persistent load never lands on a freed row).
+    try p.prepareSeed(testing.allocator, &.{ 3, 3, 5 });
+    p.plan(&.{ 3, 5 }, .prefill, &out);
+    try checkPlan(&p, &.{ 3, 5 }, &out, max_route_ids);
+    for (out.loadsOf()) |l| if (l.persistent) try testing.expect(l.slot < 2);
+    // And the phase change grows it back: the freed slots empty again, used before any eviction.
+    try p.grow(4);
+    p.plan(&.{ 7, 8 }, .decode, &out);
+    try testing.expectEqual(@as(u32, 0), out.n_evictions);
 }
 
 test "dsv41 policy: bounded parts cut at the last physical gap" {
