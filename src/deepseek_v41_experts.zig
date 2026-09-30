@@ -2845,6 +2845,68 @@ test "dsv41 experts: the wide feed and read-ahead serve every routed row from it
     }
 }
 
+test "dsv41 experts: P1 at wide depth 3: three groups live, the read-ahead landed before the seed, every routed row served from its record" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    // 60 tokens x top-6, token t's j-th expert (j * 20 + t) mod 120: 120 distinct experts, three groups of the feed.
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 20 + i / k) % 120);
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = 3, .transient_rows = 3 * max_route_ids });
+    defer s.deinit();
+    StreamRec.stream = s;
+    defer StreamRec.stream = null;
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var rrs = [_]StreamRec{StreamRec.init(a)};
+    defer rrs[0].deinit(&g);
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .hot_first = true, .depth = 3, .read_ahead = true } });
+    defer ex.deinit();
+    StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+    StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+    // The predicted seed (the model's predictor pass would hand it over): 16 experts, every one routed by the call.
+    var predicted: [16]u16 = undefined;
+    for (&predicted, 0..) |*e, i| e.* = @intCast(i * 7);
+    try ex.at(0).readAheadSeed(&predicted);
+    try testing.expect(s.ahead.live and s.ahead.n == 16);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+    try ex.flush();
+    try testing.expect(!s.ahead.live);
+    // Exact: every routed row once, computed from its own expert's record with its token.
+    var seen: [n * k]bool = @splat(false);
+    for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+        const row = for (0..k) |j| {
+            const i = t * k + j;
+            if (ids[i] == e and !seen[i]) break i;
+        } else return error.RowNotRouted;
+        seen[row] = true;
+    };
+    for (seen) |x| try testing.expect(x);
+    // Three groups routed, the first group's waves run with all three live (the third window's reads in flight).
+    try testing.expectEqual(@as(u64, 3), s.stats().route_calls);
+    var max_live: u32 = 0;
+    for (rrs[0].recs.items) |r| max_live = @max(max_live, r.live);
+    try testing.expectEqual(@as(u32, 3), max_live);
+    // The read-ahead's records at the barrier: 16 posted, every one routed by the call; its bytes are the reads'.
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 16), st.ahead_posted);
+    try testing.expectEqual(@as(u64, 16), st.ahead_hits);
+    const rec = sb.bank.layers[0].logical_bytes;
+    try testing.expectEqual(16 * rec, st.ahead_bytes);
+    try testing.expectEqual((st.expert_cache_misses - st.loads_skipped + st.ahead_posted) * rec, st.expert_bytes_read);
+}
+
 test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {
     const a = testing.allocator;
     var sb = try SynthBank.open(32);
