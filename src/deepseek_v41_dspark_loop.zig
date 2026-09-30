@@ -126,14 +126,23 @@ pub fn Loop(comptime G: type) type {
             return g.slice(x, &.{ 0, lo, 0 }, &.{ s.d[0], hi, s.d[2] }, &.{ 1, 1, 1 });
         }
 
-        fn evalWindows(self: *Self) !void {
-            var ws: [8]T = undefined;
+        fn windows(self: *const Self, ws: *[8]T) []const T {
             var n: usize = 0;
             for (self.caches) |c| if (c.window) |w| {
                 ws[n] = w;
                 n += 1;
             };
-            try self.g.evalAll(ws[0..n]);
+            return ws[0..n];
+        }
+
+        fn evalWindows(self: *Self) !void {
+            var ws: [8]T = undefined;
+            try self.g.evalAll(self.windows(&ws));
+        }
+
+        fn dispatchWindows(self: *Self) !void {
+            var ws: [8]T = undefined;
+            try self.g.asyncEval(self.windows(&ws));
         }
 
         fn isStop(self: *const Self, tok: u32) bool {
@@ -385,10 +394,13 @@ pub fn Loop(comptime G: type) type {
             if (self.k_cap > 0) {
                 const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
-                try g.evalAll(&.{ d.ids, d.conf });
+                // CYCLE_TRIM draftfold: the confidence sigmoid is realised by the draft's own eval (one
+                // sync), which also realises the main row and window update the previous commit left.
+                const sig = try g.sigmoid(try g.astype(d.conf, .float32));
+                try g.evalAll(&.{ d.ids, sig });
                 _ = try g.hostU32(d.ids, native[0..bs]);
                 var conf: [ds.max_block]f32 = undefined;
-                _ = try g.hostF32(try g.sigmoid(try g.astype(d.conf, .float32)), conf[0..bs]);
+                _ = try g.hostF32(sig, conf[0..bs]);
                 k_eff = ds.effectiveDraftLen(conf[0..bs], self.k_cap, self.cfg.confidence_threshold);
                 if (log) |lg| {
                     lg.k_native = k_eff;
@@ -445,10 +457,12 @@ pub fn Loop(comptime G: type) type {
             const kept = @min(o.accepted, accepted_cap);
             const next = if (kept < o.accepted) drafts[kept] else correction;
             const trimmed = o.verified - (kept + 1);
-            // Commit: keep [primary, d1 .. d_kept] in the target, seed the draft windows.
+            // Commit: keep [primary, d1 .. d_kept] in the target, seed the draft windows. CYCLE_TRIM gap:
+            // the window update is dispatched, not waited; the round boundary's host work (the tail, the
+            // caller's, the next draft's build) runs under it, and the next draft's eval waits for it.
             try self.model.trim(g, self.st, trimmed);
             try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(kept + 1)), self.caches);
-            try self.evalWindows();
+            try self.dispatchWindows();
             mark(stamp, .commit);
             if (log) |lg| {
                 lg.primary = self.primary;
@@ -488,8 +502,8 @@ pub fn Loop(comptime G: type) type {
             if (finish == null and out.items.len >= self.cfg.max_tokens) finish = .length;
             if (finish == null) {
                 self.primary = c.next;
+                // The next draft's main row, realised by that draft's eval.
                 self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
-                try g.evalAll(&.{self.main_h.?});
             }
             try ex.flush();
             g.reset();
@@ -520,8 +534,8 @@ pub fn Loop(comptime G: type) type {
                 try l.appendCommitted(&.{c.next});
             }
             self.primary = c.next;
+            // The next draft's main row, realised by that draft's eval.
             self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
-            try g.evalAll(&.{self.main_h.?});
             try ex.flush();
             g.reset();
             mark(stamp, .tail);
@@ -685,6 +699,49 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(script.f32s.len, script.nf);
     // Every verify forward routed through the source: 3 prompt forwards + 4 verifies per layer.
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
+}
+
+test "dsv41 dspark loop: CYCLE_TRIM: one eval per draft with its sigmoid, the commit's window update dispatched and waited by the next draft" {
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    const g = &rig.g;
+    for (0..4) |_| {
+        const n0 = g.nodes.items.len;
+        const e0 = g.evals.items.len;
+        _ = try lp.cycle(&rig.ex, &out, a, null);
+        const nodes = g.nodes.items;
+        const evals = g.evals.items[e0..];
+        // Two syncs per greedy cycle: the draft and the verify. The draft's ids and confidence
+        // sigmoid are both read right after its eval, with nothing built between (realised in it).
+        try testing.expectEqual(@as(usize, 2), evals.len);
+        for (nodes[n0..evals[0]]) |nd| try testing.expect(nd.op != .host_read);
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[0]].op);
+        try testing.expectEqual(ops.Op.host_read, nodes[evals[0] + 1].op);
+        // The last GPU commit of the cycle is the window update, after its last sync.
+        var last_async: usize = 0;
+        for (nodes[n0..], n0..) |nd, i| {
+            if (nd.op == .async_eval) last_async = i;
+        }
+        try testing.expect(last_async >= evals[evals.len - 1]);
+    }
+    // The same tokens as the unfolded cycles (the first test's script).
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
 }
 
 test "dsv41 dspark loop: the shell's prompt (all but the last token, then the last) and its rounds give the cell's tokens" {
