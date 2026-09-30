@@ -66,11 +66,21 @@ pub const LayerSlotBank = struct {
 
     /// Nine arrays in the Python bank's dtypes (code int16 [rows, in/16, out/16,
     /// 16K], rout / rin float16 [rows, out] / [rows, in]), zero-filled and
-    /// evaluated once on `stream`. The data pointers are taken here; the arrays
-    /// stay held (never donated or recycled) until `deinit`, after the pool stops.
-    /// MLX allocates through Metal even on the CPU stream: callers hold the GPU lock.
+    /// evaluated on `stream` in one eval. The data pointers are taken here; the
+    /// arrays stay held (never donated or recycled) until `deinit`, after the pool
+    /// stops. MLX allocates through Metal even on the CPU stream: callers hold the GPU lock.
     pub fn init(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
-        var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = undefined, .row_bytes = undefined, .rows = rows };
+        var b = try initLazy(layer, rows, stream);
+        errdefer b.deinit();
+        try evalArrays(&b.arrays);
+        try b.bind();
+        return b;
+    }
+
+    /// `init`'s zero arrays, not yet evaluated: a grow builds every layer's, evaluates them all in one eval
+    /// (`Stream.grow`: one GPU round trip, not nine per layer), then `bind`s each.
+    fn initLazy(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+        var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
         errdefer b.deinit();
         for (layer.segments, 0..) |seg, c| {
             var shape: [4]c_int = undefined;
@@ -82,12 +92,14 @@ pub const LayerSlotBank = struct {
             };
             b.arrays[c] = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
-            try mlx.check(mlx.mlx_array_eval(b.arrays[c]));
-            const p = mlx.mlx_array_data_uint8(b.arrays[c]) orelse return error.MlxNoData;
-            b.base[c] = @intFromPtr(p);
             b.row_bytes[c] = seg.length;
         }
         return b;
+    }
+
+    /// The evaluated arrays' data pointers (after `initLazy` and an eval that covered them).
+    fn bind(b: *LayerSlotBank) !void {
+        for (b.arrays, &b.base) |arr, *base| base.* = @intFromPtr(mlx.mlx_array_data_uint8(arr) orelse return error.MlxNoData);
     }
 
     pub fn deinit(self: *LayerSlotBank) void {
@@ -110,6 +122,13 @@ pub const LayerSlotBank = struct {
     }
 };
 
+/// One eval over `arrays` (a single GPU round trip).
+fn evalArrays(arrays: []const mlx.mlx_array) !void {
+    const vec = mlx.mlx_vector_array_new_data(arrays.ptr, arrays.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+}
+
 /// Where the stream keeps its slot rows: host pages (the default; hermetic
 /// tests and CPU checks) or MLX arrays the kernels bind, created and evaluated
 /// on `mlx` (creating any MLX array creates the Metal device: callers hold the
@@ -118,6 +137,17 @@ pub const SlotMemory = union(enum) { host, mlx: mlx.mlx_stream };
 
 /// One bank of slot rows. Both memories are addressed by the same row
 /// arithmetic, so the read path never asks which one it has.
+/// One eval over every MLX bank among `rows` (none for host rows).
+fn evalRows(a: std.mem.Allocator, rows: []const ?Rows) !void {
+    var arrays: std.ArrayList(mlx.mlx_array) = .empty;
+    defer arrays.deinit(a);
+    for (rows) |r| if (r) |x| switch (x.backing) {
+        .mlx => |m| try arrays.appendSlice(a, &m.arrays),
+        .none, .host => {},
+    };
+    if (arrays.items.len > 0) try evalArrays(arrays.items);
+}
+
 const Rows = struct {
     rows: u32 = 0,
     base: [n_components]u64 = @splat(0),
@@ -137,6 +167,30 @@ const Rows = struct {
                 const m = try LayerSlotBank.init(layer, rows, stream);
                 return .{ .rows = rows, .base = m.base, .row_bytes = m.row_bytes, .backing = .{ .mlx = m } };
             },
+        }
+    }
+
+    /// `init` for a grow: an MLX bank's arrays built without their eval (`bind` after one eval of every layer's,
+    /// `evalRows`); host rows are complete at once.
+    fn initLazy(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+        if (rows == 0) return .{};
+        switch (memory) {
+            .host => return init(layer, rows, memory),
+            .mlx => |stream| {
+                const m = try LayerSlotBank.initLazy(layer, rows, stream);
+                return .{ .rows = rows, .row_bytes = m.row_bytes, .backing = .{ .mlx = m } };
+            },
+        }
+    }
+
+    /// After the eval that covered an MLX bank's arrays: its data pointers (host rows have theirs).
+    fn bind(self: *Rows) !void {
+        switch (self.backing) {
+            .mlx => |*m| {
+                try m.bind();
+                self.base = m.base;
+            },
+            .none, .host => {},
         }
     }
 
@@ -915,8 +969,11 @@ pub const Stream = struct {
         @memset(exts, null);
         errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
         for (self.layers, decode_rows, exts, self.bank.layers) |*ls, rows, *e, *geom| {
-            if (rows > ls.policy.capacity) e.* = try Rows.init(geom, rows - ls.policy.capacity, self.memory);
+            if (rows > ls.policy.capacity) e.* = try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory);
         }
+        // Every layer's new MLX arrays in one eval (growth-overlap step 1: not nine evals per layer, 360 at 40).
+        try evalRows(a, exts);
+        for (exts) |*e| if (e.*) |*r| try r.bind();
         for (self.layers, decode_rows, exts) |*ls, rows, e| {
             ls.ext = e;
             ls.policy.grow(rows) catch unreachable;
