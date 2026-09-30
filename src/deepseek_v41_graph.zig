@@ -130,6 +130,10 @@ pub const Routes = struct {
     /// the packed mxfp8 wo_a (one expert per group) and wo_b as a bf16 qmm, widened to f32 (no f32
     /// einsum over the dense f32 wo_a).
     prefill_oproj: bool = false,
+    /// PREFILL_HOST shared (K16): after the routing barrier each chunk's shared expert (f32) is
+    /// started on the GPU before the routed call, so it runs while the host plans the waves;
+    /// the combine reads it (the same expression: exact). Billed in the layer-major wave.
+    prefill_host_shared: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -1808,8 +1812,8 @@ pub fn Trunk(comptime G: type) type {
 
         /// `MoE.combine_routed`: the shared expert and the f32 combine (K22 at
         /// rows <= 32) of routed rows computed elsewhere (K16's batched switch).
-        pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, ro: T, weights: T, xf: T) !T {
-            const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
+        pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, ro: T, weights: T, xf: T, pre_shared: ?T) !T {
+            const shared = pre_shared orelse try g.astype(try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
             if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
                 var o: [1]T = undefined;

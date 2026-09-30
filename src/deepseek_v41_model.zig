@@ -623,6 +623,18 @@ pub fn Model(comptime G: type) type {
                     const idxs = try a.alloc(T, j - i);
                     for (routes_[i..j], idxs) |r, *d| d.* = r.indices;
                     const cat_idx = if (j - i == 1) routes_[i].indices else try g.concat(idxs, 0);
+                    // PREFILL_HOST shared: the routing barrier (the ids evaluated, as the routed call's
+                    // host read needs them), then each chunk's shared expert started on the GPU so it
+                    // runs while the host plans the routed waves (it depends on the MoE input only).
+                    const pre_shared = try a.alloc(?T, j - i);
+                    @memset(pre_shared, null);
+                    if (rt.prefill_host_shared) {
+                        try g.evalAll(&.{cat_idx});
+                        for (i..j, pre_shared) |k, *ps| ps.* = try g.astype(try Tr.sharedExpert(g, c, lw, xfs[k]), .float32);
+                        const started = try a.alloc(T, j - i);
+                        for (pre_shared, started) |ps, *st_| st_.* = ps.?;
+                        try g.asyncEval(started);
+                    }
                     const ro = try routed.at(@intCast(l)).routed(g, cat_xf, cat_idx);
                     // The profile's own stage for the group's routed compute (else it lands in moe.shared).
                     try probe.put("moe.routed", ro);
@@ -632,7 +644,7 @@ pub fn Model(comptime G: type) type {
                         const rs = g.shapeOf(ro);
                         const part = if (j - i == 1) ro else try g.slice(ro, &.{ pos, 0, 0 }, &.{ pos + nk, rs.d[1], rs.d[2] }, &.{ 1, 1, 1 });
                         pos += nk;
-                        const y = try Tr.combineRouted(g, probe, c, rt, self.kx.at(l), lw, part, routes_[k].weights, xfs[k]);
+                        const y = try Tr.combineRouted(g, probe, c, rt, self.kx.at(l), lw, part, routes_[k].weights, xfs[k], pre_shared[k - i]);
                         const sh = g.shapeOf(halves[k].moe_in);
                         const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
