@@ -134,14 +134,14 @@ const StepHashes = struct {
 
 const testing = std.testing;
 
-// Guarded window only (loads the bank): DSV41_AR_REF=<dump_dsv41_ar_ref.py json> DSV41_BANK=<bank>
-// DSV41_ENGRAM_TOKEN_MAP=<converter map> _GPU_WINDOW_LOCKED=1 [DSV41_AR_ROWS=<decode rows per layer, default 16>]
+// Loads the bank on Metal; runs on its explicit inputs, under the guard that wraps the process from outside:
+// DSV41_AR_REF=<dump_dsv41_ar_ref.py json> DSV41_BANK=<bank>
+// DSV41_ENGRAM_TOKEN_MAP=<converter map> [DSV41_AR_ROWS=<decode rows per layer, default 16>]
 test "dsv41 ar: the native path with streamed experts generates the Python reference's tokens" {
     const ref_path = std.mem.span(std.c.getenv("DSV41_AR_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
     if (servedSchedule()) return error.SkipZigTest; // the served schedule's own test below
-    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -362,8 +362,9 @@ const ServedRecord = struct {
     wall_ms: i64,
 };
 
-// Guarded window only (loads the bank): DSV41_AR_SCHEDULE=served DSV41_AR_REF=<ar-ref json: its prompt and
-// token count> DSV41_BANK=<bank> DSV41_AR_OUT=<new json> _GPU_WINDOW_LOCKED=1 [DSV41_AR_BASELINE_GB=<the
+// Loads the bank on Metal; runs on its explicit inputs, under the guard that wraps the process from outside:
+// DSV41_AR_SCHEDULE=served DSV41_AR_REF=<ar-ref json: its prompt and
+// token count> DSV41_BANK=<bank> DSV41_AR_OUT=<new json> [DSV41_AR_BASELINE_GB=<the
 // server's --memory-baseline-gb>] [DSV41_AR_ROWS=<the server's --expert-rows>]. The server's schedule through the
 // served module itself (mlx-serve Generator: generate.zig step 0 + deepseek_v41_module prefill / extend):
 // ONE forward of prompt[0 .. n-1] (Module.prefill, the model's own chunk rule, the wide routed lane), then the
@@ -375,7 +376,6 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const ref_path = std.mem.span(std.c.getenv("DSV41_AR_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const out_path = std.mem.span(std.c.getenv("DSV41_AR_OUT") orelse return error.SkipZigTest);
-    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -876,8 +876,9 @@ const CellReceipt = struct {
     file_backed_start_bytes: ?u64 = null,
 };
 
-// Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
-// (the standard cell's)> DSV41_BANK=<bank> DSV41_CELL_OUT=<new json> _GPU_WINDOW_LOCKED=1
+// Loads the bank and the served module on Metal; runs on its explicit inputs, under the guard that wraps the
+// process from outside: DSV41_CELL_PROMPT_IDS=<prompt-ids json
+// (the standard cell's)> DSV41_BANK=<bank> DSV41_CELL_OUT=<new json>
 // [DSV41_CELL_BASELINE_GB=<the box baseline for the admission>] [DSV41_CELL_ROWS=<fixed decode rows>]
 // [DSV41_CELL_DELTA=<typical delta, 0.3>] [DSV41_CELL_MAX_TOKENS=<1024>]. The typical tier's timed cell:
 // the served module as the server builds it, the standard 16,384-token prompt as ONE prompt pass (the
@@ -887,7 +888,6 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const out_path = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
-    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     // The Module's construction / phase-change evidence lines (log.info: the routes installed, the
     // construction check, the phase change's boundary marks) reach the window log; none is per token.
     testing.log_level = .info;
@@ -900,15 +900,15 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     const prompt = inputs.prompt;
     var config = inputs.config;
-    const ov = try cellConfig(&config);
+    const args = try cellConfig(&config);
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
     // The cap counts every generated id, the prompt pass's primary included (the Python headline's
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
     if (max_tokens < 2) return error.CellMaxTokens;
-    try cellFill(a, io, &config, ov, prompt.len, max_tokens);
+    try cellFill(a, io, &config, args, prompt.len, max_tokens);
     // The bill at the admitted rows (host): the phase records' billed terms.
-    const bill = try cellBill(a, io, &config, ov, prompt.len, max_tokens);
+    const bill = try cellBill(a, io, &config, args, prompt.len, max_tokens);
 
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
@@ -927,7 +927,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const vm_start = status.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
     // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
@@ -1159,29 +1159,48 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     try checkGrowResidency(box_before, box_grown);
 }
 
-/// The window's admission inputs on the shell's config, from the environment the runner sets:
-/// DSV41_CELL_BASELINE_GB (the guard's box baseline, required), DSV41_CELL_CEILING_GB (the box the
-/// admission fits, required: the window and the bill plan the same rows) and DSV41_CELL_ROWS (a
-/// forced decode row count; unset = the admission's fill).
-fn cellConfig(config: *model.ModelConfig) !module.RouteOverrides {
-    // The route overrides are the Module's construction options (`Module.initWith`), not the shared config's.
-    var ov: module.RouteOverrides = .{};
+/// The cell harness's explicit arguments beyond the shell's config, parsed once at the test's entry
+/// (`cellConfig`) and passed down: the Module's route overrides and the admission's inputs.
+const CellArgs = struct {
+    /// The Module's construction options (`Module.initWith`), not the shared config's.
+    ov: module.RouteOverrides = .{},
+    /// The window's wired bytes, measured by the runner after the guard unloaded the service
+    /// (DSV41_CELL_WIRED_GB); null: the bill reads them now.
+    wired: ?u64 = null,
+    /// Forced prompt rows beside DSV41_CELL_ROWS's decode rows (DSV41_CELL_PREFILL_ROWS; a ladder's later
+    /// lines at its first line's rows).
+    prefill_rows: ?u32 = null,
+    /// DSV41_CELL_FILL_LADDER=1: fill at the prefill ladder's widest admission.
+    fill_ladder: bool = false,
+};
+
+/// The window's admission inputs, once, from the runner's explicit arguments: DSV41_CELL_BASELINE_GB (the
+/// box baseline the runner derived from the guard's start, required; the binary reads no guard variable),
+/// DSV41_CELL_CEILING_GB (the box the admission fits, required: the window and the bill plan the same rows),
+/// DSV41_CELL_ROWS (a forced decode row count; unset = the admission's fill), DSV41_CELL_PREFILL_ROWS,
+/// DSV41_CELL_FILL_LADDER, DSV41_CELL_WIRED_GB, and the routes (the shell's settings onto `config`, the
+/// Module's overrides into the returned args).
+fn cellConfig(config: *model.ModelConfig) !CellArgs {
+    var args: CellArgs = .{};
+    const ov = &args.ov;
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
             return @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
         }
     }.of;
-    // The box baseline the guard's stop compares against: its non-file start (the guard exports it as
-    // _GPU_WINDOW_USED_START_NONFILE_BYTES in nonfile mode; its accounting is non-file start + the
-    // step's footprint), else the runner's DSV41_CELL_BASELINE_GB. In-run file-cache growth has no
-    // bill term: every resident and record read bypasses the page cache.
-    config.memory_baseline_bytes = if (std.c.getenv("_GPU_WINDOW_USED_START_NONFILE_BYTES")) |v|
-        std.fmt.parseInt(u64, std.mem.span(v), 10) catch return error.CellBaselineValue
-    else
-        (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
+    // The box baseline the guard's stop compares against (its non-file start, which the runner converts
+    // and passes). In-run file-cache growth has no bill term: every resident and record read bypasses
+    // the page cache.
+    config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
     config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
     if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    if (std.c.getenv("DSV41_CELL_PREFILL_ROWS")) |v| {
+        if (config.expert_rows == null) return error.CellPrefillRowsWithoutRows;
+        args.prefill_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellPrefillRowsValue;
+    }
+    args.fill_ladder = std.c.getenv("DSV41_CELL_FILL_LADDER") != null;
+    args.wired = try gb("DSV41_CELL_WIRED_GB");
     // The prefill ladder's routes (all off by default; the Module refuses what it cannot build):
     // K16 layer-major, the wide read schedule's feed and depth, the cold rows on the decode GEMV.
     if (envStr("DSV41_CELL_LAYER_MAJOR")) |v| config.layer_major_prefill = try cellBool("DSV41_CELL_LAYER_MAJOR", v);
@@ -1219,7 +1238,7 @@ fn cellConfig(config: *model.ModelConfig) !module.RouteOverrides {
     // A combination the bills do not cover is refused here, by name, before any window work
     // (the Module's own construction check: K16 only on the served tier, with its request bill).
     _ = try module.layerMajor(config);
-    return ov;
+    return args;
 }
 
 /// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
@@ -1229,12 +1248,12 @@ fn cellConfig(config: *model.ModelConfig) !module.RouteOverrides {
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
 /// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt
 /// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
-fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !void {
+fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !void {
     const target = config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes;
-    if (std.c.getenv("DSV41_CELL_PREFILL_ROWS")) |v| {
-        const decode = config.expert_rows orelse return error.CellPrefillRowsWithoutRows;
-        config.expert_prefill_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellPrefillRowsValue;
-        const b = try cellBill(a, io, config, ov, prompt_tokens, max_tokens);
+    if (args.prefill_rows) |pr| {
+        const decode = config.expert_rows.?;
+        config.expert_prefill_rows = pr;
+        const b = try cellBill(a, io, config, args, prompt_tokens, max_tokens);
         std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"forced_rows\": [{d}, {d}], \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}}}\n", .{
             gbOf(b.baseline), gbOf(target), config.expert_prefill_rows.?, decode, gbOf(b.prefillTotal()), gbOf(b.decodeTotal()),
         });
@@ -1242,18 +1261,18 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, ov: mo
         return;
     }
     if (config.expert_rows != null) return;
-    var nr = try fillAt(a, io, config.*, ov, prompt_tokens, max_tokens);
-    if (std.c.getenv("DSV41_CELL_FILL_LADDER") != null) {
+    var nr = try fillAt(a, io, config.*, args, prompt_tokens, max_tokens);
+    if (args.fill_ladder) {
         for ([_]bool{ false, true }) |lm| {
             var wide = config.*;
             wide.expert_wide_depth = 2;
             wide.layer_major_prefill = lm;
-            const r = try fillAt(a, io, wide, ov, prompt_tokens, max_tokens);
+            const r = try fillAt(a, io, wide, args, prompt_tokens, max_tokens);
             nr = .{ .prefill = @min(nr.prefill, r.prefill), .decode = @min(nr.decode, r.decode) };
         }
     }
     std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"ladder\": {}, \"filled_rows\": [{d}, {d}]}}\n", .{
-        gbOf(config.memory_baseline_bytes.?), gbOf(target), std.c.getenv("DSV41_CELL_FILL_LADDER") != null, nr.prefill, nr.decode,
+        gbOf(config.memory_baseline_bytes.?), gbOf(target), args.fill_ladder, nr.prefill, nr.decode,
     });
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
@@ -1263,23 +1282,16 @@ fn gbOf(x: u64) f64 {
     return @as(f64, @floatFromInt(x)) / 1e9;
 }
 
-/// The window's wired bytes, when the runner measured them after the guard unloaded the service
-/// (DSV41_CELL_WIRED_GB); null: `planRows` reads them now.
-fn harnessWired() !?u64 {
-    const v = std.c.getenv("DSV41_CELL_WIRED_GB") orelse return null;
-    return @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
-}
-
 /// The harness's bill (`bill_mod.billAt` at the window's wired bytes).
-pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !CellBill {
-    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, try harnessWired(), ov);
+fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
+    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ov);
 }
 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less its 2.0 GB
 /// stop (the window's own numbers, passed explicitly), refused by name on stdout.
-pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, ov: module.RouteOverrides, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     const target = (config.memory_ceiling_bytes orelse return error.CellCeilingMissing) -| module.ceiling_stop_bytes;
-    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, try harnessWired(), target, ov) catch |e| {
+    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, target, args.ov) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };
@@ -1435,10 +1447,10 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     defer arena.deinit();
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
-    const ov = try cellConfig(&config);
+    const args = try cellConfig(&config);
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
-    try cellFill(a, testing.io, &config, ov, 16384, max_tokens);
-    const b = try cellBill(a, testing.io, &config, ov, 16384, max_tokens);
+    try cellFill(a, testing.io, &config, args, 16384, max_tokens);
+    const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
     printBill(b);
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
 }
@@ -1497,8 +1509,8 @@ const PrefillProbe = struct {
 };
 
 // Profiling window only (the prompt pass, no decode): DSV41_CELL_PROFILE=1 plus the cell's window env
-// (DSV41_CELL_PROMPT_IDS [DSV41_CELL_CASE] DSV41_BANK DSV41_CELL_BASELINE_GB DSV41_CELL_CEILING_GB
-// _GPU_WINDOW_LOCKED). The served module as the cell builds it; the prompt as ONE model forward at the
+// (DSV41_CELL_PROMPT_IDS [DSV41_CELL_CASE] DSV41_BANK DSV41_CELL_BASELINE_GB DSV41_CELL_CEILING_GB), under the
+// guard that wraps the process from outside. The served module as the cell builds it; the prompt as ONE model forward at the
 // model's chunk rule through the served hook (the cell's prompt pass without the draft seed), probed.
 // Prints PREFILL_PROFILE lines: per stage (seconds, share), per chunk (rows, seconds), the stream's
 // reads (bytes, read-busy wall, misses), the probed wall. Writes nothing.
@@ -1506,7 +1518,6 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     if (std.c.getenv("DSV41_CELL_PROFILE") == null) return error.SkipZigTest;
     const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1515,8 +1526,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
-    const ov = try cellConfig(&config);
-    try cellFill(a, io, &config, ov, inputs.prompt.len, 1024);
+    const args = try cellConfig(&config);
+    try cellFill(a, io, &config, args, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
     defer {
@@ -1530,7 +1541,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer _ = mlx.mlx_stream_free(s);
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
     const arm = switch (md.arm) {
         .host_waits => |t| t.arm,
@@ -1727,14 +1738,14 @@ test "dsv41 engram: a reference without the Engram trim hashes the verify rows a
     try testing.expect(first != null and first.? >= 1);
 }
 
-// Guarded window only (loads the bank): DSV41_DSPARK_REF=<dump_dsv41_dspark_ref.py json> DSV41_BANK=<bank>
-// DSV41_ENGRAM_TOKEN_MAP=<converter map> _GPU_WINDOW_LOCKED=1 [DSV41_AR_ROWS=<decode rows per layer, default 16>]
+// Loads the bank on Metal; runs on its explicit inputs, under the guard that wraps the process from outside:
+// DSV41_DSPARK_REF=<dump_dsv41_dspark_ref.py json> DSV41_BANK=<bank>
+// DSV41_ENGRAM_TOKEN_MAP=<converter map> [DSV41_AR_ROWS=<decode rows per layer, default 16>]
 // [DSV41_KV_BOUNDED=1: the request's KV lanes bounded to its positions (M5BOUND), else the tier's route]
 test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions on the real model" {
     const ref_path = std.mem.span(std.c.getenv("DSV41_DSPARK_REF") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
-    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
