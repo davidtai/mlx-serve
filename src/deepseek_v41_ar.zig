@@ -28,6 +28,7 @@ const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const CellBill = bill_mod.Bill;
 const PhaseTerms = bill_mod.PhaseTerms;
 const PhaseMemory = bill_mod.PhaseMemory;
@@ -394,8 +395,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const forwards = try forwardRows(a, calls, ref.new_tokens);
     var config = try model.parseConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
-    // The box the module's admission fills (the guard's ceiling; unset: the GPU's working set).
-    if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| config.memory_ceiling_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    // The box the module's admission fills: the guard's ceiling through upstream's static override, as the
+    // server's --memory-ceiling-gb sets it (restored when the test ends); unset: the GPU's working set.
+    const prev_ceiling = gpu_ceiling.static_ceiling_override;
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| gpu_ceiling.static_ceiling_override = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     config.numeric_tier = switch (run.tier) {
         .served => .served,
@@ -901,6 +905,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const prompt = inputs.prompt;
     var config = inputs.config;
     const args = try cellConfig(&config);
+    const prev_ceiling = args.applyCeiling();
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
     // The cap counts every generated id, the prompt pass's primary included (the Python headline's
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
@@ -1162,6 +1168,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
 /// The cell harness's explicit arguments beyond the shell's config, parsed once at the test's entry
 /// (`cellConfig`) and passed down: the Module's route overrides and the admission's inputs.
 const CellArgs = struct {
+    /// The box the admission fits (DSV41_CELL_CEILING_GB, the guard's ceiling): the module and the bill read it
+    /// through upstream's static override (`applyCeiling`), as the server's --memory-ceiling-gb sets it; the
+    /// harness's fill targets its 2.0 GB stop under it.
+    ceiling: u64,
     /// The Module's construction options (`Module.initWith`), not the shared config's.
     ov: module.RouteOverrides = .{},
     /// The window's wired bytes, measured by the runner after the guard unloaded the service
@@ -1172,6 +1182,14 @@ const CellArgs = struct {
     prefill_rows: ?u32 = null,
     /// DSV41_CELL_FILL_LADDER=1: fill at the prefill ladder's widest admission.
     fill_ladder: bool = false,
+
+    /// The window's ceiling onto upstream's static override for the test's span; returns the override it
+    /// replaced, for the caller's deferred restore.
+    fn applyCeiling(self: CellArgs) ?u64 {
+        const prev = gpu_ceiling.static_ceiling_override;
+        gpu_ceiling.static_ceiling_override = self.ceiling;
+        return prev;
+    }
 };
 
 /// The window's admission inputs, once, from the runner's explicit arguments: DSV41_CELL_BASELINE_GB (the
@@ -1181,8 +1199,6 @@ const CellArgs = struct {
 /// DSV41_CELL_FILL_LADDER, DSV41_CELL_WIRED_GB, and the routes (the shell's settings onto `config`, the
 /// Module's overrides into the returned args).
 fn cellConfig(config: *model.ModelConfig) !CellArgs {
-    var args: CellArgs = .{};
-    const ov = &args.ov;
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
@@ -1193,7 +1209,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     // and passes). In-run file-cache growth has no bill term: every resident and record read bypasses
     // the page cache.
     config.memory_baseline_bytes = (try gb("DSV41_CELL_BASELINE_GB")) orelse return error.CellBaselineMissing;
-    config.memory_ceiling_bytes = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing;
+    var args: CellArgs = .{ .ceiling = (try gb("DSV41_CELL_CEILING_GB")) orelse return error.CellCeilingMissing };
+    const ov = &args.ov;
     if (std.c.getenv("DSV41_CELL_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     if (std.c.getenv("DSV41_CELL_PREFILL_ROWS")) |v| {
         if (config.expert_rows == null) return error.CellPrefillRowsWithoutRows;
@@ -1249,7 +1266,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
 /// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt
 /// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
 fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !void {
-    const target = config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes;
+    const target = args.ceiling -| module.ceiling_stop_bytes;
     if (args.prefill_rows) |pr| {
         const decode = config.expert_rows.?;
         config.expert_prefill_rows = pr;
@@ -1290,7 +1307,7 @@ fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less its 2.0 GB
 /// stop (the window's own numbers, passed explicitly), refused by name on stdout.
 fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
-    const target = (config.memory_ceiling_bytes orelse return error.CellCeilingMissing) -| module.ceiling_stop_bytes;
+    const target = args.ceiling -| module.ceiling_stop_bytes;
     return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, target, args.ov) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
@@ -1448,6 +1465,8 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
     const args = try cellConfig(&config);
+    const prev_ceiling = args.applyCeiling();
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
     try cellFill(a, testing.io, &config, args, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
@@ -1527,6 +1546,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     const args = try cellConfig(&config);
+    const prev_ceiling = args.applyCeiling();
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
     try cellFill(a, io, &config, args, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);

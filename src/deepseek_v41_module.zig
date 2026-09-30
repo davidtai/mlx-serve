@@ -216,10 +216,11 @@ pub const Module = struct {
         };
         try self.acceptKernels(gpa, &c0, s, &diag);
         // The box the admission fits: upstream's static GPU ceiling (Metal's working set, or its static override:
-        // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB), unless a harness states its window's ceiling; the
-        // fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill's totals carry
-        // the baseline (the preflight's sample of the memory in use before the load, or `--memory-baseline-gb`).
-        const ceiling_bytes = config.memory_ceiling_bytes orelse gpu_ceiling.staticGpuMemoryCeiling();
+        // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling through the same
+        // override); the fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill
+        // (which reads the same ceiling) carries the baseline (the preflight's sample of the memory in use before
+        // the load, or `--memory-baseline-gb`).
+        const ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
         const target = ceiling_bytes -| gpu_ceiling.wired_limit_margin_bytes;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
         // The served admission, one kind only (the native bill; the Python envelope planner never runs here):
@@ -227,7 +228,6 @@ pub const Module = struct {
         // the fill's capped at R. Both row counts then reach the arm as native rows.
         var admitted = config.*;
         if (admitted.expert_prefill_rows == null) {
-            admitted.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target, ov);
@@ -244,11 +244,9 @@ pub const Module = struct {
         // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
         {
-            var cfg = admitted;
-            cfg.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ov) catch |e| {
+            const b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -384,7 +382,7 @@ pub const Module = struct {
         }
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
-        try self.checkConstruction(io, &admitted, ceiling_bytes);
+        try self.checkConstruction(io, &admitted);
         return self;
     }
 
@@ -392,9 +390,7 @@ pub const Module = struct {
     /// check against it: the footprint after the install (warm-up released, cache cleared) must sit
     /// within `construction_tolerance_bytes` of the bill's construction terms, else the module is
     /// refused by name before any request.
-    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig, ceiling_bytes: u64) !void {
-        var cfg = admitted.*;
-        cfg.memory_ceiling_bytes = ceiling_bytes;
+    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         // The bill plans through the arm's own inputs: the wired bytes the arm was planned with (a live
@@ -402,7 +398,7 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try bill_mod.billAt(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired, self.overrides);
+        const b = try bill_mod.billAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, planned_wired, self.overrides);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };

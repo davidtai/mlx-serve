@@ -245,7 +245,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     var vd: v41.Diag = .{};
     errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
     const c = try v41.Config.load(a, io, dir, &vd);
-    const ceiling = module.boxCeiling(config.memory_ceiling_bytes orelse return error.CeilingMissing, c.n_routed_experts);
+    // The box: upstream's static GPU ceiling (`--memory-ceiling-gb`, or a harness's window ceiling through the
+    // same override), the one the module's fill targets.
+    const ceiling = module.boxCeiling(gpu_ceiling.staticGpuMemoryCeiling(), c.n_routed_experts);
     var diag: arm_mod.Diag = .{};
     var opts = module.armOptions(config, ceiling, .host);
     if (wired_bytes) |w| opts.wired_bytes = w;
@@ -359,7 +361,6 @@ fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prom
 pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig) !u64 {
     var c = config;
     c.memory_baseline_bytes = 0;
-    if (c.memory_ceiling_bytes == null) c.memory_ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
     // The server's load preflight: the served routes, no harness override.
     const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, .{});
     return b.processBound();
@@ -520,17 +521,20 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 8_548_761_600;
-    config.memory_ceiling_bytes = 119_259_000_000;
+    const ceiling_bytes: u64 = 119_259_000_000;
+    const prev_ceiling = gpu_ceiling.static_ceiling_override;
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    gpu_ceiling.static_ceiling_override = ceiling_bytes;
     const wired: u64 = 3_380_379_648;
-    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes, .{});
+    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, ceiling_bytes - module.ceiling_stop_bytes, .{});
     try testing.expect(nr.prefill <= nr.decode);
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
     const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired, .{});
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
-    try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
-    try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    try testing.expect(b.prefillTotal() <= ceiling_bytes - module.ceiling_stop_bytes);
+    try testing.expect(b.decodeTotal() <= ceiling_bytes - module.ceiling_stop_bytes);
     // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
     try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
     try testing.expectEqual(@as(u64, 2 << 30), b.prefill_cache);
@@ -554,8 +558,11 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
     defer arena.deinit();
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
-    config.memory_ceiling_bytes = 120_259_084_288;
-    const target = config.memory_ceiling_bytes.? - module.ceiling_stop_bytes;
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const prev_ceiling = gpu_ceiling.static_ceiling_override;
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    gpu_ceiling.static_ceiling_override = ceiling_bytes;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
@@ -636,8 +643,10 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
-    config.memory_ceiling_bytes = 120_259_084_288;
+    const config = try model.parseConfig(testing.io, a, bank_dir);
+    const prev_ceiling = gpu_ceiling.static_ceiling_override;
+    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    gpu_ceiling.static_ceiling_override = 120_259_084_288;
     const need = try loadRequirementBytes(a, testing.io, config);
     var floor = config;
     floor.memory_baseline_bytes = 0;

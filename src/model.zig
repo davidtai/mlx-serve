@@ -415,9 +415,6 @@ pub const ModelConfig = struct {
     memory_baseline_bytes: ?u64 = null,
     /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
     expert_rows: ?u32 = null,
-    /// A harness's window ceiling for a streamed-expert model's fill (the guard's number, passed
-    /// explicitly); null = upstream's static GPU ceiling (`gpu_ceiling.staticGpuMemoryCeiling`).
-    memory_ceiling_bytes: ?u64 = null,
     /// deepseek_v41's prompt-pass bill for the prefill admission (its own estimator, as deepseek_v4 has one).
     dsv41_prefill: ?deepseek_v41.PrefillBill = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
