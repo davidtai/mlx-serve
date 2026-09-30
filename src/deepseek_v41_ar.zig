@@ -379,6 +379,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const forwards = try forwardRows(a, calls, ref.new_tokens);
     var config = try model.parseConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    // The box the module's admission fills (the guard's ceiling; unset: the GPU's working set).
+    if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| config.memory_ceiling_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     config.numeric_tier = switch (run.tier) {
         .served => .served,
