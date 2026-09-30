@@ -593,14 +593,15 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     defer arena.deinit();
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
-    config.memory_ceiling_bytes = 120_259_084_288;
+    // Option B: the ceiling is the harness's argument, not a config field.
+    const ceiling: u64 = 120_259_084_288;
     config.memory_baseline_bytes = 9_200_000_000;
     config.expert_rows = min_fill_rows;
     config.expert_prefill_rows = min_fill_rows;
-    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null);
+    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{});
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
-    const opts = module.armOptions(&config, module.boxCeiling(config.memory_ceiling_bytes.?, c.n_routed_experts), .host);
+    const opts = module.armOptions(&config, module.boxCeiling(ceiling, c.n_routed_experts), .host);
     try testing.expectEqual(@as(u8, 2), opts.wide_depth);
     try testing.expectEqual(@as(u64, opts.wide_depth) * xp.max_route_ids, b.transient_rows);
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
