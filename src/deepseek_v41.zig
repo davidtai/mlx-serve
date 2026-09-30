@@ -10,6 +10,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const expert_admission = @import("expert_admission.zig");
+const kvc = @import("deepseek_v41_cache.zig");
 
 pub const max_layers = 64;
 pub const max_rank = 6;
@@ -28,11 +29,16 @@ pub const PrefillBill = struct {
     selected_keys: u64,
     /// The chunk rule's smallest positive compression ratio (`prefillScoreBytesPerRow`).
     min_ratio: u64,
-    /// f32 bytes one position adds: the stock tier keeps every layer's window history, the served tier's
-    /// window is a ring (its fixed bytes below) and only the sources' compressed and index lanes grow.
+    /// f32 bytes one position adds on the stock tier, which keeps every layer's window history.
     kv_pos_bytes: u64,
-    kv_source_pos_bytes: u64,
-    window_ring_bytes: u64,
+    /// The served tier's bounded lanes (`laneBytes`, `ringPromptBytes`, `ringDecodeBytes`): the window, the head
+    /// widths, the kv sources' compression ratios, and one ring row over every layer (bf16 on layer 0, f32 after).
+    window: u64 = 0,
+    head_dim: u64 = 0,
+    index_head_dim: u64 = 0,
+    kv_sources: [max_layers]u8 = @splat(0),
+    n_kv_sources: u8 = 0,
+    ring_row_bytes: u64 = 0,
     /// The stock head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
     head_promotion_bytes: u64,
     /// The allocator cache the module holds MLX to during the prefill: the stock tier's (the envelope's
@@ -80,13 +86,22 @@ pub const PrefillBill = struct {
         var min_ratio: u64 = 0;
         var kv: u64 = 0;
         var src: u64 = 0;
+        var sources: [max_layers]u8 = @splat(0);
+        var n_sources: u8 = 0;
+        var ring_row: u64 = 0;
         for (c.layers[0 .. c.n_layers + c.dspark.n_stages], 0..) |li, l| {
             if (li.ratio > 0 and (min_ratio == 0 or li.ratio < min_ratio)) min_ratio = li.ratio;
             if (l >= c.n_layers) continue;
             kv += @as(u64, c.head_dim) * 4;
+            // The ring's row: layer 0's KV comes off the bf16 embedding stream, every later layer's is f32.
+            ring_row += @as(u64, c.head_dim) * @as(u64, if (l == 0) 2 else 4);
             if (li.ratio == 0) continue;
             if (li.kv_source) src += @as(u64, c.head_dim) * 4 / li.ratio;
             if (li.index_source) src += @as(u64, c.index_head_dim) * 4 / li.ratio;
+            if (li.kv_source) {
+                sources[n_sources] = li.ratio;
+                n_sources += 1;
+            }
         }
         kv += src;
         return .{
@@ -95,8 +110,12 @@ pub const PrefillBill = struct {
             .selected_keys = @as(u64, c.window) + c.index_topk,
             .min_ratio = min_ratio,
             .kv_pos_bytes = kv,
-            .kv_source_pos_bytes = src,
-            .window_ring_bytes = @as(u64, c.n_layers) * c.window * c.head_dim * 4,
+            .window = c.window,
+            .head_dim = c.head_dim,
+            .index_head_dim = c.index_head_dim,
+            .kv_sources = sources,
+            .n_kv_sources = n_sources,
+            .ring_row_bytes = ring_row,
             .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
             .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
             .served_cache_bytes = served_prefill_cache_bytes,
@@ -173,13 +192,56 @@ pub const PrefillBill = struct {
         return b.layerMajorWaveBytes(seq, tier) + b.wideLaneBytes(seq);
     }
 
+    /// The served tier's bounded KV lanes outside the window ring, for a request of `positions` (its prompt, its
+    /// tokens and one verify block): each allocated at its cap at its first write and held to the request's end
+    /// (`deepseek_v41_cache.LayerState`, W107). Every kv source holds its compressed lane and its index lane,
+    /// `boundedCompCap` rows of head_dim and index_head_dim f32 (an index-only source reads its kv source's lane);
+    /// a ratio > 1 kv source also holds its compressor frontier, raw_kv and raw_score, `boundedLatentCap` rows of
+    /// head_dim f32 each.
+    pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
+        const m: u32 = @intCast(positions);
+        var n: u64 = 0;
+        for (b.kv_sources[0..b.n_kv_sources]) |r| {
+            n += @as(u64, kvc.boundedCompCap(m, r).?) * (b.head_dim + b.index_head_dim) * 4;
+            if (r > 1) n += 2 * @as(u64, kvc.boundedLatentCap(m).?) * b.head_dim * 4;
+        }
+        return n;
+    }
+
+    /// The window ring through the prompt pass: both of its slots at the compaction size, a chunk plus the window
+    /// less one row, on every layer.
+    pub fn ringPromptBytes(b: PrefillBill, seq: u64) u64 {
+        return b.ring_row_bytes * 2 * (@min(b.chunkRows(seq), @max(seq, 1)) + b.window -| 1);
+    }
+
+    /// The window ring in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows
+    /// plus the window less one) beside the base (the window, a verify block, its slack and the headroom); steady
+    /// decode holds two bases.
+    pub fn ringDecodeBytes(b: PrefillBill, seq: u64) u64 {
+        const geo: kvc.Geometry = .{};
+        const base = b.window + geo.max_verify + geo.slack + geo.headroom;
+        const chunk = @min(b.chunkRows(seq), @max(seq, 1));
+        const n_last = ((@max(seq, 1) - 1) % chunk) + 1;
+        return b.ring_row_bytes * @max(n_last + (b.window -| 1) + base, 2 * base);
+    }
+
+    /// The served tier's KV in the prompt phase (the lanes and the prompt's ring) and in decode (the lanes and the
+    /// decode ring), for a prompt of `seq` in a request of `positions`.
+    pub fn kvPromptBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
+        return b.laneBytes(positions) + b.ringPromptBytes(seq);
+    }
+
+    pub fn kvDecodeBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
+        return b.laneBytes(positions) + b.ringDecodeBytes(seq);
+    }
+
     /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
     /// chunk-major wave.
     pub fn layerMajorBytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
         const positions = seq + max_tokens + 8;
         const kv = switch (tier) {
             .stock => positions * b.kv_pos_bytes,
-            .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
+            .served => b.kvPromptBytes(seq, positions),
         };
         const head = if (tier == .stock) b.head_promotion_bytes else 0;
         return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cacheBytes(tier);
@@ -192,7 +254,7 @@ pub const PrefillBill = struct {
         const positions = seq + max_tokens + 8;
         const kv = switch (tier) {
             .stock => positions * b.kv_pos_bytes,
-            .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
+            .served => b.kvPromptBytes(seq, positions),
         };
         const head = if (tier == .stock) b.head_promotion_bytes else 0;
         return wave / 4 * 5 + kv + head + b.cacheBytes(tier);
@@ -202,7 +264,7 @@ pub const PrefillBill = struct {
 /// The 3.0 bank's geometry as `PrefillBill.of` reads it (text_config: 64 heads, 32 index heads, window
 /// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets).
 fn bank30Bill() PrefillBill {
-    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .kv_source_pos_bytes = 0, .window_ring_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512 };
+    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512 };
 }
 
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
