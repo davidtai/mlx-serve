@@ -153,6 +153,10 @@ pub fn Model(comptime G: type) type {
                 lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
                 if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
             }
+            // The prefill core's sink views, once per layer (`W.sink4`).
+            if (tier.routes.prefill_attn) for (self.layers) |*lw| {
+                lw.sink4 = try self.own(g, try Tr.sinkView(g, cp, lw.attn_sink));
+            };
             // DENSE16 o-projection: its rhs index pair, once, shared by every layer (`W.oproj_idx`).
             if (tier.routes.prefill_oproj) {
                 const oi = try Tr.oprojIndices(g, cp);
