@@ -706,6 +706,8 @@ pub fn Model(comptime G: type) type {
                 const li = c.layers[l];
                 const lc = &st.layers[l];
                 if (comptime has_ahead) {
+                    // The predictor's stages charge the layer's first chunk (not the previous layer's last).
+                    probeChunk(probe, 0);
                     if (read_ahead) try self.predictSeed(g, l, lw, routed.at(@intCast(l)), hs, pms, probe);
                 }
                 // One wave per layer (freed at its end; hs, pms and the chunks' shared runtime carried).
