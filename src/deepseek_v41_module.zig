@@ -208,6 +208,15 @@ pub const Module = struct {
         errdefer gpa.free(self.warm_peaks);
         self.g.clearCache();
         log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        // The input embedding moves to its host rows now, not at the phase change: every lookup (the
+        // prompt's included) reads the table's rows past the page cache, and the device table is gone
+        // from both phases. Checked once: the rows equal the table's, byte for byte.
+        if (config.embedding_host_rows orelse true) {
+            try self.checkEmbeddingRows(gpa);
+            try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
+            self.fenced = true;
+            self.installed.embedding_rows = true;
+        }
         // The bill against the warm-up's measured peak (C4 G7): the widest decode-width wave, the tier's head.
         if (config.dsv41_prefill) |bill| {
             const bt: v41.PrefillBill.Tier = switch (config.numeric_tier orelse .served) {
@@ -332,6 +341,34 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
+    /// A few ids' rows through the resident table and through the host rows, compared bitwise.
+    fn checkEmbeddingRows(self: *Module, gpa: std.mem.Allocator) !void {
+        const g = &self.g;
+        const vocab: u32 = self.model.c.vocab_size;
+        const dim: u32 = self.model.c.hidden_size;
+        const ids = [_]u32{ 0, 1, 7, vocab / 2, vocab - 1 };
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table = switch (self.model.embed) {
+            .table => |w| w,
+            .rows => return error.EmbeddingRetired,
+        };
+        const m = g.mark();
+        defer g.resetTo(m);
+        const from_table = try g.astype(try (M.Embed{ .table = table }).of(g, a, &ids, dim), .float32);
+        const from_rows = try g.astype(try (M.Embed{ .rows = &self.embed_rows }).of(g, a, &ids, dim), .float32);
+        try g.evalAll(&.{ from_table, from_rows });
+        const t = try a.alloc(f32, ids.len * dim);
+        const r = try a.alloc(f32, ids.len * dim);
+        _ = try g.hostF32(from_table, t);
+        _ = try g.hostF32(from_rows, r);
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(t), std.mem.sliceAsBytes(r))) {
+            log.err("embedding rows: the host rows differ from the resident table", .{});
+            return error.EmbeddingRowsDiffer;
+        }
+    }
+
     fn streamStats(self: *Module) expert_stream.Stats {
         return switch (self.arm) {
             inline else => |t| t.arm.stream.stats(),
@@ -433,6 +470,8 @@ pub const Installed = struct {
     layer_major: bool = false,
     wide: xp.Wide = .{},
     stream_windows: u8 = 1,
+    /// The input embedding reads its host rows from construction (no device table in either phase).
+    embedding_rows: bool = false,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -447,7 +486,7 @@ pub const Installed = struct {
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
