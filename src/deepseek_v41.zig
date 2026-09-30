@@ -139,7 +139,25 @@ pub const PrefillBill = struct {
         return kept_stream + halves + selection + @max(attn, group);
     }
 
-    /// `bytes` for a K16 request: the layer-major wave (x 5/4) in place of the chunk-major one.
+    /// The K16 wide lane's own transient beside the layer-major wave: one more copy of the routed
+    /// outputs, `seq x top_k x hidden` f32. `experts.runWide` keeps each wide group's DIG-X output until
+    /// the layer's join, while the last group's DIG-X call holds its own waves in flight, parts, join and
+    /// take. `layerMajorWaveBytes` bills two routed-output copies (the join and the take), and its trace
+    /// test runs a stand-in routed hook that has none of these. Measured (NATIVE, 16,384 tokens, 4 K16
+    /// cells: 184119, 184631, 185131, 195452): prompt MLX peak over constructed = 16.24-16.25 GB =
+    /// wave 14.40 + KV 0.16 + 1.69 unmodeled, so this term (2.01 GB) covers it with 0.32 GB to spare.
+    /// It replaces the x 5/4 pad (3.60 GB at 16K).
+    pub fn wideLaneBytes(b: PrefillBill, seq: u64) u64 {
+        return seq * b.top_k * b.hidden * 4;
+    }
+
+    /// The K16 prompt pass's billed transient: the layer-major wave plus the wide lane's own.
+    pub fn layerMajorBilledBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
+        return b.layerMajorWaveBytes(seq, tier) + b.wideLaneBytes(seq);
+    }
+
+    /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
+    /// chunk-major wave.
     pub fn layerMajorBytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
         const positions = seq + max_tokens + 8;
         const kv = switch (tier) {
@@ -147,7 +165,7 @@ pub const PrefillBill = struct {
             .served => b.window_ring_bytes + positions * b.kv_source_pos_bytes,
         };
         const head = if (tier == .stock) b.head_promotion_bytes else 0;
-        return b.layerMajorWaveBytes(seq, tier) / 4 * 5 + kv + head + b.cache_bytes;
+        return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cache_bytes;
     }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
@@ -163,6 +181,27 @@ pub const PrefillBill = struct {
         return wave / 4 * 5 + kv + head + b.cache_bytes;
     }
 };
+
+/// The 3.0 bank's geometry as `PrefillBill.of` reads it (text_config: 64 heads, 32 index heads, window
+/// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets).
+fn bank30Bill() PrefillBill {
+    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .kv_source_pos_bytes = 0, .window_ring_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512 };
+}
+
+test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
+    const b = bank30Bill();
+    const wave = b.layerMajorWaveBytes(16384, .served);
+    try std.testing.expectEqual(@as(u64, 14_396_751_872), wave);
+    try std.testing.expectEqual(@as(u64, 2_013_265_920), b.wideLaneBytes(16384));
+    const billed = b.layerMajorBilledBytes(16384, .served);
+    // The K16 cells' prompt MLX peak over the constructed module (16.25 GB) less the request's KV (0.16 GB).
+    const measured: u64 = 16_250_000_000 - 160_000_000;
+    try std.testing.expect(billed >= measured and billed - measured < 400_000_000);
+    // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
+    try std.testing.expectEqual(@as(u64, 1_585_922_048), wave / 4 * 5 - billed);
+    // The per-request bill (the server's admission) carries the same transient.
+    try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
+}
 
 /// Per-layer attention mode (Python `_derive_layer_modes`): ratio 0 is a pure
 /// sliding window; a kv source owns its group's compressed KV and index keys, a

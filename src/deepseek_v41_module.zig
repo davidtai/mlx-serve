@@ -245,7 +245,12 @@ pub const Module = struct {
         cfg.memory_ceiling_bytes = ceiling_bytes;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        const b = try ar_bill.cellBill(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens);
+        // The bill plans through the arm's own inputs: the wired bytes the arm was planned with (a live
+        // read here would count this module's own banks and residents as the box's).
+        const planned_wired = switch (self.arm) {
+            inline else => |t| t.arm.inputs.wired_bytes,
+        };
+        const b = try ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, planned_wired);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
