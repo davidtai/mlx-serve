@@ -935,6 +935,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
+    // The prompt's start: the phase change's reclaim reference (the loop drives the prompt itself).
+    md.promptStart();
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
