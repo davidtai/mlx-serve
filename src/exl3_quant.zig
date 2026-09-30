@@ -252,19 +252,6 @@ pub fn Accepted(comptime G: type) type {
 /// a self-check failure (SelfCheckFailed, `diag` naming kernel / check / site). The set's
 /// launcher must be installed on `g` first (`Set.install`): a backend that prepares launches
 /// prepares them through it.
-/// What `accept` self-checks on the device: this consumer's kernels less the texts no route launches yet. The take2
-/// retune stays out until its route flips: its 0b smoke checks it (and prices it) on the device first, so a device
-/// fault costs that smoke line, not a served construction.
-const checked_at_accept = blk: {
-    var out: [kernels.len - 1]Kernel = undefined;
-    var n: usize = 0;
-    for (kernels) |k| if (k != .dsv41_prefill_dig_take2v_5120) {
-        out[n] = k;
-        n += 1;
-    };
-    break :blk out;
-};
-
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
     const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
     try checkSpec(spec, diag);
@@ -274,7 +261,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
+    try set.selfCheck(a, &kernels, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -507,9 +494,9 @@ pub fn DigX(comptime G: type) type {
         const Self = @This();
         gemm_gu: *const Entry,
         gemm_dn: *const Entry,
+        /// the lane's take2 text: the retune's bitwise reference (its 0b smoke), not launched by the route
         take2_e: *const Entry,
-        /// the take2 retune (`dsv41_prefill_dig_take2v_5120`): registered, and launched by its 0b smoke only, until
-        /// its route flips; the route launches the lane's take2
+        /// the take2 retune the route launches (both outputs per simdgroup from one act load)
         take2v_e: *const Entry,
         roundx_e: *const Entry,
         onepass_e: *const Entry,
@@ -554,11 +541,14 @@ pub fn DigX(comptime G: type) type {
         }
 
         /// act [A, 5120] bf16 rows ridx [rows] i32, rhs [rows] u32 (expert per row), slots = a
-        /// table -> (f16(t128(act * rin_g[slot])), f16(t128(act * rin_u[slot]))) [rows, 1, 5120].
+        /// table -> (f16(t128(act * rin_g[slot])), f16(t128(act * rin_u[slot]))) [rows, 1, 5120]. The retune
+        /// (`dsv41_prefill_dig_take2v_5120`): one simdgroup per (row, 128-block) writes both outputs from one act
+        /// load, the lane text's butterflies in its bit order, so its words are the lane's (the device self-check
+        /// `mlx_chain`, bitwise; the 0b smoke against the lane text on real records).
         pub fn take2(self: *const Self, g: *G, act: G.T, ridx: G.T, rhs: G.T, slots: G.T, rin_g: G.T, rin_u: G.T) ![2]G.T {
             const vars = rowsVars(rowsOf(G, g, ridx, 0));
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.take2_e, &vars, &.{ act, ridx, rhs, slots, rin_g, rin_u }, &out);
+            try launchRule(G, g, self.take2v_e, &vars, &.{ act, ridx, rhs, slots, rin_g, rin_u }, &out);
             return out;
         }
 
@@ -1077,6 +1067,23 @@ fn routeRows(a: Allocator, seed: u64, slots: []const u32, counts: []const u32) !
 }
 
 
+/// A take2 launch line's two forms. The lane samples and the move's pinned log name the lane's take2
+/// (`q3_prefill_dig_rot_take2_5120`, grid z 2: one simdgroup per output); the route launches the retune
+/// (`dsv41_prefill_dig_take2v_5120`, grid z 1: both outputs per simdgroup) over the same inputs and outputs, so the
+/// two lines differ in the kernel name and the grid's z only.
+const Take2Form = struct { prefix: []const u8, z: u8 };
+const take2_lane: Take2Form = .{ .prefix = "launch q3_prefill_dig_rot_take2_5120 g=1280,", .z = '2' };
+const take2_retune: Take2Form = .{ .prefix = "launch dsv41_prefill_dig_take2v_5120 g=1280,", .z = '1' };
+
+/// `line` in the `to` form when it is a take2 launch in the `from` form (allocated in `a`), else `line` itself.
+fn swapTake2(a: Allocator, line: []const u8, from: Take2Form, to: Take2Form) ![]const u8 {
+    if (!std.mem.startsWith(u8, line, from.prefix)) return line;
+    const rest = line[from.prefix.len..];
+    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse return error.TestUnexpectedResult;
+    if (comma + 2 >= rest.len or rest[comma + 1] != from.z or rest[comma + 2] != ' ') return error.TestUnexpectedResult;
+    return std.mem.concat(a, u8, &.{ to.prefix, rest[0..comma], &.{ ',', to.z }, rest[comma + 2 ..] });
+}
+
 /// The trace's log from `from` on is the lane's `want`, event for event.
 fn expectEvents(t: *const Trace, from: usize, want: []const []const u8, case: []const u8, what: []const u8) !void {
     const got = t.log.items[from..];
@@ -1172,6 +1179,7 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
     try testing.expectEqualStrings("mlx-serve-exl3-prefill-wave-samples-v1", parsed.value.format);
     var n_calls: usize = 0;
     var n_waves: usize = 0;
+    var n_retuned: usize = 0;
     for (parsed.value.cases) |*cs| {
         var t: Trace = .{ .a = a };
         defer t.deinit();
@@ -1189,7 +1197,15 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
             const nodes0 = t.nodes.items.len;
             const resets0 = t.freed.items.len;
             const res = try r.call(&t, act, .{ .slot = slots }, bank);
-            try expectEvents(&t, mark, cl.events, cs.case, cl.name);
+            // the lane's take2 launches in the retune's form (name and grid z); every other event as sampled
+            var want_arena = std.heap.ArenaAllocator.init(a);
+            defer want_arena.deinit();
+            const want = try want_arena.allocator().alloc([]const u8, cl.events.len);
+            for (want, cl.events) |*w, e| {
+                w.* = try swapTake2(want_arena.allocator(), e, take2_lane, take2_retune);
+                n_retuned += @intFromBool(w.*.ptr != e.ptr);
+            }
+            try expectEvents(&t, mark, want, cs.case, cl.name);
             // the wave lifecycle: one mark / resetTo per wave and one around the join; nothing the
             // call built outlives it but the kept result and the waves still in flight
             const waves = (t.launches.items.len - launches0) / 5;
@@ -1218,6 +1234,8 @@ test "dsv41 kernels ops: the prefill wave route replays the lane's own launches,
         try testing.expectEqual(@as(isize, 0), t.keeps);
     }
     try testing.expect(n_calls >= 10 and n_waves >= 60);
+    // every sampled wave's take2 went through the retune
+    try testing.expectEqual(n_waves, n_retuned);
 }
 
 test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wave, half of Record 3's waves, every row once" {
@@ -1319,7 +1337,7 @@ test "dsv41 kernels ops: prefill rows read by act_row take the same act words (t
     for (ta.launches.items, tb.launches.items) |la, lb| {
         try testing.expectEqual(la.k, lb.k);
         try testing.expectEqual(la.cfg.grid, lb.cfg.grid);
-        if (la.k != .q3_prefill_dig_rot_take2_5120) continue;
+        if (la.k != .dsv41_prefill_dig_take2v_5120) continue;
         // ridx: assignment row p in A reads act row p; in B, act_row[p] = p / 6
         const ba, const bb = .{ ta.nodes.items[la.inputs[1]].bytes, tb.nodes.items[lb.inputs[1]].bytes };
         try testing.expectEqual(ba.len, bb.len);
@@ -1484,8 +1502,23 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     };
     try acc.finishPrefill(&tb);
     try renderLog(&tb, b0, &lb);
-    try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lb.items, "\n"));
-    try testing.expectEqualStrings(moved_log_sha256, &digestOf(lb.items));
+    // The route launches the take2 retune (same inputs and outputs; name and grid z differ): its lines back in the
+    // lane's form, then every byte as pinned at the move.
+    var lane_arena = std.heap.ArenaAllocator.init(a);
+    defer lane_arena.deinit();
+    var lane_log: std.ArrayList(u8) = .empty;
+    defer lane_log.deinit(a);
+    var n_retuned: usize = 0;
+    var lines = std.mem.splitScalar(u8, lb.items, '\n');
+    while (lines.next()) |line| {
+        const l2 = try swapTake2(lane_arena.allocator(), line, take2_retune, take2_lane);
+        n_retuned += @intFromBool(l2.ptr != line.ptr);
+        try lane_log.appendSlice(a, l2);
+        if (lines.index != null) try lane_log.append(a, '\n');
+    }
+    try testing.expect(n_retuned > 0);
+    try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lane_log.items, "\n"));
+    try testing.expectEqualStrings(moved_log_sha256, &digestOf(lane_log.items));
     // checkBank: the moved per-projection check's refusals, through the quant's entry
     for ([_]struct { cap: c_int, last: c_int, rin_dt: Dtype, what: []const u8 }{
         .{ .cap = 1, .last = 32, .rin_dt = .float16, .what = "input code" },
