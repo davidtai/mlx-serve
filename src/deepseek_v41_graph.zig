@@ -1601,8 +1601,16 @@ pub fn Trunk(comptime G: type) type {
             const sa = try g.reshape(w.wo_a.s, &.{ G_, R, ss.dim(-1) });
             const idx = try g.astype(try g.arange(0, @floatFromInt(G_), 1, .int32), .uint32);
             const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, idx, w.wo_a.mode);
-            const flat = try g.reshape(try g.transposeAxes(o2, &.{ 1, 0, 2 }), &.{ b, s, G_ * R });
-            return g.astype(try qlinear(g, flat, w.wo_b), .float32);
+            // [S, g x rank] (the bf16 copy), then wo_b as the lane does: one gather_qmm over its [1, out,
+            // in / 4] view with rhs [0] (the NAX gather kernel at the chunk's rows), widened to f32.
+            const flat = try g.reshape(try g.transposeAxes(o2, &.{ 1, 0, 2 }), &.{ 1, b * s, G_ * R });
+            const bs_ = g.shapeOf(w.wo_b.w);
+            const bss = g.shapeOf(w.wo_b.s);
+            const wb = try g.reshape(w.wo_b.w, &.{ 1, bs_.dim(0), bs_.dim(1) });
+            const sb = try g.reshape(w.wo_b.s, &.{ 1, bss.dim(0), bss.dim(1) });
+            const idx0 = try g.astype(try g.arange(0, 1, 1, .int32), .uint32);
+            const y = try g.gatherQmm(flat, wb, sb, idx0, w.wo_b.mode);
+            return g.astype(try g.reshape(y, &.{ b, s, bs_.dim(0) }), .float32);
         }
 
         /// `outProj` after the prefill core: o already inverse-roped as [g, S, in] f32 -> the grouped
