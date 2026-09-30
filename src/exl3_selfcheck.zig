@@ -93,9 +93,10 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .compile, .row_invariance => true,
         .join_equiv => k == .q3jl_combine,
         .twin => twinOf(k) != null,
+        .fused => fusedOf(k) != null,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
-        .composition => isDigGemm(k),
+        .composition => isDigGemm(k) or fusedOf(k) != null,
         .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
         .mlx_chain => switch (k) {
             .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
@@ -112,6 +113,11 @@ pub fn implemented(k: Kernel, c: Check) bool {
 
 fn isDigGemm(k: Kernel) bool {
     return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null;
+}
+
+/// The fused down GEMM's GEMM text (its `fused` check's reference is that text, then rot_widen1); null otherwise.
+fn fusedOf(k: Kernel) ?Kernel {
+    return if (k == .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1) .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 else null;
 }
 
 /// A 128-row DIG-X GEMM's 64-row text (its `twin` check's reference); null for every other kernel.
@@ -208,6 +214,7 @@ const H = struct {
             .composition => try checkComposition(h, k),
             .join_equiv => try checkJoinEquiv(h, k),
             .twin => try checkTwin(h, k),
+            .fused => try checkFused(h, k),
         }
     }
 };
@@ -1576,8 +1583,9 @@ fn isGateUp(k: Kernel) bool {
     return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128;
 }
 
-/// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand).
-fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []const mlx.mlx_array, wave: *const Wave) ![xk.max_outputs]mlx.mlx_array {
+/// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand); `rout` for the fused
+/// down GEMM's epilogue (its bank's rout, before the table).
+fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []const mlx.mlx_array, rout: ?mlx.mlx_array, wave: *const Wave) ![xk.max_outputs]mlx.mlx_array {
     const e = h.reg.get(k);
     const tbl_arg = &e.inputs[e.inputs.len - 1];
     var t: [80]i32 = undefined;
@@ -1598,6 +1606,10 @@ fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []c
         ins[n] = c;
         n += 1;
     }
+    if (rout) |r| {
+        ins[n] = r;
+        n += 1;
+    }
     ins[n] = tbl;
     n += 1;
     return launch(h, sc, k, ins[0..n], &vars, null);
@@ -1606,6 +1618,7 @@ fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []c
 const DigFull = struct {
     xs: [2]mlx.mlx_array,
     codes: [2]mlx.mlx_array,
+    rout: ?mlx.mlx_array = null,
     n_ops: usize,
     outs: [xk.max_outputs]mlx.mlx_array,
     wave: Wave,
@@ -1634,7 +1647,8 @@ fn digFullAt(h: *H, sc: *Scope, k: Kernel, rows_of: []const u32) !DigFull {
         f.xs[o] = try genInput(h, sc, &e.inputs[o], &vars, &wave);
         f.codes[o] = try genInput(h, sc, &e.inputs[n_ops + o], &vars, &wave);
     }
-    f.outs = try digLaunch(h, sc, k, f.xs[0..n_ops], f.codes[0..n_ops], &wave);
+    if (fusedOf(k) != null) f.rout = try genInput(h, sc, &e.inputs[2 * n_ops], &vars, &wave);
+    f.outs = try digLaunch(h, sc, k, f.xs[0..n_ops], f.codes[0..n_ops], f.rout, &wave);
     return f;
 }
 
@@ -1677,7 +1691,7 @@ fn checkComposition(h: *H, k: Kernel) !void {
             w.slots[i] = f.wave.slots[j];
             w.rows[i] = f.wave.rows[j];
         }
-        const outs = try digLaunch(h, &sg, k, xs[0..f.n_ops], f.codes[0..f.n_ops], &w);
+        const outs = try digLaunch(h, &sg, k, xs[0..f.n_ops], f.codes[0..f.n_ops], f.rout, &w);
         for (0..f.n_ops) |o| {
             const got = try hostCopy(h, outs[o]);
             defer h.a.free(got);
@@ -1702,7 +1716,7 @@ fn checkTwin(h: *H, k: Kernel) !void {
     var sc: Scope = .{ .a = h.a };
     defer sc.deinit();
     const f = try digFullAt(h, &sc, k, &twin_rows);
-    const ref = try digLaunch(h, &sc, twinOf(k).?, f.xs[0..f.n_ops], f.codes[0..f.n_ops], &f.wave);
+    const ref = try digLaunch(h, &sc, twinOf(k).?, f.xs[0..f.n_ops], f.codes[0..f.n_ops], null, &f.wave);
     var words: u64 = 0;
     var bad: u64 = 0;
     for (0..f.n_ops) |o| {
@@ -1714,6 +1728,41 @@ fn checkTwin(h: *H, k: Kernel) !void {
         bad += if (got.len == want.len) countDiff(want, got, 4) else got.len / 4;
     }
     try h.record(.{ .kernel = k, .check = .twin, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
+}
+
+/// The fused down GEMM against its two-kernel chain on the same x, codes, rout and wave (experts of 270 / 129 / 64 / 1
+/// rows): the 128-row down text's z, then rot_widen1 over it (each row's expert into the wave table's slots). Every
+/// output word.
+fn checkFused(h: *H, k: Kernel) !void {
+    var sc: Scope = .{ .a = h.a };
+    defer sc.deinit();
+    const f = try digFullAt(h, &sc, k, &twin_rows);
+    const z = try digLaunch(h, &sc, fusedOf(k).?, f.xs[0..1], f.codes[0..1], null, &f.wave);
+    const total: usize = @intCast(f.wave.total());
+    const rhs = try h.a.alloc(u32, total);
+    defer h.a.free(rhs);
+    var r: usize = 0;
+    for (f.wave.rows[0..f.wave.n], 0..) |rows, j| for (0..rows) |_| {
+        rhs[r] = @intCast(j);
+        r += 1;
+    };
+    var t: [80]i32 = undefined;
+    _ = f.wave.table(h.reg.get(k).inputs[3].domain.tiles, 128, &t);
+    var vars: Vars = .initFill(0);
+    vars.set(.rows, total);
+    vars.set(.a_rows, total);
+    vars.set(.cap, 4);
+    vars.set(.experts, f.wave.n);
+    const slots = try fromHost(&sc, std.mem.sliceAsBytes(&t), &.{80}, .int32);
+    const rhs_a = try fromHost(&sc, std.mem.sliceAsBytes(rhs), &.{@intCast(total)}, .uint32);
+    const ref = try launch(h, &sc, .q3_prefill_dig_rot_widen1_5120, &.{ z[0], rhs_a, slots, f.rout.? }, &vars, null);
+    const got = try hostCopy(h, f.outs[0]);
+    defer h.a.free(got);
+    const want = try hostCopy(h, ref[0]);
+    defer h.a.free(want);
+    const words = got.len / 4;
+    const bad = if (got.len == want.len) countDiff(want, got, 4) else words;
+    try h.record(.{ .kernel = k, .check = .fused, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
 }
 
 /// f16(z) of the first and last rows of experts 0 and 3 vs x (f16) @ W_hat (exl3_ref decode)
