@@ -62,6 +62,7 @@ pub fn run(comptime A: type, a: std.mem.Allocator, io: std.Io, arm: *A, g: *A.Ba
     try generated.append(a, try decode.prefill(arm, g, prompt));
     const prompt_eval = t0.untilNow(io, .boot);
     const io_after_prefill = arm.stream.stats();
+    _ = try arm.releaseTransient();
     try arm.grow(g);
     // The phase change is in neither prompt_eval nor decode_wall: the Python harness grows in its prefill callback.
     const t1 = std.Io.Timestamp.now(io, .boot);

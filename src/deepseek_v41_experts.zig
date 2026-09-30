@@ -222,6 +222,11 @@ pub const StreamSource = struct {
         return self.stream.grow(decode_rows);
     }
 
+    /// The phase change's first free (`Stream.releaseTransient`): the bytes freed.
+    pub fn releaseTransient(self: *StreamSource) !u64 {
+        return self.stream.releaseTransient();
+    }
+
     pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
         return self.stream.seedPrefill(layer, ids);
     }
@@ -1010,6 +1015,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         wide: WideScratch = .{},
         /// The wide lane's read schedule (`Options.wide`).
         wide_route: Wide = .{},
+        /// `releaseTransient` nulled the transient bindings; `grow` binds decode's window 0.
+        transient_released: bool = false,
 
         pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{} };
 
@@ -1121,10 +1128,22 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return arrays;
         }
 
-        /// The one phase change: the source grows, the grown rows are bound.
+        /// The phase change's first free: every layer's transient binding nulled (from here to `grow` a stray use
+        /// fails on null, never on freed arrays), then the source frees the scratch. Returns the bytes freed.
+        pub fn releaseTransient(self: *Self) !u64 {
+            for (self.banks) |*b| b[@backingInt(BankKind.transient)] = null;
+            self.transient_released = true;
+            return self.source.releaseTransient();
+        }
+
+        /// The one phase change: the source grows, the grown rows (and after a release, decode's window 0) are bound.
         pub fn grow(self: *Self, g: *G, decode_rows: []const u32) !void {
             try self.source.grow(decode_rows);
-            for (self.banks, 0..) |*b, l| b[@backingInt(BankKind.ext)] = try bind(g, self.source, @intCast(l), .ext);
+            for (self.banks, 0..) |*b, l| {
+                b[@backingInt(BankKind.ext)] = try bind(g, self.source, @intCast(l), .ext);
+                if (self.transient_released) b[@backingInt(BankKind.transient)] = try bind(g, self.source, @intCast(l), .transient);
+            }
+            self.transient_released = false;
         }
 
         /// After the forward's last eval: settles and unpins released calls.
@@ -2320,6 +2339,32 @@ fn expectRowsHold(s: *expert_stream.Stream, sb: *const SynthBank, layer: u32, id
     }
 }
 
+test "dsv41 experts: the transient release nulls every layer's binding before the stream frees the scratch, and the grow binds window 0" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 5 * 12, .wide_depth = 5, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 } });
+    defer s.deinit();
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const c = testConfig(64, 32, 2);
+    var ex = try Experts(TraceOps, StreamSource, TraceMath).init(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c);
+    defer ex.deinit();
+    for (ex.banks) |b| try testing.expect(g.shapeOf(b[@backingInt(BankKind.transient)].?.down.rin).eql(ops.Shape.of(&.{ 60, 32 })));
+    // The one holder outside the stream (the binding table) is cleared in the call that frees the scratch.
+    try testing.expect(try ex.releaseTransient() > 0);
+    for (ex.banks, 0..) |b, l| {
+        try testing.expect(b[@backingInt(BankKind.transient)] == null);
+        try testing.expectEqual(@as(u32, 0), src.bankRows(@intCast(l), .transient));
+        try testing.expect(try src.bankArrays(&g, @intCast(l), .transient) == null);
+    }
+    try testing.expectEqual(@as(u8, 1), src.wideDepth());
+    // The grow binds decode's window 0 in every layer (the grown banks' check then sees it).
+    try ex.grow(&g, &.{ 4, 8 });
+    for (ex.banks) |b| try testing.expect(g.shapeOf(b[@backingInt(BankKind.transient)].?.down.rin).eql(ops.Shape.of(&.{ 12 + expert_stream.decode_staging_rows, 32 })));
+}
+
 test "dsv41 experts: the stream adapter hands the hook every routed record's rows, parts after their reads" {
     const a = testing.allocator;
     var sb = try SynthBank.open(32);
@@ -2347,6 +2392,7 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
     try expectRowsHold(s, &sb, 0, script.calls[0], src.served(&src.calls[0]));
     try testing.expectEqual(@as(u32, 1), src.served(&src.calls[0]).n_parts);
     // Growth binds layer 1's grown rows; decode routes cut parts of <= 3 records.
+    _ = try ex.releaseTransient();
     try ex.grow(&g, &.{ 4, 8 });
     try testing.expect(g.shapeOf(ex.banks[1][@backingInt(BankKind.ext)].?.up.rout).eql(ops.Shape.of(&.{ 4, 32 })));
     try testing.expect(ex.banks[0][@backingInt(BankKind.ext)] == null);

@@ -210,6 +210,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
     var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
+    _ = try ex.releaseTransient();
     try ex.grow(&g, grown);
     try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 ar", "slots grown (the residents are loaded lazily, at first use)");
@@ -451,7 +452,10 @@ test "dsv41 ar: the served schedule through the served module records its greedy
             var prev_limit: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev_limit, @import("expert_admission.zig").Envelope.dsv41_pass2.decode_cache_bytes);
             switch (m.arm) {
-                inline else => |t| try t.arm.grow(&m.g),
+                inline else => |t| {
+                    _ = try t.arm.releaseTransient();
+                    try t.arm.grow(&m.g);
+                },
             }
         },
     }
@@ -866,6 +870,8 @@ const CellReceipt = struct {
     wide_seed: ?bool = null,
     wide_hot_first: ?bool = null,
     wide_depth: ?u8 = null,
+    /// Decode's transient rows after the phase change (window 0 + `decode_staging_rows`; the bill's name).
+    transient_decode_rows: ?u32 = null,
     wide_cold_rows: ?u8 = null,
     /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
     wide_read_ahead: ?bool = null,
@@ -1160,6 +1166,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_seed = md.installed.wide.seed,
         .wide_hot_first = md.installed.wide.hot_first,
         .wide_depth = md.installed.wide.depth,
+        .transient_decode_rows = switch (md.arm) {
+            inline else => |t| t.arm.stream.transient.rows,
+        },
         .wide_cold_rows = md.installed.wide.cold_rows,
         .wide_read_ahead = md.installed.wide.read_ahead,
         .wide_base_at_seed = md.installed.wide.base_at_seed,
@@ -2531,6 +2540,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
     var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
+    _ = try ex.releaseTransient();
     try ex.grow(&g, grown);
     try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 dspark", "residents and the draft head built, slots grown");

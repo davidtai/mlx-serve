@@ -180,6 +180,8 @@ pub const Module = struct {
     fill_target: u64 = 0,
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
+    /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
+    phase_observer: ?PhaseObserver = null,
     /// The prompt-start reference and the terminal refusal (`PhaseGate`).
     gate: PhaseGate = .{},
     /// The shell's io (the phase change's bounded settle waits on it).
@@ -807,8 +809,8 @@ pub const Module = struct {
     /// 1. Every GPU command of the prompt retires (synchronize): MLX's completion handlers hand the buffers
     ///    they held back to its allocator, and Metal keeps a released buffer's pages until its command
     ///    buffers complete (v6b: a clear before the handlers ran left 4.1 GB in the footprint into decode).
-    /// 2. The frees: the device embedding if it is still there, MLX's buffer cache cleared, the decode cache
-    ///    limit set, synchronize.
+    /// 2. The frees: the device embedding if it is still there, the transient scratch (`releaseTransient`: the
+    ///    grow allocates decode's window 0), MLX's buffer cache cleared, the decode cache limit set, synchronize.
     /// 3. The settle (read every `phase_change_poll_ms`, at most `phase_change_settle_ms`) and ONE check on
     ///    this process's own ledgers: MLX's cache empty, MLX active and the footprint down by the freed bytes.
     ///    The whole box's pages (the guard's metric, other processes included) are the harness's and the
@@ -819,10 +821,11 @@ pub const Module = struct {
     fn phaseChange(self: *Module) !void {
         try self.gate.request();
         if (self.grown()) return;
-        var marks: [4]VmMark = undefined;
+        var marks: [5]VmMark = undefined;
         marks[0] = VmMark.now();
         _ = mlx.mlx_synchronize(self.g.s);
         const before = BoundaryMemory.now();
+        try self.observe(.start);
         var freed_device: u64 = 0;
         if (!self.fenced) {
             freed_device = self.model.embeddingBytes();
@@ -830,21 +833,36 @@ pub const Module = struct {
             self.fenced = true;
         }
         marks[1] = VmMark.now();
+        // The transient scratch, freed before the cache clear so the boundary check counts it (the grow allocates
+        // decode's window 0); a holder that kept it refuses here by name (TransientStillReferenced).
+        const transient_freed = switch (self.arm) {
+            inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
+        };
+        freed_device += transient_freed;
+        marks[2] = VmMark.now();
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
         const st = settle(LiveReader{ .io = self.io }, before, freed_device);
-        marks[2] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .settle_ms = st.waited_ms };
+        marks[3] = VmMark.now();
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms };
         checkFreed(before, st.after, freed_device) catch |e| return self.refuseBoundary(e);
+        try self.observe(.released);
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
-        marks[3] = VmMark.now();
+        marks[4] = VmMark.now();
         self.phase_change.?.grown = BoundaryMemory.now();
+        try self.observe(.grown);
         self.logPhaseChange();
-        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (settled)", "after the banks grew" }) |m, name|
+        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |m, name|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
+    }
+
+    /// The harness's observer at a proof point (none on the served path); its error refuses the boundary.
+    fn observe(self: *Module, stage: PhaseObserver.Stage) !void {
+        const o = self.phase_observer orelse return;
+        o.mark(o.ctx, stage) catch |e| return self.refuseBoundary(e);
     }
 
     /// One `NATIVE DSV41_PHASE_CHANGE {json}` line of the record (success or refusal): the server log carries
@@ -1028,9 +1046,21 @@ pub const PhaseChangeRecord = struct {
     after: BoundaryMemory,
     grown: ?BoundaryMemory = null,
     freed_bytes: u64,
+    /// The transient scratch the release freed (included in `freed_bytes`; 0 for a shrink).
+    transient_freed_bytes: u64 = 0,
     settle_ms: u32,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
+};
+
+/// A harness's observer of the phase change (the window's box proofs), set before the first request; none on the served
+/// path. `start`: after the first synchronize, before any free; `released`: after the release, the clear and the
+/// boundary check, before the grow allocates; `grown`: after the grow and the grown banks' check.
+pub const PhaseObserver = struct {
+    ctx: *anyopaque,
+    mark: *const fn (ctx: *anyopaque, stage: Stage) anyerror!void,
+
+    pub const Stage = enum { start, released, grown };
 };
 
 /// The request's phase gate: every public Module entry asks it first, so the order of a request's entries is
