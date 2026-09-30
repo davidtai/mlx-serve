@@ -481,8 +481,9 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The prompt's start (before it allocates anything): while the banks have not grown, the first one
-    /// records the reference the phase change judges its reclaim against (`PhaseGate.startPrompt`). The
+    /// The prompt's start (before it allocates anything): while the banks have not grown, every prompt
+    /// records the reference the phase change judges its reclaim against (`PhaseGate.startPrompt`), so the
+    /// shell's warm-up forwards (a prefill at load) never pin it for a request that comes much later. The
     /// served path calls it from `prefill`; a harness that drives the loop itself calls it before its prompt.
     pub fn promptStart(self: *Module) void {
         self.gate.startPrompt(self.grown(), outsideOf(BoundaryMemory.now()));
@@ -721,15 +722,16 @@ pub const PhaseChangeRecord = struct {
     refused: ?[]const u8 = null,
 };
 
-/// The phase change's gate: the prompt-start reference (the first prompt while the banks have not grown;
-/// kept until the grow, never refreshed, so a later prompt cannot fold earlier unreclaimed pages into it)
-/// and the terminal refusal (every later request refused by name).
+/// The phase change's gate: the prompt-start reference (taken at every prompt start while the banks have not
+/// grown: the latest prompt's own start, so the drift the check sees is one prompt's, never the idle time
+/// since a warm-up at load; a refused phase change is terminal, so no retry can take a reference over its own
+/// unreclaimed pages) and the terminal refusal (every later request refused by name).
 pub const PhaseGate = struct {
     outside_ref: ?u64 = null,
     refused: ?anyerror = null,
 
     pub fn startPrompt(g: *PhaseGate, grown: bool, outside: u64) void {
-        if (!grown and g.outside_ref == null) g.outside_ref = outside;
+        if (!grown) g.outside_ref = outside;
     }
 
     pub fn request(g: *const PhaseGate) error{PhaseChangeRefused}!void {
@@ -1533,12 +1535,12 @@ test "dsv41 memory: the prompt-start reference catches releases older than the b
     const st = settle(FakeReader{ .readings = &.{ drop_only, drop_only, drop_only, clean }, .i = &i, .slept_ms = &slept }, before, 0, ref);
     try std.testing.expectEqual(@as(u32, 3 * phase_change_poll_ms), st.waited_ms);
     try checkFreed(before, st.after, 0, ref);
-    // The gate: the first prompt's reference is kept (a later prompt cannot fold unreclaimed pages in),
-    // none is taken once grown, and a refusal refuses every later request by name.
+    // The gate: every prompt start while not grown takes the reference (a warm-up prefill at load never pins
+    // it for the first real request), none is taken once grown, and a refusal refuses every later request.
     var g: PhaseGate = .{};
     try g.request();
-    g.startPrompt(false, ref);
     g.startPrompt(false, ref + 3 * gb);
+    g.startPrompt(false, ref);
     try std.testing.expectEqual(@as(?u64, ref), g.outside_ref);
     var grown: PhaseGate = .{};
     grown.startPrompt(true, ref);
