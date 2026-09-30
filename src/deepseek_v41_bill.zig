@@ -615,9 +615,9 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     try testing.expect(351_152_128 - at_change < 500_000);
     // The bill carries them per phase.
     var config = try model.parseConfig(testing.io, a, bank_dir);
-    config.memory_ceiling_bytes = 120_259_084_288;
+    // Option B: the ceiling is the bill's argument, not a config field.
     config.memory_baseline_bytes = 9_200_000_000;
-    const b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);
+    const b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, 120_259_084_288, .{});
     try testing.expectEqual(pb.kvPromptBytes(fill_prompt_tokens, positions), b.kv);
     try testing.expectEqual(pb.kvDecodeBytes(fill_prompt_tokens, positions), b.kv_decode);
 }
