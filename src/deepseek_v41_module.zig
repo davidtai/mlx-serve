@@ -287,8 +287,12 @@ pub const Module = struct {
             inline else => |t| try dsl.Loop(G).warmFor(&self.g, gpa, self.model, self.head, &t.arm.hook, .{ .k_request = 0, .max_tokens = std.math.maxInt(u32) }, graph.attn_compile_max_rows),
         };
         errdefer gpa.free(self.warm_peaks);
+        // Every warm-up command retired before the clear: their completion handlers hand the buffers they
+        // held to the allocator's cache, and a clear ahead of them leaves those cached.
+        _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}", .{ self.warm_peaks.len - 1, self.warm_peaks });
         // The input embedding moves to its host rows now, not at the phase change: every lookup (the
         // prompt's included) reads the table's rows past the page cache, and the device table is gone
         // from both phases. Checked once: the rows equal the table's, byte for byte.
@@ -337,8 +341,19 @@ pub const Module = struct {
             return error.BillRowsMismatch;
         }
         self.bill = b;
+        // The footprint the module keeps: every command retired (their completion handlers hand the buffers
+        // they held to MLX's cache), then the cache cleared. SERVED9 (pass3an) read it with the fence's
+        // table still cached: the fence cleared before its reads retired, and the 2 GiB prefill cache held
+        // the 1.32 GB table (+1.33 GB over v7's construction, 0.75 GB over the bill).
+        _ = mlx.mlx_synchronize(self.g.s);
+        self.g.clearCache();
         const measured = status.footprint().now;
         const billed = b.constructionTerms().sum();
+        var mlx_active: usize = 0;
+        var mlx_cache: usize = 0;
+        _ = mlx.mlx_get_active_memory(&mlx_active);
+        _ = mlx.mlx_get_cache_memory(&mlx_cache);
+        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
         log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
         checkConstructionBytes(billed, measured) catch |e| {
             log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });

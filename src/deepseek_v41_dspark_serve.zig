@@ -103,12 +103,17 @@ pub fn Resources(comptime G: type) type {
 /// The prompt pass's fence (the stack of record's `embedding_install.retire`,
 /// before the phase change): the model's lookups move to `rows` and `owner`
 /// frees the table (`drop`). On MLX the active bytes must drop by at least
-/// the table's bytes (refused otherwise).
+/// the table's bytes (refused otherwise), and the table leaves the cache too:
+/// the commands that read it retire before the clear (their completion
+/// handlers release its buffer into MLX's cache; cleared ahead of them, the
+/// table stays cached whenever the cache limit holds it, as SERVED9's 2 GiB
+/// prefill cache held the 1.32 GB table while active dropped).
 pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *qwen4.NgramTable, owner: anytype) !void {
     const before = activeBytes(G, g);
     _ = try model.retireEmbedding(g, rows);
     owner.drop("embed.weight");
     if (G == ops.MlxOps) {
+        _ = mlx.mlx_synchronize(g.s);
         g.clearCache();
         if (before -| activeBytes(G, g) < model.embeddingBytes()) return error.EmbeddingNotReleased;
     }
