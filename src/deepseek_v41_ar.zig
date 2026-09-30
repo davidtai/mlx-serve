@@ -1228,6 +1228,12 @@ pub const CellBill = struct {
     /// The input embedding reads its host rows from construction (`embedding_host_rows`, default on): the
     /// device table is freed after the install warm-up, so no phase holds it.
     embedding_host_rows: bool = false,
+    /// What the prompt pass leaves alive through decode beyond the KV: the DSpark seed keeps a view of
+    /// the whole prompt's main taps (`main_h` slices the concat of every row's `main_hidden`, f32
+    /// [seq, n_main x hidden]) and each draft stage's window a view of its whole-prompt main KV
+    /// ([seq, head_dim] f32); a view keeps its parent's buffer (v6b: +1.30 GB persistent after the prompt,
+    /// 1.11 GB of it these). Decode phase only (inside the prompt wave's kept state during the pass).
+    prompt_state: u64 = 0,
 
     pub fn prefillTotal(b: CellBill) u64 {
         return b.baseline + b.prefillTerms().sum();
@@ -1244,7 +1250,7 @@ pub const CellBill = struct {
 
     /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
     pub fn decodeTerms(b: CellBill) PhaseTerms {
-        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead };
+        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .prompt_state = b.prompt_state };
     }
 
     /// What the constructed module holds before any request (after the install warm-up released its
@@ -1275,6 +1281,8 @@ pub const PhaseTerms = struct {
     host_reserve: u64 = 0,
     wide_window: u64 = 0,
     unbilled_overhead: u64 = 0,
+    /// The retained prompt state (decode phase).
+    prompt_state: u64 = 0,
 
     pub fn sum(t: PhaseTerms) u64 {
         var n: u64 = 0;
@@ -1406,9 +1414,14 @@ pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.Mode
         .residents = m.totalBytes(),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes() + engram.row_cache_host_bytes,
-        // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave) and the
-        // wide lane's routed-output copy; the chunk-major wave keeps its x 5/4 margin.
-        .prefill_wave = if (config.dsv41LayerMajor()) bill.layerMajorBilledBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
+        // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no joined copy, and
+        // the wave alone covers the pass (v6b: 13.54 GB measured incl. KV against 14.40 + 0.16 billed);
+        // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
+        .prefill_wave = if (config.dsv41LayerMajor())
+            (if (config.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
+        else
+            bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
         .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
@@ -1417,6 +1430,7 @@ pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.Mode
         .host_reserve = p.inputs.host_reserve_bytes,
         .wide_window = p.inputs.wide_window_bytes,
         .embedding_host_rows = config.embedding_host_rows orelse true,
+        .prompt_state = prompt_tokens * (bill.n_main * bill.hidden * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4),
     };
 }
 
@@ -1439,6 +1453,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
         .{ .name = "wide read window (depth 2)", .p = b.wide_window, .d = b.wide_window },
+        .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
         .{ .name = "unbilled process overhead (measured, unattributed)", .p = b.unbilled_overhead, .d = b.unbilled_overhead },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
@@ -1447,6 +1462,11 @@ fn printBill(b: CellBill) void {
 
 /// cell4's bill (served-cell-typical-fastest-20260929-195452: 106 / 148 rows, the 8.716 GB non-file
 /// baseline), term by term in bytes as `cellBill` built it on the bank.
+/// `cell4Bill` for the module's tests.
+pub fn cell4BillForTests() CellBill {
+    return cell4Bill();
+}
+
 fn cell4Bill() CellBill {
     const rec: u64 = 13_315_584;
     return .{
@@ -1535,13 +1555,14 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     config.memory_ceiling_bytes = 119_259_000_000;
     const wired: u64 = 3_380_379_648;
     const nr = try fillAtWired(a, testing.io, config, module.fill_prompt_tokens, module.fill_max_tokens, wired);
-    try testing.expectEqual(nr.prefill, nr.decode);
+    try testing.expect(nr.prefill <= nr.decode);
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
     const b = try cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired);
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
     try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // The failure mode: the same bill with the constructed module's wired bytes read live.
     try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));
