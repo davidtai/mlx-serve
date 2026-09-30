@@ -1579,9 +1579,9 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     var b = ar_bill.cell4BillForTests();
     const target: u64 = 118_259_084_288;
     try admitPhases(b, target);
-    // Decode rows forced past the target (148 -> 168 rows: +10.65 GB).
-    b.decode_rows = 168;
-    b.slot_decode = (40 * 168 + 48) * 13_315_584;
+    // Decode rows forced past the target (148 -> 170 rows: +11.72 GB).
+    b.decode_rows = 170;
+    b.slot_decode = (40 * 170 + 48) * 13_315_584;
     try std.testing.expect(b.decodeTotal() > target);
     try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
     // The prompt phase over it is refused first.
