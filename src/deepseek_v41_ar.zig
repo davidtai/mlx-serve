@@ -24,6 +24,7 @@ const kernel_set = @import("kernel_set.zig");
 const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -393,6 +394,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The box the module's admission fills (the guard's ceiling; unset: the GPU's working set).
     if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| config.memory_ceiling_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    const stop = WindowStop.set();
+    defer stop.restore();
     config.numeric_tier = switch (run.tier) {
         .served => .served,
         .stock => .stock,
@@ -882,6 +885,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
     if (max_tokens < 2) return error.CellMaxTokens;
+    const stop = WindowStop.set();
+    defer stop.restore();
     try cellFill(a, io, &config, prompt.len, max_tokens);
     // The bill at the admitted rows (host): the phase records' billed terms.
     const bill = try cellBill(a, io, &config, prompt.len, max_tokens);
@@ -1225,6 +1230,23 @@ pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, promp
     };
 }
 
+/// A window's harness states the guard's ceiling (`memory_ceiling_bytes`) and its stop: the stop reaches the
+/// Module as upstream's wired margin, so the Module admits against the target the harness filled to (the ceiling
+/// less `module.ceiling_stop_bytes`), not upstream's 8 GiB default. Restored when the harness returns.
+const WindowStop = struct {
+    prev: u64,
+
+    fn set() WindowStop {
+        const w: WindowStop = .{ .prev = gpu_ceiling.wired_limit_margin_bytes };
+        gpu_ceiling.wired_limit_margin_bytes = module.ceiling_stop_bytes;
+        return w;
+    }
+
+    fn restore(w: WindowStop) void {
+        gpu_ceiling.wired_limit_margin_bytes = w.prev;
+    }
+};
+
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1")) return true;
     if (std.mem.eql(u8, v, "0")) return false;
@@ -1365,6 +1387,39 @@ test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
     try testing.expect(m.physical > 0 and m.physical <= status.getTotalMemBytes());
 }
 
+// DSV41_BANK=<bank> (host): the harness's rows reach the Module's admission at the window's inputs (pass3an3's:
+// 9.73 GB baseline, box 120.259 GB). Upstream's default wired margin (8 GiB) refuses the harness's forced rows
+// before construction; the window's stop, which the harness sets, admits them.
+test "dsv41 memory: the harness's filled rows pass the Module's admission under the window's stop (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_730_000_000;
+    config.memory_ceiling_bytes = 120_259_084_288;
+    const nr = try bill_mod.fill(a, testing.io, config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
+    const b = try bill_mod.billAt(a, testing.io, &config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null);
+    try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);
+    // The Module's admission target (Module.init: the ceiling less upstream's wired margin).
+    const target = struct {
+        fn of(ceiling: u64) u64 {
+            return ceiling -| gpu_ceiling.wired_limit_margin_bytes;
+        }
+    }.of;
+    try testing.expectError(error.PromptOverTarget, bill_mod.admitPhases(b, target(config.memory_ceiling_bytes.?)));
+    {
+        const stop = WindowStop.set();
+        defer stop.restore();
+        try bill_mod.admitPhases(b, target(config.memory_ceiling_bytes.?));
+        try testing.expectEqual(config.memory_ceiling_bytes.? - module.ceiling_stop_bytes, target(config.memory_ceiling_bytes.?));
+    }
+    try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);
+    std.debug.print("\nthe window's rows at 9.73 GB: {d} / {d}, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
+}
+
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
 // DSV41_CELL_CEILING_GB [DSV41_CELL_WIRED_GB] [DSV41_CELL_ROWS] [DSV41_CELL_MAX_TOKENS]: the cell's bill at the rows the window
 // will admit, printed as a table and one DSV41_CELL_BILL json line.
@@ -1456,6 +1511,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     try cellConfig(&config);
+    const stop = WindowStop.set();
+    defer stop.restore();
     try cellFill(a, io, &config, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);
