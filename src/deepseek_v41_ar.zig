@@ -1265,7 +1265,7 @@ pub const CellBill = struct {
     host_reserve: u64,
     /// The wide read schedule's depth window (the admission's `wide_window_bytes`: process lifetime).
     wide_window: u64 = 0,
-    /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in both phases.
+    /// The process overhead no term above names (`unbilled_process_overhead_bytes`), in the prompt phase.
     unbilled_overhead: u64 = unbilled_process_overhead_bytes,
     /// The input embedding reads its host rows from construction (`embedding_host_rows`, default on): the
     /// device table is freed after the install warm-up, so no phase holds it.
@@ -1292,7 +1292,7 @@ pub const CellBill = struct {
 
     /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
     pub fn decodeTerms(b: CellBill) PhaseTerms {
-        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .prompt_state = b.prompt_state };
+        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state };
     }
 
     /// What the constructed module holds before any request (after the install warm-up released its
@@ -1405,10 +1405,14 @@ pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
     std.debug.print("NATIVE DSV41_PHASE_MEMORY {s}\n", .{json});
 }
 
-/// The measured process overhead the named terms do not cover: the served cells' peak phys_footprint
-/// over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657 GB = 0.637; standard
-/// 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up; re-sized after the
-/// full-admission window. Unattributed so far (Metal libraries / pipelines, allocator slack).
+/// The measured process overhead the named terms do not cover, PROMPT PHASE ONLY: calibrated from the
+/// served cells' peak phys_footprint over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657
+/// GB = 0.637; standard 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up. Those peaks were
+/// decode peaks, and what they measured there is now attributed: the retained prompt state (`prompt_state`,
+/// 1.11 GB at 16K; pass3ak's decode: MLX 1.46 GB above the constructed module after the prompt, the host side
+/// 0.38-0.59 GB against 1.26 billed with this term), so the decode phase no longer carries it (pass3ak's decode
+/// residual was +1.30 GB with both). The prompt phase keeps it: its host side measured 1.64-1.87 GB against
+/// 1.26 billed without it.
 pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 
 pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
@@ -1506,7 +1510,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "wide read window (depth 2)", .p = b.wide_window, .d = b.wide_window },
         .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
         .{ .name = "page cache created by the step (assumed 0; enforced)", .p = 0, .d = 0 },
-        .{ .name = "unbilled process overhead (measured, unattributed)", .p = b.unbilled_overhead, .d = b.unbilled_overhead },
+        .{ .name = "unbilled process overhead (prompt phase; decode's is prompt_state)", .p = b.unbilled_overhead, .d = 0 },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
     std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()) });
@@ -1548,7 +1552,9 @@ fn cell4Bill() CellBill {
 test "dsv41 memory: a phase's total is the baseline plus its terms; the construction terms drop the wave, the KV and the cache" {
     const b = cell4Bill();
     try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window, b.prefillTotal());
-    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.unbilled_overhead + b.wide_window, b.decodeTotal());
+    // The decode phase carries no unbilled overhead (what it covered there is the retained prompt state).
+    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state, b.decodeTotal());
+    try testing.expectEqual(@as(u64, 0), b.decodeTerms().unbilled_overhead);
     const c = b.constructionTerms();
     try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache, c.sum());
     // cell4's constructed footprint (76.41 GB) sits under its construction terms (77.00 GB).
@@ -1620,6 +1626,9 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(nr.decode, b.decode_rows);
     try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
     try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
+    try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
+    try testing.expectEqual(@as(u64, 1 << 30), b.prefill_cache);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // The failure mode: the same bill with the constructed module's wired bytes read live.
     try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));

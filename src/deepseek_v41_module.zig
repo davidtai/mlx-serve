@@ -953,11 +953,14 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
     return out;
 }
 
-/// The allocator cache the prefill holds: the tier of record's 4 GiB (its CACHE_GIB, charged in the arm's
-/// prefill charge), the stock tier the envelope's own.
+/// The allocator cache the prefill holds, which the bill charges at exactly this limit: MLX trims its cache
+/// to the limit after every allocation (allocator.cpp malloc: release_cached_buffers(cache - max_pool_size_)),
+/// and a free that overshoots it lowers active by as much, so at every footprint peak the cache is at most
+/// the limit. The served tier holds 1 GiB (Python's prefill limit): pass3ak (v6c3) held ~2.1 GB of cache at its
+/// prompt peak under the old 4 GiB, and its bill had 3.3 GB to spare there. The stock tier the envelope's own.
 pub fn prefillCacheLimit(t: @import("model_settings.zig").NumericTier) usize {
     return switch (t) {
-        .served => 4 << 30,
+        .served => 1 << 30,
         .stock => envelope.prefill_cache_bytes,
     };
 }
@@ -1609,9 +1612,9 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     var b = ar_bill.cell4BillForTests();
     const target: u64 = 118_259_084_288;
     try admitPhases(b, target);
-    // Decode rows forced past the target (148 -> 168 rows: +10.65 GB).
-    b.decode_rows = 168;
-    b.slot_decode = (40 * 168 + 48) * 13_315_584;
+    // Decode rows forced past the target (148 -> 170 rows: +11.72 GB).
+    b.decode_rows = 170;
+    b.slot_decode = (40 * 170 + 48) * 13_315_584;
     try std.testing.expect(b.decodeTotal() > target);
     try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
     // The prompt phase over it is refused first.
