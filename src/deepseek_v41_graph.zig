@@ -120,6 +120,12 @@ pub const Routes = struct {
     /// `index_topk` as ascending indices and the mask in one more (no eager einsum / relu / sum,
     /// no argpartition, no mask-to-index argsort).
     prefill_index: bool = false,
+    /// The prefill HC norms (ATTN hcnorm: rsqrt of the stream's mean square, and the pre-collapse
+    /// + RMSNorm) at rows >= `hc_norm_min_rows`, one kernel each in the stock reduction order.
+    prefill_hc: bool = false,
+    /// The prefill MoE combine (SMALLK): routed x weights summed over the experts + shared, one f32
+    /// kernel at rows above `attn_compile_max_rows`.
+    prefill_combine: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -151,6 +157,8 @@ pub fn woaDenseBytes(c: *const v41.Config) u64 {
 }
 
 pub const attn_compile_max_rows = 32;
+/// The prefill HC norms' first row count (the lane's HC_MIN_ROWS).
+pub const hc_norm_min_rows = 32;
 /// A forward wider than this releases its score chains inside the layer
 /// (`closeScores`): the prefill widths, where a chain's arrays are score-sized;
 /// a decode / verify forward keeps no per-layer host calls for it.
@@ -174,6 +182,8 @@ pub fn MixKernels(comptime G: type) type {
     return struct {
         sinkhorn: ?*const kr.Sinkhorn(G) = null,
         premix: ?*const kr.Premix(G) = null,
+        /// The prefill HC norms by stream dtype (0: bf16, 1: f32; `Routes.prefill_hc`).
+        norm: [2]?*const kr.HcNorm(G) = .{ null, null },
     };
 }
 
@@ -257,15 +267,18 @@ pub fn LayerKernels(comptime G: type) type {
         /// The prefill indexer's score and select (`Routes.prefill_index`; one of each per trunk).
         idx_score: ?*const kr.IdxScore(G) = null,
         index_topk: ?*const kr.IndexTopk(G) = null,
+        /// The prefill HC norms by stream dtype (0: bf16, 1: f32) and the prefill combine.
+        hc_norm: [2]?*const kr.HcNorm(G) = .{ null, null },
+        combine: ?*const kr.SmallKCombine(G) = null,
         /// C16: the shared expert's projections (the draft's; the trunk's shared expert is stock).
         shared: ?*const SharedRc(G) = null,
 
         pub fn attnMix(self: Self) MixKernels(G) {
-            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn };
+            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_attn, .norm = self.hc_norm };
         }
 
         pub fn ffnMix(self: Self) MixKernels(G) {
-            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_ffn };
+            return .{ .sinkhorn = self.sinkhorn, .premix = self.premix_ffn, .norm = self.hc_norm };
         }
     };
 }
@@ -304,9 +317,11 @@ pub fn Trunk(comptime G: type) type {
             /// The prefill indexer's score and select.
             idx_score: ?kr.IdxScore(G) = null,
             index_topk: ?kr.IndexTopk(G) = null,
+            hc_norm: [2]?kr.HcNorm(G) = .{ null, null },
+            combine: ?kr.SmallKCombine(G) = null,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index or rt.prefill_hc or rt.prefill_combine;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -380,6 +395,16 @@ pub fn Trunk(comptime G: type) type {
                     k.idx_score = try kr.IdxScore(G).init(reg, &geo, null);
                     k.index_topk = try kr.IndexTopk(G).init(g, reg, &geo, null);
                 }
+                if (rt.prefill_hc) {
+                    const geo = prefillGeometry(c);
+                    const eps: f32 = @floatCast(c.rms_norm_eps);
+                    k.hc_norm[0] = try kr.HcNorm(G).init(g, reg, &geo, .bfloat16, eps, null);
+                    k.hc_norm[1] = try kr.HcNorm(G).init(g, reg, &geo, .float32, eps, null);
+                }
+                if (rt.prefill_combine) {
+                    const geo = prefillGeometry(c);
+                    k.combine = try kr.SmallKCombine(G).init(reg, &geo, null);
+                }
                 return k;
             }
 
@@ -392,6 +417,7 @@ pub fn Trunk(comptime G: type) type {
                 for (self.fused.items) |*x| x.deinit(g);
                 for (&self.prefill_attn) |*x| if (x.*) |*r| r.deinit(g);
                 if (self.index_topk) |*x| x.deinit(g);
+                for (&self.hc_norm) |*x| if (x.*) |*r| r.deinit(g);
                 if (self.gpa) |a| {
                     self.router.deinit(a);
                     self.premix.deinit(a);
@@ -414,6 +440,8 @@ pub fn Trunk(comptime G: type) type {
                     .prefill_attn = if (self.prefill_attn[self.prefill_attn_kind[l]]) |*x| x else null,
                     .idx_score = if (self.idx_score) |*x| x else null,
                     .index_topk = if (self.index_topk) |*x| x else null,
+                    .hc_norm = .{ if (self.hc_norm[0]) |*x| x else null, if (self.hc_norm[1]) |*x| x else null },
+                    .combine = if (self.combine) |*x| x else null,
                 };
             }
         };
@@ -632,7 +660,7 @@ pub fn Trunk(comptime G: type) type {
             fs.n -= 1;
             fs.d[fs.n - 1] = hc * sh.dim(-1);
             const flat = try g.reshape(xf, fs.slice());
-            const rs = try g.rsqrt(try g.add(try g.mean(try g.square(flat), -1, true), try g.scalar(c.rms_norm_eps, .float32)));
+            const rs = if (hcNormFor(mk.norm, g, x)) |hn| try hn.rsqrt(g, x) else try g.rsqrt(try g.add(try g.mean(try g.square(flat), -1, true), try g.scalar(c.rms_norm_eps, .float32)));
             // C13 hcpremix at <= 8 rows (the kernel's plans; wider: the stock GEMM).
             const mm = if (mk.premix) |k| (if (rowsOf(g, flat, 1) <= rc_max_rows) try k.mm(g, flat) else null) else null;
             const mixes = try g.mul(mm orelse try g.matmul(flat, try g.transpose(try g.astype(fnw, .float32))), rs);
@@ -651,6 +679,17 @@ pub fn Trunk(comptime G: type) type {
             comb = try g.reshape(comb, cshape.slice());
             const sk = if (mk.sinkhorn) |k| try k.call(g, comb) else try sinkhorn(g, comb, c.hc_sinkhorn_iters, eps);
             return .{ .pre = pre, .post = post, .comb = sk };
+        }
+
+        /// The prefill HC norm for stream `x` [1, S, hc, dim] at S >= hc_norm_min_rows (by its dtype).
+        fn hcNormFor(ns: [2]?*const kr.HcNorm(G), g: *G, x: T) ?*const kr.HcNorm(G) {
+            const sh = g.shapeOf(x);
+            if (sh.n != 4 or sh.d[0] != 1 or sh.d[1] < hc_norm_min_rows) return null;
+            return switch (g.dtypeOf(x)) {
+                .bfloat16 => ns[0],
+                .float32 => ns[1],
+                else => null,
+            };
         }
 
         /// `DecoderLayer._hc_pre`: collapse the hc copies with the threaded pre mix.
@@ -797,6 +836,20 @@ pub fn Trunk(comptime G: type) type {
 
         /// `idx` (the prefill indexer only): the selection as ascending indices, -1 padded [1, S, k].
         const Selection = struct { mask: T, cand: ?T, idx: ?T = null };
+
+        /// Each row's reach over `n_comp` compressed rows: [1, S, n_comp] (index < compress_lens).
+        fn reachMask(g: *G, compress_lens: T, n_comp: c_int) !T {
+            const ar = try g.expandDims(try g.expandDims(try g.arange(0, @floatFromInt(n_comp), 1, .int32), 0), 0);
+            return g.less(ar, try g.expandDims(try g.expandDims(compress_lens, 0), -1));
+        }
+
+        /// The stock index score: sum_h relu(q_h . k_n) w_h (f32), -inf past each row's reach.
+        fn indexScoreStock(g: *G, q: T, index_k: T, wts: T, compress_lens: T, n_comp: c_int) !T {
+            var score = try g.einsum("bshd,btd->bsht", &.{ try g.astype(q, .float32), try g.astype(index_k, .float32) });
+            score = try g.mul(try g.maximum(score, try sf(g, 0.0, score)), try g.expandDims(try g.astype(wts, .float32), -1));
+            score = try g.sum(score, 2, false);
+            return g.where(try reachMask(g, compress_lens, n_comp), score, try sf(g, -std.math.inf(f64), score));
+        }
         /// The prefill indexer's launches (one prompt row block, b = 1).
         const PrefillIndex = struct { score: *const kr.IdxScore(G), topk: *const kr.IndexTopk(G) };
 
@@ -825,12 +878,8 @@ pub fn Trunk(comptime G: type) type {
                 const r = try ix.topk.select(g, try g.reshape(score, &.{ s_, n_comp }), compress_lens);
                 return .{ .mask = try g.reshape(r[1], &.{ 1, s_, n_comp }), .cand = cand, .idx = try g.expandDims(r[0], 0) };
             }
-            var score = try g.einsum("bshd,btd->bsht", &.{ try g.astype(q, .float32), try g.astype(index_k, .float32) });
-            score = try g.mul(try g.maximum(score, try sf(g, 0.0, score)), try g.expandDims(try g.astype(wts, .float32), -1));
-            score = try g.sum(score, 2, false);
-            const ar = try g.expandDims(try g.expandDims(try g.arange(0, @floatFromInt(n_comp), 1, .int32), 0), 0);
-            const reach = try g.less(ar, try g.expandDims(try g.expandDims(compress_lens, 0), -1));
-            score = try g.where(reach, score, try sf(g, -std.math.inf(f64), score));
+            var score = try indexScoreStock(g, q, index_k, wts, compress_lens, n_comp);
+            const reach = try reachMask(g, compress_lens, n_comp);
             var cand: ?T = null;
             if (set_candidates) {
                 cand = try candidateBlocks(g, c, score, compress_lens);
@@ -1094,6 +1143,101 @@ pub fn Trunk(comptime G: type) type {
             return qlinear(g, try g.reshape(o2, &.{ s0.d[0], s0.d[1], -1 }), wo_b);
         }
 
+        /// One construction self-check: a route's name and its bool scalar (all within tolerance / equal).
+        pub const RouteCheck = struct { name: []const u8, ok: T };
+
+        /// Uniform [-amp, amp) host data at `shape` (f32, cast to `d`), from `scratch`.
+        fn checkFill(g: *G, rr: std.Random, buf: []f32, shape: []const c_int, amp: f32, d: Dtype) !T {
+            var n: usize = 1;
+            for (shape) |x| n *= @intCast(x);
+            if (buf.len < n) return error.PrefillCheckScratch;
+            for (buf[0..n]) |*v| v.* = (rr.float(f32) * 2 - 1) * amp;
+            return g.astype(try g.hostArray(std.mem.sliceAsBytes(buf[0..n]), shape, .float32), d);
+        }
+
+        /// |got - want| <= tol x (1 + |want|) everywhere (f32 compare), as one bool scalar.
+        fn checkClose(g: *G, got: T, want: T, tol: f64) !T {
+            const a = try g.astype(got, .float32);
+            const b = try g.astype(want, .float32);
+            const err = try g.sub(try g.abs(try g.sub(a, b)), try g.mul(try g.add(try g.abs(b), try sf(g, 1.0, b)), try sf(g, tol, b)));
+            return g.lessEqual(try g.max(try g.reshape(err, &.{-1}), 0, false), try sf(g, 0.0, b));
+        }
+
+        /// Every element equal, as one bool scalar.
+        fn checkEqual(g: *G, got: T, want: T) !T {
+            var cnt: usize = 1;
+            for (g.shapeOf(got).slice()) |d| cnt *= @intCast(d);
+            const n: f64 = @floatFromInt(cnt);
+            const eq = try g.sum(try g.astype(try g.reshape(try g.equal(got, want), &.{-1}), .int32), 0, false);
+            return g.equal(eq, try g.scalar(n, .int32));
+        }
+
+        /// The prefill call sites' construction self-checks against the stock chain (the attention
+        /// core by kind, the indexer's score and select, the HC norms by stream dtype, the combine),
+        /// on deterministic host data at prompt widths; one RouteCheck per installed route into `out`.
+        /// Tolerances: the score and the f32 norms / combine 1e-3 x (1 + |stock|) (reduction order),
+        /// bf16 norm outputs 2e-2; the select's indices equal the stock top-k on the stock score.
+        pub fn prefillRoutesCheck(g: *G, c: *const v41.Config, kx: *const Kernels, layers: []const W, scratch: []f32, out: []RouteCheck) !usize {
+            var n: usize = 0;
+            const attn = try prefillAttnCheck(g, c, kx, layers, scratch);
+            const attn_names = [_][]const u8{ "attention core, layer 0 kind", "attention core, f32 window kind", "attention core, compressed kind" };
+            for (attn, attn_names) |ok, name| if (ok) |x| {
+                out[n] = .{ .name = name, .ok = x };
+                n += 1;
+            };
+            var rng = std.Random.DefaultPrng.init(0x5eed_d542);
+            const r = rng.random();
+            const S: c_int = 64;
+            if (kx.idx_score) |*sc| {
+                // Rows at positions 2048.. of a ratio-2 layer: every row reaches ~1,024 compressed rows
+                // (> index_topk, so the select ranks).
+                const N: c_int = 1056;
+                const IH: c_int = @intCast(c.index_n_heads);
+                const ID: c_int = @intCast(c.index_head_dim);
+                const q = try checkFill(g, r, scratch, &.{ 1, S, IH, ID }, 1.0, .float32);
+                const ik = try checkFill(g, r, scratch, &.{ 1, N, ID }, 1.0, .float32);
+                const wts = try checkFill(g, r, scratch, &.{ 1, S, IH }, 0.1, .float32);
+                const pos = try g.arange(2048, 2048 + @as(f64, @floatFromInt(S)), 1, .int32);
+                const lens = try g.floorDiv(try g.add(pos, try g.scalar(1, .int32)), try g.scalar(2, .int32));
+                const want = try indexScoreStock(g, q, ik, wts, lens, N);
+                const got = try sc.call(g, q, ik, wts, lens);
+                const reach = try reachMask(g, lens, N);
+                out[n] = .{ .name = "indexer score", .ok = try checkClose(g, try g.where(reach, got, try sf(g, 0.0, got)), try g.where(reach, want, try sf(g, 0.0, want)), 1e-3) };
+                n += 1;
+                if (kx.index_topk) |*tk| {
+                    const k: c_int = @min(@as(c_int, @intCast(c.index_topk)), N);
+                    const stock_idx = try maskToTopkIdx(g, try g.logicalAnd(try topkRows(g, want, k), reach), k);
+                    const sel = try tk.select(g, try g.reshape(want, &.{ S, N }), lens);
+                    out[n] = .{ .name = "indexer select", .ok = try checkEqual(g, try g.expandDims(sel[0], 0), stock_idx) };
+                    n += 1;
+                }
+            }
+            const hc: c_int = @intCast(c.hc_mult);
+            const dim: c_int = @intCast(c.hidden_size);
+            for (kx.hc_norm, 0..) |maybe, di| if (maybe) |*hn| {
+                const dt: Dtype = if (di == 0) .bfloat16 else .float32;
+                const h = try checkFill(g, r, scratch, &.{ 1, S, hc, dim }, 1.0, dt);
+                const pre = try g.add(try checkFill(g, r, scratch, &.{ 1, S, hc }, 0.5, .float32), try g.scalar(0.5, .float32));
+                const flat = try g.reshape(try g.astype(h, .float32), &.{ 1, S, hc * dim });
+                const rs = try g.rsqrt(try g.add(try g.mean(try g.square(flat), -1, true), try g.scalar(c.rms_norm_eps, .float32)));
+                out[n] = .{ .name = if (di == 0) "HC rsqrt, bf16 stream" else "HC rsqrt, f32 stream", .ok = try checkClose(g, try hn.rsqrt(g, h), rs, 1e-3) };
+                n += 1;
+                const w = layers[0].attn_norm;
+                const want = try rmsnorm(g, try hcPre(g, h, pre), w, c.rms_norm_eps);
+                out[n] = .{ .name = if (di == 0) "HC pre-norm, bf16 stream" else "HC pre-norm, f32 stream", .ok = try checkClose(g, try hn.preNorm(g, h, pre, w), want, if (di == 0) 2e-2 else 1e-3) };
+                n += 1;
+            };
+            if (kx.combine) |*cb| {
+                const top: c_int = @intCast(c.n_experts_per_tok);
+                const ro = try checkFill(g, r, scratch, &.{ S, top, dim }, 1.0, .float32);
+                const wt = try checkFill(g, r, scratch, &.{ S, top }, 1.0, .float32);
+                const sh = try checkFill(g, r, scratch, &.{ S, dim }, 1.0, .float32);
+                out[n] = .{ .name = "MoE combine", .ok = try checkClose(g, try cb.call(g, ro, wt, sh), try moeCombine(g, ro, wt, sh), 1e-3) };
+                n += 1;
+            }
+            return n;
+        }
+
         /// The prefill attention core's construction self-check against the stock chain: per installed
         /// kind, on its first layer's weights, 64 prompt rows over a 64-row window (and 32 compressed
         /// rows, each row selecting the ones its position reaches), deterministic host data. The stock
@@ -1159,7 +1303,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// The model's prefill geometry, as the kernel lane's routes compare it.
         fn prefillGeometry(c: *const v41.Config) kr.PrefillGeometry {
-            return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size };
+            return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size, .hc_mult = c.hc_mult };
         }
 
         /// `outProj` after the prefill core: o already inverse-roped as [g, S, in] f32 -> the grouped
@@ -1389,6 +1533,13 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// `_moe_combine_impl`: the weighted routed sum in f32 plus the shared output.
+        /// The combine at prompt widths: SMALLK's kernel above attn_compile_max_rows when bound.
+        fn combineWide(g: *G, lk: LK, ro: T, weights: T, shared: T) !T {
+            if (lk.combine) |k| if (g.shapeOf(shared).dim(0) > attn_compile_max_rows)
+                return k.call(g, try g.astype(ro, .float32), try g.astype(weights, .float32), shared);
+            return moeCombine(g, ro, weights, shared);
+        }
+
         fn moeCombine(g: *G, ro: T, weights: T, shared: T) !T {
             return g.add(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(weights, -1)), -2, false), shared);
         }
@@ -1419,7 +1570,7 @@ pub fn Trunk(comptime G: type) type {
                 var o: [1]T = undefined;
                 try g.tape(MoeCombine, c, &.{ ro, r.weights, shared }, &o);
                 break :blk o[0];
-            } else try moeCombine(g, ro, r.weights, shared);
+            } else try combineWide(g, lk, ro, r.weights, shared);
             return g.reshape(try g.astype(y, g.dtypeOf(x)), sh.slice());
         }
 
@@ -1433,7 +1584,7 @@ pub fn Trunk(comptime G: type) type {
                 return .{ try g.reshape(cn[2], &.{ d.b, d.s, d.dim }), mx.pre, mx.post, mx.comb };
             };
             const m = try hcMixes(g, c, lk.attnMix(), h, fnw, base, scale);
-            const x = try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
+            const x = if (hcNormFor(lk.hc_norm, g, h)) |hn| try hn.preNorm(g, h, pre_mix, norm_w) else try rmsnorm(g, try hcPre(g, h, pre_mix), norm_w, c.rms_norm_eps);
             return .{ x, m.pre, m.post, m.comb };
         }
 
@@ -1450,7 +1601,7 @@ pub fn Trunk(comptime G: type) type {
             };
             const h1 = try hcPost(g, attn_out, residual, attn_post, attn_comb);
             const m = try hcMixes(g, c, lk.ffnMix(), h1, fnw, base, scale);
-            const x = try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
+            const x = if (hcNormFor(lk.hc_norm, g, h1)) |hn| try hn.preNorm(g, h1, attn_pre, norm_w) else try rmsnorm(g, try hcPre(g, h1, attn_pre), norm_w, c.rms_norm_eps);
             return .{ x, h1, m.post, m.comb, m.pre };
         }
 
@@ -1629,7 +1780,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `MoE.combine_routed`: the shared expert and the f32 combine (K22 at
         /// rows <= 32) of routed rows computed elsewhere (K16's batched switch).
-        pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, w: *const W, ro: T, weights: T, xf: T) !T {
+        pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, ro: T, weights: T, xf: T) !T {
             const shared = try g.astype(try sharedExpert(g, c, w, xf), .float32);
             try p.put("moe.shared", shared);
             if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
@@ -1637,7 +1788,7 @@ pub fn Trunk(comptime G: type) type {
                 try g.tape(MoeCombine, c, &.{ ro, weights, shared }, &o);
                 return o[0];
             }
-            return moeCombine(g, ro, weights, shared);
+            return combineWide(g, lk, ro, weights, shared);
         }
 
         /// `_PREFILL_HC_POST`: K16's ffn combine, always the compiled `_hc_post_impl`.
@@ -2182,6 +2333,17 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
         try testing.expect(o != null);
         try testing.expectEqual(Dtype.bool_, g.dtypeOf(o.?));
         try testing.expectEqual(@as(u8, 0), g.shapeOf(o.?).n);
+    }
+    // Every prefill route's check builds (all routes on: 3 core kinds, score, select, 2 x 2 HC, combine).
+    const all: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .selected_keys = true };
+    var ka = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &all, &.{});
+    defer ka.deinit(&g);
+    var checks: [16]Tr.RouteCheck = undefined;
+    const n = try Tr.prefillRoutesCheck(&g, &c, &ka, ws[0..c.n_layers], scratch, &checks);
+    try testing.expectEqual(@as(usize, 10), n);
+    for (checks[0..n]) |ck| {
+        try testing.expectEqual(Dtype.bool_, g.dtypeOf(ck.ok));
+        try testing.expectEqual(@as(u8, 0), g.shapeOf(ck.ok).n);
     }
     var bad = c;
     bad.window = 64;

@@ -178,7 +178,7 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        if (tier.routes.prefill_attn) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
             inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index },
         };
@@ -278,20 +278,22 @@ pub const Module = struct {
     fn checkPrefillRoutes(self: *Module) !void {
         const Tr = graph.Trunk(G);
         const c = &self.model.c;
-        const scratch = try self.gpa.alloc(f32, @as(usize, 64) * c.n_heads * c.head_dim);
+        const n_scratch = @max(@as(usize, 64) * c.n_heads * c.head_dim, @as(usize, 64) * c.n_experts_per_tok * c.hidden_size, @as(usize, 64) * c.hc_mult * c.hidden_size);
+        const scratch = try self.gpa.alloc(f32, n_scratch);
         defer self.gpa.free(scratch);
         const m = self.g.mark();
         defer self.g.resetTo(m);
-        const oks = try Tr.prefillAttnCheck(&self.g, c, &self.model.kx, self.model.layers, scratch);
-        for (oks, 0..) |ok, kind| if (ok) |x| {
+        var checks: [16]Tr.RouteCheck = undefined;
+        const n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, &checks);
+        for (checks[0..n]) |ck| {
             var b: [1]bool = undefined;
-            _ = try self.g.hostBool(x, &b);
+            _ = try self.g.hostBool(ck.ok, &b);
             if (!b[0]) {
-                log.err("prefill attention core, kind {d}: the construction self-check against the stock chain failed", .{kind});
-                return error.PrefillAttnSelfCheck;
+                log.err("NATIVE prefill route {s}: the construction self-check against the stock chain failed", .{ck.name});
+                return error.PrefillRouteSelfCheck;
             }
-            log.info("prefill attention core, kind {d}: construction self-check against the stock chain passed", .{kind});
-        };
+        }
+        log.info("NATIVE prefill routes: {d} construction self-checks against the stock chain passed", .{n});
     }
 
     /// The kernels go after the last launch drained.

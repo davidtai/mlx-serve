@@ -630,7 +630,7 @@ pub fn Model(comptime G: type) type {
                         const rs = g.shapeOf(ro);
                         const part = if (j - i == 1) ro else try g.slice(ro, &.{ pos, 0, 0 }, &.{ pos + nk, rs.d[1], rs.d[2] }, &.{ 1, 1, 1 });
                         pos += nk;
-                        const y = try Tr.combineRouted(g, probe, c, rt, lw, part, routes_[k].weights, xfs[k]);
+                        const y = try Tr.combineRouted(g, probe, c, rt, self.kx.at(l), lw, part, routes_[k].weights, xfs[k]);
                         const sh = g.shapeOf(halves[k].moe_in);
                         const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
