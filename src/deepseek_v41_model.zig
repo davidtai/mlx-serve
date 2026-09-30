@@ -31,6 +31,9 @@ pub const Want = struct {
 pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameTooLong, EmbeddingRetired, EmbeddingRowsMismatch };
 
 /// `_derive_moe_row_cap`: rows one K16 routed call may carry.
+/// JOINLESS takes a wide call only (the experts' wide lane: more than one route of ids).
+const joinless_min_ids: u64 = 48;
+
 pub fn moeRowCap(c: *const v41.Config, target_bytes: f64) u64 {
     const per_row: u64 = @as(u64, c.n_experts_per_tok) * c.hidden_size * 4;
     return @max(1, @as(u64, @intFromFloat(@floor(@max(target_bytes, 1e9) / @as(f64, @floatFromInt(per_row))))));
@@ -635,16 +638,40 @@ pub fn Model(comptime G: type) type {
                         for (pre_shared, started) |ps, *st_| st_.* = ps.?;
                         try g.asyncEval(started);
                     }
-                    const ro = try routed.at(@intCast(l)).routed(g, cat_xf, cat_idx);
-                    // The profile's own stage for the group's routed compute (else it lands in moe.shared).
-                    try probe.put("moe.routed", ro);
+                    const hook = routed.at(@intCast(l));
+                    const lk = self.kx.at(l);
+                    const top: c_int = @intCast(c.n_experts_per_tok);
+                    // JOINLESS on a wide call (a routed source that hands out its unjoined outputs):
+                    // each chunk's combine reads the routed rows in place (its loc rows).
+                    const has_parts = comptime @hasDecl(@TypeOf(hook), "routedParts");
+                    var parts: ?struct { outs: []const T, loc: T } = null;
+                    var ro: T = undefined;
+                    if (comptime has_parts) {
+                        if (lk.joinless != null and n_rows * c.n_experts_per_tok > joinless_min_ids) {
+                            const pt = try hook.routedParts(g, cat_xf, cat_idx);
+                            parts = .{ .outs = pt.outs, .loc = pt.loc };
+                        }
+                    }
+                    if (parts) |pt| {
+                        try probe.put("moe.routed", pt.loc);
+                    } else {
+                        ro = try hook.routed(g, cat_xf, cat_idx);
+                        // The profile's own stage for the group's routed compute (else it lands in moe.shared).
+                        try probe.put("moe.routed", ro);
+                    }
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         const nk = g.shapeOf(xfs[k]).dim(0);
-                        const rs = g.shapeOf(ro);
-                        const part = if (j - i == 1) ro else try g.slice(ro, &.{ pos, 0, 0 }, &.{ pos + nk, rs.d[1], rs.d[2] }, &.{ 1, 1, 1 });
+                        const y = if (parts) |pt| blk: {
+                            const loc = if (j - i == 1) pt.loc else try g.slice(pt.loc, &.{ pos, 0, 0 }, &.{ pos + nk, top, 2 }, &.{ 1, 1, 1 });
+                            const shared = pre_shared[k - i] orelse try g.astype(try Tr.sharedExpert(g, c, lw, xfs[k]), .float32);
+                            break :blk try lk.joinless.?.call(g, pt.outs, loc, try g.astype(routes_[k].weights, .float32), shared);
+                        } else blk: {
+                            const rs = g.shapeOf(ro);
+                            const part = if (j - i == 1) ro else try g.slice(ro, &.{ pos, 0, 0 }, &.{ pos + nk, rs.d[1], rs.d[2] }, &.{ 1, 1, 1 });
+                            break :blk try Tr.combineRouted(g, probe, c, rt, lk, lw, part, routes_[k].weights, xfs[k], pre_shared[k - i]);
+                        };
                         pos += nk;
-                        const y = try Tr.combineRouted(g, probe, c, rt, self.kx.at(l), lw, part, routes_[k].weights, xfs[k], pre_shared[k - i]);
                         const sh = g.shapeOf(halves[k].moe_in);
                         const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
@@ -655,6 +682,9 @@ pub fn Model(comptime G: type) type {
                         releaseHalf(g, &halves[k]);
                     }
                     try g.evalAll(hs[i..j]);
+                    if (comptime has_parts) {
+                        if (parts != null) hook.releaseParts(g);
+                    }
                     g.resetTo(group_wave);
                     i = j;
                 }

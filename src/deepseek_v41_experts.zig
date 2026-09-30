@@ -796,9 +796,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             pos: std.ArrayList(u32) = .empty,
             inv: std.ArrayList(u32) = .empty,
             kept: std.ArrayList(T) = .empty,
+            /// JOINLESS: each assignment's (output, row), int32 pairs.
+            loc: std.ArrayList(i32) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc }) |l| l.deinit(a);
             }
         };
 
@@ -890,6 +892,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             pub fn routed(h: Hook, g: *G, xf: T, indices: T) !T {
                 return h.ex.run(g, h.layer, xf, indices);
+            }
+
+            /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs and
+            /// each assignment's (output, row); `releaseParts` after the combines are evaluated.
+            pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
+                if (comptime !routes.prefill) return error.PrefillLaneNotPorted;
+                const n: u32 = @intCast(g.shapeOf(xf).dim(0));
+                const k: u32 = @intCast(g.shapeOf(indices).dim(1));
+                if (n * k <= max_route_ids) return error.WideLaneUnderMinIds;
+                return h.ex.runWideParts(g, h.layer, xf, indices, n, k);
+            }
+
+            pub fn releaseParts(h: Hook, g: *G) void {
+                h.ex.releaseParts(g);
             }
         };
 
@@ -1066,6 +1082,74 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// the call and drains each group once; `.hot_first` orders the groups hottest first;
         /// `Options.wide.depth` 2 routes group g + 1 (its reads) before group g's waves.
         fn runWide(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
+            try self.runWideCore(g, layer, xf, indices, n, k);
+            const a = self.a;
+            const w = &self.wide;
+            const n_ids = n * k;
+            // `take(concatenate(outputs), argsort(positions))`, the permutation made on the host.
+            const joined = try g.concat(w.kept.items, 0);
+            for (w.kept.items) |x| g.release(x);
+            w.kept.clearRetainingCapacity();
+            try w.inv.resize(a, n_ids);
+            invertPositions(w.pos.items, w.inv.items);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
+            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// JOINLESS: the wide call's outputs unjoined (at most `max_parts`, adjacent ones concatenated
+        /// beyond that) and each assignment's (output, row) as int32 [n, k, 2]; the combine reads the
+        /// rows in place. The outputs stay kept until `releaseParts`.
+        pub const max_parts = 24;
+        pub const Parts = struct { outs: []const T, loc: T };
+
+        fn runWideParts(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !Parts {
+            try self.runWideCore(g, layer, xf, indices, n, k);
+            const a = self.a;
+            const w = &self.wide;
+            const n_ids = n * k;
+            // Each output's rows, in join order; beyond max_parts, runs of adjacent outputs concatenated.
+            const n_out = w.kept.items.len;
+            const per = (n_out + max_parts - 1) / max_parts;
+            try w.loc.resize(a, 2 * n_ids);
+            var merged: std.ArrayList(T) = .empty;
+            defer merged.deinit(a);
+            var j: usize = 0;
+            var src: usize = 0;
+            var o: usize = 0;
+            while (o < n_out) : (src += 1) {
+                const end = @min(o + per, n_out);
+                var row: i32 = 0;
+                for (w.kept.items[o..end]) |x| {
+                    const r: usize = @intCast(g.shapeOf(x).dim(0));
+                    for (w.pos.items[j .. j + r]) |p| {
+                        w.loc.items[2 * p] = @intCast(src);
+                        w.loc.items[2 * p + 1] = row;
+                        row += 1;
+                    }
+                    j += r;
+                }
+                if (end - o == 1) {
+                    try merged.append(a, w.kept.items[o]);
+                } else {
+                    const cat = g.keep(try g.concat(w.kept.items[o..end], 0));
+                    for (w.kept.items[o..end]) |x| g.release(x);
+                    try merged.append(a, cat);
+                }
+                o = end;
+            }
+            w.kept.clearRetainingCapacity();
+            try w.kept.appendSlice(a, merged.items);
+            const loc = try g.hostArray(std.mem.sliceAsBytes(w.loc.items), &.{ @intCast(n), @intCast(k), 2 }, .int32);
+            return .{ .outs = w.kept.items, .loc = loc };
+        }
+
+        /// Releases the outputs `runWideParts` kept (after the combines that read them are evaluated).
+        pub fn releaseParts(self: *Self, g: *G) void {
+            for (self.wide.kept.items) |x| g.release(x);
+            self.wide.kept.clearRetainingCapacity();
+        }
+
+        fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !void {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
@@ -1193,14 +1277,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 calls[gi % depth] = null;
                 if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
             }
-            // `take(concatenate(outputs), argsort(positions))`, the permutation made on the host.
-            const joined = try g.concat(w.kept.items, 0);
-            for (w.kept.items) |x| g.release(x);
-            w.kept.clearRetainingCapacity();
-            try w.inv.resize(a, n_ids);
-            invertPositions(w.pos.items, w.inv.items);
-            const ord = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
-            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
     };
 }
@@ -1619,6 +1695,49 @@ test "dsv41 experts: a decode-width call never takes the wide lane: construction
     try testing.expectEqual(@as(u32, 48), decode_forward_rows * 6);
     try testing.expectError(error.WideLaneUnderMinIds, ex.runWide(&g, 0, try g.input(&.{ 8, 256 }, .float32), try g.input(&.{ 8, 6 }, .int32), 8, 6));
     try testing.expectEqual(@as(usize, 0), rrs[0].calls.items.len);
+}
+
+test "dsv41 experts: JOINLESS hands out the wide call's outputs unjoined, each assignment at one (output, row)" {
+    const a = testing.allocator;
+    var c = testConfig(5120, 2304, 1);
+    c.n_routed_experts = 64;
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var src = try FakeSource.init(a, .{ .hidden = 5120, .inter = 2304, .n_experts = 64, .rows = &.{64} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Math = WithPrefillRoutes(TraceOps, Chain, xq.DigXPrefill(TraceOps));
+    var digx = [_]xq.DigXPrefill(TraceOps){try xq.DigXPrefill(TraceOps).init(a, &reg, .tier, null)};
+    defer digx[0].deinit(&g);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &digx }, &c);
+    defer ex.deinit();
+    // 40 tokens x top-6 over 60 experts (two groups of at most 48): a deterministic spread.
+    const n: u32 = 40;
+    const k: u32 = 6;
+    var rows: [40 * 6]u16 = undefined;
+    for (&rows, 0..) |*e, i| e.* = @intCast((i * 7 + i / 6) % 60);
+    var script: Script = .{ .calls = &.{&rows} };
+    g.host_values = script.values();
+    const parts = try ex.at(0).routedParts(&g, try g.input(&.{ @intCast(n), 5120 }, .bfloat16), try g.input(&.{ @intCast(n), @intCast(k) }, .int32));
+    try testing.expect(parts.outs.len >= 2 and parts.outs.len <= Ex.max_parts);
+    try testing.expect(g.shapeOf(parts.loc).eql(ops.Shape.of(&.{ @intCast(n), @intCast(k), 2 })));
+    // Every (output, row) is some assignment's, once.
+    var seen = std.AutoHashMap(u64, void).init(a);
+    defer seen.deinit();
+    const loc = ex.wide.loc.items;
+    for (0..n * k) |q| {
+        const s_: usize = @intCast(loc[2 * q]);
+        const r_: i32 = loc[2 * q + 1];
+        try testing.expect(s_ < parts.outs.len and r_ >= 0 and r_ < g.shapeOf(parts.outs[s_]).dim(0));
+        try testing.expect(!(try seen.getOrPut((@as(u64, s_) << 32) | @as(u64, @intCast(r_)))).found_existing);
+    }
+    var total: c_int = 0;
+    for (parts.outs) |o| total += g.shapeOf(o).dim(0);
+    try testing.expectEqual(@as(c_int, @intCast(n * k)), total);
+    ex.at(0).releaseParts(&g);
 }
 
 test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samples' wave structure" {

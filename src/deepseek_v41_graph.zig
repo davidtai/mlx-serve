@@ -134,6 +134,9 @@ pub const Routes = struct {
     /// started on the GPU before the routed call, so it runs while the host plans the waves;
     /// the combine reads it (the same expression: exact). Billed in the layer-major wave.
     prefill_host_shared: bool = false,
+    /// JOINLESS (K16): the combine reads the wide call's unjoined outputs in place (each
+    /// assignment's (output, row)); no concatenate / take of the routed rows. Exact vs SMALLK.
+    prefill_joinless: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -278,6 +281,7 @@ pub fn LayerKernels(comptime G: type) type {
         /// The prefill HC norms by stream dtype (0: bf16, 1: f32) and the prefill combine.
         hc_norm: [2]?*const kr.HcNorm(G) = .{ null, null },
         combine: ?*const kr.SmallKCombine(G) = null,
+        joinless: ?*const kr.JoinlessCombine(G) = null,
         /// C16: the shared expert's projections (the draft's; the trunk's shared expert is stock).
         shared: ?*const SharedRc(G) = null,
 
@@ -327,9 +331,10 @@ pub fn Trunk(comptime G: type) type {
             index_topk: ?kr.IndexTopk(G) = null,
             hc_norm: [2]?kr.HcNorm(G) = .{ null, null },
             combine: ?kr.SmallKCombine(G) = null,
+            joinless: ?kr.JoinlessCombine(G) = null,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index or rt.prefill_hc or rt.prefill_combine;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index or rt.prefill_hc or rt.prefill_combine or rt.prefill_joinless;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -413,6 +418,10 @@ pub fn Trunk(comptime G: type) type {
                     const geo = prefillGeometry(c);
                     k.combine = try kr.SmallKCombine(G).init(reg, &geo, null);
                 }
+                if (rt.prefill_joinless) {
+                    const geo = prefillGeometry(c);
+                    k.joinless = try kr.JoinlessCombine(G).init(reg, &geo, null);
+                }
                 return k;
             }
 
@@ -450,6 +459,7 @@ pub fn Trunk(comptime G: type) type {
                     .index_topk = if (self.index_topk) |*x| x else null,
                     .hc_norm = .{ if (self.hc_norm[0]) |*x| x else null, if (self.hc_norm[1]) |*x| x else null },
                     .combine = if (self.combine) |*x| x else null,
+                    .joinless = if (self.joinless) |*x| x else null,
                 };
             }
         };
@@ -1241,6 +1251,35 @@ pub fn Trunk(comptime G: type) type {
                 const og = try checkFill(g, r, scratch, &.{ @intCast(c.o_groups), S, in_ }, 1.0, .float32);
                 const w = &layers[1];
                 out[n] = .{ .name = "o-projection DENSE16", .ok = try checkClose(g, try outProjDense16(g, c, og, w, 1, S), try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, 1, S), 3e-2) };
+                n += 1;
+            }
+            if (kx.joinless) |*jl| {
+                // Three outputs (40 + 24 + 64 rows) holding 64 rows x top-k assignments in a
+                // deterministic shuffle; against take(concat(outs), inverse) and the stock combine.
+                const top: c_int = @intCast(c.n_experts_per_tok);
+                const n_as: usize = @intCast(S * top);
+                const rows = [_]usize{ 80, 48, n_as - 128 };
+                var outs: [3]T = undefined;
+                for (&outs, rows) |*o, rr| o.* = try checkFill(g, r, scratch, &.{ @intCast(rr), dim }, 1.0, .float32);
+                var perm: [64 * 8]u32 = undefined;
+                for (perm[0..n_as], 0..) |*p, q| p.* = @intCast(q);
+                r.shuffle(u32, perm[0..n_as]);
+                // Assignment perm[j] is joined row j.
+                var loc: [64 * 8 * 2]i32 = undefined;
+                var inv: [64 * 8]u32 = undefined;
+                var j: usize = 0;
+                for (rows, 0..) |rr, src| for (0..rr) |row| {
+                    loc[2 * perm[j]] = @intCast(src);
+                    loc[2 * perm[j] + 1] = @intCast(row);
+                    inv[perm[j]] = @intCast(j);
+                    j += 1;
+                };
+                const locT = try g.hostArray(std.mem.sliceAsBytes(loc[0 .. 2 * n_as]), &.{ S, top, 2 }, .int32);
+                const invT = try g.hostArray(std.mem.sliceAsBytes(inv[0..n_as]), &.{@intCast(n_as)}, .uint32);
+                const ro = try g.reshape(try g.take(try g.concat(&outs, 0), invT, 0), &.{ S, top, dim });
+                const wt = try checkFill(g, r, scratch, &.{ S, top }, 1.0, .float32);
+                const sh = try checkFill(g, r, scratch, &.{ S, dim }, 1.0, .float32);
+                out[n] = .{ .name = "JOINLESS combine", .ok = try checkClose(g, try jl.call(g, &outs, locT, wt, sh), try moeCombine(g, ro, wt, sh), 1e-3) };
                 n += 1;
             }
             if (kx.combine) |*cb| {
@@ -2367,13 +2406,13 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
         try testing.expectEqual(@as(u8, 0), g.shapeOf(o.?).n);
     }
     // Every prefill route's check builds (all routes on: 3 core kinds, score, select, 2 x 2 HC, combine).
-    const all: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .selected_keys = true };
+    const all: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_joinless = true, .selected_keys = true };
     var ka = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &all, &.{});
     defer ka.deinit(&g);
     var checks: [16]Tr.RouteCheck = undefined;
-    const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .selected_keys = true };
+    const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .prefill_joinless = true, .selected_keys = true };
     const n = try Tr.prefillRoutesCheck(&g, &c, &all_o, &ka, ws[0..c.n_layers], scratch, &checks);
-    try testing.expectEqual(@as(usize, 11), n);
+    try testing.expectEqual(@as(usize, 12), n);
     for (checks[0..n]) |ck| {
         try testing.expectEqual(Dtype.bool_, g.dtypeOf(ck.ok));
         try testing.expectEqual(@as(u8, 0), g.shapeOf(ck.ok).n);
