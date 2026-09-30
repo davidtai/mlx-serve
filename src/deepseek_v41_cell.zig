@@ -10,6 +10,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
+const status = @import("status.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_stream = @import("expert_stream.zig");
@@ -34,7 +35,7 @@ pub const Run = struct {
     stats: arm_mod.Stats,
     io_after_prefill: expert_stream.Stats,
     io_end: expert_stream.Stats,
-    footprint: arm_mod.Footprint,
+    footprint: status.Footprint,
     mlx_peak_bytes: ?u64,
 
     pub fn deinit(self: *Run, a: std.mem.Allocator) void {
@@ -82,7 +83,7 @@ pub fn run(comptime A: type, a: std.mem.Allocator, io: std.Io, arm: *A, g: *A.Ba
         .stats = decode.stats(),
         .io_after_prefill = io_after_prefill,
         .io_end = arm.stream.stats(),
-        .footprint = arm_mod.footprint(),
+        .footprint = status.footprint(),
         .mlx_peak_bytes = mlx_peak,
     };
 }

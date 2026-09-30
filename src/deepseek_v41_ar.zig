@@ -30,7 +30,7 @@ const expert_admission = @import("expert_admission.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
-/// (`status.getAppMemFootprintMb`). The gap between the footprint and MLX is the host side.
+/// (`status.footprint`, the one reader). The gap between the footprint and MLX is the host side.
 fn memProbe(harness: []const u8, phase: []const u8) void {
     _ = memProbePeak(harness, phase);
 }
@@ -41,14 +41,14 @@ fn memProbePeak(harness: []const u8, phase: []const u8) usize {
     var peak: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_peak_memory(&peak);
-    const fp_mib: u64 = status.getAppMemFootprintMb();
+    const fp = status.footprint().now;
     std.debug.print("\n{s}: memory {s}: MLX active {d:.2} GB, MLX peak since the last probe {d:.2} GB, footprint {d:.2} GB\n", .{
-        harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp_mib << 20)) / 1e9,
+        harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp)) / 1e9,
     });
     // The box's pages as the guard reads them: what is outside this footprint shows here.
-    const v = arm_mod.vmBytes();
+    const v = status.vmBytes();
     std.debug.print("NATIVE vm {s}: physical used {d} B (wired {d}, active {d}, inactive {d}, compressor {d}; purgeable {d}, speculative {d}, file-backed {d}), footprint {d} B\n", .{
-        phase, arm_mod.physicalUsed(v), v.wired, v.active, v.inactive, v.compressor, v.purgeable, v.speculative, v.external, arm_mod.footprint().now,
+        phase, status.physicalUsedBytes(v), v.wired, v.active, v.inactive, v.compressor, v.purgeable, v.speculative, v.external, fp,
     });
     _ = mlx.mlx_reset_peak_memory();
     return peak;
@@ -404,14 +404,17 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     memProbe("dsv41 ar served", "start");
-    arm_mod.startInterval();
+    status.startFootprintInterval();
     // The step's vm start (before any load): the page cache the step creates is measured from here.
-    const vm_start = arm_mod.vmBytes();
+    const vm_start = status.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
     const m = try module.Module.init(gpa, io, &config, &weights, s);
     defer m.deinit();
-    printPhaseMemory(a, phaseMemory("module constructed", m.bill.constructionTerms(), engram.row_cache_host_bytes, vm_start.external));
+    const constructed = phaseMemory("module constructed", m.bill.constructionTerms(), 0, vm_start.external);
+    printPhaseMemory(a, constructed);
+    // The window's own proofs (the harness's, never the served path's): no page cache left by the load.
+    try checkPageCache(constructed.file_cache_created_bytes);
     memProbe("dsv41 ar served", "module constructed (kernels, arm, residents, warm-up)");
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -436,6 +439,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The prompt's calls; the last one's logits are generated id 0.
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
+    // The prompt's start: the box's pages outside this footprint, the reference the phase change's box proof uses.
+    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
     for (calls[1..]) |c| {
@@ -443,7 +448,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
         logits = try m.extend(prompt[c.lo..c.hi]);
     }
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
-    printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), engram.row_cache_host_bytes, vm_start.external));
+    printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
     memProbe("dsv41 ar served", "the prompt's calls");
     for (out, steps, 0..) |*o, *st, i| {
         if (i > 0) {
@@ -458,8 +463,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     _ = mlx.mlx_array_free(logits);
     const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
     // The phase change ran inside the first decode-width extend: this interval spans it and the decode.
-    printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), engram.row_cache_host_bytes, vm_start.external));
-    if (m.phase_change) |pc| if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {};
+    printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), 0, vm_start.external));
+    if (m.phase_change) |pc| {
+        if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {}
+        try checkBoxReclaimed(pc, prompt_start_outside);
+    }
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
     var d: [32]u8 = undefined;
@@ -881,14 +889,16 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     memProbe("dsv41 served cell", "start");
-    arm_mod.startInterval();
+    status.startFootprintInterval();
     // The step's vm start (before any load): the page cache the step creates is measured from here.
-    const vm_start = arm_mod.vmBytes();
+    const vm_start = status.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
     const md = try module.Module.init(gpa, io, &config, &weights, s);
     defer md.deinit();
-    const constructed = phaseMemory("module constructed", bill.constructionTerms(), engram.row_cache_host_bytes, vm_start.external);
+    const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
+    // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
+    try checkPageCache(constructed.file_cache_created_bytes);
     printPhaseMemory(a, constructed);
     memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
 
@@ -952,7 +962,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
     // The prompt's start: the phase change's reclaim reference (the loop drives the prompt itself).
-    md.promptStart();
+    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
@@ -960,14 +970,16 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // The phase records (outside the timed spans' hot paths: at their boundaries).
     var phases: [4]PhaseMemory = undefined;
     phases[0] = cx.constructed;
-    phases[1] = phaseMemory("prompt pass", cx.bill.prefillTerms(), engram.row_cache_host_bytes, cx.file_backed_start);
+    phases[1] = phaseMemory("prompt pass", cx.bill.prefillTerms(), 0, cx.file_backed_start);
     printPhaseMemory(a, phases[1]);
     // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
     var mlx_peak: usize = @max(phases[1].mlx_peak_bytes, memProbePeak("dsv41 served cell", "prompt (one pass)"));
     const t1 = std.Io.Timestamp.now(io, .boot);
     try md.phaseChange();
+    // The window's box proof (the harness's): every release since the prompt began reclaimed in vm_stat too.
+    if (md.phase_change) |pc| try checkBoxReclaimed(pc, prompt_start_outside);
     const phase_s = secondsSince(io, t1);
-    phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), engram.row_cache_host_bytes, cx.file_backed_start);
+    phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
     printPhaseMemory(a, phases[2]);
     mlx_peak = @max(mlx_peak, @max(phases[2].mlx_peak_bytes, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)")));
@@ -1007,14 +1019,14 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const decode_s = secondsSince(io, t2);
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
-    phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), engram.row_cache_host_bytes, cx.file_backed_start);
+    phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     printPhaseMemory(a, phases[3]);
     mlx_peak = @max(mlx_peak, @max(phases[3].mlx_peak_bytes, memProbePeak("dsv41 served cell", "cycles")));
 
     const ids = try a.alloc(u32, out.items.len + 1);
     ids[0] = primary;
     @memcpy(ids[1..], out.items);
-    const fp = arm_mod.footprint();
+    const fp = status.footprint();
     const stt = lp.stats;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
@@ -1217,10 +1229,30 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     return error.CellBoolValue;
 }
 
+/// The window's proofs, the harness's to assert (the served path judges only its own ledgers): the page
+/// cache the step created by the end of construction, and the box's pages at the phase change. A guarded
+/// window's guard counts the whole box (other processes included), so these hold the harness's run to it.
+pub const page_cache_tolerance_bytes: u64 = 500_000_000;
+pub const box_tolerance_bytes: u64 = 500_000_000;
+
+/// The load left no page cache to be aged into the guard's count later (v6c2: 15 GB of speculative pages from
+/// unaligned F_NOCACHE reads, 7.7 GB aged in at the grow).
+pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
+    if (created > @as(i64, @intCast(page_cache_tolerance_bytes))) return error.ConstructionLeftPageCache;
+}
+
+/// At the phase change: the box's physical pages (vm_stat, the guard's metric) down by the freed bytes, and
+/// nothing outside this footprint beyond the prompt's start (SERVED7: the pages stayed counted after they
+/// had left the footprint).
+pub fn checkBoxReclaimed(r: module.PhaseChangeRecord, prompt_start_outside: u64) error{PhaseChangeNotReclaimed}!void {
+    if (r.after.physical + r.freed_bytes > r.before.physical + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
+    if (module.outsideOf(r.after) > prompt_start_outside + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
+}
+
 /// ASSUMPTION the bill rests on: the step creates no page cache. The guard credits only the file cache present
 /// at its start and does not count speculative pages until the kernel ages them into inactive, so page cache
 /// the step creates is unbilled memory that can land at any later allocation (v6c2: 15 GB of it from
-/// construction, 7.7 GB aged in at the grow). `Module.init` enforces it (ConstructionLeftPageCache), and each
+/// construction, 7.7 GB aged in at the grow). The harnesses assert it (`checkPageCache`), and each
 /// phase record carries `file_cache_created_bytes` and `box_speculative_bytes`.
 ///
 /// Every prompt pass is billed at the prompt rows: the first one before the phase change grows the banks,
@@ -1341,7 +1373,7 @@ pub const PhaseMemory = struct {
     phase: []const u8,
     billed: PhaseTerms,
     billed_process_bytes: u64,
-    process: arm_mod.ProcessMemory,
+    process: status.ProcessMemory,
     mlx_active_bytes: u64,
     mlx_cache_bytes: u64,
     mlx_peak_bytes: u64,
@@ -1362,6 +1394,8 @@ pub const PhaseMemory = struct {
 
 /// The boundary's record from what the kernel and MLX already track (no new counter): reads the
 /// ledgers and MLX's allocator, then restarts both high-water marks for the next phase.
+/// `engram_host_bytes`: the part of the billed Engram term that is host memory (0 since the host side is billed
+/// as measured: the Engram term holds its device residents only).
 pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64, file_backed_start: u64) PhaseMemory {
     var active: usize = 0;
     var cache: usize = 0;
@@ -1369,17 +1403,17 @@ pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_cache_memory(&cache);
     _ = mlx.mlx_get_peak_memory(&peak);
-    const pm = arm_mod.processMemory();
-    const v = arm_mod.vmBytes();
+    const pm = status.processMemory();
+    const v = status.vmBytes();
     _ = mlx.mlx_reset_peak_memory();
-    arm_mod.startInterval();
-    return recordOf(phase, billed, pm, active, cache, peak, arm_mod.physicalUsed(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
+    status.startFootprintInterval();
+    return recordOf(phase, billed, pm, active, cache, peak, status.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
 }
 
 /// `phaseMemory`'s arithmetic (host-testable): the MLX-device share of the bill is every term but the
 /// host ones (lookahead staging, host reserve, the wide window's host records, the overhead, the
 /// Engram row caches) and the allocator cache.
-pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: arm_mod.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
+pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: status.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
     const process = billed.sum();
     const measured = @max(pm.footprint_interval_peak, pm.footprint);
     const device = billed.slot_banks + billed.residents + (billed.engram -| engram_host_bytes) + billed.waves + billed.kv;
@@ -1414,6 +1448,16 @@ pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
 /// residual was +1.30 GB with both). The prompt phase keeps it: its host side measured 1.64-1.87 GB against
 /// 1.26 billed without it.
 pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
+
+/// The process's host side (its footprint less MLX's active and cache: the read pool and its staging, the
+/// lookahead staging, the Engram row caches, the tables, the process itself), billed as measured with a
+/// 0.3 GB margin in place of the named host terms (lookahead staging, row caches, host reserve, the wide
+/// window's second transient window, the prompt phase's unattributed overhead: 1.90 GB together). pass3am (v7,
+/// served-cell-typical-fastest-20260930-065643): 0.31 GB after construction; host and cache together 0.59 GB
+/// at the prompt pass's footprint peak (MLX 104.90, footprint 105.49 GB); 0.50-0.59 GB in decode; 1.93 GB at the
+/// prompt's end, after its waves were freed (footprint 96.1 GB, far under the peak). MLX active equals the
+/// device terms without the wide window at every boundary, so that window is no device memory either.
+pub const measured_host_side_bytes: u64 = 900_000_000;
 
 pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
     return cellBillWired(a, io, config, prompt_tokens, max_tokens, null);
@@ -1465,10 +1509,11 @@ pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.Mode
         .decode_rows = p.decode_rows,
         .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
         .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient) * rec,
-        .lookahead_staging = p.inputs.lookahead_staging_bytes,
+        // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
+        .lookahead_staging = 0,
         .residents = m.totalBytes(),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
-        .engram = em.totalBytes() + engram.row_cache_host_bytes,
+        .engram = em.totalBytes(),
         // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
         // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no joined copy, and
         // the wave alone covers the pass (v6b: 13.54 GB measured incl. KV against 14.40 + 0.16 billed);
@@ -1482,8 +1527,9 @@ pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.Mode
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
         .decode_wave = decode_wave,
         .draft_wave = decode_wave,
-        .host_reserve = p.inputs.host_reserve_bytes,
-        .wide_window = p.inputs.wide_window_bytes,
+        .host_reserve = measured_host_side_bytes,
+        .wide_window = 0,
+        .unbilled_overhead = 0,
         .embedding_host_rows = config.embedding_host_rows orelse true,
         .prompt_state = prompt_tokens * (bill.n_main * bill.hidden * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4),
     };
@@ -1502,11 +1548,11 @@ fn printBill(b: CellBill) void {
         .{ .name = "slot banks (layers x rows + 48) x record", .p = b.slot_prefill, .d = b.slot_decode },
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
         .{ .name = "residents (the embedding: host rows, else off at the fence)", .p = b.prefillTerms().residents, .d = b.residents - b.embedding },
-        .{ .name = "Engram residents + row caches", .p = b.engram, .d = b.engram },
+        .{ .name = "Engram residents (row caches: host side)", .p = b.engram, .d = b.engram },
         .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify + draft", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
-        .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
+        .{ .name = "host side, measured (pools, staging, caches, process)", .p = b.host_reserve, .d = b.host_reserve },
         .{ .name = "wide read window (depth 2)", .p = b.wide_window, .d = b.wide_window },
         .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
         .{ .name = "page cache created by the step (assumed 0; enforced)", .p = 0, .d = 0 },
@@ -1583,7 +1629,7 @@ test "dsv41 memory: with the embedding on its host rows no phase bills the devic
 test "dsv41 memory: the phase record's residuals: billed less the interval peak, billed device terms less MLX's peak" {
     const b = cell4Bill();
     // cell4's prompt boundary: footprint 83.03 GB now; MLX active 76.56, peak 91.35 GB.
-    const pm: arm_mod.ProcessMemory = .{ .footprint = 83_030_000_000, .footprint_interval_peak = 97_000_000_000, .footprint_lifetime_peak = 97_000_000_000 };
+    const pm: status.ProcessMemory = .{ .footprint = 83_030_000_000, .footprint_interval_peak = 97_000_000_000, .footprint_lifetime_peak = 97_000_000_000 };
     const r = recordOf("prompt pass", b.prefillTerms(), pm, 76_560_000_000, 5_000_000_000, 91_350_000_000, 110_000_000_000, 3_000_000_000, 850_000_000, 4_870_000_000, engram.row_cache_host_bytes);
     // The page cache the step created (file-backed now less at its vm start) and the speculative pages, recorded.
     try testing.expectEqual(@as(i64, 3_000_000_000 - 4_870_000_000), r.file_cache_created_bytes);
@@ -1593,7 +1639,7 @@ test "dsv41 memory: the phase record's residuals: billed less the interval peak,
     const device = b.slot_prefill + b.residents + (b.engram - engram.row_cache_host_bytes) + b.prefill_wave + b.kv;
     try testing.expectEqual(@as(i64, @intCast(device)) - 91_350_000_000, r.mlx_residual_bytes);
     // A footprint above its (stale) interval peak counts as the measurement; a peak below active reads active.
-    const late: arm_mod.ProcessMemory = .{ .footprint = 99_000_000_000, .footprint_interval_peak = 0 };
+    const late: status.ProcessMemory = .{ .footprint = 99_000_000_000, .footprint_interval_peak = 0 };
     const r2 = recordOf("decode", b.decodeTerms(), late, 97_000_000_000, 0, 0, 0, 19_950_000_000, 15_940_000_000, 4_870_000_000, engram.row_cache_host_bytes);
     // v6c2's construction: 15.08 GB of page cache created, 15.94 GB of it speculative.
     try testing.expectEqual(@as(i64, 15_080_000_000), r2.file_cache_created_bytes);
@@ -1628,10 +1674,39 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
     // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
     try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
-    try testing.expectEqual(@as(u64, 1 << 30), b.prefill_cache);
+    try testing.expectEqual(@as(u64, 2 << 30), b.prefill_cache);
+    // The host side billed as measured, the named host terms folded into it.
+    try testing.expectEqual(measured_host_side_bytes, b.host_reserve);
+    try testing.expectEqual(@as(u64, 0), b.lookahead_staging + b.wide_window + b.unbilled_overhead);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // The failure mode: the same bill with the constructed module's wired bytes read live.
     try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));
+}
+
+test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {
+    // v6c2's construction: file-backed 4.87 -> 19.95 GB: refused; configs and the metallib's pages: within it.
+    try testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
+    try checkPageCache(200_000_000);
+    try checkPageCache(-300_000_000);
+    const ref: u64 = 13_933_000_000;
+    const before: module.BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 91_915_000_000 + ref };
+    const freed: module.BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    const ok: module.PhaseChangeRecord = .{ .before = before, .after = freed, .freed_bytes = before.cache, .settle_ms = 250 };
+    try checkBoxReclaimed(ok, ref);
+    // SERVED7's shape: the footprint dropped, the box's pages did not.
+    var served7 = ok;
+    served7.after.physical = before.physical;
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(served7, ref));
+    // A short prompt's older releases still counted at the boundary: outside the footprint above the prompt's start.
+    const lag: u64 = 2_100_000_000;
+    var lagged = ok;
+    lagged.before.physical += lag;
+    lagged.after.physical += lag;
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(lagged, ref));
+    // Within the tolerance (other processes' movement): passes.
+    var noisy = ok;
+    noisy.after.physical += box_tolerance_bytes;
+    try checkBoxReclaimed(noisy, ref);
 }
 
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB

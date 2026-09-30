@@ -6,6 +6,7 @@
 //! A failed read panics naming the file, as MLX's own reader throws.
 
 const std = @import("std");
+const status = @import("status.zig");
 const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
 
@@ -174,22 +175,6 @@ pub fn residentBytes(path: [:0]const u8) !u64 {
     return resident * page;
 }
 
-/// `vm_stat`'s file-backed pages, in bytes (the whole box's; other processes move it too).
-pub fn fileBackedBytes(a: std.mem.Allocator, io: std.Io) !u64 {
-    const r = try std.process.run(a, io, .{ .argv = &.{"/usr/bin/vm_stat"}, .stdout_limit = .limited(1 << 16) });
-    defer a.free(r.stdout);
-    defer a.free(r.stderr);
-    const page_key = "page size of ";
-    const pi = std.mem.indexOf(u8, r.stdout, page_key) orelse return error.VmStatFormat;
-    const page_end = std.mem.indexOfScalarPos(u8, r.stdout, pi + page_key.len, ' ') orelse return error.VmStatFormat;
-    const page = try std.fmt.parseInt(u64, r.stdout[pi + page_key.len .. page_end], 10);
-    const key = "File-backed pages:";
-    const ki = std.mem.indexOf(u8, r.stdout, key) orelse return error.VmStatFormat;
-    const line_end = std.mem.indexOfScalarPos(u8, r.stdout, ki, '\n') orelse r.stdout.len;
-    const v = std.mem.trim(u8, r.stdout[ki + key.len .. line_end], " .\t");
-    return page * try std.fmt.parseInt(u64, v, 10);
-}
-
 // ── Tests (host: no MLX array; the reader's callbacks driven as MLX drives them) ──
 
 const testing = std.testing;
@@ -349,7 +334,7 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
 
     var cached_before: u64 = 0;
     for (shards.items) |s| cached_before += try residentBytes(s);
-    const fb0 = try fileBackedBytes(a, io);
+    const fb0 = status.vmBytes().external;
     const chunk = try a.alloc(u8, 64 << 20);
     defer a.free(chunk);
     var total: u64 = 0;
@@ -368,7 +353,7 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
         }
     }
     const read_s = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e9;
-    const fb1 = try fileBackedBytes(a, io);
+    const fb1 = status.vmBytes().external;
     var cached_after: u64 = 0;
     for (shards.items) |s| cached_after += try residentBytes(s);
     std.debug.print("nocache proof: {d} resident shards, {d} B read through the reader in {d:.2} s ({d:.2} GB/s); their cached bytes {d} -> {d} (mincore); box file-backed {d} -> {d} B (vm_stat, delta {d})\n", .{
@@ -393,7 +378,7 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
     defer for (files) |f| a.free(f);
     var eng_before: u64 = 0;
     for (files) |f| eng_before += try residentBytes(f);
-    const fb2 = try fileBackedBytes(a, io);
+    const fb2 = status.vmBytes().external;
     const n_records: usize = 100_000;
     const rows = try a.alloc(i64, 1);
     defer a.free(rows);
@@ -410,7 +395,7 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
         try eng.readRows(src.fds[li], &src.bank, rows, codes, scales);
     }
     const rec_s = @as(f64, @floatFromInt(t1.untilNow(io, .boot).nanoseconds)) / 1e9;
-    const fb3 = try fileBackedBytes(a, io);
+    const fb3 = status.vmBytes().external;
     var eng_after: u64 = 0;
     for (files) |f| eng_after += try residentBytes(f);
     std.debug.print("nocache proof: {d} random Engram records ({d} B each) in {d:.3} s ({d:.1} us each, one thread); the Engram files' cached bytes {d} -> {d} (mincore); box file-backed {d} -> {d} B (vm_stat, delta {d})\n", .{
