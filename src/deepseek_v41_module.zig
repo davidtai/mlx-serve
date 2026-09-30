@@ -933,11 +933,12 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
 /// The allocator cache the prefill holds, which the bill charges at exactly this limit: MLX trims its cache
 /// to the limit after every allocation (allocator.cpp malloc: release_cached_buffers(cache - max_pool_size_)),
 /// and a free that overshoots it lowers active by as much, so at every footprint peak the cache is at most
-/// the limit. The served tier holds 1 GiB (Python's prefill limit): pass3ak (v6c3) held ~2.1 GB of cache at its
-/// prompt peak under the old 4 GiB, and its bill had 3.3 GB to spare there. The stock tier the envelope's own.
+/// the limit. The served tier holds 2 GiB, what pass3ak (v6c3) actually held at its prompt peak under 4 GiB:
+/// at 1 GiB (pass3am, v7) the prompt read the same 186.0 GB in the same 14.4 s of read-busy time while TTFT
+/// rose 37.64 -> 39.14 s, the allocator churning in the prompt pass. The stock tier the envelope's own.
 pub fn prefillCacheLimit(t: @import("model_settings.zig").NumericTier) usize {
     return switch (t) {
-        .served => 1 << 30,
+        .served => 2 << 30,
         .stock => envelope.prefill_cache_bytes,
     };
 }
