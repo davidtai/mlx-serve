@@ -688,13 +688,14 @@ pub fn Model(comptime G: type) type {
             const xfs = try a.alloc(T, nc);
             const routes_ = try a.alloc(Tr.Route, nc);
             const dim: c_int = @intCast(c.hidden_size);
+            // P1 (the routed hook's construction option, read once): each layer's predicted seed read ahead during its attention.
+            const has_ahead = comptime @hasDecl(@TypeOf(routed.at(0)), "readAheadSeed");
+            const read_ahead = if (comptime has_ahead) routed.at(0).readAhead() else false;
             for (self.layers, 0..) |*lw, l| {
                 const li = c.layers[l];
                 const lc = &st.layers[l];
-                // P1: the layer's predicted seed read ahead while its attention runs (the hook's construction option).
-                const ahead = routed.at(@intCast(l));
-                if (comptime @hasDecl(@TypeOf(ahead), "readAheadSeed")) {
-                    if (ahead.readAhead()) try self.predictSeed(g, l, lw, ahead, hs, pms, probe);
+                if (comptime has_ahead) {
+                    if (read_ahead) try self.predictSeed(g, l, lw, routed.at(@intCast(l)), hs, pms, probe);
                 }
                 // One wave per layer (freed at its end; hs, pms and the chunks' shared runtime carried).
                 const layer_wave = g.mark();
