@@ -64,6 +64,8 @@ pub fn Model(comptime G: type) type {
         kx: Tr.Kernels = .{},
         /// C11: the verify head's m1rows route (rows <= 8), over the dense bf16 head.
         head_rows: ?kr.HeadRows(G) = null,
+        /// C29: the Engram wkv's M-invariant rows route per Engram slot (rows <= 8).
+        engram_m1: [eng.max_layers]?kr.Mxfp8Rows(G) = @splat(null),
 
         const EngramBind = struct { src: *const eng.RowSource, w: [eng.max_layers]graph.EngramW(T) };
 
@@ -180,6 +182,9 @@ pub fn Model(comptime G: type) type {
                     if (tier.routes.head != .bf16) return error.HeadRowsNeedsBf16;
                     self.head_rows = kr.HeadRows(G).init(g, reg, self.head.dense, null) catch |e| return if (e == error.RouteInput) error.HeadRowsGeometry else e;
                 }
+                if (tier.routes.rc_mxfp8_rows) if (self.engram) |en| {
+                    for (0..cp.engram.n_layers) |i| self.engram_m1[i] = try Tr.m1Site(g, reg, .engram_wkv, en.w[i].wkv);
+                };
             }
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
@@ -191,6 +196,7 @@ pub fn Model(comptime G: type) type {
             self.owned.deinit(self.gpa);
             self.kx.deinit(g);
             if (self.head_rows) |*x| x.deinit(g);
+            for (&self.engram_m1) |*x| if (x.*) |*r| r.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
         }
@@ -327,7 +333,7 @@ pub fn Model(comptime G: type) type {
             const ca = try g.hostArray(codes, &.{ nr, @intCast(hd / 4) }, .uint32);
             const sa = try g.hostArray(scales, &.{ nr, @intCast(hd / 32) }, .uint8);
             const er = try Tr.engramRows(g, ca, sa, 1, @intCast(n), @intCast(cols));
-            return Tr.engramApply(g, &self.c, en.w[slot], h, er);
+            return Tr.engramApplyM1(g, &self.c, en.w[slot], if (self.engram_m1[slot]) |*x| x else null, h, er);
         }
 
         /// `mean(h.astype(f32), axis=2).astype(h.dtype)`.

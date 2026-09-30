@@ -208,6 +208,11 @@ pub const Module = struct {
         if (config.prefill_combine) |v| tier.routes.prefill_combine = v;
         if (config.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
         if (config.prefill_joinless) |v| tier.routes.prefill_joinless = v;
+        // The verify-row routes (C23, C27-C29): a setting overrides the tier's route.
+        if (config.decode_attn_softmax) |v| tier.routes.rc_attn_softmax = v;
+        if (config.decode_index_topk) |v| tier.routes.rc_index_topk = v;
+        if (config.decode_smallm) |v| tier.routes.rc_smallm = v;
+        if (config.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         if (config.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -216,13 +221,18 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
             inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
         log.info("{s}", .{self.installed.callSites(&line_buf)});
+        self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
+        self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
+        self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
+        self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
+        log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -365,8 +375,21 @@ pub const Module = struct {
         defer self.gpa.free(scratch);
         const m = self.g.mark();
         defer self.g.resetTo(m);
-        var checks: [16]Tr.RouteCheck = undefined;
-        const n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
+        var checks: [40]Tr.RouteCheck = undefined;
+        var n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
+        n += try Tr.decodeRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, checks[n..]);
+        // C29's Engram wkv (the model's route): its first slot against the stock qmm at 5 rows.
+        if (self.model.engram_m1[0]) |*s| {
+            const en = self.model.engram.?;
+            const K = self.g.shapeOf(en.w[0].wkv.w).dim(1) * 4;
+            var rng = std.Random.DefaultPrng.init(0x5eed_d544);
+            const need: usize = @intCast(5 * K);
+            if (scratch.len < need) return error.PrefillCheckScratch;
+            for (scratch[0..need]) |*v| v.* = (rng.random().float(f32) * 2 - 1);
+            const x = try self.g.astype(try self.g.hostArray(std.mem.sliceAsBytes(scratch[0..need]), &.{ 5, K }, .float32), .bfloat16);
+            checks[n] = .{ .name = "engram_wkv", .ok = try Tr.checkCloseOf(&self.g, try s.call(&self.g, x), try Tr.qlinear(&self.g, x, en.w[0].wkv), 2e-2) };
+            n += 1;
+        }
         for (checks[0..n]) |ck| {
             var b: [1]bool = undefined;
             _ = try self.g.hostBool(ck.ok, &b);
@@ -568,8 +591,18 @@ pub const Installed = struct {
     /// PREFILL_HOST shared and JOINLESS (K16's routed group; installed).
     prefill_host_shared: bool = false,
     prefill_joinless: bool = false,
+    /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows; installed).
+    decode_attn_softmax: bool = false,
+    decode_index_topk: bool = false,
+    decode_smallm: bool = false,
+    decode_mxfp8_rows: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
+    /// The verify-row routes' construction line.
+    pub fn decodeSites(self: Installed, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "NATIVE decode sites installed: softmax {}, select {}, smallm {}, mxfp8 rows {}", .{ self.decode_attn_softmax, self.decode_index_topk, self.decode_smallm, self.decode_mxfp8_rows }) catch buf[0..0];
+    }
+
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined }) catch buf[0..0];
     }

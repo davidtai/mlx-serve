@@ -824,6 +824,11 @@ const CellReceipt = struct {
     phase_memory: ?[]const PhaseMemory = null,
     /// The phase change's readings before / after the frees and after the grow, the freed bytes, the reclaim time.
     phase_change: ?module.PhaseChangeRecord = null,
+    /// The verify-row routes the Module installed.
+    decode_attn_softmax: ?bool = null,
+    decode_index_topk: ?bool = null,
+    decode_smallm: ?bool = null,
+    decode_mxfp8_rows: ?bool = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -1054,6 +1059,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
         .phase_change = md.phase_change,
+        .decode_attn_softmax = md.installed.decode_attn_softmax,
+        .decode_index_topk = md.installed.decode_index_topk,
+        .decode_smallm = md.installed.decode_smallm,
+        .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1106,6 +1115,10 @@ fn cellConfig(config: *model.ModelConfig) !void {
     if (envStr("DSV41_CELL_PREFILL_HOST_SHARED")) |v| config.prefill_host_shared = try cellBool("DSV41_CELL_PREFILL_HOST_SHARED", v);
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| config.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
+    if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| config.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
+    if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| config.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
+    if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| config.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
+    if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| config.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;
