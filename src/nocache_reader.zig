@@ -9,6 +9,9 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
 
+/// One read's staging buffer: page-aligned (the page allocator), a multiple of every page size.
+const stage_bytes: usize = 8 << 20;
+
 /// The reader's state (MLX owns it once handed over; `free` releases it).
 /// Allocated with the C allocator: MLX may free it from an IO thread.
 pub const Desc = struct {
@@ -38,17 +41,42 @@ pub const Desc = struct {
         std.heap.c_allocator.destroy(d);
     }
 
-    /// `buf.len` bytes at `off` (pread is safe from MLX's IO threads).
+    /// `buf.len` bytes at `off`, through a page-aligned staging buffer. macOS honours F_NOCACHE only
+    /// for page-aligned reads (the file offset, the length and the destination): an unaligned read goes
+    /// through the unified buffer cache and leaves its pages cached (speculative pages, which the
+    /// guard's metric does not count until the kernel ages them under pressure). Measured on the bank's
+    /// resident shards: 0.19 GB cached per 0.54 GB read unaligned, none aligned; MLX's tensor loads
+    /// arrive unaligned (safetensors offsets, MLX buffers), and a served cell's construction left
+    /// 15.1 GB of page cache (pass3aj 20260930-060358). pread is safe from MLX's IO threads: each call
+    /// owns its stage.
     pub fn readAt(d: *const Desc, buf: []u8, off: u64) void {
-        var done: usize = 0;
-        while (done < buf.len) {
-            const n = std.c.pread(d.fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
-            if (n < 0) {
-                if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
-                std.debug.panic("nocache reader: {s}: pread of {d} B at {d} failed, errno {d}", .{ d.label, buf.len - done, off + done, std.c._errno().* });
+        if (buf.len == 0) return;
+        const page: u64 = std.heap.pageSize();
+        const stage = std.heap.page_allocator.alloc(u8, stage_bytes) catch
+            std.debug.panic("nocache reader: {s}: no {d} B staging buffer", .{ d.label, stage_bytes });
+        defer std.heap.page_allocator.free(stage);
+        var pos = off;
+        const end = off + buf.len;
+        var out: usize = 0;
+        while (pos < end) {
+            const a0 = pos - pos % page;
+            const want_end = @min(end, a0 + stage_bytes);
+            const need: usize = @intCast(want_end - a0);
+            const len = std.mem.alignForward(usize, need, @intCast(page));
+            var got: usize = 0;
+            while (got < need) {
+                const n = std.c.pread(d.fd, stage[got..].ptr, len - got, @intCast(a0 + got));
+                if (n < 0) {
+                    if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                    std.debug.panic("nocache reader: {s}: pread of {d} B at {d} failed, errno {d}", .{ d.label, len - got, a0 + got, std.c._errno().* });
+                }
+                if (n == 0) std.debug.panic("nocache reader: {s}: short read at {d} ({d} B file)", .{ d.label, a0 + got, d.size });
+                got += @intCast(n);
             }
-            if (n == 0) std.debug.panic("nocache reader: {s}: short read at {d} ({d} B file)", .{ d.label, off + done, d.size });
-            done += @intCast(n);
+            const s0: usize = @intCast(pos - a0);
+            @memcpy(buf[out..][0 .. need - s0], stage[s0..need]);
+            out += need - s0;
+            pos = want_end;
         }
     }
 };
@@ -329,11 +357,13 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
     for (shards.items) |s| {
         const d = try Desc.open(s);
         defer d.close();
-        var off: u64 = 0;
-        while (off < d.size) : (off += chunk.len) {
+        // Unaligned, as MLX's tensor loads arrive (a safetensors offset, a destination off the page).
+        const step = chunk.len - 12_347;
+        var off: u64 = 8 + 4_321;
+        while (off < d.size) : (off += step) {
             if (held(hold)) return error.QuietHoldAppeared;
-            const n: usize = @intCast(@min(chunk.len, d.size - off));
-            d.readAt(chunk[0..n], off);
+            const n: usize = @intCast(@min(step, d.size - off));
+            d.readAt(chunk[1..][0..n], off);
             total += n;
         }
     }
