@@ -686,6 +686,25 @@ pub const ModelConfig = struct {
     /// the top-k arm at long context and the bound must track it rather than
     /// freezing at `index_topk`. A checkpoint declaring no ratios stays dense —
     /// an arch we cannot bound must never be billed as though we had.
+    /// deepseek_v41's prefill routes as the module builds them: a setting when given, else the tier's
+    /// default (the served tier: K16 layer-major, two wide groups in flight, the wide feed; the stock
+    /// tier, whose prompt forwards are decode-width: none).
+    pub fn dsv41LayerMajor(self: *const ModelConfig) bool {
+        return self.layer_major_prefill orelse self.dsv41ServedTier();
+    }
+
+    pub fn dsv41WideDepth(self: *const ModelConfig) u8 {
+        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 2 else 1;
+    }
+
+    pub fn dsv41WideFeed(self: *const ModelConfig) bool {
+        return self.expert_wide_feed orelse self.dsv41ServedTier();
+    }
+
+    fn dsv41ServedTier(self: *const ModelConfig) bool {
+        return (self.numeric_tier orelse .served) == .served;
+    }
+
     pub fn prefillAttnKeys(self: *const ModelConfig, seq: u64) u64 {
         if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return seq;
         const n = @min(self.dsv4_n_compress_ratios, self.dsv4_compress_ratios.len);
