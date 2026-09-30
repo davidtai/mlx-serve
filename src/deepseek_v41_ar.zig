@@ -795,6 +795,7 @@ const CellReceipt = struct {
     wide_cold_rows: ?u8 = null,
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
+    prefill_index: ?bool = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -993,6 +994,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_depth = md.installed.wide.depth,
         .wide_cold_rows = md.installed.wide.cold_rows,
         .prefill_attn = md.installed.prefill_attn,
+        .prefill_index = md.installed.prefill_index,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1035,6 +1037,7 @@ fn cellConfig(config: *model.ModelConfig) !void {
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The attention call sites (the served tier's routes by default; 0 = the stock chain).
     if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
+    if (envStr("DSV41_CELL_PREFILL_INDEX")) |v| config.prefill_index = try cellBool("DSV41_CELL_PREFILL_INDEX", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;
@@ -1201,7 +1204,7 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
     var eck = try v41.Checkpoint.openFile(a, epath, &vd);
     defer eck.deinit();
     const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
-    const bill = v41.PrefillBill.of(&c);
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config));
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).

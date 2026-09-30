@@ -413,6 +413,7 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
         mini_served.routes.rc_head = false;
         mini_served.routes.rc_draft = false;
         mini_served.routes.prefill_attn = false;
+        mini_served.routes.prefill_index = false;
         const r = try Rig.createAt(mini_served);
         defer r.destroy();
         var s: Script = .{ .n_experts = 0, .k = 0, .pick = 3, .u32s = &.{}, .f32s = &.{} };

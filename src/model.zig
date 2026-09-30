@@ -436,6 +436,9 @@ pub const ModelConfig = struct {
     /// deepseek_v41's prefill attention core (ATTNHALF ropefuse) at prompt widths: null = the tier's
     /// route (served: on), false = the stock chain by construction.
     prefill_attn: ?bool = null,
+    /// deepseek_v41's prefill indexer (ATTNHALF idxscore + INDEX_TOPK) at prompt widths: null = the
+    /// tier's route (served: on), false = the stock chain by construction.
+    prefill_index: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

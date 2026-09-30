@@ -115,6 +115,11 @@ pub const Routes = struct {
     /// roped in the QK load and o handed on inverse-roped in the o-LoRA group layout (no gathered
     /// KVg, no eager core); one route per (query dtype, window-store dtype, compressed) kind.
     prefill_attn: bool = false,
+    /// The prefill indexer (ATTNHALF idxscore + INDEX_TOPK select): at rows above
+    /// `attn_compile_max_rows` an index source's reach-masked scores in one launch and its top
+    /// `index_topk` as ascending indices and the mask in one more (no eager einsum / relu / sum,
+    /// no argpartition, no mask-to-index argsort).
+    prefill_index: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -249,6 +254,9 @@ pub fn LayerKernels(comptime G: type) type {
         fused: ?*const kr.FusedProj(G) = null,
         /// The prefill attention core of this layer's kind (`Routes.prefill_attn`).
         prefill_attn: ?*const kr.PrefillAttn(G) = null,
+        /// The prefill indexer's score and select (`Routes.prefill_index`; one of each per trunk).
+        idx_score: ?*const kr.IdxScore(G) = null,
+        index_topk: ?*const kr.IndexTopk(G) = null,
         /// C16: the shared expert's projections (the draft's; the trunk's shared expert is stock).
         shared: ?*const SharedRc(G) = null,
 
@@ -293,9 +301,12 @@ pub fn Trunk(comptime G: type) type {
             /// 1: f32, window only; 2: f32, compressed) and each layer's kind.
             prefill_attn: [3]?kr.PrefillAttn(G) = .{ null, null, null },
             prefill_attn_kind: [v41.max_layers]u8 = @splat(0),
+            /// The prefill indexer's score and select.
+            idx_score: ?kr.IdxScore(G) = null,
+            index_topk: ?kr.IndexTopk(G) = null,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -364,6 +375,11 @@ pub fn Trunk(comptime G: type) type {
                         }
                     }
                 }
+                if (rt.prefill_index) {
+                    const geo = prefillGeometry(c);
+                    k.idx_score = try kr.IdxScore(G).init(reg, &geo, null);
+                    k.index_topk = try kr.IndexTopk(G).init(g, reg, &geo, null);
+                }
                 return k;
             }
 
@@ -375,6 +391,7 @@ pub fn Trunk(comptime G: type) type {
                 if (self.tape) |*x| x.deinit(g);
                 for (self.fused.items) |*x| x.deinit(g);
                 for (&self.prefill_attn) |*x| if (x.*) |*r| r.deinit(g);
+                if (self.index_topk) |*x| x.deinit(g);
                 if (self.gpa) |a| {
                     self.router.deinit(a);
                     self.premix.deinit(a);
@@ -395,6 +412,8 @@ pub fn Trunk(comptime G: type) type {
                     .tape_attn = if (self.tape) |*x| x else null,
                     .fused = if (self.fused.items.len > 0) &self.fused.items[l] else null,
                     .prefill_attn = if (self.prefill_attn[self.prefill_attn_kind[l]]) |*x| x else null,
+                    .idx_score = if (self.idx_score) |*x| x else null,
+                    .index_topk = if (self.index_topk) |*x| x else null,
                 };
             }
         };
@@ -470,8 +489,8 @@ pub fn Trunk(comptime G: type) type {
         /// to the layer's reset (a 953-row prefill chunk's attention and indexer
         /// arrays are 8 GB each at 16K).
         fn closeScores(g: *G, m: ops.Mark, outs: []const *T) !void {
-            std.debug.assert(outs.len <= 2);
-            var kept: [2]T = undefined;
+            std.debug.assert(outs.len <= 3);
+            var kept: [3]T = undefined;
             for (outs, 0..) |o, i| kept[i] = g.keep(o.*);
             g.resetTo(m);
             for (outs, 0..) |o, i| o.* = try g.adopt(kept[i]);
@@ -776,10 +795,13 @@ pub fn Trunk(comptime G: type) type {
             return ropeLast(g, k, cs, false);
         }
 
-        const Selection = struct { mask: T, cand: ?T };
+        /// `idx` (the prefill indexer only): the selection as ascending indices, -1 padded [1, S, k].
+        const Selection = struct { mask: T, cand: ?T, idx: ?T = null };
+        /// The prefill indexer's launches (one prompt row block, b = 1).
+        const PrefillIndex = struct { score: *const kr.IdxScore(G), topk: *const kr.IndexTopk(G) };
 
         /// `Indexer.select`: score the compressed rows, keep the top `index_topk`.
-        fn indexerSelect(g: *G, p: anytype, c: *const v41.Config, w: *const W, x: T, qr: T, index_k: T, cs: CosSin, compress_lens: T, n_comp: c_int, candidates: ?T, set_candidates: bool) !Selection {
+        fn indexerSelect(g: *G, p: anytype, c: *const v41.Config, w: *const W, x: T, qr: T, index_k: T, cs: CosSin, compress_lens: T, n_comp: c_int, candidates: ?T, set_candidates: bool, pi: ?PrefillIndex) !Selection {
             const sh = g.shapeOf(x);
             const iq = w.idx_q.?;
             const H: c_int = @intCast(c.index_n_heads);
@@ -789,6 +811,20 @@ pub fn Trunk(comptime G: type) type {
             const softmax_scale = std.math.pow(f64, @floatFromInt(c.index_head_dim), -0.5);
             const wts0 = try linear(g, x, iq.weights_proj);
             const wts = try g.mul(wts0, try sf(g, softmax_scale * std.math.pow(f64, @floatFromInt(c.index_n_heads), -0.5), wts0));
+            if (pi) |ix| {
+                // One launch: sum_h relu(q_h . k_n) w_h, -inf past each row's reach.
+                var score = try ix.score.call(g, q, index_k, try g.astype(wts, .float32), compress_lens);
+                var cand: ?T = null;
+                if (set_candidates) {
+                    cand = try candidateBlocks(g, c, score, compress_lens);
+                } else if (candidates) |cm| {
+                    score = try g.where(cm, score, try sf(g, -std.math.inf(f64), score));
+                }
+                try p.put("attn.index_score", score);
+                const s_ = sh.d[1];
+                const r = try ix.topk.select(g, try g.reshape(score, &.{ s_, n_comp }), compress_lens);
+                return .{ .mask = try g.reshape(r[1], &.{ 1, s_, n_comp }), .cand = cand, .idx = try g.expandDims(r[0], 0) };
+            }
             var score = try g.einsum("bshd,btd->bsht", &.{ try g.astype(q, .float32), try g.astype(index_k, .float32) });
             score = try g.mul(try g.maximum(score, try sf(g, 0.0, score)), try g.expandDims(try g.astype(wts, .float32), -1));
             score = try g.sum(score, 2, false);
@@ -843,7 +879,7 @@ pub fn Trunk(comptime G: type) type {
 
         /// `Attention._compressed`: the CSA2 mode dispatch. Under K30 an index
         /// source also publishes its selection as gather indices.
-        fn compressed(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, qr: T, positions: T, cs: CosSin, cache: *Cache, shared: *Share) !?Compressed {
+        fn compressed(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, li: v41.LayerInfo, w: *const W, inv_freq: T, x: T, qr: T, positions: T, cs: CosSin, cache: *Cache, shared: *Share, pi: ?PrefillIndex) !?Compressed {
             if (li.kv_source) try publishCompressed(g, p, c, li, w, inv_freq, x, cache, shared);
             const ckv = shared.compress_kv orelse return null;
             const n_comp = g.shapeOf(ckv).dim(1);
@@ -852,9 +888,11 @@ pub fn Trunk(comptime G: type) type {
                 const lens = try g.floorDiv(try g.add(positions, try g.scalar(1, .int32)), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const cand = if (li.candidate_source) null else shared.candidates;
                 const scores: ?ops.Mark = if (rowsOf(g, x, 1) > score_wave_min_rows) g.mark() else null;
-                var sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source);
+                var sel = try indexerSelect(g, p, c, w, x, qr, shared.index_k.?, cs, lens, n_comp, cand, li.candidate_source, pi);
                 if (scores) |m| {
-                    if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd }) else try closeScores(g, m, &.{&sel.mask});
+                    if (sel.idx) |*ix| {
+                        if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd, ix }) else try closeScores(g, m, &.{ &sel.mask, ix });
+                    } else if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd }) else try closeScores(g, m, &.{&sel.mask});
                 }
                 shared.topk_mask = sel.mask;
                 if (li.candidate_source) shared.candidates = sel.cand;
@@ -862,7 +900,7 @@ pub fn Trunk(comptime G: type) type {
                 if (rt.selected_keys) {
                     // A fixed-shape core pads the selection to index_topk.
                     const k: c_int = if (rt.core_rows > 0) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
-                    shared.selected_idx = try maskToTopkIdx(g, mask, k);
+                    shared.selected_idx = if (sel.idx) |ix| try padIdx(g, ix, k) else try maskToTopkIdx(g, mask, k);
                     try p.put("attn.selected_idx", shared.selected_idx.?);
                 }
             } else {
@@ -926,6 +964,13 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_mask_to_topk_idx`: the True positions of each row, ascending,
         /// padded with -1 to `k` columns.
+        /// The prefill select's min(index_topk, N) indices padded with -1 to `k` (as `maskToTopkIdx`).
+        fn padIdx(g: *G, idx: T, k: c_int) !T {
+            const sh = g.shapeOf(idx);
+            if (sh.d[2] >= k) return idx;
+            return g.concat(&.{ idx, try g.full(&.{ sh.d[0], sh.d[1], k - sh.d[2] }, try g.scalar(-1, .int32), .int32) }, -1);
+        }
+
         fn maskToTopkIdx(g: *G, mask: T, k: c_int) !T {
             const sh = g.shapeOf(mask);
             const n = sh.d[2];
@@ -1154,6 +1199,8 @@ pub fn Trunk(comptime G: type) type {
             const compiled = rc == null and b * s <= rt.attn_rows;
             // The prefill attention core at prompt widths (above the compiled regions' rows; K30 keys).
             const pa: ?*const kr.PrefillAttn(G) = if (rc == null and !compiled and b * s > attn_compile_max_rows and rt.selected_keys) lk.prefill_attn else null;
+            // The prefill indexer at the same widths (one prompt row block).
+            const pi: ?PrefillIndex = if (b == 1 and s > attn_compile_max_rows and lk.idx_score != null) .{ .score = lk.idx_score.?, .topk = lk.index_topk.? } else null;
             const cs = try cosSin(g, inv_freq, positions);
             var q: T = undefined;
             var qr: T = undefined;
@@ -1195,7 +1242,7 @@ pub fn Trunk(comptime G: type) type {
             if (rt.selected_keys) {
                 var ckv: ?T = null;
                 var cidx: ?T = null;
-                if (li.ratio > 0) if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
+                if (li.ratio > 0) if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared, pi)) |comp| {
                     ckv = comp.kv;
                     cidx = shared.selected_idx;
                 };
@@ -1220,7 +1267,7 @@ pub fn Trunk(comptime G: type) type {
                 var attend = try windowMask(g, c, shared, positions, g.shapeOf(window).dim(1), drop, b, s);
                 var keys = window;
                 if (li.ratio > 0) {
-                    if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared)) |comp| {
+                    if (try compressed(g, p, c, rt, li, w, inv_freq, x, qr, positions, cs, cache, shared, pi)) |comp| {
                         keys = try g.concat(&.{ window, comp.kv }, 1);
                         attend = try g.concat(&.{ attend, comp.mask }, -1);
                     }
@@ -2139,6 +2186,40 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
     var bad = c;
     bad.window = 64;
     try testing.expectError(error.RouteInput, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &rt, &.{}));
+}
+
+test "dsv41 graph: the prefill indexer scores and selects in two launches at prompt widths; verify widths keep the chain" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const rt: Routes = .{ .prefill_index = true, .selected_keys = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+    defer k.deinit(&g);
+    var l: usize = 0;
+    while (!c.layers[l].index_source) l += 1;
+    const li = c.layers[l];
+    const w = try traceLayerW(&g, &c, li);
+    const inv = try Tr.yarnInvFreq(&g, &c);
+    var cache = Tr.Cache.init(li, c.window, .{});
+    defer cache.deinit(&g);
+    var shared: Tr.Share = .{};
+    const n0 = g.nodes.items.len;
+    _ = try Tr.attention(&g, &p, &c, &rt, k.at(l), li, &w, inv, try g.input(&.{ 1, 64, 5120 }, .float32), try g.arange(0, 64, 1, .int32), &cache, &shared);
+    const n_comp: c_int = @intCast(64 / li.ratio);
+    try expectStage(&g, &p, "attn.index_score", &.{ 1, 64, n_comp }, .float32);
+    try expectStage(&g, &p, "attn.selected_idx", &.{ 1, 64, @min(n_comp, @as(c_int, @intCast(c.index_topk))) }, .int32);
+    try testing.expect(!noneOf(&g, n0, .kernel));
+    try testing.expect(noneOf(&g, n0, .argpartition) and noneOf(&g, n0, .argsort));
+    // A verify width (8 rows) keeps the eager score (its einsum) and select; no launches.
+    const n1 = g.nodes.items.len;
+    _ = try Tr.attention(&g, &p, &c, &rt, k.at(l), li, &w, inv, try g.input(&.{ 1, 8, 5120 }, .float32), try g.arange(64, 72, 1, .int32), &cache, &shared);
+    try testing.expect(noneOf(&g, n1, .kernel));
+    try testing.expect(!noneOf(&g, n1, .einsum));
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {

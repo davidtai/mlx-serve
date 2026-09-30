@@ -173,13 +173,14 @@ pub const Module = struct {
             if (v and !tier.routes.selected_keys) return error.PrefillAttnNeedsSelectedKeys;
             tier.routes.prefill_attn = v;
         }
+        tier.routes.prefill_index = try prefillIndexRoute(config);
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         if (tier.routes.prefill_attn) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn },
+            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index },
         };
         var line_buf: [192]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -401,10 +402,12 @@ pub const Installed = struct {
     stream_windows: u8 = 1,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
+    /// The prefill indexer (installed).
+    prefill_index: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}", .{self.prefill_attn}) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}", .{ self.prefill_attn, self.prefill_index }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
@@ -414,6 +417,15 @@ pub const Installed = struct {
         }) catch buf[0..0];
     }
 };
+
+/// The prefill indexer route as the Module builds it (the setting, else the tier's route); the bill
+/// reads the same answer. It needs K30's selected keys.
+pub fn prefillIndexRoute(config: *const model_io.ModelConfig) !bool {
+    const t = numericTier(config.numeric_tier orelse .served);
+    const on = config.prefill_index orelse t.routes.prefill_index;
+    if (on and !t.routes.selected_keys) return error.PrefillIndexNeedsSelectedKeys;
+    return on;
+}
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {

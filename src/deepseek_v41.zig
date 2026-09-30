@@ -40,6 +40,15 @@ pub const PrefillBill = struct {
     top_k: u64 = 0,
     n_main: u64 = 0,
     index_topk: u64 = 0,
+    /// The served prefill indexer route (idxscore + INDEX_TOPK): an index source's score chain is one
+    /// [rows, positions] f32 score (and the select's mask), not the per-head [rows, heads, positions].
+    index_launch: bool = false,
+
+    pub fn withIndexLaunch(b: PrefillBill, on: bool) PrefillBill {
+        var x = b;
+        x.index_launch = on;
+        return x;
+    }
 
     /// The trunk's attention: the stock tier scores every position (masked full), the served tier the selected keys.
     pub const Tier = enum { stock, served };
@@ -105,7 +114,7 @@ pub const PrefillBill = struct {
             .served => b.selected_keys,
         };
         const attn = rows * b.n_heads * (keys + 1) * 4;
-        const index = rows * b.index_heads * positions * 4;
+        const index = if (tier == .served and b.index_launch) rows * positions * 4 else rows * b.index_heads * positions * 4;
         return wave_fixed_bytes + rows * wave_row_bytes + chain_copies * @max(attn, index) + positions * kept_pos_bytes;
     }
 
