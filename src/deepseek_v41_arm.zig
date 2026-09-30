@@ -74,6 +74,10 @@ pub const Options = struct {
     /// and decode rows per layer. The envelope admission still runs (AUTO, for its record); its rows
     /// are not used. Exclusive with `fixed_rows`.
     native_rows: ?NativeRows = null,
+    /// Every layer's slot banks at their decode rows from construction: the prompt phase holds the
+    /// same rows and the phase change allocates nothing (no bank growth, no transient beside the
+    /// frees). Native rows must then be one count (prefill == decode).
+    preallocate: bool = false,
     allocation: expert_admission.Allocation = .prefill_excess,
     phase_reserve_bytes: u64 = pass2_phase_reserve_bytes,
     host_reserve_bytes: u64 = pass2_host_reserve_bytes,
@@ -165,10 +169,13 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     if (opt.native_rows) |nr| {
         if (opt.fixed_rows != null) return refuse(diag, error.NativeRowsWithFixedRows, "admission: native rows and forced rows are exclusive", .{});
         if (nr.prefill == 0 or nr.prefill > nr.decode or nr.decode > n_experts) return refuse(diag, error.InvalidNativeRows, "admission: native rows {d} prefill / {d} decode (1..{d})", .{ nr.prefill, nr.decode, n_experts });
+        if (opt.preallocate and nr.prefill != nr.decode) return refuse(diag, error.NativeRowsNotOneCount, "admission: preallocated banks take one row count, native rows {d} prefill / {d} decode", .{ nr.prefill, nr.decode });
         prefill = nr.prefill;
         decode = nr.decode;
     }
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
+    // Preallocated: the decode rows in both phases (the prompt phase's bill holds them).
+    if (opt.preallocate) prefill = decode;
     return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
 }
 
@@ -962,6 +969,41 @@ test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
     std.debug.print("dsv41 arm on the real bank: {d} prefill / {d} decode rows per layer, slot banks {d} B, modeled peak {d} B\n", .{
         p.prefill_rows, p.decode_rows, adm.final_bank_bytes, p.plan.peak_fill.?.modeled_peak_bytes,
     });
+}
+
+// DSV41_BANK=<the 3.0 bank dir>: preallocated, one row count in both phases (the decode rows).
+test "dsv41 arm: the real bank's preallocated plan holds the decode rows in the prompt phase too" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var diag: Diag = .{};
+    var p = try planRows(testing.allocator, std.testing.io, .{
+        .model_dir = dir,
+        .baseline_bytes = 7_755_397_656,
+        .wired_bytes = 3_377_741_824,
+        .fixed_rows = 147,
+        .lookahead = .{},
+        .slot_memory = .host,
+        .preallocate = true,
+    }, &diag);
+    defer p.bank.deinit();
+    try testing.expectEqual(@as(u32, 147), p.decode_rows);
+    try testing.expectEqual(p.decode_rows, p.prefill_rows);
+}
+
+test "dsv41 arm: a preallocated arm grows nothing at the phase change; split native rows are refused" {
+    const tm = try TestModel.create(true);
+    defer tm.destroy();
+    var g = ops.TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var diag: Diag = .{};
+    var o = tm.options();
+    o.preallocate = true;
+    const arm = try TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag);
+    defer arm.deinit();
+    for (arm.prefill_rows, arm.decode_rows) |pr, d| try testing.expectEqual(d, pr);
+    try arm.grow(&g);
+    for (arm.stream.layers) |ls| try testing.expect(ls.ext == null);
+    o.native_rows = .{ .prefill = 2, .decode = 4 };
+    try testing.expectError(error.NativeRowsNotOneCount, TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag));
 }
 
 test "dsv41 arm: every construction refusal is named" {
