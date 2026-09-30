@@ -492,7 +492,7 @@ pub const Module = struct {
         const after = BoundaryMemory.settled(self.io, before, freed_device);
         marks[2] = VmMark.now();
         checkFreed(before, after, freed_device) catch |e| {
-            log.err("phase change refused before the grow: {s} (before: active {d} B, cache {d} B, footprint {d} B; after: active {d} B, cache {d} B, footprint {d} B; freed device bytes {d})", .{ @errorName(e), before.active, before.cache, before.footprint, after.active, after.cache, after.footprint, freed_device });
+            log.err("phase change refused before the grow: {s} (before: active {d} B, cache {d} B, footprint {d} B, physical {d} B; after: active {d} B, cache {d} B, footprint {d} B, physical {d} B; freed device bytes {d})", .{ @errorName(e), before.active, before.cache, before.footprint, before.physical, after.active, after.cache, after.footprint, after.physical, freed_device });
             return e;
         };
         switch (self.arm) {
@@ -616,31 +616,33 @@ pub fn admitPhases(b: ar_bill.CellBill, target: u64) error{ PromptOverTarget, De
     if (b.decodeTotal() > target) return error.DecodeOverTarget;
 }
 
-/// MLX's allocator and the process footprint at the phase boundary (existing counters only).
+/// MLX's allocator, the process footprint and the box's physical pages (the guard's own metric, vm_stat)
+/// at the phase boundary: existing counters only.
 pub const BoundaryMemory = struct {
     active: u64,
     cache: u64,
     footprint: u64,
+    physical: u64,
 
     fn now() BoundaryMemory {
         var active: usize = 0;
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
-        return .{ .active = active, .cache = cache, .footprint = arm_mod.footprint().now };
+        return .{ .active = active, .cache = cache, .footprint = arm_mod.footprint().now, .physical = arm_mod.physicalUsed(arm_mod.vmBytes()) };
     }
 
-    /// After the frees: the footprint read until it has dropped by the released bytes, at most
-    /// `phase_change_settle_ms` (the kernel's ledger can trail a release by a few ms); the one check
-    /// then judges what it reads.
+    /// After the frees: the footprint AND the box's physical pages read until both have dropped by the
+    /// released bytes, at most `phase_change_settle_ms` (the kernel's ledgers can trail a release; SERVED7's
+    /// pages stayed counted in vm_stat after the footprint had dropped); the one check then judges what it reads.
     fn settled(io: std.Io, before: BoundaryMemory, freed_device: u64) BoundaryMemory {
         var m = now();
         var waited: u32 = 0;
-        while (!footprintFreed(before, m, freed_device) and waited < phase_change_settle_ms) : (waited += 1) {
+        while (!(footprintFreed(before, m, freed_device) and physicalFreed(before, m, freed_device)) and waited < phase_change_settle_ms) : (waited += 1) {
             std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
             m = now();
         }
-        if (waited > 0) log.info("NATIVE phase change: the footprint settled in {d} ms", .{waited});
+        if (waited > 0) log.info("NATIVE phase change: the frees settled in {d} ms (footprint and physical pages)", .{waited});
         return m;
     }
 };
@@ -648,19 +650,28 @@ pub const BoundaryMemory = struct {
 /// The footprint may sit this far above its expected drop at the boundary (the ledger's page rounding
 /// and the host side's own movement).
 pub const phase_change_tolerance_bytes: u64 = 250_000_000;
-/// The longest the phase change waits for the footprint to show the frees before it refuses.
-pub const phase_change_settle_ms: u32 = 2000;
+/// The box's physical pages may sit this far above their expected drop (they are the whole box's: other
+/// processes move them too, within a guarded window by little).
+pub const phase_change_physical_tolerance_bytes: u64 = 500_000_000;
+/// The longest the phase change waits for the frees to show before it refuses.
+pub const phase_change_settle_ms: u32 = 5000;
 
 fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
 }
 
+fn physicalFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
+    return after.physical + before.cache + freed_device <= before.physical + phase_change_physical_tolerance_bytes;
+}
+
 /// The phase boundary's one check: the MLX cache empty (every prompt buffer released, none parked for the
-/// grow to miss), MLX active down by the freed device bytes, the footprint down by the cache and those bytes.
-pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed }!void {
+/// grow to miss), MLX active down by the freed device bytes, the footprint AND the box's physical pages (the
+/// guard's metric) down by the cache and those bytes.
+pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed, PhaseChangePhysicalNotFreed }!void {
     if (after.cache != 0) return error.PhaseChangeCacheNotEmpty;
     if (after.active + freed_device > before.active) return error.PhaseChangeActiveNotFreed;
     if (!footprintFreed(before, after, freed_device)) return error.PhaseChangeFootprintNotFreed;
+    if (!physicalFreed(before, after, freed_device)) return error.PhaseChangePhysicalNotFreed;
 }
 
 pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
@@ -1257,19 +1268,33 @@ test "dsv41 memory: the native fill takes two row counts, each phase at its targ
 
 test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, by name" {
     const gb: u64 = 1_000_000_000;
-    // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92 GB.
-    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
-    // Released: cache empty, footprint down by the cache.
-    try checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache }, 0);
-    // The embedding freed at the boundary: active and footprint down by it too.
-    try checkFreed(before, .{ .active = before.active - 1_323_827_200, .cache = 0, .footprint = before.footprint - before.cache - 1_323_827_200 }, 1_323_827_200);
+    const emb: u64 = 1_323_827_200;
+    // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92, box physical 105.85 GB.
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
+    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    // Released: cache empty, footprint and physical pages down by the cache.
+    try checkFreed(before, freed, 0);
+    // The embedding freed at the boundary: active, footprint and physical down by it too.
+    try checkFreed(before, .{ .active = before.active - emb, .cache = 0, .footprint = freed.footprint - emb, .physical = freed.physical - emb }, emb);
     // Cache bytes left: refused.
-    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, .{ .active = before.active, .cache = 16384, .footprint = before.footprint - before.cache }, 0));
-    // v6b as it ran (cache cleared before the handlers returned their buffers): the footprint 91.07 GB, 4.07 GB
-    // above the drop, refused.
-    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = 91_065_000_000 }, 0));
+    var left = freed;
+    left.cache = 16384;
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, left, 0));
+    // v6b as it ran (the cache cleared before the handlers returned their buffers): the footprint 91.07 GB,
+    // 4.07 GB above the drop: refused.
+    var v6b = freed;
+    v6b.footprint = 91_065_000_000;
+    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, v6b, 0));
+    // SERVED7's shape: the footprint dropped, the box's physical pages did not (the guard's metric): refused.
+    var served7 = freed;
+    served7.physical = before.physical;
+    try std.testing.expectError(error.PhaseChangePhysicalNotFreed, checkFreed(before, served7, 0));
+    // Within the physical tolerance (other processes' movement): passes.
+    var noisy = freed;
+    noisy.physical += phase_change_physical_tolerance_bytes;
+    try checkFreed(before, noisy, 0);
     // Active not down by the embedding: refused.
-    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb }, 1_323_827_200));
+    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb, .physical = before.physical - before.cache - 2 * gb }, emb));
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
