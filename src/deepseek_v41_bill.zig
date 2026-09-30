@@ -561,8 +561,8 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 139, .decode = 166 }, .on = .{ .prefill = 138, .decode = 166 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 165 }, .on = .{ .prefill = 138, .decode = 165 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 139, .decode = 168 }, .on = .{ .prefill = 138, .decode = 168 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 167 }, .on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);

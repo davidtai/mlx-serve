@@ -36,14 +36,16 @@ pub const Finish = enum { length, stop };
 pub const whole_prompt: u32 = std.math.maxInt(u32);
 
 /// What a request's strategy keeps alive from its prompt pass into decode (the native bill's `prompt_state`,
-/// decode phase), as `Loop.prefillImpl` leaves it: the next draft's main row (`main_h`) is a 1-row view of the
-/// whole prompt's main taps (f32 `[P, n_main x hidden]`) and keeps them alive, and each stage's window is a view
-/// of its whole-prompt main KV (f32 `[P, head_dim]`) until the first round's `setMain` and `seedMain` replace
-/// both. Stated here, beside the code that retains it, so a change to the seed changes the bill with it.
+/// decode phase), as `Loop.prefillImpl` leaves it: the seed gathers its own copies (`copyRows`), so what stays is
+/// the next draft's main row (`main_h`, f32 `[1, n_main x hidden]`) and each stage's window (f32 `[rows, head_dim]`,
+/// at most `c.window` rows); the prompt's main taps and main KV are freed at the prefill's reset. Stated here,
+/// beside the code that retains it, so a change to the seed changes the bill with it (the served bank: 847,872 B
+/// for any prompt of at least the window; the views it replaced held P x 67,584 B, 1,107,296,256 B at 16K).
 pub fn seedRetainedBytes(c: *const v41.Config, prompt_tokens: u64) u64 {
     var n_main: u64 = 0;
     for (c.layers[0..c.n_layers]) |li| n_main += @intFromBool(li.dspark_target);
-    return prompt_tokens * (n_main * c.hidden_size * 4 + @as(u64, c.dspark.n_stages) * c.head_dim * 4);
+    const window_rows: u64 = @min(prompt_tokens, c.window);
+    return n_main * c.hidden_size * 4 + @as(u64, c.dspark.n_stages) * window_rows * c.head_dim * 4;
 }
 
 /// One cycle's decisions, as the Python oracle fixture records them.
@@ -1387,6 +1389,18 @@ test "dsv41 dspark loop: the install warm-up traces every region at the served s
     }
     try testing.expectEqualSlices(u32, &.{ 2, 2, 3 }, &verified);
     try testing.expectEqual(warmed, rig.g.compiles);
+}
+
+test "dsv41 dspark loop: the seed keeps its copies only: the bank's retained prompt state is 847,872 B at 16K" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 seed: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(testing.allocator, testing.io, bank, &diag);
+    // main_h 1 x 3 x 5120 x 4 = 61,440; the windows 3 x 128 x 512 x 4 = 786,432 (the views held 16,384 x 67,584).
+    try testing.expectEqual(@as(u64, 847_872), seedRetainedBytes(&c, 16_384));
+    try testing.expectEqual(seedRetainedBytes(&c, 16_384), seedRetainedBytes(&c, c.window));
+    // A prompt shorter than the window keeps only its rows.
+    try testing.expectEqual(@as(u64, 61_440 + 3 * 64 * 512 * 4), seedRetainedBytes(&c, 64));
 }
 
 test "dsv41 dspark loop: on a bounded state the lookup's history and key map are reserved to the request's positions" {
