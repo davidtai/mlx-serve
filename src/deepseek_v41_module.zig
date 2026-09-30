@@ -168,16 +168,22 @@ pub const Module = struct {
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
+        if (config.prefill_attn) |v| {
+            // The core reads K30's selection: only a tier with selected keys can take it.
+            if (v and !tier.routes.selected_keys) return error.PrefillAttnNeedsSelectedKeys;
+            tier.routes.prefill_attn = v;
+        }
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         if (tier.routes.prefill_attn) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth },
+            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn },
         };
         var line_buf: [192]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
+        log.info("{s}", .{self.installed.callSites(&line_buf)});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -393,6 +399,13 @@ pub const Installed = struct {
     layer_major: bool = false,
     wide: xp.Wide = .{},
     stream_windows: u8 = 1,
+    /// The prefill attention core (installed and past its construction self-check).
+    prefill_attn: bool = false,
+
+    /// The attention call sites' construction line (apart from the ladder routes' line).
+    pub fn callSites(self: Installed, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}", .{self.prefill_attn}) catch buf[0..0];
+    }
 
     /// The construction log line the gates assert.
     pub fn line(self: Installed, buf: []u8) []const u8 {
