@@ -447,6 +447,9 @@ pub const ModelConfig = struct {
     prefill_hc: ?bool = null,
     prefill_combine: ?bool = null,
     prefill_oproj: ?bool = null,
+    /// deepseek_v41's K16 PREFILL_HOST shared and JOINLESS: null = the tier's route (served: on).
+    prefill_host_shared: ?bool = null,
+    prefill_joinless: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

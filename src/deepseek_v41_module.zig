@@ -177,6 +177,8 @@ pub const Module = struct {
         // The HC norms, the combine and the o-projection: a setting overrides the tier's route.
         if (config.prefill_hc) |v| tier.routes.prefill_hc = v;
         if (config.prefill_combine) |v| tier.routes.prefill_combine = v;
+        if (config.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
+        if (config.prefill_joinless) |v| tier.routes.prefill_joinless = v;
         if (config.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -187,7 +189,7 @@ pub const Module = struct {
         errdefer self.model.deinit(&self.g);
         if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless) try self.checkPrefillRoutes();
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj },
+            inline else => |t| .{ .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless },
         };
         var line_buf: [192]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -439,10 +441,13 @@ pub const Installed = struct {
     prefill_hc: bool = false,
     prefill_combine: bool = false,
     prefill_oproj: bool = false,
+    /// PREFILL_HOST shared and JOINLESS (K16's routed group; installed).
+    prefill_host_shared: bool = false,
+    prefill_joinless: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
