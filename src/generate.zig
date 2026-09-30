@@ -297,6 +297,42 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// gate, `mtpBatchedAcceptGraph`, the pre-draft and the horizon valve all work
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
+/// A module arch's own block-parallel draft lane (DSpark): the one dispatch `Generator.nextDspark`
+/// runs its rounds through, over every arch whose module ships one (the readiness signal is
+/// `Transformer.nativeDraftBlock`).
+pub const NativeDraft = union(enum) {
+    dsv4: *dsv4_mod.Dsv4Model,
+    dsv41: *transformer_mod.Dsv41Module,
+
+    /// One round's commit, whichever module ran it: `tokens` = [t1, accepted drafts] (owned by the
+    /// round's allocator), `next_token` the next round's trunk token (not yet in the state).
+    pub const Round = struct {
+        tokens: []u32,
+        accepted: u32,
+        next_token: u32,
+
+        pub fn of(r: anytype) Round {
+            return .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token };
+        }
+    };
+
+    /// The transformer's installed lane, or null (no draft head, or not installed).
+    pub fn of(xfm: *Transformer) ?NativeDraft {
+        if (xfm.nativeDraftBlock() == 0) return null;
+        if (xfm.dsv4) |m| return .{ .dsv4 = m };
+        if (xfm.dsv41) |m| return .{ .dsv41 = m };
+        return null;
+    }
+
+    /// The module's committed length (the shell's `cache.step` mirrors it after a round).
+    pub fn position(self: NativeDraft) usize {
+        return switch (self) {
+            .dsv4 => |m| m.dec_state.?.n,
+            .dsv41 => |m| @intCast(m.position()),
+        };
+    }
+};
+
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
@@ -1425,6 +1461,8 @@ pub const Generator = struct {
     /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
     /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
     dspark_stochastic: bool = false,
+    /// The armed lane `nextDspark` runs its rounds on (set with `dspark_enabled`).
+    native_draft: ?NativeDraft = null,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
 
@@ -2292,9 +2330,9 @@ pub const Generator = struct {
         return lookup_prompt orelse prompt_ids;
     }
 
-    /// Which DSpark accept rule (if any) the dsv4 chokepoint may arm for a
+    /// Which DSpark accept rule (if any) the chokepoint may arm for a
     /// request. Pure over its inputs so every arm is unit-testable.
-    pub const DsparkArm = enum { off, greedy, stochastic };
+    pub const DsparkArm = enum { off, greedy, stochastic, typical };
 
     /// `clean` = nothing consumes logits beyond plain sampling: penalties,
     /// grammar and logprobs stay serial on BOTH arms (matching the greedy-only
@@ -2313,6 +2351,12 @@ pub const Generator = struct {
         const greedy = sampling.temperature < 0.01 or sampling.top_k == 1;
         if (greedy) return .greedy;
         return if (stoch_enabled) .stochastic else .off;
+    }
+
+    /// The deepseek_v41 draft head's arm: a clean greedy request takes the tier's typical acceptance
+    /// (with the greedy correction, inside the module); sampled requests stay serial this round.
+    pub fn dsparkArmTypical(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
+        return if (dsparkArmFor(sampling, logprobs_n, false) == .greedy) .typical else .off;
     }
 
     /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
@@ -2369,7 +2413,8 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        var native_draft: ?NativeDraft = null;
+        if (xfm.ownsModuleDecodeState() and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2382,20 +2427,41 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const mdl_ds = xfm.dsv4.?;
+            // deepseek_v41 rides the same lane: its module's draft head (typical acceptance, greedy
+            // requests), the same round contract, the same kill switch.
             const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
-            if (mdl_ds.n_mtp > 0 and !dspark_env_off and arm != .off) {
-                dspark_active = true;
-                dspark_stochastic = arm == .stochastic;
-                if (dspark_stochastic) {
-                    log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
-                } else {
-                    log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+            const lane = NativeDraft.of(xfm);
+            if (lane) |nd| {
+                switch (nd) {
+                    .dsv4 => |mdl_ds| {
+                        const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+                        if (!dspark_env_off and arm != .off) {
+                            dspark_active = true;
+                            dspark_stochastic = arm == .stochastic;
+                            if (dspark_stochastic) {
+                                log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                            } else {
+                                log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                            }
+                        } else {
+                            log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+                        }
+                    },
+                    .dsv41 => |m| {
+                        if (!dspark_env_off and dsparkArmTypical(sampling, options.logprobs_n) == .typical) {
+                            dspark_active = true;
+                            log.info("  decode lane: {s} (deepseek_v41 draft head, block={d})\n", .{ m.decodeLane(), m.draftBlockSize() });
+                        } else {
+                            log.info("  decode lane: serial (deepseek_v41: {s})\n", .{if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalty requests stay serial"});
+                        }
+                    },
                 }
-            } else {
+            } else if (xfm.dsv4 != null) {
                 log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+            } else {
+                log.info("  decode lane: serial (deepseek_v41: no draft head installed)\n", .{});
             }
+            if (dspark_active) native_draft = lane;
             options.pld_enabled = false;
             options.drafter_enabled = false;
             options.drafter = null;
@@ -2619,7 +2685,9 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-            const loop_end = prefix_len - snapshot_backoff;
+            // An arch whose prompt forward yields the last row's logits takes the whole prompt in the final
+            // span's one forward: no prefix forwards, no separate 1-row logits forward.
+            const loop_end = if (xfm.config.prefillYieldsLastLogits()) 0 else prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
@@ -3250,6 +3318,7 @@ pub const Generator = struct {
                 .pld_enabled = pld_active,
                 .dspark_enabled = dspark_active,
                 .dspark_stochastic = dspark_stochastic,
+                .native_draft = native_draft,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
@@ -3888,23 +3957,25 @@ pub const Generator = struct {
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        const mdl = self.xfm.dsv4.?;
         const t1 = self.next_token_id;
         const accepted_cap = capAcceptedForTokenBudget(
             std.math.maxInt(u32),
             self.completion_tokens,
             self.max_tokens,
         );
-        var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
-        else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
-        errdefer round.deinit(allocator);
-        // dsparkRound advanced the module state — mirror it on the shell
+        const round: NativeDraft.Round = switch (self.native_draft.?) {
+            .dsv4 => |mdl| NativeDraft.Round.of(if (self.dspark_stochastic)
+                try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
+            else
+                try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap)),
+            .dsv41 => |m| NativeDraft.Round.of(try m.dsparkRound(allocator, t1, accepted_cap)),
+        };
+        errdefer allocator.free(round.tokens);
+        // The round advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
         // check keying on step==0) sees a consistent position. Generator.step
         // itself moves through advanceStep below (the clear-cadence clock).
-        self.ctx.cache.step = mdl.dec_state.?.n;
+        self.ctx.cache.step = self.native_draft.?.position();
         self.dspark_attempted += 1;
         self.dspark_accepted_tokens += round.accepted;
         try self.generated_ids.appendSlice(allocator, round.tokens);
@@ -18462,6 +18533,28 @@ test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill swit
     try testing.expect(Generator.dsparkStochEnabledFromEnv(""));
     try testing.expect(Generator.dsparkStochEnabledFromEnv("1"));
     try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
+}
+
+test "dsparkArmTypical: deepseek_v41's draft head takes clean greedy requests; sampled and shaped ones stay serial" {
+    try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.0 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.6, .top_k = 1 }, 0));
+    // Sampled requests stay serial this round (no stochastic arm on this head yet).
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.6, .top_p = 0.95 }, 0));
+    // Penalties, logprobs and grammar consume logits the draft path never shapes.
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0 }, 5));
+    var c: Constraint = undefined;
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0, .constraint = &c }, 0));
+}
+
+test "the DSpark chokepoint arms every module arch through NativeDraft, never one hardcoded arch" {
+    // It once read `xfm.dsv4 != null` and `self.xfm.dsv4.?`, so deepseek_v41's draft head was never armed
+    // and never dispatched. Needles are ++-split so this test's source can't satisfy the scan.
+    const src = @embedFile("generate.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "const lane = NativeDraft" ++ ".of(xfm);") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "switch (self.native" ++ "_draft.?) {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const mdl = self.xfm.dsv4" ++ ".?;\n        const t1 = self.next_token_id;") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "if (xfm.dsv4 != null and (options.pld" ++ "_enabled") == null);
 }
 
 test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit invariant (DSV4_MINI)" {

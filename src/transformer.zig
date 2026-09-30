@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = if (@import("build_options").macos_engines) @import("deepseek_v41_module.zig") else @import("deepseek_v41_module_stub.zig");
+/// The deepseek_v41 module as this build links it (the generator's draft-lane dispatch names it).
+pub const Dsv41Module = dsv41_mod.Module;
 const qwen4_mod = @import("qwen4_exp.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -19432,6 +19434,15 @@ pub const Transformer = struct {
     /// does not fall onto the generic wiring and pick up PLD by default.
     pub fn moduleSpecWiring(self: *const Transformer) bool {
         return self.ownsModuleDecodeState() or self.sharesModuleReadonlyState();
+    }
+
+    /// The arch's own block-parallel draft lane (DSpark), as its readiness signal: the block size when
+    /// the module ships one and it is installed, else 0 (ds4's `mtpDraftTokens` class). Every surface
+    /// that arms, defaults or dispatches the lane reads this one answer.
+    pub fn nativeDraftBlock(self: *const Transformer) u32 {
+        if (self.dsv4) |m| return if (m.n_mtp > 0) @intCast(m.ds_block) else 0;
+        if (self.dsv41) |m| return m.draftBlockSize();
+        return 0;
     }
 
     /// Can this arch's MODULE-owned decode state be rolled back across a

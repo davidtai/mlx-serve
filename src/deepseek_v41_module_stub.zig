@@ -16,4 +16,24 @@ pub const Module = struct {
     pub fn extend(_: *Module, _: []const u32) !mlx.mlx_array {
         return error.Dsv41NotBuiltForThisTarget;
     }
+    pub const DsparkRound = struct {
+        tokens: []u32,
+        accepted: u32,
+        next_token: u32,
+        pub fn deinit(self: *DsparkRound, a: std.mem.Allocator) void {
+            a.free(self.tokens);
+        }
+    };
+    pub fn draftBlockSize(_: *const Module) u32 {
+        return 0;
+    }
+    pub fn decodeLane(_: *const Module) []const u8 {
+        return "serial";
+    }
+    pub fn position(_: *const Module) u64 {
+        return 0;
+    }
+    pub fn dsparkRound(_: *Module, _: std.mem.Allocator, _: u32, _: u32) !DsparkRound {
+        return error.Dsv41NotBuiltForThisTarget;
+    }
 };

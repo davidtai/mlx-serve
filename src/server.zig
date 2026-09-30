@@ -573,13 +573,11 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
 /// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
 ///
-/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
-/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
-/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
-/// then requests default ON outright (the qwen MoE-verify caution is about
-/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
-/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
-/// per request.
+/// `native_stages`: the module's OWN DSpark draft lane, designed for exactly this MoE trunk
+/// (DeepSeek-V4's stages, LOADED only on the opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`;
+/// DeepSeek-V4.1's draft head, installed with its served tier). Then requests default ON outright
+/// (the qwen MoE-verify caution is about a bolted-on sidecar, not a native design). Like qwen MTP
+/// it is never subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out per request.
 ///
 /// `native_measured`: same exemption, for an arch whose head ships inside the
 /// checkpoint AND has been measured no-worse-than-serial across the context
@@ -590,25 +588,25 @@ fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
     return config.mtp_override == true or server_config.default_force_mtp;
 }
 
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool) bool {
-    if (dsv4_stages) return true;
+pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, native_stages: bool, native_measured: bool) bool {
+    if (native_stages) return true;
     if (!mtp_loaded) return false;
     return !is_moe or force or native_measured;
 }
 
 /// Does this model's MTP head carry the measured native-MoE exemption above?
-/// Mirrors `dsv4DraftStages` — a NAMED per-arch capability read once here, so
+/// Mirrors `nativeDraftStages` — a NAMED per-arch capability read once here, so
 /// the four call sites can never disagree (the list-of-one class).
 fn nativeMeasuredMoeHead(lm: *LoadedModel) bool {
     const x = lm.transformer orelse return false;
     return x.nativeMoeMtpHeadMeasured();
 }
 
-/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
-fn dsv4DraftStages(lm: *LoadedModel) bool {
+/// Does this model serve its module's own DSpark draft lane (DeepSeek-V4's loaded stages,
+/// DeepSeek-V4.1's installed draft head)? The transformer's one readiness signal.
+fn nativeDraftStages(lm: *LoadedModel) bool {
     const x = lm.transformer orelse return false;
-    const d = x.dsv4 orelse return false;
-    return d.n_mtp > 0;
+    return x.nativeDraftBlock() > 0;
 }
 
 /// Can this model run an MTP-flagged request speculatively? Either a qwen
@@ -617,7 +615,7 @@ fn dsv4DraftStages(lm: *LoadedModel) bool {
 /// the bare conjunct silently killed the flag for dsv4 at submit while the
 /// default/dispatch layers were correct (the per-surface wiring class).
 fn mtpCapable(lm: *LoadedModel) bool {
-    return lm.mtp != null or dsv4DraftStages(lm);
+    return lm.mtp != null or nativeDraftStages(lm);
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
@@ -7342,7 +7340,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
+        .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeDraftStages(lm), nativeMeasuredMoeHead(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
@@ -8821,8 +8819,8 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeDraftStages(lm), nativeMeasuredMoeHead(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -9213,8 +9211,8 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeDraftStages(lm), nativeMeasuredMoeHead(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
@@ -15074,8 +15072,8 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeDraftStages(lm), nativeMeasuredMoeHead(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system
@@ -16996,8 +16994,8 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
-    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeDraftStages(lm), nativeMeasuredMoeHead(lm));
+    if (enable_mtp_resp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.

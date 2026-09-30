@@ -901,6 +901,13 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
 
+    /// The arch's prompt forward yields the last row's logits (a module that owns its prompt pass), so
+    /// the generator sends the whole prompt in ONE forward and takes the first token from it (no
+    /// separate 1-row logits forward, no decode-width last row).
+    pub fn prefillYieldsLastLogits(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
@@ -7682,6 +7689,7 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     defer c.deinit(testing.allocator);
     try testing.expectEqualStrings("deepseek_v41", c.model_type);
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
+    try testing.expect(c.prefillYieldsLastLogits());
     try testing.expect(!c.perRequestPrefillChunk());
     try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.dsv41_prefill != null);
     try testing.expectEqual(@as(u32, 40), c.num_hidden_layers);

@@ -6464,7 +6464,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        slot.model.transformer.?.dsv4 != null;
+        slot.model.transformer.?.nativeDraftBlock() > 0;
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -9879,6 +9879,14 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         const w = specInitWiring(true, false, true, false, false, false, false, false, true);
         try testing.expect(!w.native_intent);
     }
+}
+
+test "the native draft lane is read from the transformer's readiness signal, never one hardcoded arch" {
+    // `has_native_draft` once read `transformer.?.dsv4 != null`, so deepseek_v41's draft head never reached
+    // the chokepoint and served plain AR. Needles are ++-split so this test's source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "transformer.?.nativeDraft" ++ "Block() > 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "slot.model.transformer.?.dsv4 " ++ "!= null;") == null);
 }
 
 test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
