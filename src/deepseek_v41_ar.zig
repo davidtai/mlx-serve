@@ -432,6 +432,9 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The window's own proofs (the harness's, never the served path's): no page cache left by the load.
     try checkPageCache(constructed.file_cache_created_bytes);
     memProbe("dsv41 ar served", "module constructed (kernels, arm, residents, warm-up)");
+    // The window's outside-the-footprint sentinel, from here to the end (its own thread; the timed spans unchanged).
+    const sentinel = try Sentinel.start(gpa, "harness");
+    defer _ = sentinel.stop(gpa);
 
     const out = try a.alloc(u32, ref.new_tokens);
     const steps = try a.alloc(Step, ref.new_tokens);
@@ -955,6 +958,9 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     try checkPageCache(constructed.file_cache_created_bytes);
     printPhaseMemory(a, constructed);
     memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
+    // The window's outside-the-footprint sentinel, from here to the end (its own thread; the timed spans unchanged).
+    const sentinel = try Sentinel.start(gpa, "cell");
+    defer _ = sentinel.stop(gpa);
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
     switch (md.arm) {
@@ -1478,6 +1484,241 @@ fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
     std.debug.print("NATIVE DSV41_BOX_GROW {s}\n", .{json});
 }
 
+/// The harnesses' outside-the-footprint sentinel (the window's, never the served path's). SERVED13 (pass3au): about
+/// 12 GB appeared outside this process's footprint within 13 s of decode, and the guard killed the window 4.5 GB short
+/// of physical RAM, before any record. A thread beside the run reads the box's pages through a fresh vm_stat child
+/// every `sentinel_period_ms`, this process's footprint read on either side of it. The first reading whose pages
+/// outside the footprint rise more than `sentinel_rise_bytes` over the construction's stops the process by name
+/// (OutsideFootprintGrew, exit `sentinel_exit_code`), after logging both readings' page breakdowns and this task's
+/// ledgers. It adds nothing to the timed loop. Its own memory: a 256 KiB stack and one 64 KiB output buffer, allocated
+/// once at start; its vm_stat child (posix_spawn, about 1.3 MB resident) lives about a millisecond per reading.
+pub const sentinel_period_ms: u32 = 250;
+pub const sentinel_rise_bytes: u64 = 2_000_000_000;
+pub const sentinel_exit_code: u8 = 86;
+const sentinel_stack_bytes: usize = 256 << 10;
+
+/// vm_stat's page counts, in bytes. `physical` is the guard's physical used (wired + active + inactive + compressor).
+pub const VmStatPages = struct {
+    free: u64 = 0,
+    active: u64 = 0,
+    inactive: u64 = 0,
+    speculative: u64 = 0,
+    wired: u64 = 0,
+    purgeable: u64 = 0,
+    compressor: u64 = 0,
+    file_backed: u64 = 0,
+    anonymous: u64 = 0,
+
+    pub fn physical(p: VmStatPages) u64 {
+        return p.wired + p.active + p.inactive + p.compressor;
+    }
+};
+
+/// vm_stat's output as `VmStatPages` (its header's page size times each count).
+pub fn vmStatPages(out: []const u8) !VmStatPages {
+    const hdr = "page size of ";
+    const at = std.mem.indexOf(u8, out, hdr) orelse return error.VmStatFormat;
+    const rest = out[at + hdr.len ..];
+    const page = try std.fmt.parseInt(u64, rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse return error.VmStatFormat], 10);
+    var p: VmStatPages = .{};
+    inline for (.{
+        .{ "\nPages free:", "free" },
+        .{ "\nPages active:", "active" },
+        .{ "\nPages inactive:", "inactive" },
+        .{ "\nPages speculative:", "speculative" },
+        .{ "\nPages wired down:", "wired" },
+        .{ "\nPages purgeable:", "purgeable" },
+        .{ "\nPages occupied by compressor:", "compressor" },
+        .{ "\nFile-backed pages:", "file_backed" },
+        .{ "\nAnonymous pages:", "anonymous" },
+    }) |kv| {
+        const k = std.mem.indexOf(u8, out, kv[0]) orelse return error.VmStatFormat;
+        const line = out[k + kv[0].len ..];
+        @field(p, kv[1]) = page * try std.fmt.parseInt(u64, std.mem.trim(u8, line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len], " .\t"), 10);
+    }
+    return p;
+}
+
+/// vm_stat's output into `buf`, through posix_spawn: no fork of this process (no copy-on-write of its pages, no copy
+/// of its VM map), every descriptor but the pipe closed in the child (POSIX_SPAWN_CLOEXEC_DEFAULT). No allocation.
+pub fn readVmStat(buf: []u8) ![]const u8 {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.VmStatPipe;
+    defer _ = std.c.close(fds[0]);
+    var write_open = true;
+    defer if (write_open) {
+        _ = std.c.close(fds[1]);
+    };
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.VmStatSpawn;
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+    var attr: std.c.posix_spawnattr_t = undefined;
+    if (std.c.posix_spawnattr_init(&attr) != 0) return error.VmStatSpawn;
+    defer _ = std.c.posix_spawnattr_destroy(&attr);
+    // Darwin's O_RDONLY 0, O_WRONLY 1: stdin and stderr on /dev/null, stdout on the pipe, nothing else inherited.
+    if (std.c.posix_spawnattr_setflags(&attr, .{ .CLOEXEC_DEFAULT = true }) != 0 or
+        std.c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0) != 0 or
+        std.c.posix_spawn_file_actions_adddup2(&actions, fds[1], 1) != 0 or
+        std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", 1, 0) != 0) return error.VmStatSpawn;
+    const argv = [_:null]?[*:0]const u8{"/usr/bin/vm_stat"};
+    var pid: std.c.pid_t = 0;
+    if (std.c.posix_spawn(&pid, "/usr/bin/vm_stat", &actions, &attr, &argv, @ptrCast(std.c.environ)) != 0) return error.VmStatSpawn;
+    _ = std.c.close(fds[1]);
+    write_open = false;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const r = std.c.read(fds[0], buf[n..].ptr, buf.len - n);
+        if (r > 0) {
+            n += @intCast(r);
+        } else if (r == 0 or std.posix.errno(r) != .INTR) break;
+    }
+    var st: c_int = 0;
+    while (true) {
+        const w = std.c.waitpid(pid, &st, 0);
+        if (w >= 0) break;
+        if (std.posix.errno(w) != .INTR) return error.VmStatWait;
+    }
+    // Exited normally (the low 7 bits zero) with status 0.
+    if (st & 0x7f != 0 or (st >> 8) & 0xff != 0) return error.VmStatFailed;
+    return buf[0..n];
+}
+
+/// One sentinel reading: the box's pages, this footprint read before and after them.
+pub const SentinelReading = struct {
+    pages: VmStatPages,
+    f0: u64,
+    f1: u64,
+
+    /// The box's pages outside this footprint, conservatively: physical less the larger of the two reads (a
+    /// footprint moving across the child cannot count as outside).
+    pub fn outside(r: SentinelReading) i64 {
+        return @as(i64, @intCast(r.pages.physical())) - @as(i64, @intCast(@max(r.f0, r.f1)));
+    }
+};
+
+/// How far `r`'s pages outside the footprint rose over `base`'s (the construction's); the sentinel trips past
+/// `sentinel_rise_bytes`.
+pub fn sentinelRise(base: SentinelReading, r: SentinelReading) i64 {
+    return r.outside() - base.outside();
+}
+
+pub fn sentinelTrips(base: SentinelReading, r: SentinelReading) bool {
+    return sentinelRise(base, r) > @as(i64, @intCast(sentinel_rise_bytes));
+}
+
+pub const Sentinel = struct {
+    step: []const u8,
+    base: SentinelReading,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+    ticks: u32 = 0,
+    /// Readings whose footprint moved more than `box_mark_stable_bytes` across the child (judged conservatively).
+    unstable: u32 = 0,
+    errors: u32 = 0,
+    peak: ?SentinelReading = null,
+    peak_tick: u32 = 0,
+    buf: [64 << 10]u8 = undefined,
+
+    /// After construction: the base (one moment's, as `stableBoxMark` takes it), logged, then the thread.
+    pub fn start(gpa: std.mem.Allocator, step: []const u8) !*Sentinel {
+        const self = try gpa.create(Sentinel);
+        errdefer gpa.destroy(self);
+        self.* = .{ .step = step, .base = undefined };
+        var n: u32 = 0;
+        while (true) : (n += 1) {
+            if (n == box_mark_attempts) return error.SentinelBaseUnstable;
+            if (n > 0) sleepMs(box_mark_retry_ms);
+            const r = try self.read();
+            if (@max(r.f0, r.f1) - @min(r.f0, r.f1) <= box_mark_stable_bytes) {
+                self.base = r;
+                break;
+            }
+        }
+        self.logLine("start", self.base, null);
+        self.thread = try std.Thread.spawn(.{ .stack_size = sentinel_stack_bytes }, run, .{self});
+        return self;
+    }
+
+    pub const Summary = struct { ticks: u32, unstable: u32, errors: u32, peak_rise: i64 };
+
+    /// Joins the thread (at most a period and one reading), then the summary lines: the peak reading and its rise.
+    pub fn stop(self: *Sentinel, gpa: std.mem.Allocator) Summary {
+        self.stopping.store(true, .release);
+        self.thread.join();
+        const pk = self.peak orelse self.base;
+        const sum: Summary = .{ .ticks = self.ticks, .unstable = self.unstable, .errors = self.errors, .peak_rise = sentinelRise(self.base, pk) };
+        self.logLine("peak", pk, sum.peak_rise);
+        std.debug.print("NATIVE DSV41_SENTINEL {{\"step\": \"{s}\", \"ticks\": {d}, \"unstable_ticks\": {d}, \"errors\": {d}, \"peak_tick\": {d}, \"peak_rise_bytes\": {d}, \"period_ms\": {d}, \"rise_limit_bytes\": {d}}}\n", .{ self.step, self.ticks, self.unstable, self.errors, self.peak_tick, sum.peak_rise, sentinel_period_ms, sentinel_rise_bytes });
+        gpa.destroy(self);
+        return sum;
+    }
+
+    fn read(self: *Sentinel) !SentinelReading {
+        const f0 = status.footprint().now;
+        const pages = try vmStatPages(try readVmStat(&self.buf));
+        return .{ .pages = pages, .f0 = f0, .f1 = status.footprint().now };
+    }
+
+    fn run(self: *Sentinel) void {
+        while (true) {
+            var slept: u32 = 0;
+            while (slept < sentinel_period_ms) : (slept += 50) {
+                if (self.stopping.load(.acquire)) return;
+                sleepMs(50);
+            }
+            if (self.stopping.load(.acquire)) return;
+            const r = self.read() catch {
+                self.errors += 1;
+                continue;
+            };
+            self.ticks += 1;
+            if (@max(r.f0, r.f1) - @min(r.f0, r.f1) > box_mark_stable_bytes) self.unstable += 1;
+            if (self.peak == null or sentinelRise(self.base, r) > sentinelRise(self.base, self.peak.?)) {
+                self.peak = r;
+                self.peak_tick = self.ticks;
+            }
+            if (sentinelTrips(self.base, r)) {
+                self.logLine("OutsideFootprintGrew", r, sentinelRise(self.base, r));
+                std.debug.print("NATIVE DSV41_SENTINEL {s}: OutsideFootprintGrew (the box's pages outside this footprint rose past {d} B over construction); stopping the process, exit {d}\n", .{ self.step, sentinel_rise_bytes, sentinel_exit_code });
+                std.c._exit(sentinel_exit_code);
+            }
+        }
+    }
+
+    /// One `NATIVE DSV41_SENTINEL <what> {json}` line: the reading, its change from the base by page type (bytes),
+    /// and this task's ledgers now.
+    fn logLine(self: *const Sentinel, what: []const u8, r: SentinelReading, rise: ?i64) void {
+        const d = struct {
+            fn f(a: u64, b: u64) i64 {
+                return @as(i64, @intCast(a)) - @as(i64, @intCast(b));
+            }
+        }.f;
+        const b = self.base.pages;
+        const p = r.pages;
+        const line = .{
+            .step = self.step,
+            .tick = self.ticks,
+            .physical = p.physical(),
+            .footprint = .{ r.f0, r.f1 },
+            .outside = r.outside(),
+            .base_outside = self.base.outside(),
+            .rise = rise,
+            .pages = p,
+            .delta = .{ .wired = d(p.wired, b.wired), .active = d(p.active, b.active), .inactive = d(p.inactive, b.inactive), .file_backed = d(p.file_backed, b.file_backed), .anonymous = d(p.anonymous, b.anonymous), .purgeable = d(p.purgeable, b.purgeable), .compressor = d(p.compressor, b.compressor), .speculative = d(p.speculative, b.speculative), .free = d(p.free, b.free) },
+            .task = status.processMemory(),
+        };
+        var jb: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&jb);
+        std.json.Stringify.value(line, .{}, &w) catch {};
+        std.debug.print("NATIVE DSV41_SENTINEL {s} {s}\n", .{ what, w.buffered() });
+    }
+};
+
+fn sleepMs(ms: u32) void {
+    const ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
 fn printBill(b: CellBill) void {
     const gb = struct {
         fn f(x: u64) f64 {
@@ -1597,6 +1838,76 @@ test "dsv41 memory: the box proof's before mark is one moment's (SERVED11 and SE
     var moving: Moving = .{};
     try testing.expectError(error.BoxMarkUnstable, stableBoxMark(&moving));
     try testing.expectEqual(box_mark_attempts, moving.n_physical);
+}
+
+// The sentinel on recorded marks. SERVED13 (pass3au): the construction record's pages, then the guard's last two
+// samples (0.1 GiB resolution). At 21:07:14 decode ran at its bill with the box's usual pages outside the footprint;
+// by 21:07:27 physical was 12.2 GB higher with the footprint at its last sample: that trips. SERVED12b (pass3at2),
+// construction to the decode record: quiet. SERVED12b's skewed before mark (the footprint read at the prompt record,
+// vm_stat after 1.35 GB of late frees): the larger footprint read keeps the frees from counting as outside.
+test "dsv41 memory: the sentinel trips on SERVED13's recorded marks, not on SERVED12b's" {
+    const gib: u64 = 1 << 30;
+    const at = struct {
+        fn f(physical: u64, footprint: u64) SentinelReading {
+            return .{ .pages = .{ .wired = physical }, .f0 = footprint, .f1 = footprint };
+        }
+    }.f;
+    const base13 = at(103_743_225_856, 91_366_853_376);
+    const mid = at(1124 * gib / 10, 1008 * gib / 10);
+    try testing.expect(!sentinelTrips(base13, mid));
+    try testing.expect(sentinelRise(base13, mid) < 200_000_000);
+    const kill = at(1238 * gib / 10, 1008 * gib / 10);
+    try testing.expect(sentinelTrips(base13, kill));
+    try testing.expect(sentinelRise(base13, kill) > 12_000_000_000);
+    const base12 = at(103_415_955_456, 91_366_804_176);
+    const decode12 = at(119_787_683_840, 107_697_398_216);
+    try testing.expect(!sentinelTrips(base12, decode12));
+    try testing.expectEqual(@as(i64, 41_134_344), sentinelRise(base12, decode12));
+    const skewed: SentinelReading = .{ .pages = .{ .wired = 107_482_447_872 }, .f0 = 96_781_039_320, .f1 = 95_434_176_216 };
+    try testing.expect(sentinelRise(base12, skewed) < 0);
+    // The limit: a rise of exactly `sentinel_rise_bytes` holds, one byte more trips; the footprint's own growth
+    // is not a rise.
+    const b = at(100_000_000_000, 90_000_000_000);
+    try testing.expect(!sentinelTrips(b, at(100_000_000_000 + sentinel_rise_bytes, 90_000_000_000)));
+    try testing.expect(sentinelTrips(b, at(100_000_000_000 + sentinel_rise_bytes + 1, 90_000_000_000)));
+    try testing.expect(!sentinelTrips(b, at(115_000_000_000, 105_000_000_000)));
+}
+
+test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and stops (live, host)" {
+    const sample =
+        \\Mach Virtual Memory Statistics: (page size of 16384 bytes)
+        \\Pages free:                                    29039.
+        \\Pages active:                                 339302.
+        \\Pages inactive:                              2277422.
+        \\Pages speculative:                              2622.
+        \\Pages throttled:                                   0.
+        \\Pages wired down:                            5393754.
+        \\Pages purgeable:                                2578.
+        \\File-backed pages:                           2411733.
+        \\Anonymous pages:                              207613.
+        \\Pages stored in compressor:                   417551.
+        \\Pages occupied by compressor:                 111654.
+        \\
+    ;
+    const p = try vmStatPages(sample);
+    try testing.expectEqual(@as(u64, 2_411_733 * 16_384), p.file_backed);
+    try testing.expectEqual(@as(u64, 207_613 * 16_384), p.anonymous);
+    try testing.expectEqual(@as(u64, (5_393_754 + 339_302 + 2_277_422 + 111_654) * 16_384), p.physical());
+    try testing.expectError(error.VmStatFormat, vmStatPages("Pages active: 1.\n"));
+    // The live child (no MLX): parsed, within the box's RAM, and its cost.
+    var buf: [64 << 10]u8 = undefined;
+    const t0 = std.Io.Timestamp.now(testing.io, .boot);
+    for (0..4) |_| {
+        const live = try vmStatPages(try readVmStat(&buf));
+        try testing.expect(live.physical() > 0 and live.physical() <= status.getTotalMemBytes());
+    }
+    std.debug.print("\nsentinel reading (posix_spawn vm_stat): {d:.2} ms each\n", .{secondsSince(testing.io, t0) * 1000 / 4});
+    // The thread over two periods, quiet on the host: it read, judged and stopped.
+    const s = try Sentinel.start(testing.allocator, "host test");
+    sleepMs(2 * sentinel_period_ms + 150);
+    const sum = s.stop(testing.allocator);
+    try testing.expect(sum.ticks >= 1 and sum.errors == 0);
+    try testing.expect(sum.peak_rise <= @as(i64, @intCast(sentinel_rise_bytes)));
 }
 
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
