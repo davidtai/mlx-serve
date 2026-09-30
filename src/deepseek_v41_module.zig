@@ -107,6 +107,8 @@ pub const Module = struct {
     prev_cache_limit: usize = 0,
     /// The fill's target (ceiling - `ceiling_stop_bytes`): each phase's billed total stays under it.
     fill_target: u64 = 0,
+    /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
+    phase_change: ?PhaseChangeRecord = null,
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -489,16 +491,18 @@ pub const Module = struct {
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
-        const after = BoundaryMemory.settled(self.io, before, freed_device);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_device);
         marks[2] = VmMark.now();
-        checkFreed(before, after, freed_device) catch |e| {
-            log.err("phase change refused before the grow: {s} (before: active {d} B, cache {d} B, footprint {d} B, physical {d} B; after: active {d} B, cache {d} B, footprint {d} B, physical {d} B; freed device bytes {d})", .{ @errorName(e), before.active, before.cache, before.footprint, before.physical, after.active, after.cache, after.footprint, after.physical, freed_device });
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .settle_ms = st.waited_ms };
+        checkFreed(before, st.after, freed_device) catch |e| {
+            log.err("phase change refused before the grow: {s} after {d} ms (before: active {d} B, cache {d} B, footprint {d} B, physical {d} B; after: active {d} B, cache {d} B, footprint {d} B, physical {d} B; freed device bytes {d})", .{ @errorName(e), st.waited_ms, before.active, before.cache, before.footprint, before.physical, st.after.active, st.after.cache, st.after.footprint, st.after.physical, freed_device });
             return e;
         };
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
         marks[3] = VmMark.now();
+        self.phase_change.?.grown = BoundaryMemory.now();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (settled)", "after the banks grew" }) |m, name|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d})", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
@@ -616,34 +620,44 @@ pub fn admitPhases(b: ar_bill.CellBill, target: u64) error{ PromptOverTarget, De
     if (b.decodeTotal() > target) return error.DecodeOverTarget;
 }
 
-/// MLX's allocator, the process footprint and the box's physical pages (the guard's own metric, vm_stat)
-/// at the phase boundary: existing counters only.
+/// MLX's allocator, the process footprint and the box's physical pages (vm_stat's wired + active + inactive
+/// + compressor: the guard's own metric, the source it samples) at the phase boundary: existing counters only.
 pub const BoundaryMemory = struct {
     active: u64,
     cache: u64,
     footprint: u64,
     physical: u64,
 
-    fn now() BoundaryMemory {
+    pub fn now() BoundaryMemory {
         var active: usize = 0;
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
         return .{ .active = active, .cache = cache, .footprint = arm_mod.footprint().now, .physical = arm_mod.physicalUsed(arm_mod.vmBytes()) };
     }
+};
 
-    /// After the frees: the footprint AND the box's physical pages read until both have dropped by the
-    /// released bytes, at most `phase_change_settle_ms` (the kernel's ledgers can trail a release; SERVED7's
-    /// pages stayed counted in vm_stat after the footprint had dropped); the one check then judges what it reads.
-    fn settled(io: std.Io, before: BoundaryMemory, freed_device: u64) BoundaryMemory {
-        var m = now();
-        var waited: u32 = 0;
-        while (!(footprintFreed(before, m, freed_device) and physicalFreed(before, m, freed_device)) and waited < phase_change_settle_ms) : (waited += 1) {
-            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
-            m = now();
-        }
-        if (waited > 0) log.info("NATIVE phase change: the frees settled in {d} ms (footprint and physical pages)", .{waited});
-        return m;
+/// The phase change's record: the readings before the frees (after the prompt's commands retired), after
+/// them (settled), after the grow; the bytes freed (the MLX cache cleared + device bytes released); the
+/// reclaim time the driver took (the receipts carry it, so the windows learn its behaviour).
+pub const PhaseChangeRecord = struct {
+    before: BoundaryMemory,
+    after: BoundaryMemory,
+    grown: ?BoundaryMemory = null,
+    freed_bytes: u64,
+    settle_ms: u32,
+};
+
+/// The live boundary reader: MLX's counters, the footprint, vm_stat; waits on the shell's io.
+const LiveReader = struct {
+    io: std.Io,
+
+    fn now(_: LiveReader) BoundaryMemory {
+        return BoundaryMemory.now();
+    }
+
+    fn sleep(self: LiveReader, ms: u32) void {
+        std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
     }
 };
 
@@ -653,25 +667,43 @@ pub const phase_change_tolerance_bytes: u64 = 250_000_000;
 /// The box's physical pages may sit this far above their expected drop (they are the whole box's: other
 /// processes move them too, within a guarded window by little).
 pub const phase_change_physical_tolerance_bytes: u64 = 500_000_000;
-/// The longest the phase change waits for the frees to show before it refuses.
-pub const phase_change_settle_ms: u32 = 5000;
+/// The reclaim wait: read every `phase_change_poll_ms`, refuse after `phase_change_settle_ms`.
+pub const phase_change_poll_ms: u32 = 250;
+pub const phase_change_settle_ms: u32 = 10_000;
 
 fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
 }
 
+/// The guard's metric: vm physical used minus the credited start cache has dropped by the freed bytes (the
+/// credit is the window's constant, so the drop is physical used's own).
 fn physicalFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
     return after.physical + before.cache + freed_device <= before.physical + phase_change_physical_tolerance_bytes;
 }
 
-/// The phase boundary's one check: the MLX cache empty (every prompt buffer released, none parked for the
-/// grow to miss), MLX active down by the freed device bytes, the footprint AND the box's physical pages (the
-/// guard's metric) down by the cache and those bytes.
-pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed, PhaseChangePhysicalNotFreed }!void {
+/// After the frees: `reader` read every `phase_change_poll_ms` until the footprint AND the box's physical
+/// pages show them (SERVED7: the footprint dropped at once, vm_stat still counted the pages when the grow
+/// took fresh ones), at most `phase_change_settle_ms`; the one check then judges the last reading.
+pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64) struct { after: BoundaryMemory, waited_ms: u32 } {
+    var m = reader.now();
+    var waited: u32 = 0;
+    while (!(footprintFreed(before, m, freed_device) and physicalFreed(before, m, freed_device)) and waited < phase_change_settle_ms) {
+        reader.sleep(phase_change_poll_ms);
+        waited += phase_change_poll_ms;
+        m = reader.now();
+    }
+    return .{ .after = m, .waited_ms = waited };
+}
+
+/// The phase boundary's one check, before the grow: the MLX cache empty (every prompt buffer released, none
+/// parked for the grow to miss), MLX active down by the freed device bytes, the footprint down by the cache
+/// and those bytes, and the guard's metric (the box's physical pages) down by them too; else refused by name
+/// and the run fails before timed generation.
+pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed, PhaseChangeNotReclaimed }!void {
     if (after.cache != 0) return error.PhaseChangeCacheNotEmpty;
     if (after.active + freed_device > before.active) return error.PhaseChangeActiveNotFreed;
     if (!footprintFreed(before, after, freed_device)) return error.PhaseChangeFootprintNotFreed;
-    if (!physicalFreed(before, after, freed_device)) return error.PhaseChangePhysicalNotFreed;
+    if (!physicalFreed(before, after, freed_device)) return error.PhaseChangeNotReclaimed;
 }
 
 pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
@@ -1288,13 +1320,62 @@ test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, b
     // SERVED7's shape: the footprint dropped, the box's physical pages did not (the guard's metric): refused.
     var served7 = freed;
     served7.physical = before.physical;
-    try std.testing.expectError(error.PhaseChangePhysicalNotFreed, checkFreed(before, served7, 0));
+    try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, served7, 0));
     // Within the physical tolerance (other processes' movement): passes.
     var noisy = freed;
     noisy.physical += phase_change_physical_tolerance_bytes;
     try checkFreed(before, noisy, 0);
     // Active not down by the embedding: refused.
     try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb, .physical = before.physical - before.cache - 2 * gb }, emb));
+}
+
+/// A scripted boundary reader: `readings[i]` at the i-th read (the last one repeats), no real sleep.
+const FakeReader = struct {
+    readings: []const BoundaryMemory,
+    i: *usize,
+    slept_ms: *u32,
+
+    fn now(self: FakeReader) BoundaryMemory {
+        const r = self.readings[@min(self.i.*, self.readings.len - 1)];
+        self.i.* += 1;
+        return r;
+    }
+
+    fn sleep(self: FakeReader, ms: u32) void {
+        self.slept_ms.* += ms;
+    }
+};
+
+test "dsv41 memory: the reclaim wait refuses the grow when the guard's metric does not drop, and waits it out when it does" {
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
+    const footprint_freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical };
+    const reclaimed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    // SERVED7: the footprint drops at once, vm_stat never does: the full 10 s wait, then refused by name.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{footprint_freed}, .i = &i, .slept_ms = &slept }, before, 0);
+        try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
+        try std.testing.expectEqual(phase_change_settle_ms, slept);
+        try std.testing.expectEqual(@as(usize, phase_change_settle_ms / phase_change_poll_ms + 1), i);
+        try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, st.after, 0));
+    }
+    // The pages come back on the third reading: two polls (500 ms), then the check passes.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{ footprint_freed, footprint_freed, reclaimed }, .i = &i, .slept_ms = &slept }, before, 0);
+        try std.testing.expectEqual(@as(u32, 2 * phase_change_poll_ms), st.waited_ms);
+        try checkFreed(before, st.after, 0);
+    }
+    // Already reclaimed at the first reading: no wait.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{reclaimed}, .i = &i, .slept_ms = &slept }, before, 0);
+        try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
+        try checkFreed(before, st.after, 0);
+    }
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {

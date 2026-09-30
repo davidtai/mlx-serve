@@ -457,6 +457,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
     // The phase change ran inside the first decode-width extend: this interval spans it and the decode.
     printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), engram.row_cache_host_bytes));
+    if (m.phase_change) |pc| if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {};
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
     var d: [32]u8 = undefined;
@@ -821,6 +822,8 @@ const CellReceipt = struct {
     /// high-water mark), its task_vm_info split, MLX active / cache / peak, the box's pages, the residuals.
     bill_baseline_bytes: ?u64 = null,
     phase_memory: ?[]const PhaseMemory = null,
+    /// The phase change's readings before / after the frees and after the grow, the freed bytes, the reclaim time.
+    phase_change: ?module.PhaseChangeRecord = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -950,6 +953,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     try md.phaseChange();
     const phase_s = secondsSince(io, t1);
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), engram.row_cache_host_bytes);
+    if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
     printPhaseMemory(a, phases[2]);
     mlx_peak = @max(mlx_peak, @max(phases[2].mlx_peak_bytes, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)")));
     var out: std.ArrayList(u32) = .empty;
@@ -1049,6 +1053,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .embedding_rows = md.installed.embedding_rows,
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
+        .phase_change = md.phase_change,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1312,6 +1317,8 @@ pub const PhaseMemory = struct {
     residual_bytes: i64,
     /// Billed MLX-device terms (slots, residents, Engram residents, waves, KV) less MLX's peak over the phase.
     mlx_residual_bytes: i64,
+    /// The phase change's boundary only: how long the driver took to reclaim the frees before the grow.
+    settle_ms: ?u32 = null,
 };
 
 /// The boundary's record from what the kernel and MLX already track (no new counter): reads the
