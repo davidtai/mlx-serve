@@ -1059,7 +1059,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (comptime dt.enabled) {
         dt.reset();
         recall.reset();
-        recall.active = profile;
+        // DSV41_CELL_DECODE_RECALL=0 keeps the check off (a decode profile without the predictor on its barriers).
+        recall.active = profile and !std.mem.eql(u8, std.mem.span(std.c.getenv("DSV41_CELL_DECODE_RECALL") orelse "1"), "0");
     }
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;

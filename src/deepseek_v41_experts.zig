@@ -1161,7 +1161,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             /// A1's recall check (profile builds): the layer's predicted ids [rows, k], compared at its routing barrier.
             pub fn recallPredicted(h: Hook, pred: T) void {
-                if (comptime recall.enabled) h.ex.recall_pred = pred;
+                if (comptime recall.enabled) {
+                    // The previous layer's call consumed its prediction (a stale one would outlive its wave).
+                    std.debug.assert(h.ex.recall_pred == null);
+                    h.ex.recall_pred = pred;
+                }
             }
 
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
