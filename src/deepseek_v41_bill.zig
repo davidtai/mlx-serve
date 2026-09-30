@@ -42,6 +42,10 @@ pub const Bill = struct {
     layers: u32 = 0,
     transient_rows: u64 = 0,
     transient_decode_rows: u64 = 0,
+    /// The variant this bill was built at, and the prompt wave the tight variant bills (the conservative arm's judge
+    /// compares the measured prompt transient against it; equal to `prefill_wave` without the model's fence).
+    variant: BillVariant = .conservative,
+    prefill_wave_tight: u64 = 0,
     n_experts: u32 = 0,
     prefill_rows: u32,
     decode_rows: u32,
@@ -241,6 +245,27 @@ pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 /// device terms without the wide window at every boundary, so that window is no device memory either.
 pub const measured_host_side_bytes: u64 = 900_000_000;
 
+/// The bill's variant (DSV41_BILL_VARIANT=conservative|tight, read where the bill is built, at construction): `tight`
+/// bills the main taps' chunk fences (one live stream in the K16 routed group) when the model declares them
+/// (`deepseek_v41_model.main_taps_in_chunk_fence`); `conservative` (the default) keeps the four streams. SERVED16 runs a
+/// tight arm only after the conservative arm's measured prompt transient sits a gigabyte under the tight wave.
+pub const BillVariant = enum { conservative, tight };
+
+pub fn billVariant() error{BillVariantUnknown}!BillVariant {
+    return parseBillVariant(if (std.c.getenv("DSV41_BILL_VARIANT")) |v| std.mem.span(v) else null);
+}
+
+pub fn parseBillVariant(v: ?[]const u8) error{BillVariantUnknown}!BillVariant {
+    const s = v orelse return .conservative;
+    return std.meta.stringToEnum(BillVariant, s) orelse error.BillVariantUnknown;
+}
+
+/// Whether this tree's model evaluates the main taps in their chunk fences (ee80e40's declaration).
+pub const model_taps_fenced: bool = blk: {
+    if (!@hasDecl(mdl, "main_taps_in_chunk_fence")) break :blk false;
+    break :blk mdl.main_taps_in_chunk_fence;
+};
+
 /// Whether the stream releases its transient windows past the first at the phase change (SERVED16: the integration
 /// lane's release at the PhaseGate, per-window MLX allocations freed before the grow). The declaration
 /// (`expert_stream.phase_change_releases_wide_windows`) lands with the release; a tree without it keeps every window
@@ -250,10 +275,18 @@ pub const stream_releases_wide_windows: bool = blk: {
     break :blk expert_stream.phase_change_releases_wide_windows;
 };
 
-/// Decode's transient rows: window 0 (max_route_ids) once the phase change releases the rest (decode's calls take at
-/// most max_route_ids ids, one window), else every window the prompt's wide reads allocated.
-pub fn transientDecodeRows(wide_depth: u8, releases: bool) u64 {
-    return if (releases) xp.max_route_ids else @as(u64, wide_depth) * xp.max_route_ids;
+/// Decode's own staging rows beside window 0 after the release (`expert_stream.decode_staging_rows`, declared with the
+/// release; 0 without the declaration).
+pub const stream_decode_staging_rows: u64 = blk: {
+    if (!@hasDecl(expert_stream, "decode_staging_rows")) break :blk 0;
+    break :blk expert_stream.decode_staging_rows;
+};
+
+/// Decode's transient rows: once the phase change releases the prompt's windows (the whole scratch freed, then window 0
+/// reallocated: decode's calls take at most max_route_ids ids), window 0 plus decode's staging rows; else every window
+/// the prompt's wide reads allocated.
+pub fn transientDecodeRows(wide_depth: u8, releases: bool, staging_rows: u64) u64 {
+    return if (releases) xp.max_route_ids + staging_rows else @as(u64, wide_depth) * xp.max_route_ids;
 }
 
 /// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
@@ -284,7 +317,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     // term into the host side; 9b's construction hid it behind ~0.64 GB of draft-head residents that load at the
     // first draft block, and SERVED10b's draft-block warm-up showed it (MLX active +642,935,748 B).
     const transient: u64 = @as(u64, opts.wide_depth) * xp.max_route_ids;
-    const transient_decode = transientDecodeRows(opts.wide_depth, stream_releases_wide_windows);
+    const transient_decode = transientDecodeRows(opts.wide_depth, stream_releases_wide_windows, stream_decode_staging_rows);
     var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
@@ -295,7 +328,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     // JOINLESS (the served default): the routed group's joined input is the minimal copy's bound (`joinedBytes`).
     const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null);
+    const variant = try billVariant();
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withTapsFenced(variant == .tight and model_taps_fenced);
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
@@ -321,10 +355,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         // the wave alone covers the pass, its routed group's joined input at the minimal copy's bound
         // (`PrefillBill.joinedBytes`: 63 / 86 of the routed rows at 16K, the most outputs a call can make);
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
-        .prefill_wave = if (config.dsv41LayerMajor())
-            (if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
-        else
-            bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
+        .prefill_wave = promptWave(bill, config.dsv41LayerMajor(), joinless, prompt_tokens),
+        .variant = variant,
+        .prefill_wave_tight = promptWave(bill.withTapsFenced(model_taps_fenced), config.dsv41LayerMajor(), joinless, prompt_tokens),
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
         .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
         .prefill_cache = module.prefillCacheLimit(.served),
@@ -338,6 +371,13 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .prompt_state = dsl.seedRetainedBytes(&c, prompt_tokens),
         .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
     };
+}
+
+/// The prompt pass's billed transient: K16's layer-major wave (JOINLESS: the wave alone; else with the wide lane's
+/// routed-output copy), or the chunk-major widest wave x 5 / 4.
+fn promptWave(bill: v41.PrefillBill, layer_major: bool, joinless: bool, prompt_tokens: u64) u64 {
+    if (!layer_major) return bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5;
+    return if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served);
 }
 
 /// ENGRAM=prefetch (the served tier's `engram_posted` route, dsv41-engram-prefetch b198dbd): the K16 prompt pass
@@ -692,11 +732,52 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
     // Decode's transient rows: every window until the stream declares the phase change's release, window 0 after.
-    try testing.expectEqual(transientDecodeRows(opts.wide_depth, stream_releases_wide_windows), b.transient_decode_rows);
-    try testing.expectEqual(@as(u64, 240), transientDecodeRows(5, false));
-    try testing.expectEqual(@as(u64, 48), transientDecodeRows(5, true));
-    try testing.expectEqual(@as(u64, 2_556_592_128), (transientDecodeRows(5, false) - transientDecodeRows(5, true)) * rec);
+    try testing.expectEqual(transientDecodeRows(opts.wide_depth, stream_releases_wide_windows, stream_decode_staging_rows), b.transient_decode_rows);
+    try testing.expectEqual(@as(u64, 240), transientDecodeRows(5, false, 0));
+    try testing.expectEqual(@as(u64, 48), transientDecodeRows(5, true, 0));
+    // Decode's staging rows ride window 0 once declared (the release's commit declares 0).
+    try testing.expectEqual(@as(u64, 56), transientDecodeRows(5, true, 8));
+    try testing.expectEqual(@as(u64, 2_556_592_128), (transientDecodeRows(5, false, 0) - transientDecodeRows(5, true, 0)) * rec);
     try testing.expectEqual((@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec, b.slot_decode);
+}
+
+// DSV41_BANK=<bank> (host): the bill's variants at the windows' baselines. Conservative (the default) bills the K16
+// routed group's four hc-width streams; tight bills one once the model declares its main taps fenced (ee80e40:
+// `main_taps_in_chunk_fence`). The tight rows are computed with the fence, whether or not this tree declares it.
+test "dsv41 memory: the bill's variants, conservative and tight, at the windows' baselines (bank)" {
+    try testing.expectEqual(BillVariant.conservative, try parseBillVariant(null));
+    try testing.expectEqual(BillVariant.tight, try parseBillVariant("tight"));
+    try testing.expectError(error.BillVariantUnknown, parseBillVariant("loose"));
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
+    const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withTapsFenced(true);
+    const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
+    for ([_]Want{
+        // The window release in both (this tree declares it); the fenced taps' wave (-3.95 GB) adds 7-8 prompt rows.
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 135, .decode = 169 }, .tight = .{ .prefill = 142, .decode = 169 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 169 }, .tight = .{ .prefill = 142, .decode = 169 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 141, .decode = 168 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        b0.engram_posted = posted;
+        const cons = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        b0.prefill_wave = fenced.layerMajorWaveBytes(fill_prompt_tokens, .served);
+        const tight = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        std.debug.print("\nbill variants at baseline {d:.2} GB (posted gathers on): conservative {d} / {d}, tight {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, cons.prefill, cons.decode, tight.prefill, tight.decode });
+        try testing.expectEqual(w.conservative, cons);
+        try testing.expectEqual(w.tight, tight);
+    }
+    std.debug.print("\n", .{});
 }
 
 // DSV41_BANK=<bank> (host): the decode rows the phase change's window release returns (SERVED16). Decode keeps window 0
@@ -724,7 +805,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows);
         const depth: u8 = @intCast(b0.transient_rows / xp.max_route_ids);
-        b0.transient_decode_rows = transientDecodeRows(depth, true);
+        b0.transient_decode_rows = transientDecodeRows(depth, true, 0);
         b0.slot_decode = (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows) * rec;
         b0.engram_posted = 0;
         const off = try fillRows(fillBillOf(b0), target, b0.n_experts);

@@ -436,6 +436,9 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The window's outside-the-footprint sentinel, from here to the end (its own thread; the timed spans unchanged).
     const sentinel = try Sentinel.start(gpa, "harness");
     defer _ = sentinel.stop(gpa);
+    // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
+    var marks: PhaseMarks = .{ .a = a, .io = io };
+    m.phase_observer = marks.observer();
 
     const out = try a.alloc(u32, ref.new_tokens);
     const steps = try a.alloc(Step, ref.new_tokens);
@@ -472,18 +475,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
     memProbe("dsv41 ar served", "the prompt's calls");
     // Upstream's decode handover, where the server calls it: after the prompt's calls, before the first
-    // decode step (the serial steps below; no native draft rounds here). The box's pages beside this
-    // footprint, read fresh (vm_stat) around it.
-    var box_before: ?BoxMark = null;
-    var box_grown: ?BoxMark = null;
-    {
-        const pre: ?BoxMark = if (m.phase_change == null) try boxMark(a, io) else null;
-        try m.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = 0, .native_draft = false });
-        if (pre != null and m.phase_change != null) {
-            box_before = pre;
-            box_grown = try boxMark(a, io);
-        }
-    }
+    // decode step (the serial steps below; no native draft rounds here). The observer marks the box inside it.
+    try m.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = 0, .native_draft = false });
     for (out, steps, 0..) |*o, *st, i| {
         if (i > 0) {
             _ = mlx.mlx_array_free(logits);
@@ -541,11 +534,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
         i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
     });
-    // The window's box proof (the harness's), after the reference is written: the grow added no physical pages
-    // beyond its own footprint growth.
-    if (box_before) |bb| {
-        printBoxGrow(a, bb, box_grown.?);
-        try checkGrowResidency(bb, box_grown.?);
+    // The window's box proofs (the harness's), after the reference is written: the release left the box, and the
+    // grow added no physical pages beyond its own footprint growth.
+    if (m.phase_change != null) {
+        printBoxPhase(a, &marks);
+        try marks.judge();
     }
 }
 
@@ -971,10 +964,13 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // The window's outside-the-footprint sentinel, from here to the end (its own thread; the timed spans unchanged).
     const sentinel = try Sentinel.start(gpa, "cell");
     defer _ = sentinel.stop(gpa);
+    // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
+    var marks: PhaseMarks = .{ .a = a, .io = io };
+    md.phase_observer = marks.observer();
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
     switch (md.arm) {
-        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external }),
+        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks }),
     }
 }
 
@@ -994,6 +990,8 @@ const CellCtx = struct {
     constructed: PhaseMemory,
     /// File-backed pages at the step's vm start (the page cache the step creates is measured from here).
     file_backed_start: u64,
+    /// The phase change's proof marks (the Module's observer).
+    marks: *PhaseMarks,
 };
 
 /// The timed cell over the Module's arm (`arm` the host-waits or the event-gated one).
@@ -1043,14 +1041,12 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     printPhaseMemory(a, phases[1]);
     // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
     var mlx_peak: usize = @max(phases[1].mlx_peak_bytes, memProbePeak("dsv41 served cell", "prompt (one pass)"));
-    // The box's pages beside this footprint, read fresh (vm_stat) before the phase change and after its grow,
-    // outside the timed span; judged after the receipt is written.
-    const box_before = try boxMark(a, io);
+    // The box's pages beside this footprint are marked by the Module's observer inside the phase change (start,
+    // released, grown); the marks' own time is taken out of the phase change's, and they are judged after the receipt.
     const t1 = std.Io.Timestamp.now(io, .boot);
     // Upstream's decode handover, as the server calls it: after the prompt, before the first round.
     try md.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = prompt.len + max_tokens, .native_draft = true });
-    const phase_s = secondsSince(io, t1);
-    const box_grown = try boxMark(a, io);
+    const phase_s = @max(secondsSince(io, t1) - cx.marks.observerSeconds(), 0);
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
     printPhaseMemory(a, phases[2]);
@@ -1203,10 +1199,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         stt.accepted_drafts,        stt.drafted_tokens,     wall_s,                     rec.peak_footprint_gb,
         rec.mlx_peak_gb,            rec.finish,             rec.generated_ids_sha256,   out_path,
     });
-    // The window's box proof (the harness's), after the receipt: the grow added no physical pages beyond its
-    // own footprint growth.
-    printBoxGrow(a, box_before, box_grown);
-    try checkGrowResidency(box_before, box_grown);
+    // The window's box proofs (the harness's), after the receipt: the release left the box, and the grow added no
+    // physical pages beyond its own footprint growth.
+    printBoxPhase(a, cx.marks);
+    try cx.marks.judge();
 }
 
 /// The cell harness's explicit arguments beyond the shell's config, parsed once at the test's entry
@@ -1456,12 +1452,11 @@ const LiveBox = struct {
         return status.footprint().now;
     }
 
-    fn physical(self: LiveBox) !u64 {
-        const res = try std.process.run(self.a, self.io, .{ .argv = &.{"/usr/bin/vm_stat"}, .stdout_limit = .limited(1 << 16) });
-        defer self.a.free(res.stdout);
-        defer self.a.free(res.stderr);
-        if (res.term != .exited or res.term.exited != 0) return error.VmStatFailed;
-        return vmStatPhysical(res.stdout);
+    /// Through posix_spawn (`readVmStat`), as the sentinel reads: a mark never forks this process (no copy-on-write
+    /// of its pages, no copy of its VM map).
+    fn physical(_: LiveBox) !u64 {
+        var buf: [64 << 10]u8 = undefined;
+        return vmStatPhysical(try readVmStat(&buf));
     }
 
     fn sleep(self: LiveBox, ms: u32) void {
@@ -1493,6 +1488,83 @@ pub fn checkGrowResidency(before: BoxMark, grown: BoxMark) error{PhaseChangeNotR
     const physical_growth = @as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical));
     const footprint_growth = @as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint));
     if (physical_growth > footprint_growth + @as(i64, @intCast(box_tolerance_bytes))) return error.PhaseChangeNotReclaimed;
+}
+
+/// The phase change's release (SERVED16): the box's pages outside this footprint rose by no more than
+/// `box_tolerance_bytes` from the phase change's start to after the transient release, the clear and the boundary check.
+/// The released scratch left the box, and no page stayed wired outside every footprint (SERVED13's no-copy class).
+pub fn checkReleaseResidency(start: BoxMark, released: BoxMark) error{TransientReleaseNotReclaimed}!void {
+    const outside_start = @as(i64, @intCast(start.physical)) - @as(i64, @intCast(start.footprint));
+    const outside_released = @as(i64, @intCast(released.physical)) - @as(i64, @intCast(released.footprint));
+    if (outside_released - outside_start > @as(i64, @intCast(box_tolerance_bytes))) return error.TransientReleaseNotReclaimed;
+}
+
+/// The harnesses' observer of the phase change (`module.PhaseObserver`): one stable fresh box mark at each proof point
+/// (start, released, grown), recorded only, never an error inside the phase change. The release proof and the grow
+/// proof are judged after the receipt is written (`judge`); a mark that could not be taken is recorded and fails the
+/// judgment by name. `spent_ns` is the marks' own time inside the timed phase change.
+pub const PhaseMarks = struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+    marks: [3]?BoxMark = @splat(null),
+    failed: [3]?anyerror = @splat(null),
+    spent_ns: u64 = 0,
+
+    pub fn observer(self: *PhaseMarks) module.PhaseObserver {
+        return .{ .ctx = self, .mark = mark };
+    }
+
+    fn mark(ctx: *anyopaque, stage: module.PhaseObserver.Stage) anyerror!void {
+        const self: *PhaseMarks = @ptrCast(@alignCast(ctx));
+        const t0 = std.Io.Timestamp.now(self.io, .boot);
+        const i = @intFromEnum(stage);
+        self.marks[i] = boxMark(self.a, self.io) catch |e| blk: {
+            self.failed[i] = e;
+            break :blk null;
+        };
+        self.spent_ns += @intCast(@max(t0.untilNow(self.io, .boot).nanoseconds, 0));
+    }
+
+    pub fn observerSeconds(self: *const PhaseMarks) f64 {
+        return @as(f64, @floatFromInt(self.spent_ns)) / 1e9;
+    }
+
+    /// After the receipt: the release proof (start -> released) and the grow proof (released -> grown).
+    pub fn judge(self: *const PhaseMarks) !void {
+        for (self.failed) |f| if (f) |e| return e;
+        const start = self.marks[0] orelse return error.PhaseMarkMissing;
+        const released = self.marks[1] orelse return error.PhaseMarkMissing;
+        const grown = self.marks[2] orelse return error.PhaseMarkMissing;
+        try checkReleaseResidency(start, released);
+        try checkGrowResidency(released, grown);
+    }
+};
+
+/// One `NATIVE DSV41_BOX_PHASE {json}` line: the three marks, the release's and the grow's outside-the-footprint rise,
+/// and the observer's own time.
+fn printBoxPhase(a: std.mem.Allocator, pm: *const PhaseMarks) void {
+    const outside = struct {
+        fn f(m: ?BoxMark) ?i64 {
+            const x = m orelse return null;
+            return @as(i64, @intCast(x.physical)) - @as(i64, @intCast(x.footprint));
+        }
+    }.f;
+    const rise = struct {
+        fn f(x: ?i64, y: ?i64) ?i64 {
+            return if (x != null and y != null) y.? - x.? else null;
+        }
+    }.f;
+    const r = .{
+        .start = pm.marks[0],
+        .released = pm.marks[1],
+        .grown = pm.marks[2],
+        .release_outside_rise = rise(outside(pm.marks[0]), outside(pm.marks[1])),
+        .grow_outside_rise = rise(outside(pm.marks[1]), outside(pm.marks[2])),
+        .tolerance = box_tolerance_bytes,
+        .observer_ms = pm.spent_ns / std.time.ns_per_ms,
+    };
+    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
+    std.debug.print("NATIVE DSV41_BOX_PHASE {s}\n", .{json});
 }
 
 fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
@@ -1761,7 +1833,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "unbilled process overhead (prompt phase; decode's is prompt_state)", .p = b.unbilled_overhead, .d = 0 },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
-    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv) });
 }
 
 test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {
@@ -1927,6 +1999,38 @@ test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and s
     // The peak line names the peak's own tick (SERVED14's printed the final count).
     try testing.expect(sum.peak_tick >= 1 and sum.peak_tick <= sum.ticks);
     try testing.expect(sum.peak_rise <= @as(i64, @intCast(sentinel_rise_bytes)));
+}
+
+// The phase change's two proofs from the Module's observer marks (SERVED16): the release (start -> released) left the
+// box as it left the footprint, and the grow (released -> grown) added no pages beyond its own footprint growth.
+test "dsv41 memory: the release proof and the grow proof from the observer's marks" {
+    // SERVED15's cell before its phase change; the release takes the 240-row scratch (3,195,740,160 B) and the prompt's
+    // cache (0.47 GB) off the footprint, and the box follows.
+    const start: BoxMark = .{ .physical = 108_531_089_408, .footprint = 95_381_370_800 };
+    const freed: u64 = 3_195_740_160 + 472_942_002;
+    const released: BoxMark = .{ .physical = start.physical - freed, .footprint = start.footprint - freed };
+    try checkReleaseResidency(start, released);
+    // SERVED13's class: the footprint fell, the box did not (the pages stayed wired outside every footprint).
+    try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(start, .{ .physical = start.physical, .footprint = released.footprint }));
+    // The tolerance holds, one byte more is refused.
+    try checkReleaseResidency(start, .{ .physical = released.physical + box_tolerance_bytes, .footprint = released.footprint });
+    try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(start, .{ .physical = released.physical + box_tolerance_bytes + 1, .footprint = released.footprint }));
+    // The judgment: every mark needed, a mark that could not be taken fails by its own name, full marks judge both.
+    var pm: PhaseMarks = .{ .a = testing.allocator, .io = testing.io };
+    try testing.expectError(error.PhaseMarkMissing, pm.judge());
+    const grown: BoxMark = .{ .physical = released.physical + 12_000_000_000, .footprint = released.footprint + 11_990_000_000 };
+    pm.marks = .{ start, released, grown };
+    try pm.judge();
+    pm.marks[2] = .{ .physical = grown.physical + box_tolerance_bytes + 20_000_000, .footprint = grown.footprint };
+    try testing.expectError(error.PhaseChangeNotReclaimed, pm.judge());
+    pm.marks[2] = grown;
+    pm.failed[1] = error.BoxMarkUnstable;
+    try testing.expectError(error.BoxMarkUnstable, pm.judge());
+    // The observer records a live mark (host: a posix_spawn vm_stat, no MLX) and its own time; it never errs.
+    var live: PhaseMarks = .{ .a = testing.allocator, .io = testing.io };
+    const o = live.observer();
+    try o.mark(o.ctx, .start);
+    try testing.expect(live.marks[0] != null and live.failed[0] == null and live.spent_ns > 0);
 }
 
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
