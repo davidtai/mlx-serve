@@ -53,6 +53,7 @@ pub const kernels = [_]Kernel{
     .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
     .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
     .q3_prefill_dig_rot_take2_5120,
+    .dsv41_prefill_dig_take2v_5120,
     .q3_prefill_dig_rot_roundx_2304,
     .q3_prefill_dig2_swiglu_2304_x,
     .q3_prefill_dig_rot_widen2_2304,
@@ -252,6 +253,19 @@ pub fn Accepted(comptime G: type) type {
 /// a self-check failure (SelfCheckFailed, `diag` naming kernel / check / site). The set's
 /// launcher must be installed on `g` first (`Set.install`): a backend that prepares launches
 /// prepares them through it.
+/// What `accept` self-checks on the device: this consumer's kernels less the texts no route launches yet. The take2
+/// retune stays out until its route flips: its 0b smoke checks it (and prices it) on the device first, so a device
+/// fault costs that smoke line, not a served construction.
+const checked_at_accept = blk: {
+    var out: [kernels.len - 1]Kernel = undefined;
+    var n: usize = 0;
+    for (kernels) |k| if (k != .dsv41_prefill_dig_take2v_5120) {
+        out[n] = k;
+        n += 1;
+    };
+    break :blk out;
+};
+
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
     const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
     try checkSpec(spec, diag);
@@ -261,7 +275,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &kernels, &acc.report, diag);
+    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -495,6 +509,9 @@ pub fn DigX(comptime G: type) type {
         gemm_gu: *const Entry,
         gemm_dn: *const Entry,
         take2_e: *const Entry,
+        /// the take2 retune (`dsv41_prefill_dig_take2v_5120`): registered, and launched by its 0b smoke only, until
+        /// its route flips; the route launches the lane's take2
+        take2v_e: *const Entry,
         roundx_e: *const Entry,
         onepass_e: *const Entry,
         widen2_e: *const Entry,
@@ -505,6 +522,7 @@ pub fn DigX(comptime G: type) type {
                 .gemm_gu = reg.get(.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3),
                 .gemm_dn = reg.get(.q3_prefill_dig_gemm_2304x5120_xmul1hk3),
                 .take2_e = reg.get(.q3_prefill_dig_rot_take2_5120),
+                .take2v_e = reg.get(.dsv41_prefill_dig_take2v_5120),
                 .roundx_e = reg.get(.q3_prefill_dig_rot_roundx_2304),
                 .onepass_e = reg.get(.q3_prefill_dig2_swiglu_2304_x),
                 .widen2_e = reg.get(.q3_prefill_dig_rot_widen2_2304),
@@ -1421,6 +1439,75 @@ test "dsv41 kernels ops: prefill rows read by act_row take the same act words (t
     }
 }
 
+// The take2 retune's exactness argument, on the host in f32. The lane text's 128-point butterflies (lane l holds
+// block elements l + 32q: element bits 0..4 across lanes, then 5 and 6 in registers) and the retune's (lane l holds
+// 4l + q: bits 0 and 1 in registers, then 2..6 across lanes) combine the same pairs in the same bit order, each as
+// (lower + upper, lower - upper), so every output is the same f32. A reordered stage fails here.
+test "dsv41 kernels ops: the take2 retune's butterflies are the lane text's, bit for bit (both lane layouts emulated on the host)" {
+    const Emu = struct {
+        const scale: f32 = @bitCast(@as(u32, 1035273459));
+        /// One simd_shuffle_xor stage over the 32 lanes: a lower lane keeps own + partner, an upper one partner - own.
+        fn lanes(w: *[32][4]f32, h: usize) void {
+            const old = w.*;
+            for (0..32) |l| for (0..4) |q| {
+                const o = old[l ^ h][q];
+                w[l][q] = if (l & h != 0) o - old[l][q] else old[l][q] + o;
+            };
+        }
+        /// The two in-register stages over a lane's 4 values: q bit 0, then q bit 1.
+        fn regs(v: [4]f32) [4]f32 {
+            const a0 = v[0] + v[1];
+            const a1 = v[0] - v[1];
+            const a2 = v[2] + v[3];
+            const a3 = v[2] - v[3];
+            return .{ a0 + a2, a1 + a3, a0 - a2, a1 - a3 };
+        }
+        fn laneText(x: *const [128]f32) [128]f32 {
+            var w: [32][4]f32 = undefined;
+            for (0..32) |l| for (0..4) |q| {
+                w[l][q] = x[l + 32 * q];
+            };
+            var h: usize = 1;
+            while (h < 32) : (h <<= 1) lanes(&w, h);
+            var out: [128]f32 = undefined;
+            for (0..32) |l| {
+                const v = regs(w[l]);
+                for (0..4) |q| out[l + 32 * q] = v[q] * scale;
+            }
+            return out;
+        }
+        fn retune(x: *const [128]f32) [128]f32 {
+            var w: [32][4]f32 = undefined;
+            for (0..32) |l| w[l] = regs(x[4 * l ..][0..4].*);
+            var h: usize = 1;
+            while (h < 32) : (h <<= 1) lanes(&w, h);
+            var out: [128]f32 = undefined;
+            for (0..32) |l| for (0..4) |q| {
+                out[4 * l + q] = w[l][q] * scale;
+            };
+            return out;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x7a4e2);
+    const rnd = prng.random();
+    var x: [128]f32 = undefined;
+    for (0..4000) |i| {
+        for (&x, 0..) |*v, j| v.* = switch (i % 4) {
+            // a wide dynamic range: cancellation and absorption at every stage
+            0 => (rnd.float(f32) - 0.5) * std.math.pow(f32, 2.0, @floatFromInt(rnd.intRangeAtMost(i32, -24, 24))),
+            // the products' own scale (act about 1 x rin about 0.05)
+            1 => (rnd.float(f32) - 0.5) * 0.1,
+            // exact cancellations: equal magnitudes, alternating signs
+            2 => if (j % 2 == 0) 0.375 else -0.375,
+            // one outlier per block over small values
+            else => if (j == i % 128) 1.0e3 else 1.0e-3 * (rnd.float(f32) + 0.5),
+        };
+        const want = Emu.laneText(&x);
+        const got = Emu.retune(&x);
+        try testing.expectEqualSlices(u32, @as(*const [128]u32, @ptrCast(&want)), @as(*const [128]u32, @ptrCast(&got)));
+    }
+}
+
 // ── 3. Move invariance: the C2 entries launch what today's EXL3 entries launch ──
 
 /// A trace's log from `from` on as text: every launch with its kernel, grid, threadgroup,
@@ -1524,4 +1611,228 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         }
     }
     try acc.checkBank(&tb, bb, &diag);
+}
+
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device); seconds,
+// no model load. The take2 retune on the device, and the per-wave prices the drain note left open:
+// 1. both take2 texts' construction self-checks on the device (compile, row invariance, the bitwise mlx_chain);
+// 2. the retune against the lane's take2, each through its own entry (whichever the route launches), over real
+//    records (layer 0's first 16 experts, their rin rows read by the stream), a K16 wave of 8 experts x 256 rows and
+//    a ragged one (1 / 17 / 270 rows): every output word equal, bit for bit. Fail-closed: a mismatch, an all-zero
+//    output, or DSV41_PHASE0B_MLX without the bank fails the test;
+// 3. one DIGX_WAVE_MICROBENCH line per kernel and wave (take2 lane and retune, onepass, widen1) at the tier's
+//    2,048-row wave and the DIG-X probe's 4 x 270 = 1,080: per launch, the best of 5 runs of 8 back-to-back launches
+//    and one eval ("us": the eval's encode + GPU + wait; "host_us": the launches' graph build).
+test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit for bit; per-wave microbench of take2, onepass, widen1" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse {
+        std.debug.print("\ntake2 retune smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
+        return error.TestUnexpectedResult;
+    });
+    const ops = @import("deepseek_v41_ops.zig");
+    const es = @import("expert_stream.zig");
+    const eb = @import("expert_bank.zig");
+    const G = ops.MlxOps;
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("kernel set refused: {s}\n", .{kd.message()});
+        return e;
+    };
+    defer set.deinit();
+    set.install(G, &g);
+    defer ks.Set.uninstall(G, &g);
+    // 1. both texts' construction self-checks, on the device
+    {
+        var report: selfcheck.Report = .{};
+        defer report.deinit(a);
+        set.selfCheck(a, &.{ .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120 }, &report, &kd) catch |e| {
+            std.debug.print("take2 self-checks refused: {s}\n", .{kd.message()});
+            return e;
+        };
+        var chains: usize = 0;
+        for (report.results.items) |r| chains += @intFromBool(r.check == .mlx_chain and r.ok and r.bad == 0 and r.words > 0);
+        try testing.expectEqual(@as(usize, 2), chains);
+    }
+    // layer 0's first 16 experts, read by the stream into 16 persistent MLX rows (the base bank)
+    var bdiag: eb.Diag = .{};
+    var bank = eb.Bank.open(a, io, dir, eb.dsv41, &bdiag) catch |e| {
+        std.debug.print("bank refused: {s}\n", .{bdiag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const n_experts = 16;
+    var base_rows: [40]u32 = @splat(0);
+    base_rows[0] = n_experts;
+    const st = try es.Stream.init(a, &bank, .{ .rows = &base_rows, .max_route_ids = n_experts, .transient_rows = n_experts, .slot_memory = .{ .mlx = s } });
+    defer st.deinit();
+    var ids: [n_experts]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(i);
+    const route = try st.route(0, &ids, &.{});
+    defer st.release(route);
+    for (0..route.n_parts) |p| {
+        try st.waitGu(route, @intCast(p));
+        try st.waitDown(route, @intCast(p));
+    }
+    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    const rf = st.refsOf(route, &refs);
+    try testing.expectEqual(@as(usize, n_experts), rf.len);
+    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    const dig = DigX(G).init(&set.reg);
+    const Wave = struct {
+        rows: u32,
+        act: G.T,
+        ridx: G.T,
+        rhs: G.T,
+        tbl_gu: G.T,
+        tbl_dn: G.T,
+
+        /// A wave's rows grouped by expert in order (expert j at real record `refs_[j]`), act row i for row i, act a
+        /// deterministic spread of bf16 values (a sum of two uniforms in [-2, 2)).
+        fn init(al: Allocator, gg: *G, per: []const u32, refs_: []const es.SlotRef, d: DigX(G), seed: u64) !@This() {
+            var ex: [wave_max]WaveExpert = undefined;
+            var n: u32 = 0;
+            for (per, 0..) |c, j| {
+                ex[j] = .{ .slot = refs_[j].row, .rows = c };
+                n += c;
+            }
+            const ridx = try al.alloc(i32, n);
+            defer al.free(ridx);
+            const rhs = try al.alloc(u32, n);
+            defer al.free(rhs);
+            var i: usize = 0;
+            for (per, 0..) |c, j| for (0..c) |_| {
+                ridx[i] = @intCast(i);
+                rhs[i] = @intCast(j);
+                i += 1;
+            };
+            const xs = try al.alloc(f32, @as(usize, n) * 5120);
+            defer al.free(xs);
+            var h: u64 = seed;
+            for (xs) |*v| {
+                h = h *% 6364136223846793005 +% 1442695040888963407;
+                const u_1: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 40)))) / 16777216.0;
+                const u_2: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 16)) & 0xffffff)) / 16777216.0;
+                v.* = (u_1 + u_2 - 1.0) * 2.0;
+            }
+            const tg = digTable(ex[0..per.len], d.digTiles(.gate_up));
+            const td = digTable(ex[0..per.len], d.digTiles(.down));
+            const ni: c_int = @intCast(n);
+            return .{
+                .rows = n,
+                .act = try gg.astype(try gg.hostArray(std.mem.sliceAsBytes(xs), &.{ ni, 5120 }, .float32), .bfloat16),
+                .ridx = try gg.hostArray(std.mem.sliceAsBytes(ridx), &.{ni}, .int32),
+                .rhs = try gg.hostArray(std.mem.sliceAsBytes(rhs), &.{ni}, .uint32),
+                .tbl_gu = try gg.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32),
+                .tbl_dn = try gg.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32),
+            };
+        }
+    };
+    const k16 = [_]u32{ 256, 256, 256, 256, 256, 256, 256, 256 };
+    // 2. the retune against the lane's take2 on the real rin rows: every output word, bit for bit
+    for ([_][]const u32{ &k16, &.{ 1, 17, 270 } }, 0..) |per, wi| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const w = try Wave.init(a, &g, per, rf, dig, 0x5eed + wi);
+        const vars = rowsVars(w.rows);
+        var lane: [2]G.T = undefined;
+        try launchRule(G, &g, dig.take2_e, &vars, &.{ w.act, w.ridx, w.rhs, w.tbl_gu, ba.gate.rin, ba.up.rin }, &lane);
+        var retuned: [2]G.T = undefined;
+        try launchRule(G, &g, dig.take2v_e, &vars, &.{ w.act, w.ridx, w.rhs, w.tbl_gu, ba.gate.rin, ba.up.rin }, &retuned);
+        try g.evalAll(&.{ lane[0], lane[1], retuned[0], retuned[1] });
+        const n_words = @as(usize, w.rows) * 5120;
+        var mismatch: usize = 0;
+        var nonzero: usize = 0;
+        for (lane, retuned) |x, y| {
+            const px = mlx.mlx_array_data_uint8(x) orelse return error.TestUnexpectedResult;
+            const py = mlx.mlx_array_data_uint8(y) orelse return error.TestUnexpectedResult;
+            for (0..n_words) |k| {
+                const wx = @as(u16, px[2 * k]) | @as(u16, px[2 * k + 1]) << 8;
+                const wy = @as(u16, py[2 * k]) | @as(u16, py[2 * k + 1]) << 8;
+                mismatch += @intFromBool(wx != wy);
+                nonzero += @intFromBool(wx & 0x7fff != 0);
+            }
+        }
+        std.debug.print("\nTAKE2_RETUNE_SMOKE {{\"rows\": {d}, \"experts\": {d}, \"words\": {d}, \"mismatch\": {d}, \"nonzero\": {d}}}\n", .{ w.rows, per.len, 2 * n_words, mismatch, nonzero });
+        try testing.expectEqual(@as(usize, 0), mismatch);
+        try testing.expect(nonzero > n_words);
+    }
+    // 3. per-wave time, one line per kernel and wave
+    for ([_][]const u32{ &k16, &.{ 270, 270, 270, 270 } }) |per| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const w = try Wave.init(a, &g, per, rf, dig, 0xbe7c);
+        const n: usize = w.rows;
+        const ni: c_int = @intCast(n);
+        // the GEMM outputs' stand-ins (onepass reads z_g / z_u, widen1 z_d), uniform in [-3, 3)
+        const zs = try a.alloc(f32, n * 5120);
+        defer a.free(zs);
+        var h: u64 = 0x2d;
+        for (zs) |*v| {
+            h = h *% 6364136223846793005 +% 1442695040888963407;
+            v.* = (@as(f32, @floatFromInt(@as(u32, @truncate(h >> 40)))) / 16777216.0 - 0.5) * 6.0;
+        }
+        const zg = try g.hostArray(std.mem.sliceAsBytes(zs[0 .. n * 2304]), &.{ ni, 2304 }, .float32);
+        const zu = try g.hostArray(std.mem.sliceAsBytes(zs[n * 2304 .. n * 4608]), &.{ ni, 2304 }, .float32);
+        const zd = try g.hostArray(std.mem.sliceAsBytes(zs), &.{ ni, 5120 }, .float32);
+        try g.evalAll(&.{ w.act, w.ridx, w.rhs, w.tbl_gu, w.tbl_dn, zg, zu, zd });
+        const vars = rowsVars(w.rows);
+        const Kind = enum { take2_lane, take2_retune, onepass, widen1 };
+        for ([_]Kind{ .take2_lane, .take2_retune, .onepass, .widen1 }) |kind| {
+            var best_eval: u64 = std.math.maxInt(u64);
+            var best_host: u64 = std.math.maxInt(u64);
+            // run 0 warms (the pipeline's first compile); runs 1..5 are timed
+            for (0..6) |run| {
+                const mr = g.mark();
+                defer g.resetTo(mr);
+                var outs: [16]G.T = undefined;
+                var n_out: usize = 0;
+                const t0 = std.Io.Timestamp.now(io, .boot);
+                for (0..8) |_| switch (kind) {
+                    .take2_lane => {
+                        var o: [2]G.T = undefined;
+                        try launchRule(G, &g, dig.take2_e, &vars, &.{ w.act, w.ridx, w.rhs, w.tbl_gu, ba.gate.rin, ba.up.rin }, &o);
+                        outs[n_out] = o[0];
+                        outs[n_out + 1] = o[1];
+                        n_out += 2;
+                    },
+                    .take2_retune => {
+                        var o: [2]G.T = undefined;
+                        try launchRule(G, &g, dig.take2v_e, &vars, &.{ w.act, w.ridx, w.rhs, w.tbl_gu, ba.gate.rin, ba.up.rin }, &o);
+                        outs[n_out] = o[0];
+                        outs[n_out + 1] = o[1];
+                        n_out += 2;
+                    },
+                    .onepass => {
+                        outs[n_out] = try dig.onePass(&g, zg, zu, w.rhs, w.tbl_gu, ba.gate.rout, ba.up.rout, ba.down.rin);
+                        n_out += 1;
+                    },
+                    .widen1 => {
+                        outs[n_out] = try dig.widen1(&g, zd, w.rhs, w.tbl_dn, ba.down.rout);
+                        n_out += 1;
+                    },
+                };
+                const host: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
+                const t1 = std.Io.Timestamp.now(io, .boot);
+                try g.evalAll(outs[0..n_out]);
+                const eval: u64 = @intCast(t1.untilNow(io, .boot).nanoseconds);
+                if (run > 0) {
+                    best_eval = @min(best_eval, eval);
+                    best_host = @min(best_host, host);
+                }
+            }
+            const kname = switch (kind) {
+                .take2_lane => @tagName(Kernel.q3_prefill_dig_rot_take2_5120),
+                .take2_retune => @tagName(Kernel.dsv41_prefill_dig_take2v_5120),
+                .onepass => @tagName(Kernel.q3_prefill_dig2_swiglu_2304_x),
+                .widen1 => @tagName(Kernel.q3_prefill_dig_rot_widen1_5120),
+            };
+            std.debug.print("DIGX_WAVE_MICROBENCH {{\"kernel\": \"{s}\", \"rows\": {d}, \"us\": {d:.1}, \"host_us\": {d:.1}}}\n", .{ kname, w.rows, @as(f64, @floatFromInt(best_eval)) / 8000.0, @as(f64, @floatFromInt(best_host)) / 8000.0 });
+        }
+    }
 }
