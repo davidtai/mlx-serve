@@ -793,6 +793,9 @@ pub fn Model(comptime G: type) type {
                     }
                     if (parts) |pt| {
                         try probe.put("moe.routed", pt.loc);
+                        // The profile's own stage for the wide call's merged sources, evaluated before the first
+                        // combine reads them (else the merge lands in moe.y).
+                        try probeMerge(probe, pt.outs);
                     } else {
                         ro = try hook.routed(g, cat_xf, cat_idx);
                         // The profile's own stage for the group's routed compute (else it lands in moe.shared).
@@ -872,6 +875,13 @@ pub fn Model(comptime G: type) type {
         fn probeChunk(probe: anytype, i: usize) void {
             const P = @TypeOf(probe);
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "atChunk")) probe.atChunk(i);
+        }
+
+        /// A probe that splits the wide call's merge (the profile's) evaluates the merged sources on their own stage,
+        /// MLX's active and cache read around them; compiled out for every other probe (NoProbe in timed builds).
+        fn probeMerge(probe: anytype, outs: []const T) !void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "merge")) try probe.merge(outs);
         }
 
         fn keepHalf(g: *G, hf: *Tr.Half) void {

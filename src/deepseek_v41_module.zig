@@ -591,12 +591,17 @@ pub const Module = struct {
         try self.engram.checkPosted(gpa, rows, n);
     }
 
-    /// A few ids' rows through the resident table and through the host rows, compared bitwise.
+    /// Ids' rows through the resident table and through the host rows, compared bitwise: 64 ids (unsorted, repeats,
+    /// both ends of the table), so the host rows' aligned parallel gather is the one checked (32 ids and more).
     fn checkEmbeddingRows(self: *Module, gpa: std.mem.Allocator) !void {
         const g = &self.g;
         const vocab: u32 = self.model.c.vocab_size;
         const dim: u32 = self.model.c.hidden_size;
-        const ids = [_]u32{ 0, 1, 7, vocab / 2, vocab - 1 };
+        var ids: [64]u32 = undefined;
+        for (&ids, 0..) |*d, i| d.* = @intCast((@as(u64, i) * 40503 + 17) % vocab);
+        ids[0..5].* = .{ 0, 1, 7, vocab / 2, vocab - 1 };
+        ids[40] = ids[3];
+        ids[63] = ids[1];
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();

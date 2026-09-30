@@ -1742,6 +1742,11 @@ const PrefillProbe = struct {
     layers_done: u64 = 0,
     /// K16's chunk of the stages that follow (set by the layer-major pass), else the chunk-major count.
     cur_chunk: ?usize = null,
+    /// The wide calls' merges (`merge`): how many, and the bytes they took beyond what MLX's cache gave back
+    /// (fresh) against the bytes the cache gave back (reused).
+    merges: u64 = 0,
+    merge_fresh: u64 = 0,
+    merge_reused: u64 = 0,
     chunk_ns: [64]u64 = @splat(0),
     chunk_rows: [64]u32 = @splat(0),
     read_wall_ns: u64 = 0,
@@ -1751,6 +1756,35 @@ const PrefillProbe = struct {
 
     pub fn atChunk(self: *PrefillProbe, i: usize) void {
         self.cur_chunk = i;
+    }
+
+    /// The wide call's merged sources evaluated on their own stage ("moe.merge"), MLX's active and cache read around
+    /// them: active growth the cache did not give back is fresh allocation.
+    pub fn merge(self: *PrefillProbe, outs: []const ops.MlxOps.T) !void {
+        var a0: usize = 0;
+        var c0: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a0);
+        _ = mlx.mlx_get_cache_memory(&c0);
+        try self.g.evalAll(outs);
+        var a1: usize = 0;
+        var c1: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a1);
+        _ = mlx.mlx_get_cache_memory(&c1);
+        const grew: u64 = a1 -| a0;
+        const reused: u64 = @min(grew, c0 -| c1);
+        self.merges += 1;
+        self.merge_reused += reused;
+        self.merge_fresh += grew - reused;
+        try self.charge("moe.merge");
+    }
+
+    /// The time since the last stage, charged to `name` and to the current chunk.
+    fn charge(self: *PrefillProbe, name: []const u8) !void {
+        const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.last = std.Io.Timestamp.now(self.io, .boot);
+        self.ns[try self.slot(name)] += d;
+        const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        self.chunk_ns[chunk] += d;
     }
 
     fn slot(self: *PrefillProbe, name: []const u8) !usize {
@@ -1861,6 +1895,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
+    // The wide calls' merges (K16 JOINLESS): the bytes they allocated fresh against those MLX's cache gave back.
+    if (probe.merges > 0) std.debug.print("PREFILL_PROFILE_MERGE {{\"merges\": {d}, \"fresh_gb\": {d:.3}, \"reused_gb\": {d:.3}}}\n", .{ probe.merges, @as(f64, @floatFromInt(probe.merge_fresh)) / 1e9, @as(f64, @floatFromInt(probe.merge_reused)) / 1e9 });
     // A profile build (-Ddsv41-prefill-timers=true): the routed calls' host time by step, the waves and launches.
     if (dsv41_prof.enabled) std.debug.print("PREFILL_PROFILE_ROUTED {{\"barrier_s\": {d:.3}, \"route_s\": {d:.3}, \"read_wait_s\": {d:.3}, \"encode_s\": {d:.3}, \"drain_s\": {d:.3}, \"join_s\": {d:.3}, \"dig_calls\": {d}, \"waves\": {d}, \"launches\": {d}}}\n", .{
         dsv41_prof.seconds(.barrier), dsv41_prof.seconds(.route), dsv41_prof.seconds(.read_wait), dsv41_prof.seconds(.encode), dsv41_prof.seconds(.drain), dsv41_prof.seconds(.join), dsv41_prof.calls, dsv41_prof.waves, dsv41_prof.launches,
@@ -1904,6 +1940,65 @@ fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
     if (config.num_eos_tokens == 0) return error.NoEosIds;
     return .{ .prompt = prompt, .config = config };
+}
+
+// DSV41_EMBED_GATHER_BENCH=1 with DSV41_BANK and DSV41_CELL_PROMPT_IDS (host I/O only; never inside a window): the
+// input embedding's rows for the standard prompt (16,384 real ids, unsorted, repeats), chunk by chunk as the prompt
+// pass asks for them, through the table's aligned parallel gather and through the serial path it replaced (one
+// unaligned F_NOCACHE pread per row, which the page cache keeps: evict the shard's clean cache after this test).
+// Every chunk's bytes equal both ways; the two times and the distinct rows print as one EMBED_GATHER line.
+test "dsv41 served cell: the embedding rows' aligned parallel gather equals the serial reads on the prompt's ids (bench)" {
+    if (std.c.getenv("DSV41_EMBED_GATHER_BENCH") == null) return error.SkipZigTest;
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("embed gather bench: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(aa, io, bank, &diag);
+    var rows = try dss.openEmbeddingRows(aa, io, bank, &c, &diag);
+    defer rows.close();
+    const prompt = try cellPrompt(aa, io, prompt_path, null);
+    const kvc = @import("deepseek_v41_cache.zig");
+    const spans = try kvc.prefillSpans(aa, @intCast(prompt.len), kvc.resolvePrefillChunk(&c, prompt.len, null, kvc.default_chunk_target_bytes));
+    const rb: usize = @as(usize, rows.dim) * 2;
+    var widest: usize = 0;
+    for (spans) |sp| widest = @max(widest, sp[1] - sp[0]);
+    const got = try aa.alloc(u8, widest * rb);
+    const want = try aa.alloc(u8, widest * rb);
+    // Aligned parallel first: its reads leave no page behind, so the serial reads after it start cold too.
+    var aligned_ns: u64 = 0;
+    var serial_ns: u64 = 0;
+    for (spans) |sp| {
+        const ids = prompt[sp[0]..sp[1]];
+        const t0 = std.Io.Timestamp.now(io, .boot);
+        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
+        aligned_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
+    }
+    for (spans) |sp| {
+        const ids = prompt[sp[0]..sp[1]];
+        const t0 = std.Io.Timestamp.now(io, .boot);
+        for (ids, 0..) |r, i| {
+            const dst = want[i * rb ..][0..rb];
+            var done: usize = 0;
+            while (done < rb) {
+                const k = std.c.pread(rows.fd, dst[done..].ptr, rb - done, @intCast(rows.w_off + @as(usize, r) * rb + done));
+                try testing.expect(k > 0);
+                done += @intCast(k);
+            }
+        }
+        serial_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
+        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
+        try testing.expectEqualSlices(u8, want[0 .. ids.len * rb], got[0 .. ids.len * rb]);
+    }
+    var seen = try std.DynamicBitSet.initEmpty(aa, c.vocab_size);
+    for (prompt) |r| seen.set(r);
+    std.debug.print("\nEMBED_GATHER {{\"chunks\": {d}, \"rows\": {d}, \"distinct\": {d}, \"serial_s\": {d:.3}, \"aligned_parallel_s\": {d:.3}}}\n", .{
+        spans.len, prompt.len, seen.count(), @as(f64, @floatFromInt(serial_ns)) / 1e9, @as(f64, @floatFromInt(aligned_ns)) / 1e9,
+    });
 }
 
 // The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and

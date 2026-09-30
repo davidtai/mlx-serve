@@ -151,6 +151,268 @@ pub fn reader(path: [:0]const u8) !mlx.mlx_io_reader {
     return mlx.mlx_io_reader_new(d, vtable);
 }
 
+/// `buf.len` bytes at `off` of an F_NOCACHE descriptor, through whole aligned pages into a page-aligned stage (the
+/// construction's header reads of a table read past the page cache, `NgramTable.openTensor`); errors by name.
+pub fn readAligned(fd: std.c.fd_t, buf: []u8, off: u64) !void {
+    if (buf.len == 0) return;
+    const page: u64 = std.heap.pageSize();
+    const span = std.mem.alignForward(u64, off % page + buf.len, page);
+    const stage = try std.heap.page_allocator.alloc(u8, @intCast(@min(span, stage_bytes)));
+    defer std.heap.page_allocator.free(stage);
+    var pos = off;
+    const end = off + buf.len;
+    var out: usize = 0;
+    while (pos < end) {
+        const a0 = pos - pos % page;
+        const want_end = @min(end, a0 + stage.len);
+        const need = want_end - a0;
+        const len = std.mem.alignForward(u64, need, page);
+        var got: u64 = 0;
+        while (got < need) {
+            if (got % page != 0) return error.ReadShort;
+            const n = std.c.pread(fd, stage[@intCast(got)..].ptr, @intCast(len - got), @intCast(a0 + got));
+            if (n < 0) {
+                if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                return error.ReadFailed;
+            }
+            if (n == 0) return error.ReadShort;
+            got += @intCast(n);
+        }
+        const s0: usize = @intCast(pos - a0);
+        const take: usize = @intCast(need - (pos - a0));
+        @memcpy(buf[out..][0..take], stage[s0..][0..take]);
+        out += take;
+        pos = want_end;
+    }
+}
+
+// ── Row gather: a table's rows past the page cache ──
+
+/// A table's rows past the page cache (the input embedding's host rows): `row_bytes` at `base + id * row_bytes` of an
+/// F_NOCACHE descriptor, gathered into the caller's id order. Every read is page-aligned in offset, length and
+/// destination, and checked, since macOS keeps only aligned reads out of the page cache (`Desc.readAt`). Each distinct
+/// row is read once; rows whose aligned pages touch are read as one run; `helpers` threads and the caller take the runs
+/// in parallel. `init` allocates everything once (the page-aligned stages, the sort and run scratch, the threads): a
+/// gather allocates nothing. One gather at a time (the model's thread); the descriptor stays its owner's.
+pub const RowGather = struct {
+    /// One reader's stage: the widest run it reads (whole pages).
+    pub const stage_len: usize = 128 << 10;
+    pub const Item = struct { id: u32, at: u32 };
+    /// `len` aligned bytes at `off` (aligned) hold `items[first..end]`'s rows; the last of them ends `need` bytes in.
+    pub const Run = struct { off: u64, len: u64, need: u64, first: u32, end: u32 };
+
+    fd: std.c.fd_t,
+    base: u64,
+    row_bytes: usize,
+    rows: u64,
+    page: usize,
+    /// Ids per piece (a longer call runs in pieces of this many).
+    max_ids: usize,
+    /// Below this many ids the caller reads alone (no helper woken).
+    parallel_min: usize,
+    /// `helpers + 1` stages; `[0]` is the caller's.
+    stages: [][]u8,
+    items: []Item,
+    runs: []Run,
+    threads: []std.Thread,
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    gen: u64 = 0,
+    quit: bool = false,
+    /// The piece in flight (set before `gen` moves, read after it).
+    out: []u8 = &.{},
+    n_runs: usize = 0,
+    next: std.atomic.Value(usize) = .init(0),
+    pending: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(u32) = .init(0),
+    unaligned: std.atomic.Value(u32) = .init(0),
+
+    /// Host bytes a gather keeps for the table's life (the bill's term): the stages and the scratch.
+    pub fn persistentBytes(helpers: usize, max_ids: usize) u64 {
+        return @as(u64, helpers + 1) * stage_len + @as(u64, max_ids) * (@sizeOf(Item) + @sizeOf(Run));
+    }
+
+    pub fn init(fd: std.c.fd_t, base: u64, row_bytes: usize, rows: u64, helpers: usize, max_ids: usize, parallel_min: usize) !*RowGather {
+        const page = std.heap.pageSize();
+        if (row_bytes == 0 or max_ids == 0 or row_bytes + 2 * page > stage_len or stage_len % page != 0) return error.GatherGeometry;
+        const a = std.heap.c_allocator;
+        const self = try a.create(RowGather);
+        errdefer a.destroy(self);
+        self.* = .{ .fd = fd, .base = base, .row_bytes = row_bytes, .rows = rows, .page = page, .max_ids = max_ids, .parallel_min = parallel_min, .stages = &.{}, .items = &.{}, .runs = &.{}, .threads = &.{} };
+        self.stages = try a.alloc([]u8, helpers + 1);
+        errdefer a.free(self.stages);
+        var made: usize = 0;
+        errdefer for (self.stages[0..made]) |st| std.heap.page_allocator.free(st);
+        for (self.stages) |*st| {
+            st.* = try std.heap.page_allocator.alloc(u8, stage_len);
+            made += 1;
+            if (@intFromPtr(st.*.ptr) % page != 0) return error.GatherGeometry;
+        }
+        self.items = try a.alloc(Item, max_ids);
+        errdefer a.free(self.items);
+        self.runs = try a.alloc(Run, max_ids);
+        errdefer a.free(self.runs);
+        self.threads = try a.alloc(std.Thread, helpers);
+        errdefer a.free(self.threads);
+        var started: usize = 0;
+        errdefer self.stop(started);
+        for (self.threads, 0..) |*t, i| {
+            t.* = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, helper, .{ self, i });
+            started += 1;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *RowGather) void {
+        self.stop(self.threads.len);
+        const a = std.heap.c_allocator;
+        for (self.stages) |st| std.heap.page_allocator.free(st);
+        a.free(self.stages);
+        a.free(self.items);
+        a.free(self.runs);
+        a.free(self.threads);
+        a.destroy(self);
+    }
+
+    fn stop(self: *RowGather, started: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.quit = true;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        for (self.threads[0..started]) |t| t.join();
+    }
+
+    /// The rows of `ids` (any order, repeats allowed) into `out` (`ids.len * row_bytes`), in `ids` order.
+    pub fn gather(self: *RowGather, ids: []const u32, out: []u8) !void {
+        if (out.len != ids.len * self.row_bytes) return error.GatherShape;
+        for (ids) |id| if (id >= self.rows) return error.RowOutOfRange;
+        var start: usize = 0;
+        while (start < ids.len) : (start += self.max_ids) {
+            const end = @min(start + self.max_ids, ids.len);
+            try self.piece(ids[start..end], out[start * self.row_bytes .. end * self.row_bytes]);
+        }
+    }
+
+    fn lessId(_: void, x: Item, y: Item) bool {
+        return x.id < y.id;
+    }
+
+    fn alignUp(self: *const RowGather, x: u64) u64 {
+        return std.mem.alignForward(u64, x, self.page);
+    }
+
+    /// The sorted items' runs: each distinct row once, rows whose aligned pages touch in one run up to a stage.
+    fn plan(self: *RowGather, n: usize) usize {
+        const p: u64 = self.page;
+        const rb: u64 = self.row_bytes;
+        const items = self.items[0..n];
+        var nr: usize = 0;
+        var i: usize = 0;
+        while (i < n) {
+            const o0 = self.base + @as(u64, items[i].id) * rb;
+            const start = o0 - o0 % p;
+            var end_row = o0 + rb;
+            var j = i + 1;
+            while (j < n) : (j += 1) {
+                if (items[j].id == items[j - 1].id) continue;
+                const o = self.base + @as(u64, items[j].id) * rb;
+                if (o - o % p > self.alignUp(end_row)) break;
+                if (self.alignUp(o + rb) - start > stage_len) break;
+                end_row = o + rb;
+            }
+            self.runs[nr] = .{ .off = start, .len = self.alignUp(end_row) - start, .need = end_row - start, .first = @intCast(i), .end = @intCast(j) };
+            nr += 1;
+            i = j;
+        }
+        return nr;
+    }
+
+    fn piece(self: *RowGather, ids: []const u32, out: []u8) !void {
+        for (self.items[0..ids.len], ids, 0..) |*it, id, i| it.* = .{ .id = id, .at = @intCast(i) };
+        std.mem.sort(Item, self.items[0..ids.len], {}, lessId);
+        self.n_runs = self.plan(ids.len);
+        self.out = out;
+        self.next.store(0, .release);
+        self.failed.store(0, .release);
+        self.unaligned.store(0, .release);
+        if (self.threads.len == 0 or ids.len < self.parallel_min or self.n_runs == 1) {
+            self.work(self.stages[0]);
+        } else {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.mu.lockUncancelable(io);
+            self.pending.store(@intCast(self.threads.len), .release);
+            self.gen += 1;
+            self.cv.broadcast(io);
+            self.mu.unlock(io);
+            self.work(self.stages[0]);
+            while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        }
+        if (self.unaligned.load(.acquire) != 0) return error.GatherUnaligned;
+        if (self.failed.load(.acquire) != 0) return error.GatherRead;
+    }
+
+    fn helper(self: *RowGather, idx: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen: u64 = 0;
+        while (true) {
+            self.mu.lockUncancelable(io);
+            while (self.gen == seen and !self.quit) self.cv.wait(io, &self.mu) catch {};
+            if (self.quit) {
+                self.mu.unlock(io);
+                return;
+            }
+            seen = self.gen;
+            self.mu.unlock(io);
+            self.work(self.stages[idx + 1]);
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+
+    /// Runs taken in turn: each read into `stage`, its rows copied to their places in the piece's `out`.
+    fn work(self: *RowGather, stage: []u8) void {
+        while (true) {
+            const r = self.next.fetchAdd(1, .acq_rel);
+            if (r >= self.n_runs) return;
+            const run = self.runs[r];
+            if (!self.aligned(run, stage)) {
+                _ = self.unaligned.fetchAdd(1, .acq_rel);
+                continue;
+            }
+            if (!self.readRun(run, stage)) {
+                _ = self.failed.fetchAdd(1, .acq_rel);
+                continue;
+            }
+            for (self.items[run.first..run.end]) |it| {
+                const off: usize = @intCast(self.base + @as(u64, it.id) * self.row_bytes - run.off);
+                @memcpy(self.out[@as(usize, it.at) * self.row_bytes ..][0..self.row_bytes], stage[off..][0..self.row_bytes]);
+            }
+        }
+    }
+
+    /// A run's read is page-aligned in offset, length and destination, and fits its stage.
+    pub fn aligned(self: *const RowGather, run: Run, stage: []const u8) bool {
+        return run.off % self.page == 0 and run.len % self.page == 0 and @intFromPtr(stage.ptr) % self.page == 0 and run.len <= stage.len and run.need <= run.len;
+    }
+
+    /// `run.len` bytes at `run.off` into `stage`, until its rows are in (the file may end inside the last page). Each
+    /// pread stays aligned: a short read that is not whole pages is the file's end, never continued unaligned.
+    fn readRun(self: *const RowGather, run: Run, stage: []u8) bool {
+        var got: u64 = 0;
+        while (got < run.need) {
+            if (got % self.page != 0) return false;
+            const k = std.c.pread(self.fd, stage[@intCast(got)..].ptr, @intCast(run.len - got), @intCast(run.off + got));
+            if (k < 0) {
+                if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                return false;
+            }
+            if (k == 0) return false;
+            got += @intCast(k);
+        }
+        return true;
+    }
+};
+
 // ── Residency probes (proof tests) ──
 
 /// Bytes of `path` resident in the page cache (mincore over a read-only map:
@@ -403,4 +665,72 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
         @as(i64, @intCast(fb3)) - @as(i64, @intCast(fb2)),
     });
     try testing.expect(eng_after <= eng_before + 64 * std.heap.pageSize());
+}
+
+test "dsv41 nocache reader: the row gather reads whole aligned pages, each row once, and scatters them in the caller's order" {
+    const a = testing.allocator;
+    // 300 rows of 10,240 B (not a page multiple) after a 1,000 B prefix (unaligned), the embedding's row shape.
+    const base: u64 = 1000;
+    const rb: usize = 10240;
+    const n_rows: usize = 300;
+    const image = try a.alloc(u8, base + n_rows * rb);
+    defer a.free(image);
+    for (image[0..base], 0..) |*b, i| b.* = @truncate(i *% 5);
+    for (0..n_rows) |r| for (0..rb) |k| {
+        image[base + r * rb + k] = @truncate(r *% 131 +% k *% 7 +% 3);
+    };
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try td.dir.writeFile(testing.io, .{ .sub_path = "rows.bin", .data = image });
+    var root: [512]u8 = undefined;
+    var pbuf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/rows.bin", .{root[0..try td.dir.realPath(testing.io, &root)]}, 0);
+    const fd = try io_util.openNoCache(path.ptr, .{});
+    defer _ = std.c.close(fd);
+    // The serial path's bytes: one plain pread per row (what gatherRaw read before), on its own descriptor.
+    const plain = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    defer _ = std.c.close(plain);
+    // Unsorted ids with repeats, the first and the last row (the file ends inside the last row's page).
+    var rng = std.Random.DefaultPrng.init(0x5eed_e3b);
+    var ids: [200]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, n_rows);
+    ids[3] = 0;
+    ids[7] = n_rows - 1;
+    ids[8] = ids[2];
+    ids[150] = ids[2];
+    for ([_]usize{ 0, 7 }) |helpers| {
+        // Pieces of 64 ids (a 200-id call runs 4); the caller alone below 8.
+        const rg = try RowGather.init(fd, base, rb, n_rows, helpers, 64, 8);
+        defer rg.deinit();
+        const out = try a.alloc(u8, ids.len * rb);
+        defer a.free(out);
+        @memset(out, 0xAA);
+        try rg.gather(&ids, out);
+        const want = try a.alloc(u8, rb);
+        defer a.free(want);
+        for (ids, 0..) |r, i| {
+            try testing.expectEqual(@as(isize, @intCast(rb)), std.c.pread(plain, want.ptr, rb, @intCast(base + r * rb)));
+            try testing.expectEqualSlices(u8, want, out[i * rb ..][0..rb]);
+        }
+        // The last piece's runs: whole aligned pages, each distinct row in exactly one.
+        var rows_in_runs: usize = 0;
+        for (rg.runs[0..rg.n_runs]) |run| {
+            try testing.expect(rg.aligned(run, rg.stages[0]));
+            var k = run.first;
+            while (k < run.end) : (k += 1) rows_in_runs += @intFromBool(k == run.first or rg.items[k].id != rg.items[k - 1].id);
+        }
+        var distinct: usize = 0;
+        for (rg.items[0 .. ids.len - 3 * 64], 0..) |it, k| distinct += @intFromBool(k == 0 or it.id != rg.items[k - 1].id);
+        try testing.expectEqual(distinct, rows_in_runs);
+        // One row (the caller alone), and the refusals by name.
+        var one: [10240]u8 = undefined;
+        try rg.gather(&.{n_rows - 1}, &one);
+        try testing.expectEqualSlices(u8, image[base + (n_rows - 1) * rb ..][0..rb], &one);
+        try testing.expectError(error.RowOutOfRange, rg.gather(&.{@intCast(n_rows)}, &one));
+        try testing.expectError(error.GatherShape, rg.gather(&.{ 0, 1 }, &one));
+        // An unaligned run is refused by the reader's check (never planned: `plan` aligns by construction).
+        try testing.expect(!rg.aligned(.{ .off = 1000, .len = 16384, .need = 10240, .first = 0, .end = 1 }, rg.stages[0]));
+        try testing.expect(!rg.aligned(.{ .off = 0, .len = 12288, .need = 10240, .first = 0, .end = 1 }, rg.stages[0]) or std.heap.pageSize() == 4096);
+    }
+    try testing.expectEqual(@as(u64, 16 * RowGather.stage_len + 1024 * 40), RowGather.persistentBytes(15, 1024));
 }
