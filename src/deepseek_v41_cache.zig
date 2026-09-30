@@ -355,6 +355,30 @@ pub fn Lanes(comptime G: type) type {
                 };
             }
 
+            /// Rows appended so far, dropped ones included (the logical length).
+            pub fn rows(self: *const Window) u32 {
+                return switch (self.*) {
+                    .store => |*l| l.rows(),
+                    .ring => |r| r.logicalLen(),
+                };
+            }
+
+            /// Whether `truncateTo(n)` keeps what a later read needs (a ring's rule; a store keeps every row).
+            pub fn canTruncateTo(self: *const Window, n: u32) bool {
+                return switch (self.*) {
+                    .store => true,
+                    .ring => |r| r.canTruncateToLength(n),
+                };
+            }
+
+            /// Back to `n` rows (logical).
+            pub fn truncateTo(self: *Window, g: *G, n: u32) !void {
+                switch (self.*) {
+                    .store => |*l| try l.truncate(g, n),
+                    .ring => |*r| try r.truncateToLength(n),
+                }
+            }
+
             pub fn deinit(self: *Window, g: *G) void {
                 switch (self.*) {
                     inline else => |*l| l.deinit(g),
@@ -380,8 +404,11 @@ pub fn LayerState(comptime G: type) type {
         window: L.Window,
         compress: L.Store,
         index: L.Store,
-        /// The compressor frontier (`raw_kv`, `raw_score`) of a ratio > 1 kv source.
-        frontier: ?struct { kv: L.Store, score: L.Store } = null,
+        /// The compressor frontier (`raw_kv`, `raw_score`) of a ratio > 1 kv source. On the ring routes a `Ring` of
+        /// window `ratio`: a push pools only the groups it completes, whose rows start within `ratio - 1` rows of the
+        /// fed length, and a verify's rollback re-exposes at most its own rows, so the ring's retained rows (ratio plus
+        /// the verify margin and slack) hold every row a later push reads. Elsewhere a plain store of every fed row.
+        frontier: ?struct { kv: L.Window, score: L.Window } = null,
 
         pub const Mark = struct { offset: u32, window: u32, compress: u32, index: u32, frontier: u32 };
 
@@ -395,8 +422,7 @@ pub fn LayerState(comptime G: type) type {
                 .compress = .{ .concat = .{} },
                 .index = .{ .concat = .{} },
             };
-            const plain: L.Store = .{ .concat = .{} };
-            var frontier_lane = plain;
+            var frontier_lane: L.Window = .{ .store = .{ .concat = .{} } };
             switch (geo.route) {
                 .full_history => {},
                 .chunk_grow => {
@@ -409,6 +435,7 @@ pub fn LayerState(comptime G: type) type {
                     const icap = geo.max_kv orelse 256;
                     self.compress = .{ .grow = L.Grow.init(icap, null) };
                     self.index = .{ .grow = L.Grow.init(icap, null) };
+                    frontier_lane = .{ .ring = L.Ring.init(@max(ratio, 1), geo) };
                 },
                 .bounded => {
                     self.bounded_max_kv = geo.max_kv;
@@ -416,8 +443,7 @@ pub fn LayerState(comptime G: type) type {
                     const cc = boundedCompCap(geo.max_kv, ratio);
                     self.compress = .{ .grow = L.Grow.init(cc orelse 256, cc) };
                     self.index = .{ .grow = L.Grow.init(cc orelse 256, cc) };
-                    const lc = boundedLatentCap(geo.max_kv);
-                    frontier_lane = .{ .grow = L.Grow.init(lc orelse 256, lc) };
+                    frontier_lane = .{ .ring = L.Ring.init(@max(ratio, 1), geo) };
                 },
             }
             if (li.kv_source and ratio > 1) self.frontier = .{ .kv = frontier_lane, .score = frontier_lane };
@@ -439,9 +465,6 @@ pub fn LayerState(comptime G: type) type {
         pub fn admitLimit(self: *const Self) ?u32 {
             const m = self.bounded_max_kv orelse return null;
             var lim: ?u32 = null;
-            if (self.frontier != null) if (boundedLatentCap(m)) |cap| {
-                lim = cap;
-            };
             if (self.kv_source and self.ratio >= 1) if (boundedCompCap(m, self.ratio)) |cap| {
                 const l = (cap + 1) * self.ratio - 1; // new_len / ratio <= cap
                 lim = if (lim) |x| @min(x, l) else l;
@@ -453,7 +476,6 @@ pub fn LayerState(comptime G: type) type {
         pub fn canAdmit(self: *const Self, n: u32) Error!void {
             const m = self.bounded_max_kv orelse return;
             const new_len = self.offset + n;
-            if (self.frontier != null) if (boundedLatentCap(m)) |cap| if (new_len > cap) return error.BoundedLaneFull;
             if (self.kv_source and self.ratio >= 1) if (boundedCompCap(m, self.ratio)) |cap| if (new_len / self.ratio > cap) return error.BoundedLaneFull;
         }
 
@@ -461,9 +483,11 @@ pub fn LayerState(comptime G: type) type {
             return if (self.frontier) |f| f.kv.rows() else 0;
         }
 
-        /// `CompressorState.push`: append the fp32 projections, return the
-        /// softmax-gated pooled latents of the groups this push completed.
-        pub fn frontierPush(self: *Self, g: *G, kv: T, score: T) !?T {
+        /// The groups a push completes: `kv` / `score` appended, then the completed groups' rows (fed rows
+        /// [g_before * ratio, g_after * ratio)) as views of the lanes (a ring's view starts at its drop offset).
+        pub const Groups = struct { kv: T, score: T, groups: u32 };
+
+        pub fn frontierGroups(self: *Self, g: *G, kv: T, score: T) !?Groups {
             const f = &self.frontier.?;
             const r = self.ratio;
             const n_before = f.kv.rows();
@@ -472,12 +496,22 @@ pub fn LayerState(comptime G: type) type {
             const g_before = n_before / r;
             const g_after = f.kv.rows() / r;
             if (g_after == g_before) return null;
-            const raw_kv = (try f.kv.view(g)).?;
-            const raw_sc = (try f.score.view(g)).?;
+            const drop = f.kv.dropOffset();
+            // The ring keeps the incomplete group's rows by construction (see `frontier`); checked, never taken.
+            if (g_before * r < drop) return error.FrontierRowsDropped;
+            const lo = g_before * r - drop;
+            const hi = g_after * r - drop;
+            return .{ .kv = try L.rowsSlice(g, (try f.kv.view(g)).?, lo, hi), .score = try L.rowsSlice(g, (try f.score.view(g)).?, lo, hi), .groups = g_after - g_before };
+        }
+
+        /// `CompressorState.push`: append the fp32 projections, return the
+        /// softmax-gated pooled latents of the groups this push completed.
+        pub fn frontierPush(self: *Self, g: *G, kv: T, score: T) !?T {
+            const gr = (try self.frontierGroups(g, kv, score)) orelse return null;
             const sh = g.shapeOf(kv);
-            const grp: [4]c_int = .{ sh.d[0], @intCast(g_after - g_before), @intCast(r), sh.d[2] };
-            const gk = try g.reshape(try L.rowsSlice(g, raw_kv, g_before * r, g_after * r), &grp);
-            const gs = try g.reshape(try L.rowsSlice(g, raw_sc, g_before * r, g_after * r), &grp);
+            const grp: [4]c_int = .{ sh.d[0], @intCast(gr.groups), @intCast(self.ratio), sh.d[2] };
+            const gk = try g.reshape(gr.kv, &grp);
+            const gs = try g.reshape(gr.score, &grp);
             return try g.sum(try g.mul(gk, try g.softmax(gs, 2)), 2, false);
         }
 
@@ -490,6 +524,7 @@ pub fn LayerState(comptime G: type) type {
         /// the next query).
         pub fn canTrim(self: *const Self, n: u32) bool {
             if (n > self.offset) return false;
+            if (self.frontier) |f| if (n > f.kv.rows() or !f.kv.canTruncateTo(f.kv.rows() - n)) return false;
             return switch (self.window) {
                 .ring => |r| r.canTruncateToLength(self.offset - n),
                 .store => true,
@@ -502,6 +537,8 @@ pub fn LayerState(comptime G: type) type {
             if (n == 0) return 0;
             if (n > self.offset) return error.TrimPastStart;
             const new_len = self.offset - n;
+            // The frontier ring's rule with the window's: a rollback either lands whole or is a clean miss.
+            if (self.frontier) |f| if (n <= f.kv.rows() and !f.kv.canTruncateTo(f.kv.rows() - n)) return 0;
             switch (self.window) {
                 .ring => |*r| {
                     if (!r.canTruncateToLength(new_len)) return 0;
@@ -516,8 +553,8 @@ pub fn LayerState(comptime G: type) type {
                 if (self.frontier) |*f| {
                     if (n > f.kv.rows()) return error.TrimPastStart;
                     const keep = f.kv.rows() - n;
-                    try f.kv.truncate(g, keep);
-                    try f.score.truncate(g, keep);
+                    try f.kv.truncateTo(g, keep);
+                    try f.score.truncateTo(g, keep);
                 }
             }
             self.offset = new_len;
@@ -545,8 +582,8 @@ pub fn LayerState(comptime G: type) type {
             try self.compress.truncate(g, m.compress);
             try self.index.truncate(g, m.index);
             if (self.frontier) |*f| {
-                try f.kv.truncate(g, m.frontier);
-                try f.score.truncate(g, m.frontier);
+                try f.kv.truncateTo(g, m.frontier);
+                try f.score.truncateTo(g, m.frontier);
             }
             self.offset = m.offset;
         }
@@ -762,13 +799,14 @@ test "dsv41 cache: grow and bounded lanes read like the concatenated store, trim
         for (g.rows((try lane.view(&g)).?), 0..) |id, j| try testing.expectEqual(@as(i64, @intCast(j)), id);
         if (lane.grow.bounded_cap != null) try testing.expectError(error.BoundedLaneFull, lane.append(&g, try g.range(0, 200)));
     }
-    // W107 caps at max_kv 700, ratio 2: 358 groups and 708 frontier rows; admission refuses before any write.
+    // W107 caps at max_kv 700, ratio 2: 358 groups (the frontier is a ring, no cap of its own); admission refuses
+    // before any write.
     try testing.expectEqual(@as(?u32, 358), boundedCompCap(700, 2));
     const li: v41.LayerInfo = .{ .ratio = 2, .kv_source = true, .index_source = true, .mode = .full };
     var st = RS.init(li, 128, .{ .route = .bounded, .max_kv = 700 });
     st.offset = 700;
-    try testing.expectError(error.BoundedLaneFull, st.canAdmit(9));
-    try st.canAdmit(8);
+    try testing.expectError(error.BoundedLaneFull, st.canAdmit(18));
+    try st.canAdmit(17);
     // The per-state limit agrees with the per-forward check at every length around it,
     // for every compression ratio the model has (with and without the frontier).
     for ([_]u8{ 1, 2, 4, 128 }) |ratio| for ([_]u32{ 1, 7, 700, 4096 }) |max_kv| {
@@ -808,6 +846,55 @@ test "dsv41 cache: the compressor frontier pools each group once, across chunks 
     try testing.expectEqual(@as(u32, 10), st.nFed());
     const kv = try g.input(&.{ 1, 2, 512 }, .float32);
     try testing.expect(g.shapeOf((try st.frontierPush(&g, kv, kv)).?).eql(ops.Shape.of(&.{ 1, 1, 512 })));
+}
+
+test "dsv41 cache: the frontier ring hands every push its completed groups' rows, as the full store does, across prefill chunks, verify blocks and trims" {
+    var g: RowOps = .{ .gpa = testing.allocator };
+    defer g.deinit();
+    for ([_]u8{ 2, 4 }) |ratio| {
+        const li: v41.LayerInfo = .{ .ratio = ratio, .kv_source = true, .index_source = true, .mode = .full };
+        var st = RS.init(li, 128, .{ .route = .bounded, .max_kv = 20000 });
+        defer st.deinit(&g);
+        var full = RS.init(li, 128, .{ .route = .full_history });
+        defer full.deinit(&g);
+        try testing.expect(st.frontier.?.kv == .ring and full.frontier.?.kv == .store);
+        // K16's chunks (953 and a ragged tail), then decode / verify blocks with rejected rows trimmed.
+        const Step = struct { n: u32, trim: u32 = 0 };
+        var steps: [40]Step = @splat(.{ .n = 6, .trim = 2 });
+        steps[0..8].* = .{ .{ .n = 953 }, .{ .n = 953 }, .{ .n = 953 }, .{ .n = 183 }, .{ .n = 1 }, .{ .n = 6, .trim = 5 }, .{ .n = 8, .trim = 7 }, .{ .n = 3 } };
+        var pos: u32 = 0;
+        for (steps) |sp| {
+            const x = try g.range(pos, pos + sp.n);
+            const got = try st.frontierGroups(&g, x, x);
+            const want = try full.frontierGroups(&g, x, x);
+            try testing.expectEqual(want == null, got == null);
+            if (got) |gr| {
+                try testing.expectEqual(want.?.groups, gr.groups);
+                try testing.expectEqualSlices(i64, g.rows(want.?.kv), g.rows(gr.kv));
+                try testing.expectEqualSlices(i64, g.rows(want.?.score), g.rows(gr.score));
+                // The rows of groups g_before .. g_after: every one fed, each group's rows once.
+                const first = g.rows(gr.kv)[0];
+                try testing.expectEqual(@as(i64, 0), @mod(first, ratio));
+                for (g.rows(gr.kv), 0..) |id, j| try testing.expectEqual(first + @as(i64, @intCast(j)), id);
+            }
+            st.advance(sp.n);
+            full.advance(sp.n);
+            pos += sp.n;
+            if (sp.trim > 0) {
+                try testing.expect(st.canTrim(sp.trim));
+                try testing.expectEqual(sp.trim, try st.trim(&g, sp.trim));
+                _ = try full.trim(&g, sp.trim);
+                pos -= sp.trim;
+                try testing.expectEqual(full.nFed(), st.nFed());
+            }
+        }
+        // The ring stayed small: two buffers of ratio + 8 + 8 + 64 rows once the wide chunks passed.
+        try testing.expectEqual(@as(u32, ratio + 8 + 8 + 64), st.frontier.?.kv.ring.phys_cap);
+        // A rollback deeper than the ring keeps is a clean miss (the window's rule), never a wrong group.
+        try testing.expect(!st.canTrim(200));
+        try testing.expectEqual(@as(u32, 0), try st.trim(&g, 200));
+        try testing.expectEqual(full.nFed(), st.nFed());
+    }
 }
 
 test "dsv41 cache: prefill chunks follow the Python shape-aware derivation" {
