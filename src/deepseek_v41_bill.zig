@@ -12,7 +12,6 @@ const mdl = @import("deepseek_v41_model.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
-const gpu_ceiling = @import("gpu_ceiling.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const module = @import("deepseek_v41_module.zig");
@@ -240,14 +239,14 @@ pub const measured_host_side_bytes: u64 = 900_000_000;
 /// admission a harness asks for) for a request of `prompt_tokens` + `max_tokens`. `wired_bytes` pins the wired
 /// bytes `planRows` reads (null: now). A bill taken after construction passes the wired bytes the arm was
 /// planned with (`arm.inputs.wired_bytes`), never a live read: the module's own banks are wired by then.
-pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ov: module.RouteOverrides) !Bill {
+pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
     errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
     const c = try v41.Config.load(a, io, dir, &vd);
-    // The box: upstream's static GPU ceiling (`--memory-ceiling-gb`, or a harness's window ceiling through the
-    // same override), the one the module's fill targets.
-    const ceiling = module.boxCeiling(gpu_ceiling.staticGpuMemoryCeiling(), c.n_routed_experts);
+    // The box: the caller's ceiling, passed explicitly (the Module's own, a harness's window ceiling, the load
+    // preflight's upstream static ceiling): no hidden global, and a host-side bill never queries the device.
+    const ceiling = module.boxCeiling(ceiling_bytes, c.n_routed_experts);
     var diag: arm_mod.Diag = .{};
     var opts = module.armOptions(config, ceiling, .host);
     if (wired_bytes) |w| opts.wired_bytes = w;
@@ -331,8 +330,8 @@ fn engramPostedRoute(config: *const model.ModelConfig, ov: module.RouteOverrides
 /// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
 /// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
 /// `wired_bytes` as `billAt`.
-pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
-    const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes, ov);
+pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
+    const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
     return fillRows(fillBillOf(b0), target, b0.n_experts);
 }
 
@@ -348,21 +347,21 @@ pub fn fillBillOf(b: Bill) FillBill {
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
-fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ov: module.RouteOverrides) !Bill {
+fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
-    return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes, ov);
+    return billAt(a, io, &c, prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
 }
 
 /// What the module needs free to load at all, for upstream's load preflight (`scheduler.loadRequirementBytes`
 /// is fed this in place of the shards' disk bytes): the process bound of the standard request's bill at the
 /// fill's floor rows. The fill then takes rows up to the box's target; below the floor it refuses by name.
-pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig) !u64 {
+pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, ceiling_bytes: u64) !u64 {
     var c = config;
     c.memory_baseline_bytes = 0;
     // The server's load preflight: the served routes, no harness override.
-    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, .{});
+    const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
     return b.processBound();
 }
 
@@ -522,15 +521,12 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     var config = try model.parseConfig(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 8_548_761_600;
     const ceiling_bytes: u64 = 119_259_000_000;
-    const prev_ceiling = gpu_ceiling.static_ceiling_override;
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
-    gpu_ceiling.static_ceiling_override = ceiling_bytes;
     const wired: u64 = 3_380_379_648;
-    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, ceiling_bytes - module.ceiling_stop_bytes, .{});
+    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, ceiling_bytes, ceiling_bytes - module.ceiling_stop_bytes, .{});
     try testing.expect(nr.prefill <= nr.decode);
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
-    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired, .{});
+    const b = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired, ceiling_bytes, .{});
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
     try testing.expect(b.prefillTotal() <= ceiling_bytes - module.ceiling_stop_bytes);
@@ -544,7 +540,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // v6's failure mode is gone by construction: without the envelope planner the native bill does not read
     // the wired bytes at all (the constructed module's own +85 GB changes nothing).
-    const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000, .{});
+    const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000, ceiling_bytes, .{});
     try testing.expectEqual(b.prefillTotal(), b_live.prefillTotal());
     try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
 }
@@ -559,9 +555,6 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
-    const prev_ceiling = gpu_ceiling.static_ceiling_override;
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
-    gpu_ceiling.static_ceiling_override = ceiling_bytes;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
@@ -573,7 +566,7 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
         .{ .base = 9_550_000_000, .off = .{ .prefill = 138, .decode = 167 }, .on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
-        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, .{});
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         // This tree's own route decision: off without the route's declarations, the served tier's with them.
         try testing.expectEqual(if (engramPostedRoute(&config, .{}, &c)) posted else 0, b0.engram_posted);
         b0.engram_posted = 0;
@@ -644,15 +637,13 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     defer arena.deinit();
     const a = arena.allocator();
     const config = try model.parseConfig(testing.io, a, bank_dir);
-    const prev_ceiling = gpu_ceiling.static_ceiling_override;
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
-    gpu_ceiling.static_ceiling_override = 120_259_084_288;
-    const need = try loadRequirementBytes(a, testing.io, config);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const need = try loadRequirementBytes(a, testing.io, config, ceiling_bytes);
     var floor = config;
     floor.memory_baseline_bytes = 0;
     floor.expert_rows = min_fill_rows;
     floor.expert_prefill_rows = min_fill_rows;
-    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null, .{});
+    const b = try billAt(a, testing.io, &floor, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
     try testing.expectEqual(b.processBound(), need);
     // Residents (17.7 GB) + the prompt wave (14.4 GB) + the floor's slot rows: tens of GB, never the bank's 204 GB.
     try testing.expect(need > 30_000_000_000 and need < 60_000_000_000);

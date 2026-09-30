@@ -24,11 +24,11 @@ const kernel_set = @import("kernel_set.zig");
 const xq = @import("exl3_quant.zig");
 const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
-const gpu_ceiling = @import("gpu_ceiling.zig");
 const CellBill = bill_mod.Bill;
 const PhaseTerms = bill_mod.PhaseTerms;
 const PhaseMemory = bill_mod.PhaseMemory;
@@ -395,12 +395,12 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const forwards = try forwardRows(a, calls, ref.new_tokens);
     var config = try model.parseConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
-    // The box the module's admission fills: the guard's ceiling through upstream's static override, as the
-    // server's --memory-ceiling-gb sets it (restored when the test ends); unset: the GPU's working set.
-    const prev_ceiling = gpu_ceiling.static_ceiling_override;
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
-    if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| gpu_ceiling.static_ceiling_override = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    // The box the module's admission fills: the guard's ceiling (unset: the GPU's working set), with its stop, for
+    // the test's span (`WindowStop`).
+    const ar_ceiling: ?u64 = if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9)) else null;
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    const stop = WindowStop.set(ar_ceiling);
+    defer stop.restore();
     config.numeric_tier = switch (run.tier) {
         .served => .served,
         .stock => .stock,
@@ -905,8 +905,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const prompt = inputs.prompt;
     var config = inputs.config;
     const args = try cellConfig(&config);
-    const prev_ceiling = args.applyCeiling();
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    const stop = WindowStop.set(args.ceiling);
+    defer stop.restore();
     const delta: f64 = if (std.c.getenv("DSV41_CELL_DELTA")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else 0.3;
     // The cap counts every generated id, the prompt pass's primary included (the Python headline's
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
@@ -1168,9 +1168,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
 /// The cell harness's explicit arguments beyond the shell's config, parsed once at the test's entry
 /// (`cellConfig`) and passed down: the Module's route overrides and the admission's inputs.
 const CellArgs = struct {
-    /// The box the admission fits (DSV41_CELL_CEILING_GB, the guard's ceiling): the module and the bill read it
-    /// through upstream's static override (`applyCeiling`), as the server's --memory-ceiling-gb sets it; the
-    /// harness's fill targets its 2.0 GB stop under it.
+    /// The box the admission fits (DSV41_CELL_CEILING_GB, the guard's ceiling): the harness passes it to the bill
+    /// and, for the Module, sets it as upstream's static override (`WindowStop`), as the server's
+    /// --memory-ceiling-gb does; the harness's fill targets its 2.0 GB stop under it.
     ceiling: u64,
     /// The Module's construction options (`Module.initWith`), not the shared config's.
     ov: module.RouteOverrides = .{},
@@ -1182,14 +1182,6 @@ const CellArgs = struct {
     prefill_rows: ?u32 = null,
     /// DSV41_CELL_FILL_LADDER=1: fill at the prefill ladder's widest admission.
     fill_ladder: bool = false,
-
-    /// The window's ceiling onto upstream's static override for the test's span; returns the override it
-    /// replaced, for the caller's deferred restore.
-    fn applyCeiling(self: CellArgs) ?u64 {
-        const prev = gpu_ceiling.static_ceiling_override;
-        gpu_ceiling.static_ceiling_override = self.ceiling;
-        return prev;
-    }
 };
 
 /// The window's admission inputs, once, from the runner's explicit arguments: DSV41_CELL_BASELINE_GB (the
@@ -1301,18 +1293,39 @@ fn gbOf(x: u64) f64 {
 
 /// The harness's bill (`bill_mod.billAt` at the window's wired bytes).
 fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
-    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ov);
+    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, args.ov);
 }
 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less its 2.0 GB
 /// stop (the window's own numbers, passed explicitly), refused by name on stdout.
 fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     const target = args.ceiling -| module.ceiling_stop_bytes;
-    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, target, args.ov) catch |e| {
+    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, target, args.ov) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };
 }
+
+/// A window's harness states the guard's ceiling and its stop, the Module's box through upstream's own knobs: the
+/// ceiling as the static override (`--memory-ceiling-gb`'s; null keeps the GPU's working set) and the stop as the
+/// wired margin, so the Module admits against the target the harness filled to (the ceiling less
+/// `module.ceiling_stop_bytes`), not upstream's 8 GiB default. Both restored when the harness returns.
+const WindowStop = struct {
+    prev_margin: u64,
+    prev_ceiling: ?u64,
+
+    fn set(ceiling: ?u64) WindowStop {
+        const w: WindowStop = .{ .prev_margin = gpu_ceiling.wired_limit_margin_bytes, .prev_ceiling = gpu_ceiling.static_ceiling_override };
+        gpu_ceiling.wired_limit_margin_bytes = module.ceiling_stop_bytes;
+        if (ceiling) |c| gpu_ceiling.static_ceiling_override = c;
+        return w;
+    }
+
+    fn restore(w: WindowStop) void {
+        gpu_ceiling.wired_limit_margin_bytes = w.prev_margin;
+        gpu_ceiling.static_ceiling_override = w.prev_ceiling;
+    }
+};
 
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1")) return true;
@@ -1454,6 +1467,39 @@ test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
     try testing.expect(m.physical > 0 and m.physical <= status.getTotalMemBytes());
 }
 
+// DSV41_BANK=<bank> (host): the harness's rows reach the Module's admission at the window's inputs (pass3an3's:
+// 9.73 GB baseline, box 120.259 GB). Upstream's default wired margin (8 GiB) refuses the harness's forced rows
+// before construction; the window's stop, which the harness sets, admits them.
+test "dsv41 memory: the harness's filled rows pass the Module's admission under the window's stop (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_730_000_000;
+    const ceiling: u64 = 120_259_084_288;
+    const nr = try bill_mod.fill(a, testing.io, config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null, ceiling, ceiling - module.ceiling_stop_bytes, .{});
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
+    const b = try bill_mod.billAt(a, testing.io, &config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null, ceiling, .{});
+    try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);
+    // The Module's admission target (Module.init: the ceiling less upstream's wired margin).
+    const target = struct {
+        fn of(box: u64) u64 {
+            return box -| gpu_ceiling.wired_limit_margin_bytes;
+        }
+    }.of;
+    try testing.expectError(error.PromptOverTarget, bill_mod.admitPhases(b, target(ceiling)));
+    {
+        const stop = WindowStop.set(null);
+        defer stop.restore();
+        try bill_mod.admitPhases(b, target(ceiling));
+        try testing.expectEqual(ceiling - module.ceiling_stop_bytes, target(ceiling));
+    }
+    try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);
+    std.debug.print("\nthe window's rows at 9.73 GB: {d} / {d}, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
+}
+
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
 // DSV41_CELL_CEILING_GB [DSV41_CELL_WIRED_GB] [DSV41_CELL_ROWS] [DSV41_CELL_MAX_TOKENS]: the cell's bill at the rows the window
 // will admit, printed as a table and one DSV41_CELL_BILL json line.
@@ -1465,8 +1511,8 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     const a = arena.allocator();
     var config = try model.parseConfig(testing.io, a, bank_dir);
     const args = try cellConfig(&config);
-    const prev_ceiling = args.applyCeiling();
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    const stop = WindowStop.set(args.ceiling);
+    defer stop.restore();
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
     try cellFill(a, testing.io, &config, args, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
@@ -1546,8 +1592,8 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const inputs = try cellInputs(a, io, prompt_path, case_id, bank_dir);
     var config = inputs.config;
     const args = try cellConfig(&config);
-    const prev_ceiling = args.applyCeiling();
-    defer gpu_ceiling.static_ceiling_override = prev_ceiling;
+    const stop = WindowStop.set(args.ceiling);
+    defer stop.restore();
     try cellFill(a, io, &config, args, inputs.prompt.len, 1024);
     var prev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&prev);

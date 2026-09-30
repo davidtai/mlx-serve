@@ -219,7 +219,7 @@ pub const Module = struct {
         // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling through the same
         // override); the fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill
         // (which reads the same ceiling) carries the baseline (the preflight's sample of the memory in use before
-        // the load, or `--memory-baseline-gb`).
+        // the load, or `--memory-baseline-gb`). Read once here and passed to the bill explicitly.
         const ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
         const target = ceiling_bytes -| gpu_ceiling.wired_limit_margin_bytes;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
@@ -230,7 +230,7 @@ pub const Module = struct {
         if (admitted.expert_prefill_rows == null) {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target, ov);
+            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, target, ov);
             if (admitted.expert_rows) |forced| {
                 admitted.expert_prefill_rows = @min(nr.prefill, forced);
             } else {
@@ -246,7 +246,7 @@ pub const Module = struct {
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ov) catch |e| {
+            const b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -382,7 +382,7 @@ pub const Module = struct {
         }
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
-        try self.checkConstruction(io, &admitted);
+        try self.checkConstruction(io, &admitted, ceiling_bytes);
         return self;
     }
 
@@ -390,7 +390,7 @@ pub const Module = struct {
     /// check against it: the footprint after the install (warm-up released, cache cleared) must sit
     /// within `construction_tolerance_bytes` of the bill's construction terms, else the module is
     /// refused by name before any request.
-    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig) !void {
+    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig, ceiling_bytes: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         // The bill plans through the arm's own inputs: the wired bytes the arm was planned with (a live
@@ -398,7 +398,7 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try bill_mod.billAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, planned_wired, self.overrides);
+        const b = try bill_mod.billAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, planned_wired, ceiling_bytes, self.overrides);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
@@ -832,7 +832,8 @@ pub const Module = struct {
 pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig) !u64 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    return bill_mod.loadRequirementBytes(arena.allocator(), io, config.*);
+    // Upstream's load preflight (the server, the device in hand): its static GPU ceiling, read here at the call site.
+    return bill_mod.loadRequirementBytes(arena.allocator(), io, config.*, gpu_ceiling.staticGpuMemoryCeiling());
 }
 
 /// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
