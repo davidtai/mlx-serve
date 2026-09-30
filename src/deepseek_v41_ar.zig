@@ -379,6 +379,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const forwards = try forwardRows(a, calls, ref.new_tokens);
     var config = try model.parseConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    // The box the module's admission fills (the guard's ceiling; unset: the GPU's working set).
+    if (std.c.getenv("DSV41_AR_CEILING_GB")) |v| config.memory_ceiling_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     if (std.c.getenv("DSV41_AR_ROWS")) |v| config.expert_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     config.numeric_tier = switch (run.tier) {
         .served => .served,
@@ -791,6 +793,8 @@ const CellReceipt = struct {
     layer_major: ?bool = null,
     event_gates: ?bool = null,
     wide_feed: ?bool = null,
+    wide_seed: ?bool = null,
+    wide_hot_first: ?bool = null,
     wide_depth: ?u8 = null,
     wide_cold_rows: ?u8 = null,
     /// The attention call sites the Module installed (read back from it).
@@ -990,7 +994,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         // The routes the module installed (read back from it, not from the settings).
         .layer_major = md.installed.layer_major,
         .event_gates = config.expert_event_gates,
-        .wide_feed = md.installed.wide.feed,
+        .wide_feed = md.installed.wide.seed and md.installed.wide.hot_first,
+        .wide_seed = md.installed.wide.seed,
+        .wide_hot_first = md.installed.wide.hot_first,
         .wide_depth = md.installed.wide.depth,
         .wide_cold_rows = md.installed.wide.cold_rows,
         .prefill_attn = md.installed.prefill_attn,
@@ -1035,6 +1041,9 @@ fn cellConfig(config: *model.ModelConfig) !void {
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
+    // The feed's halves on their own (each overrides the feed's value for its half).
+    if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);
+    if (envStr("DSV41_CELL_WIDE_HOT_FIRST")) |v| config.expert_wide_hot_first = try cellBool("DSV41_CELL_WIDE_HOT_FIRST", v);
     // The attention call sites (the served tier's routes by default; 0 = the stock chain).
     if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
     if (envStr("DSV41_CELL_PREFILL_INDEX")) |v| config.prefill_index = try cellBool("DSV41_CELL_PREFILL_INDEX", v);
