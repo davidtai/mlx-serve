@@ -207,7 +207,7 @@ pub const Module = struct {
         self.installed = switch (self.arm) {
             inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless },
         };
-        var line_buf: [192]u8 = undefined;
+        var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
         log.info("{s}", .{self.installed.callSites(&line_buf)});
         const subset = switch (self.arm) {
