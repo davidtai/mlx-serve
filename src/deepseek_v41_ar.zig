@@ -45,6 +45,11 @@ fn memProbePeak(harness: []const u8, phase: []const u8) usize {
     std.debug.print("\n{s}: memory {s}: MLX active {d:.2} GB, MLX peak since the last probe {d:.2} GB, footprint {d:.2} GB\n", .{
         harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp_mib << 20)) / 1e9,
     });
+    // The box's pages as the guard reads them: what is outside this footprint shows here.
+    const v = arm_mod.vmBytes();
+    std.debug.print("NATIVE vm {s}: physical used {d} B (wired {d}, active {d}, inactive {d}, compressor {d}; purgeable {d}, speculative {d}, file-backed {d}), footprint {d} B\n", .{
+        phase, arm_mod.physicalUsed(v), v.wired, v.active, v.inactive, v.compressor, v.purgeable, v.speculative, v.external, arm_mod.footprint().now,
+    });
     _ = mlx.mlx_reset_peak_memory();
     return peak;
 }
@@ -428,6 +433,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
     var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
+    memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
     for (calls[1..]) |c| {
         _ = mlx.mlx_array_free(logits);
         logits = try m.extend(prompt[c.lo..c.hi]);

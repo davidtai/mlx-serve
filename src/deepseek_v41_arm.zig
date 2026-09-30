@@ -676,9 +676,43 @@ pub fn wiredBytes() u64 {
     return @as(u64, wire_count) * page;
 }
 
+/// The box's physical pages as the guard reads them (vm_stat), in bytes: physical used = wired + active +
+/// inactive + compressor-occupied (the guard's metric, file cache included); the purgeable, speculative and
+/// file-backed (external) parts named, to attribute what is outside a process's footprint.
+pub const VmBytes = struct { wired: u64 = 0, active: u64 = 0, inactive: u64 = 0, compressor: u64 = 0, purgeable: u64 = 0, speculative: u64 = 0, external: u64 = 0, free: u64 = 0 };
+
+pub fn vmBytes() VmBytes {
+    if (comptime !builtin.os.tag.isDarwin()) return .{};
+    var stats: [40]i32 = @splat(0);
+    var count: u32 = stats.len;
+    if (host_statistics64(mach_host_self(), 4, &stats, &count) != 0) return .{};
+    var page: usize = 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return .{};
+    const at = struct {
+        fn f(st: []const i32, i: usize, pg: usize) u64 {
+            return @as(u64, @as(u32, @bitCast(st[i]))) * pg;
+        }
+    }.f;
+    // vm_statistics64: free, active, inactive, wire; 9 x u64; purgeable, speculative; 4 x u64; compressor, throttled, external.
+    return .{ .free = at(&stats, 0, page), .active = at(&stats, 1, page), .inactive = at(&stats, 2, page), .wired = at(&stats, 3, page), .purgeable = at(&stats, 22, page), .speculative = at(&stats, 23, page), .compressor = at(&stats, 32, page), .external = at(&stats, 34, page) };
+}
+
+pub fn physicalUsed(v: VmBytes) u64 {
+    return v.wired + v.active + v.inactive + v.compressor;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
+
+test "dsv41 arm: the box's physical pages read as the guard reads them, and hold this process's footprint" {
+    const v = vmBytes();
+    const fp = footprint().now;
+    try testing.expect(physicalUsed(v) > fp);
+    try testing.expect(v.wired > 0 and v.active > 0 and v.free > 0);
+    // Every page of the box is in one of the counted states or free (within the uncounted ones).
+    try testing.expect(physicalUsed(v) + v.free <= @as(u64, 1) << 40);
+}
 
 /// A mini deepseek_v41 directory for host tests: the model lane's mini config
 /// (5 layers, hidden 64, inter 32, 4 experts, top-2) over a synthetic bank of
