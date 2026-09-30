@@ -489,6 +489,13 @@ pub const Module = struct {
         self.gate.startPrompt(self.grown(), outsideOf(BoundaryMemory.now()));
     }
 
+    /// The reading `reclaimShrink` judges against, taken before the caller frees the grown rows: every
+    /// command of the previous request retired first, so nothing it still held is missing from it.
+    pub fn boundaryBefore(self: *Module) BoundaryMemory {
+        _ = mlx.mlx_synchronize(self.g.s);
+        return BoundaryMemory.now();
+    }
+
     /// The served path's return to the prompt phase before a later prompt, after the caller freed the grown
     /// rows (the arm's shrink; `before` read just before it): the MLX cache cleared (the freed rows' buffers
     /// go back to the driver, not into the cache), synchronize, then the same reclaim wait and one check as
@@ -498,6 +505,9 @@ pub const Module = struct {
     /// pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
     pub fn reclaimShrink(self: *Module, before: BoundaryMemory, freed_bytes: u64) !void {
         try self.gate.request();
+        // Every command that still held the freed rows retires first (its completion handlers hand them to
+        // the allocator's cache before the clear, as at the phase change).
+        _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         _ = mlx.mlx_synchronize(self.g.s);
         const outside_before = outsideOf(before);
@@ -1044,6 +1054,8 @@ test "dsv41 module: the module's construction and forwards analyse (host, nothin
     try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);
     // The served path's per-request pieces are analysed with the module (their wiring is the served path's).
     const shrink_reclaim: *const fn (*Module, BoundaryMemory, u64) anyerror!void = &Module.reclaimShrink;
+    const boundary_before: *const fn (*Module) BoundaryMemory = &Module.boundaryBefore;
+    try std.testing.expect(@intFromPtr(boundary_before) != 0);
     const prompt_start: *const fn (*Module) void = &Module.promptStart;
     try std.testing.expect(@intFromPtr(shrink_reclaim) != 0 and @intFromPtr(prompt_start) != 0);
 }
