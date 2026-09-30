@@ -25,7 +25,7 @@ pub const Trace = struct {
     pub const T = u32;
     pub const Origin = union(enum) { none, host, ext: []const u8, out: [2]u32, view: T, cat: u32, take: u32, op: u32 };
     pub const Node = struct { shape: Shape, dtype: Dtype, bytes: []u8, origin: Origin = .none };
-    pub const Launch = struct { k: Kernel, cfg: LaunchConfig, inputs: [16]T = undefined, n_in: usize, outs: [xk.max_outputs]T = undefined, prepared: bool = false };
+    pub const Launch = struct { k: Kernel, cfg: LaunchConfig, inputs: [xk.max_inputs]T = undefined, n_in: usize, outs: [xk.max_outputs]T = undefined, prepared: bool = false };
     pub const Ev = union(enum) { launch: u32, eval: []T, async_eval: []T, concat: []T, take: [2]T, op: u32 };
     /// A graph op outside the kernel launches (the C2 adapter's gathers and activation): its
     /// kind, inputs and parameters, in the log as `op`.
@@ -274,7 +274,7 @@ pub fn isDecode2(e: *const Entry) bool {
 
 /// The prefill batch 2 families (their routes' own test covers them).
 pub fn isPrefill2(e: *const Entry) bool {
-    inline for (.{ "pf_idxscore", "pf_attn_core", "pf_hcnorm", "pf_smallk" }) |f| {
+    inline for (.{ "pf_idxscore", "pf_attn_core", "pf_hcnorm", "pf_smallk", "pf_joinless" }) |f| {
         if (std.mem.eql(u8, e.family, f)) return true;
     }
     return false;

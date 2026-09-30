@@ -91,6 +91,7 @@ fn appendJsonEscaped(j: *std.ArrayList(u8), a: Allocator, s: []const u8) !void {
 pub fn implemented(k: Kernel, c: Check) bool {
     return switch (c) {
         .compile, .row_invariance => true,
+        .join_equiv => k == .q3jl_combine,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k),
@@ -169,7 +170,7 @@ pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void
     }
 }
 
-const inputs_max = 16;
+const inputs_max = xk.max_inputs;
 const t128_scale: f32 = @bitCast(@as(u32, 0x3DB504F3));
 
 const H = struct {
@@ -195,6 +196,7 @@ const H = struct {
             .f64 => try checkF64(h, k),
             .layout_guard => try checkLayoutGuard(h, k),
             .composition => try checkComposition(h, k),
+            .join_equiv => try checkJoinEquiv(h, k),
         }
     }
 };
@@ -341,6 +343,8 @@ fn defaultVars(e: *const Entry) Vars {
     // the full 512-key selection (k = 640, the tier's common key count)
     v.set(.ring, 256);
     v.set(.store, 700);
+    // JOINLESS: 24 sources of 97 rows each (an odd count: no source is a tile multiple)
+    v.set(.src, 97);
     const kc = e.bounds.get(.kc) orelse .{ 1, 512 };
     v.set(.kc, std.math.clamp(@as(u64, 512), kc[0], kc[1]));
     return v;
@@ -377,8 +381,16 @@ fn fillArg(h: *H, buf: []u8, n: usize, arg: *const xk.Arg, vars: *const Vars, wa
         },
         .slots => for (0..n) |i| putInt(buf, i, arg.dtype, wave.slots[if (i < wave.n) i else 0]),
         .@"var" => unreachable,
+        // (source, row) pairs over the JOINLESS sources: every assignment a random row of a random source
+        .join_table => for (0..n / 2) |j| {
+            putInt(buf, 2 * j, arg.dtype, @intCast(r.uintLessThan(u64, join_sources)));
+            putInt(buf, 2 * j + 1, arg.dtype, @intCast(r.uintLessThan(u64, @max(vars.get(.src), 1))));
+        },
     }
 }
+
+/// JOINLESS binds this many call-output sources (the lane's NSRC; unused slots alias source 0).
+const join_sources = 24;
 
 fn argShape(arg: *const xk.Arg, vars: *const Vars, shape: *[xk.max_rank]c_int) usize {
     var n: usize = 1;
@@ -518,6 +530,52 @@ fn expectWords(h: *H, k: Kernel, c: Check, want: mlx.mlx_array, got: mlx.mlx_arr
 }
 
 // ── compile ──
+
+/// JOINLESS == SMALLK over the joined array, every word: the sources, the (source, row) table,
+/// the weights and the shared rows drawn once per shape; the reference joins the rows the table
+/// names (`take(concatenate(sources), source * src + row)`) and runs the registered q3sk_combine
+/// (itself proven == the stock multiply / col_reduce_small / add chain), at a partial chunk and a
+/// full one.
+fn checkJoinEquiv(h: *H, k: Kernel) !void {
+    const e = h.reg.get(k);
+    if (e.inputs.len != join_sources + 3) return error.SchemaInvalid;
+    var words: u64 = 0;
+    var bad: u64 = 0;
+    for ([_]u64{ 183, 953 }) |rows| {
+        var sc: Scope = .{ .a = h.a };
+        defer sc.deinit();
+        var vars = defaultVars(e);
+        vars.set(.rows, rows);
+        const wave = Wave.even(vars.get(.experts), rows, vars.get(.cap));
+        const ins = try genAll(h, &sc, e, &vars, null, &wave);
+        const got = try launch(h, &sc, k, ins[0..e.inputs.len], &vars, null);
+        // the reference: the rows the table names, joined, through SMALLK
+        const loc = try hostCopy(h, ins[join_sources]);
+        defer h.a.free(loc);
+        const n_as: usize = @intCast(rows * 6);
+        const glob = try h.a.alloc(i32, n_as);
+        defer h.a.free(glob);
+        const src: i32 = @intCast(vars.get(.src));
+        for (glob, 0..) |*g, j| {
+            const s_i = std.mem.readInt(i32, loc[8 * j ..][0..4], .little);
+            const r_i = std.mem.readInt(i32, loc[8 * j + 4 ..][0..4], .little);
+            g.* = s_i * src + r_i;
+        }
+        const v = mlx.mlx_vector_array_new_data(&ins, join_sources);
+        defer _ = mlx.mlx_vector_array_free(v);
+        const flat = try op(&sc, mlx.mlx_concatenate_axis, .{ v, @as(c_int, 0), h.s });
+        const gi = try fromHost(&sc, std.mem.sliceAsBytes(glob), &.{@intCast(n_as)}, .int32);
+        const routed = try reshape(&sc, try take0(&sc, flat, gi, h.s), &.{ @intCast(rows), 6, 5120 }, h.s);
+        const want = try launch(h, &sc, .q3sk_combine, &.{ routed, ins[join_sources + 1], ins[join_sources + 2] }, &vars, null);
+        const a = try hostCopy(h, got[0]);
+        defer h.a.free(a);
+        const b = try hostCopy(h, want[0]);
+        defer h.a.free(b);
+        words += a.len / 4;
+        bad += countDiff(a, b, 4);
+    }
+    try h.record(.{ .kernel = k, .check = .join_equiv, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
+}
 
 fn checkCompile(h: *H, k: Kernel) !void {
     const e = h.reg.get(k);

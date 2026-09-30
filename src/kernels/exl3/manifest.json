@@ -194,6 +194,12 @@
    "file": "header_woa_e4m3.metal",
    "id": "woa_e4m3",
    "sha256": "e2fff6033e775067d7e962d0f9179b7611cc4760d724bc650f3b23b6e3a7cc00"
+  },
+  {
+   "bytes": 1290,
+   "file": "header_joinless.metal",
+   "id": "joinless",
+   "sha256": "a7d61113a38c8da5a97863c7921c0f19fe810cef3e4723ca6bbb7eb922893821"
   }
  ],
  "kernels": [
@@ -47223,6 +47229,688 @@
      "name": "rows"
     }
    ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "field": "kernel_sha256",
+    "log": "std30-prefill-fast-exl3-30-guard-20260928.log",
+    "records": 1,
+    "tag": "Q3_PREFILL_JOINLESS_INSTALL",
+    "value": "1934fe132aa30a44132c80383469d4e154da2da4941f4fcb7750e3ae18c53852"
+   },
+   "ensure_row_contiguous": true,
+   "family": "pf_joinless",
+   "grid": [
+    {
+     "m": 1280,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": {
+    "bytes": 1290,
+    "file": "header_joinless.metal",
+    "id": "joinless",
+    "sha256": "a7d61113a38c8da5a97863c7921c0f19fe810cef3e4723ca6bbb7eb922893821"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s0",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s1",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s2",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s3",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s4",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s5",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s6",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s7",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s8",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s9",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s10",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s11",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s12",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s13",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s14",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s15",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s16",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s17",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s18",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s19",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s20",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s21",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s22",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "s23",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "src"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "join_table"
+     },
+     "dtype": "int32",
+     "name": "loc",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 6
+      },
+      {
+       "m": 2
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "weights",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 6
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "shared",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "arm": "the P line of the tier of record (std30 prefill cell / record 3: DSV41_PREFILL_SMALLK=all, DSV41_PREFILL_JOINLESS=1)",
+    "env": "DSV41_PREFILL_JOINLESS",
+    "module": "q3_prefill_joinless_candidate.py",
+    "object": "JoinlessKernel(mx, sk) (deepseek_v41_moe._moe_combine_dispatch: a Part -> the joinless kernel)",
+    "route": "rows > 32 on the layer-major MoE: the combine reads each routed row from its fused call output through a per-assignment (source, row) table; up to 24 sources, unused slots alias source 0",
+    "value": "1"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "header+source",
+     "sha256": "1934fe132aa30a44132c80383469d4e154da2da4941f4fcb7750e3ae18c53852",
+     "symbol": "q3_prefill_joinless_candidate: sha256(_header(sk) + kernel_source(sk)) (the install record's kernel_sha256)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      234240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       183,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 6,
+       "name": "K"
+      },
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 183
+      },
+      {
+       "name": "src",
+       "value": 183
+      }
+     ]
+    },
+    {
+     "grid": [
+      1219840,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       953,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 6,
+       "name": "K"
+      },
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 953
+      },
+      {
+       "name": "src",
+       "value": 953
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "q3jl_combine",
+   "notes": "s0..s23 f32 [r_i, 5120] (the fused call outputs; unused slots alias s0), loc int32 [n, 6, 2] ((source, row) per assignment), weights f32 [n, 6], shared f32 [n, 5120] -> out f32 [n, 5120]; SMALLK's op sequence with the routed loads re-pointed through the table. Exported by R/mlx-serve-kernels/tools/export_joinless.py (the pinned extractor has no JOINLESS builder); the launch samples are the lane geometry at its install self-check shapes, not captured launches.",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "join_equiv"
+    ],
+    "lane_install_check": "q3_prefill_joinless_candidate.install: 953x17 / 183x24 / 953x24, every word identical to SMALLK over the joined array, NaN classes, rerun"
+   },
+   "source": {
+    "bytes": 1813,
+    "file": "q3jl_combine.metal",
+    "sha256": "5519c520f8d9cd871b930ceb4d87a87bde4de8f1645a9c56c8bda557eaa2335d"
+   },
+   "template": [
+    {
+     "int": 6,
+     "name": "K"
+    },
+    {
+     "int": 5120,
+     "name": "D"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "src"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -47465,6 +48153,101 @@
     "q3sk_combine"
    ],
    "manifest_sha256": "9fbf4ab873c953728555fc010a5a6b81726f42690f0db667bc3b51b336803091",
+   "widened": []
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine"
+   ],
+   "manifest_sha256": "6811a8bbad51fcc0ddea845c83b1f75a7156bae04aabeed999e5262e31fcb786",
    "widened": []
   }
  ],

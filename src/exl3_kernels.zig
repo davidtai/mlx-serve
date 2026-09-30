@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "6811a8bbad51fcc0ddea845c83b1f75a7156bae04aabeed999e5262e31fcb786";
+pub const manifest_sha256 = "88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -104,6 +104,9 @@ pub const Kernel = enum {
     q3pf_hc_mix_rsqrt__f32,
     q3pf_hc_pre_norm__f32,
     q3sk_combine,
+    // JOINLESS (09-30, port-exported: R/mlx-serve-kernels/tools/export_joinless.py): SMALLK's combine reading the
+    // routed rows from the fused call outputs through a (source, row) table
+    q3jl_combine,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -119,7 +122,7 @@ pub fn baseOf(k: Kernel) ?Kernel {
 }
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
-pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk };
+pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
@@ -199,7 +202,7 @@ fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) R
 /// attention's key count; ncomp / topk / width / allfin: the index top-k's compressed count, k,
 /// output width and its k >= n flag (0-d int32 scalars of the call); ring / store / kc: the
 /// prefill attention's window-store rows, compressed-store rows and compressed selection width.
-pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq, keys, ncomp, topk, width, allfin, ring, store, kc };
+pub const Var = enum { rows, cap, m_tokens, experts, tgs, a_rows, gn, k4, k32, gk, seq, keys, ncomp, topk, width, allfin, ring, store, kc, src };
 pub const Vars = std.enums.EnumArray(Var, u64);
 
 /// One extent: m x ceil(value(v) / div) + add, or the constant m (+ add); at most `max` when
@@ -221,7 +224,7 @@ pub const Dim = struct {
 /// How the self-check fills an input: `rows` inputs are sliced by rows, `bank` inputs are
 /// slot banks indexed by ids, `static` inputs are the lane's own constants.
 pub const Role = enum { rows, shared, bank, static, table, scalar };
-pub const DomainKind = enum { normal, uniform, index, bits, zeros, values, range, signed_pow2, @"var", wave_table, slots };
+pub const DomainKind = enum { normal, uniform, index, bits, zeros, values, range, signed_pow2, @"var", wave_table, slots, join_table };
 pub const Domain = struct {
     kind: DomainKind,
     scale: f64 = 0,
@@ -264,7 +267,7 @@ pub const Launch = union(enum) { rule: Rule, plans: []const Plan };
 /// A plan kernel's weight site (rcproj): N outputs per group, K inputs, G groups, strides.
 pub const Site = struct { name: []const u8, N: u32, K: u32, G: u32, XS: u32, XG: u32, YS: u32, YG: u32 };
 
-pub const Check = enum { compile, row_invariance, decode_table, golden_tiles, mlx_chain, f64, layout_guard, composition };
+pub const Check = enum { compile, row_invariance, decode_table, golden_tiles, mlx_chain, f64, layout_guard, composition, join_equiv };
 
 /// The lane's own launch at sample sizes, captured by the extractor (the geometry's witness).
 pub const Sample = struct {
@@ -309,6 +312,8 @@ pub const Entry = struct {
 };
 
 pub const max_outputs = 4;
+/// Inputs per kernel: JOINLESS binds 24 sources + 3 (MLX: at most 31 buffers with the outputs).
+pub const max_inputs = 27;
 pub const max_rank = 4;
 
 /// Everything `Bound.apply` hands mlx-c for one launch.
@@ -517,7 +522,7 @@ pub const Registry = struct {
         var b: Bound = .{ .reg = self, .stream = stream, .kernels = @splat(.{}) };
         errdefer b.deinit();
         for (&self.entries, 0..) |*e, i| {
-            var in_names: [16][*:0]const u8 = undefined;
+            var in_names: [max_inputs][*:0]const u8 = undefined;
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
@@ -742,7 +747,7 @@ fn adoptTemplate(a: Allocator, js: []const JTemplate, k: Kernel, diag: ?*Diag) (
 }
 
 fn adoptArgs(a: Allocator, js: []const JArg, k: Kernel, diag: ?*Diag) (Refusal || Allocator.Error)![]const Arg {
-    if (js.len == 0 or js.len > 16) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: {d} arguments", .{ k, js.len });
+    if (js.len == 0 or js.len > max_inputs) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: {d} arguments", .{ k, js.len });
     const out = try a.alloc(Arg, js.len);
     for (js, out, 0..) |j, *arg, i| {
         for (js[0..i]) |prev| if (std.mem.eql(u8, prev.name, j.name)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: {t}: argument {s} twice", .{ k, j.name });
@@ -1096,8 +1101,8 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 73), n_kernels);
-    try testing.expectEqual(@as(usize, 14), n_headers);
+    try testing.expectEqual(@as(usize, 74), n_kernels);
+    try testing.expectEqual(@as(usize, 15), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1111,7 +1116,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 3), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 4), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));

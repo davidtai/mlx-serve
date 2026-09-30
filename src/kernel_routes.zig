@@ -109,8 +109,8 @@ pub fn rowsOf(comptime G: type, g: *G, x: G.T, axis: usize) u64 {
 pub fn Statics(comptime G: type) type {
     return struct {
         const Self = @This();
-        arrays: [16]G.T = undefined,
-        mask: u16 = 0,
+        arrays: [xk.max_inputs]G.T = undefined,
+        mask: u32 = 0,
 
         pub fn init(g: *G, e: *const Entry) !Self {
             var s: Self = .{};
@@ -120,14 +120,14 @@ pub fn Statics(comptime G: type) type {
                 var buf: [1024]u8 = undefined;
                 const shape, const bytes = staticBytes(a, &buf);
                 s.arrays[i] = g.keep(try g.hostArray(bytes, shape.slice(), a.dtype));
-                s.mask |= @as(u16, 1) << @intCast(i);
+                s.mask |= @as(u32, 1) << @intCast(i);
             }
             return s;
         }
 
         pub fn deinit(s: *Self, g: *G) void {
-            for (0..16) |i| {
-                if (s.mask & (@as(u16, 1) << @intCast(i)) != 0) g.release(s.arrays[i]);
+            for (0..xk.max_inputs) |i| {
+                if (s.mask & (@as(u32, 1) << @intCast(i)) != 0) g.release(s.arrays[i]);
             }
             s.mask = 0;
         }

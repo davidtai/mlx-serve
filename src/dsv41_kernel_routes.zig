@@ -88,8 +88,8 @@ pub const kernels = [_]Kernel{
     .q3pf_hc_pre_norm,
     .q3pf_hc_mix_rsqrt__f32,
     .q3pf_hc_pre_norm__f32,
-    .q3sk_combine
-,
+    .q3sk_combine,
+    .q3jl_combine,
 };
 
 /// The arch's kernel acceptance, once per backend before its routes are built: this subset's
@@ -1153,6 +1153,39 @@ pub fn SmallKCombine(comptime G: type) type {
     };
 }
 
+/// JOINLESS (`q3_prefill_joinless_candidate.JoinlessKernel`): SMALLK's combine reading each routed row
+/// from the fused call output that computed it, through a per-assignment (source, row) table, so the
+/// joined [n, 6, 5120] routed array is never built. Exact (the same f32 words, SMALLK's fold order).
+pub fn JoinlessCombine(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        /// the text's source slots (the lane's NSRC); unused slots alias source 0
+        pub const sources = 24;
+        e: *const Entry,
+
+        pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
+            try geo.admit("q3jl_combine", diag);
+            return .{ .e = reg.get(.q3jl_combine) };
+        }
+
+        /// outs: the layer's routed call outputs in join order (1..24, each f32 [r_i, 5120]; a layer
+        /// with more concatenates adjacent outputs first, as the lane does), loc int32 [n, 6, 2] (the
+        /// (source, row) of each assignment: the inverse join order split by the outputs' row
+        /// offsets), weights f32 [n, 6], shared f32 [n, 5120] -> f32 [n, 5120].
+        pub fn call(self: *const Self, g: *G, outs: []const G.T, loc: G.T, weights: G.T, shared: G.T) !G.T {
+            if (outs.len == 0 or outs.len > sources) return error.RouteInput;
+            var ins: [sources + 3]G.T = undefined;
+            for (ins[0..sources], 0..) |*x, i| x.* = outs[if (i < outs.len) i else 0];
+            ins[sources..].* = .{ loc, weights, shared };
+            var vars = rowsVars(rowsOf(G, g, weights, 0));
+            vars.set(.src, rowsOf(G, g, outs[0], 0));
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.e, &vars, &ins, &out);
+            return out[0];
+        }
+    };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1597,6 +1630,31 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, k.q, k.ring, k.cmp, null);
             r.deinit(&t);
         }
+    }
+    // JOINLESS: the call outputs in slots 0..n-1, the rest aliasing slot 0, then the table, the weights
+    // and the shared rows; at the lane's install shapes; more than 24 outputs or a foreign geometry refused
+    {
+        const e = reg.get(.q3jl_combine);
+        const r = try JoinlessCombine(Trace).init(&reg, &.derived, null);
+        for (e.samples) |*s| {
+            const n: c_int = @intCast(s.vars.get(.rows));
+            var outs: [3]Trace.T = undefined;
+            for (&outs, 0..) |*o, i| o.* = try t.node(&.{ @intCast(97 + i), 5120 }, .float32, &.{});
+            const loc, const w, const sh = .{ try t.node(&.{ n, 6, 2 }, .int32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
+            _ = try r.call(&t, &outs, loc, w, sh);
+            var want: [27]Trace.T = undefined;
+            for (want[0..24], 0..) |*x, i| x.* = outs[if (i < 3) i else 0];
+            want[24..].* = .{ loc, w, sh };
+            try expectLaunch(t.back(1), e, s, &want);
+        }
+        var many: [25]Trace.T = undefined;
+        for (&many) |*o| o.* = try t.node(&.{ 8, 5120 }, .float32, &.{});
+        const n_launch = t.launches.items.len;
+        try testing.expectError(error.RouteInput, r.call(&t, &many, try t.node(&.{ 8, 6, 2 }, .int32, &.{}), try t.node(&.{ 8, 6 }, .float32, &.{}), try t.node(&.{ 8, 5120 }, .float32, &.{})));
+        try testing.expectEqual(n_launch, t.launches.items.len);
+        var geo = PrefillGeometry.derived;
+        geo.n_experts_per_tok = 8;
+        try testing.expectError(error.RouteInput, JoinlessCombine(Trace).init(&reg, &geo, null));
     }
     // every prefill batch 2 entry was launched through its route; nothing kept past its route
     var hit: std.EnumSet(Kernel) = .empty;
