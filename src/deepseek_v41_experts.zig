@@ -630,6 +630,13 @@ pub fn QuantMath(comptime G: type, comptime Q: type) type {
         pub fn finishPrefill(self: *const Self, g: *G) !void {
             return self.q.finishPrefill(g);
         }
+
+        /// The quant's unjoined prefill, when it has one (a construction-time type choice).
+        pub const has_parts = @hasDecl(Q, "prefillParts");
+
+        pub fn prefillParts(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T), alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
+            return self.q.prefillParts(g, layer, x, rows, bank, alloc, outs, pos);
+        }
     };
 }
 
@@ -653,6 +660,12 @@ pub fn WithPrefillRoutes(comptime G: type, comptime D: type, comptime P: type) t
 
         pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T)) !T {
             return self.routes[layer].call(g, x, rows, bank);
+        }
+
+        pub const has_parts = @hasDecl(P, "callParts");
+
+        pub fn prefillParts(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T), alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
+            return self.routes[layer].callParts(g, x, rows, bank, alloc, outs, pos);
         }
 
         pub fn finishPrefill(self: *const Self, g: *G) !void {
@@ -757,6 +770,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         const Self = @This();
         const T = G.T;
         pub const Arrays = BankArraysOf(T);
+        /// The math this hook runs (its construction-time capabilities: `has_parts`).
+        pub const Math = M;
 
         /// A routed layer's gate (the lookahead predictor reads the next layer's).
         pub const Gate = struct { w: T, bias: T };
@@ -791,6 +806,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             cold_slot: std.ArrayList(u32) = .empty,
             cold_act: std.ArrayList(u32) = .empty,
             cold_pos: std.ArrayList(u32) = .empty,
+            /// The unjoined route: a call's rows' routed positions, and its wave-ordered rows' call rows.
+            call_pos: std.ArrayList(u32) = .empty,
+            wave_pos: std.ArrayList(u32) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act_row: std.ArrayList(u32) = .empty,
             pos: std.ArrayList(u32) = .empty,
@@ -800,7 +818,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             loc: std.ArrayList(i32) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc }) |l| l.deinit(a);
             }
         };
 
@@ -1082,7 +1100,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// the call and drains each group once; `.hot_first` orders the groups hottest first;
         /// `Options.wide.depth` 2 routes group g + 1 (its reads) before group g's waves.
         fn runWide(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
-            try self.runWideCore(g, layer, xf, indices, n, k);
+            try self.runWideCore(g, layer, xf, indices, n, k, false);
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
@@ -1103,7 +1121,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         pub const Parts = struct { outs: []const T, loc: T };
 
         fn runWideParts(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !Parts {
-            try self.runWideCore(g, layer, xf, indices, n, k);
+            // The math's unjoined prefill when it has one: the combine reads the waves' own outputs.
+            try self.runWideCore(g, layer, xf, indices, n, k, comptime @hasDecl(M, "has_parts") and M.has_parts);
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
@@ -1149,7 +1168,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.wide.kept.clearRetainingCapacity();
         }
 
-        fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !void {
+        fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
@@ -1239,15 +1258,23 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         }
                         try w.slot.append(a, ref.row);
                         try w.act_row.append(a, act_row);
-                        try w.pos.append(a, @intCast(row));
+                        if (parts) try w.call_pos.append(a, @intCast(row)) else try w.pos.append(a, @intCast(row));
                     }
                     if (w.slot.items.len == 0 and w.cold_slot.items.len == 0) continue;
                     const b = self.banks[layer][@backingInt(kind)].?;
                     const hot = w.slot.items.len > 0;
                     if (hot) {
-                        try w.kept.ensureUnusedCapacity(a, 1);
-                        const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
-                        w.kept.appendAssumeCapacity(y);
+                        if (parts) {
+                            // The waves' outputs as they are; each wave-ordered row's routed position.
+                            w.wave_pos.clearRetainingCapacity();
+                            try self.math.prefillParts(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b, a, &w.kept, &w.wave_pos);
+                            for (w.wave_pos.items) |p| try w.pos.append(a, w.call_pos.items[p]);
+                            w.call_pos.clearRetainingCapacity();
+                        } else {
+                            try w.kept.ensureUnusedCapacity(a, 1);
+                            const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
+                            w.kept.appendAssumeCapacity(y);
+                        }
                     }
                     // Cold rows: the decode GEMV over their slots, encoded after the bank's wide waves
                     // (the act-row index is built right before its take).
@@ -2491,5 +2518,85 @@ test "dsv41 experts: cold rows run the decode lane over their own records after 
         try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = .{ .inner = .{ .hidden = 64, .inter = 32 } }, .routes = &rrs }, &c, .{ .wide = .{ .cold_rows = Wide.max_cold_rows + 1 } }));
         const Plain = ExpertsWith(TraceOps, StreamSource, Math, .{});
         try testing.expectError(error.InvalidWideRoute, Plain.initWith(a, &g, &src, .{ .d = .{ .inner = .{ .hidden = 64, .inter = 32 } }, .routes = &rrs }, &c, .{ .wide = .{ .cold_rows = 2 } }));
+    }
+}
+
+/// A wide route whose outputs carry, per row, its act row, slot and bank (host arrays the trace
+/// records): `callParts` hands them out in waves of 3 rows, last rows first.
+const EncRoute = struct {
+    const hidden = 64;
+
+    fn rowsOut(g: *TraceOps, a: std.mem.Allocator, rows: quant.PrefillRows, bank: BankArraysOf(u32), which: []const u32) !u32 {
+        const v = try a.alloc(f32, which.len * hidden);
+        defer a.free(v);
+        @memset(v, 0);
+        for (which, 0..) |i, r| {
+            v[r * hidden] = @floatFromInt(rows.act_row.?[i]);
+            v[r * hidden + 1] = @floatFromInt(rows.slot[i]);
+            v[r * hidden + 2] = @floatFromInt(bank.gate.code);
+        }
+        return g.hostArray(std.mem.sliceAsBytes(v), &.{ @intCast(which.len), hidden }, .float32);
+    }
+
+    pub fn call(_: *EncRoute, g: *TraceOps, _: u32, rows: quant.PrefillRows, bank: BankArraysOf(u32)) !u32 {
+        const idx = try g.gpa.alloc(u32, rows.slot.len);
+        defer g.gpa.free(idx);
+        for (idx, 0..) |*x, i| x.* = @intCast(i);
+        return rowsOut(g, g.gpa, rows, bank, idx);
+    }
+
+    pub fn callParts(_: *EncRoute, g: *TraceOps, _: u32, rows: quant.PrefillRows, bank: BankArraysOf(u32), alloc: std.mem.Allocator, outs: *std.ArrayList(u32), pos: *std.ArrayList(u32)) !void {
+        var end: usize = rows.slot.len;
+        while (end > 0) {
+            const start = end -| 3;
+            var which: [3]u32 = undefined;
+            for (start..end, 0..) |i, j| which[j] = @intCast(i);
+            try outs.append(alloc, try rowsOut(g, alloc, rows, bank, which[0 .. end - start]));
+            try pos.appendSlice(alloc, which[0 .. end - start]);
+            end = start;
+        }
+    }
+
+    pub fn finish(_: *EncRoute, _: *TraceOps) !void {}
+};
+
+test "dsv41 experts: the unjoined prefill hands the combine each assignment's own row: its token, its slot, its bank" {
+    const a = testing.allocator;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 30;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 30, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.record_host = true;
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, EncRoute);
+    try testing.expect(Math.has_parts);
+    var rr = [_]EncRoute{.{}};
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rr }, &c);
+    defer ex.deinit();
+    // 10 tokens x top-6 over 30 experts: one group, both banks (16 persistent rows, the rest transient).
+    const n: u32 = 10;
+    const k: u32 = 6;
+    var ids: [10 * 6]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i / k) * 5 + (i % k) * 7) % 30);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    const parts = try ex.at(0).routedParts(&g, try g.input(&.{ @intCast(n), 64 }, .bfloat16), try g.input(&.{ @intCast(n), @intCast(k) }, .int32));
+    defer ex.at(0).releaseParts(&g);
+    try testing.expect(parts.outs.len > 2 and parts.outs.len <= Ex.max_parts);
+    const call = for (&src.calls) |*cl| {
+        if (cl.plan.n_ids > 0 and cl.plan.n_ids == ex.wide.distinct.items.len) break cl;
+    } else return error.NoCall;
+    const loc = ex.wide.loc.items;
+    for (ids, 0..) |e, q| {
+        const s_: usize = @intCast(loc[2 * q]);
+        const r_: usize = @intCast(loc[2 * q + 1]);
+        const bytes = g.hostBytesOf(parts.outs[s_]) orelse return error.NoHostBytes;
+        const row = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(bytes)))[r_ * EncRoute.hidden ..][0..3];
+        const ref = call.refs[@intCast(ex.wide.first.items[e])];
+        try testing.expectEqual(@as(f32, @floatFromInt(q / k)), row[0]);
+        try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), row[1]);
+        try testing.expectEqual(@as(f32, @floatFromInt(ex.banks[0][@backingInt(ref.bank)].?.gate.code)), row[2]);
     }
 }
