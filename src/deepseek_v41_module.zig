@@ -357,16 +357,25 @@ pub const Module = struct {
     /// rows, the prefill's parked buffers back, the decode cache charge, the banks at the decode rows.
     pub fn phaseChange(self: *Module) !void {
         if (self.grown()) return;
+        // The box's pages and this process's footprint at each step (once per process): what the
+        // guard's metric holds beyond the footprint while the banks grow.
+        var marks: [4]VmMark = undefined;
+        marks[0] = VmMark.now();
         if (!self.fenced) {
             try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
             self.fenced = true;
         }
+        marks[1] = VmMark.now();
         // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
+        marks[2] = VmMark.now();
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
+        marks[3] = VmMark.now();
+        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the cache release", "after the banks grew" }) |m, name|
+            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d})", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
     fn grown(self: *const Module) bool {
@@ -396,6 +405,19 @@ pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockT
     if (!layer_major_billed) return error.LayerMajorNotBilled;
     return true;
 }
+
+/// One reading of the box's pages (the guard's physical-used metric) beside this process's footprint.
+const VmMark = struct {
+    physical: u64,
+    footprint: u64,
+    purgeable: u64,
+    external: u64,
+
+    fn now() VmMark {
+        const v = arm_mod.vmBytes();
+        return .{ .physical = arm_mod.physicalUsed(v), .footprint = arm_mod.footprint().now, .purgeable = v.purgeable, .external = v.external };
+    }
+};
 
 /// The prefill routes a module installed (read back from the trunk's tier and the arm's hook and stream).
 pub const Installed = struct {
