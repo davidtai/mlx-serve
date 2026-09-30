@@ -107,6 +107,8 @@ pub const RouteOverrides = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
+    /// C22 moeshared: the shared expert's middle compiled at decode rows.
+    decode_shared_mid: ?bool = null,
 };
 
 /// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
@@ -303,6 +305,7 @@ pub const Module = struct {
         if (ov.decode_index_topk) |v| tier.routes.rc_index_topk = v;
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
+        if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
         if (ov.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -311,7 +314,7 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
             // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
@@ -336,7 +339,9 @@ pub const Module = struct {
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
+        self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
+        log.info("NATIVE decode dispatch fuse installed: shared middle {}", .{self.installed.decode_shared_mid});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -533,6 +538,11 @@ pub const Module = struct {
         var checks: [40]Tr.RouteCheck = undefined;
         var n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
         n += try Tr.decodeRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, checks[n..]);
+        // C22 moeshared: the compiled middle against the op chain, bit for bit.
+        if (self.model.tier.routes.shared_mid) {
+            checks[n] = .{ .name = "shared middle compiled", .ok = try Tr.sharedMidCheck(&self.g, c, &self.model.tier.routes, scratch) };
+            n += 1;
+        }
         // C29's Engram wkv (the model's route): its first slot against the stock qmm at 5 rows.
         if (self.model.engram_m1[0]) |*s| {
             const en = self.model.engram.?;
@@ -950,6 +960,8 @@ pub const Installed = struct {
     decode_index_topk: bool = false,
     decode_smallm: bool = false,
     decode_mxfp8_rows: bool = false,
+    /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
+    decode_shared_mid: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.

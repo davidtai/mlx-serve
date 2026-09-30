@@ -49,6 +49,8 @@ pub const Tier = struct {
         r.rc_mxfp8_rows = false;
         r.rc_index_topk = false;
         r.rc_attn_softmax = false;
+        // C22 moeshared compiles the trunk's shared-expert middle (checked on the trunk's geometry); the draft keeps its chain.
+        r.shared_mid = false;
         r.head = switch (self.routes.head) {
             .mxfp8 => .mxfp8,
             .f32, .bf16 => if (self.draft_head_bf16) .bf16 else .f32,
@@ -105,6 +107,7 @@ pub const served: Tier = blk: {
     t.routes.rc_mxfp8_rows = true; // C29 MINVARIANT mxfp8 rows m1order (rows <= 8)
     t.routes.rc_index_topk = true; // C27 INDEX_TOPK=metal (rows <= 8)
     t.routes.rc_attn_softmax = true; // C23 ATTN_FUSE softmax (rows <= 8)
+    t.routes.shared_mid = true; // C22 DISPATCH_FUSE moeshared: the shared expert's middle compiled (rows <= 8)
     break :blk t;
 };
 
@@ -415,6 +418,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.rc_mxfp8_rows = false;
     rc_off.rc_index_topk = false;
     rc_off.rc_attn_softmax = false;
+    rc_off.shared_mid = false;
     // C14 drops W97 (the dense f32 wo_a, 5.37 GB over 40 layers): the tier's arm keeps it.
     rc_off.wo_a_f32 = true;
     try testing.expectEqual(trunk.routes, rc_off);

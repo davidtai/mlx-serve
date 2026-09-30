@@ -862,6 +862,9 @@ const CellReceipt = struct {
     typical_delta: f64,
     /// The decode lane the Module installed (`Module.decodeLane`: "dspark typical 0.3").
     decode_lane: []const u8 = "",
+    /// D17: the MLX_MAX_OPS_PER_BUFFER this process ran with (MLX reads it once, at device init), null when unset
+    /// (MLX's default for the architecture: 50 on an M5 Max).
+    mlx_max_ops_per_buffer: ?[]const u8 = null,
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -932,6 +935,8 @@ const CellReceipt = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
+    /// C22 moeshared (installed): the shared expert's middle compiled at decode rows.
+    decode_shared_mid: ?bool = null,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1157,6 +1162,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
+        .mlx_max_ops_per_buffer = envStr("MLX_MAX_OPS_PER_BUFFER"),
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
@@ -1216,6 +1222,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
+        .decode_shared_mid = md.installed.decode_shared_mid,
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1311,6 +1318,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
+    if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > expert_stream.max_wide_depth) return error.CellWideDepth;
