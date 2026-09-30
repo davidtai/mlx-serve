@@ -10,6 +10,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const xp = @import("deepseek_v41_experts.zig");
+const expert_stream = @import("expert_stream.zig");
 const exl3 = @import("exl3_quant.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
@@ -36,10 +37,11 @@ const log = std.log.scoped(.dsv41);
 /// decode phase over the box baseline. `processBound` is what the child may hold above the baseline.
 pub const Bill = struct {
     baseline: u64,
-    /// The slot banks' geometry: routed layers, the transient rows (max_route_ids x wide depth), the
-    /// layer's experts (the rows' cap).
+    /// The slot banks' geometry: routed layers, the transient rows (the prompt's: max_route_ids x wide depth; decode's:
+    /// `transientDecodeRows`), the layer's experts (the rows' cap).
     layers: u32 = 0,
     transient_rows: u64 = 0,
+    transient_decode_rows: u64 = 0,
     n_experts: u32 = 0,
     prefill_rows: u32,
     decode_rows: u32,
@@ -239,6 +241,21 @@ pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 /// device terms without the wide window at every boundary, so that window is no device memory either.
 pub const measured_host_side_bytes: u64 = 900_000_000;
 
+/// Whether the stream releases its transient windows past the first at the phase change (SERVED16: the integration
+/// lane's release at the PhaseGate, per-window MLX allocations freed before the grow). The declaration
+/// (`expert_stream.phase_change_releases_wide_windows`) lands with the release; a tree without it keeps every window
+/// through decode, and the bill with it.
+pub const stream_releases_wide_windows: bool = blk: {
+    if (!@hasDecl(expert_stream, "phase_change_releases_wide_windows")) break :blk false;
+    break :blk expert_stream.phase_change_releases_wide_windows;
+};
+
+/// Decode's transient rows: window 0 (max_route_ids) once the phase change releases the rest (decode's calls take at
+/// most max_route_ids ids, one window), else every window the prompt's wide reads allocated.
+pub fn transientDecodeRows(wide_depth: u8, releases: bool) u64 {
+    return if (releases) xp.max_route_ids else @as(u64, wide_depth) * xp.max_route_ids;
+}
+
 /// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
 /// admission a harness asks for) for a request of `prompt_tokens` + `max_tokens`. `wired_bytes` pins the wired
 /// bytes `planRows` reads (null: now). A bill taken after construction passes the wired bytes the arm was
@@ -267,6 +284,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     // term into the host side; 9b's construction hid it behind ~0.64 GB of draft-head residents that load at the
     // first draft block, and SERVED10b's draft-block warm-up showed it (MLX active +642,935,748 B).
     const transient: u64 = @as(u64, opts.wide_depth) * xp.max_route_ids;
+    const transient_decode = transientDecodeRows(opts.wide_depth, stream_releases_wide_windows);
     var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
@@ -287,11 +305,12 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .baseline = config.memory_baseline_bytes orelse 0,
         .layers = c.n_layers,
         .transient_rows = transient,
+        .transient_decode_rows = transient_decode,
         .n_experts = c.n_routed_experts,
         .prefill_rows = p.prefill_rows,
         .decode_rows = p.decode_rows,
         .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
-        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient) * rec,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient_decode) * rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
         .residents = m.totalBytes(),
@@ -349,7 +368,7 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_
 
 /// A bill in the fill's shape: its phases' totals less their slot rows, and one row on every routed layer.
 pub fn fillBillOf(b: Bill) FillBill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
     const per_row = @as(u64, b.layers) * rec;
     return .{
         .prefill_fixed = b.prefillTotal() - b.prefill_rows * per_row,
@@ -428,6 +447,7 @@ pub fn cell4Bill() Bill {
         .baseline = 8_716_419_072,
         .layers = 40,
         .transient_rows = 48,
+        .transient_decode_rows = 48,
         .n_experts = 384,
         .prefill_rows = 106,
         .decode_rows = 148,
@@ -664,6 +684,50 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
     // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
+    // Decode's transient rows: every window until the stream declares the phase change's release, window 0 after.
+    try testing.expectEqual(transientDecodeRows(opts.wide_depth, stream_releases_wide_windows), b.transient_decode_rows);
+    try testing.expectEqual(@as(u64, 240), transientDecodeRows(5, false));
+    try testing.expectEqual(@as(u64, 48), transientDecodeRows(5, true));
+    try testing.expectEqual(@as(u64, 2_556_592_128), (transientDecodeRows(5, false) - transientDecodeRows(5, true)) * rec);
+    try testing.expectEqual((@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec, b.slot_decode);
+}
+
+// DSV41_BANK=<bank> (host): the decode rows the phase change's window release returns (SERVED16). Decode keeps window 0
+// of the transient bank (48 rows) and gives windows 1..4 back (192 records, 2,556,592,128 B at depth 5); the prompt
+// phase is unchanged. The rows are the split's, whether or not this tree declares the release yet.
+test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
+    for ([_]Want{
+        // Without the release (this tree's fill): 164 / 164 / 163 decode rows; with it, +5 at each baseline.
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 134, .decode = 169 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows);
+        const depth: u8 = @intCast(b0.transient_rows / xp.max_route_ids);
+        b0.transient_decode_rows = transientDecodeRows(depth, true);
+        b0.slot_decode = (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows) * rec;
+        b0.engram_posted = 0;
+        const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        b0.engram_posted = posted;
+        const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        std.debug.print("\nwindow release: rows at baseline {d:.2} GB: posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, off.prefill, off.decode, on.prefill, on.decode });
+        try testing.expectEqual(w.off, off);
+        try testing.expectEqual(w.on, on);
+    }
+    std.debug.print("\n", .{});
 }
 
 /// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's
