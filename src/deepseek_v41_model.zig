@@ -153,6 +153,12 @@ pub fn Model(comptime G: type) type {
                 lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
                 if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
             }
+            // DENSE16 o-projection: its rhs index pair, once, shared by every layer (`W.oproj_idx`).
+            if (tier.routes.prefill_oproj) {
+                const oi = try Tr.oprojIndices(g, cp);
+                const owned: [2]T = .{ try self.own(g, oi[0]), try self.own(g, oi[1]) };
+                for (self.layers) |*lw| lw.oproj_idx = owned;
+            }
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, cp));
             self.inv_yarn = try self.own(g, try Tr.yarnInvFreq(g, cp));
             self.embed = .{ .table = try req(lookup, "embed.weight") };

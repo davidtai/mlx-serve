@@ -48,6 +48,10 @@ pub fn LayerW(comptime T: type) type {
         idx_q: ?struct { wq_b: Q(T), weights_proj: T } = null,
         /// W97: the grouped wo_a dequantized once to f32 `[g, rank, in]`.
         wo_a_dense: ?T = null,
+        /// DENSE16 o-projection (`Routes.prefill_oproj`): the two gather_qmm rhs index arrays (uint32), wo_a's
+        /// groups `arange(o_groups)` and wo_b's `[0]`, built once at construction and shared by every layer
+        /// (Python builds them once too; per call they were 4 of the route's 9 launches).
+        oproj_idx: ?[2]T = null,
         gate_w: T,
         gate_bias: T,
         sh_w1: Q(T),
@@ -1589,6 +1593,14 @@ pub fn Trunk(comptime G: type) type {
             return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size, .hc_mult = c.hc_mult };
         }
 
+        /// `W.oproj_idx`: wo_a's group indices `arange(o_groups)` and wo_b's `[0]`, uint32, built once.
+        pub fn oprojIndices(g: *G, c: *const v41.Config) ![2]T {
+            return .{
+                try g.astype(try g.arange(0, @floatFromInt(c.o_groups), 1, .int32), .uint32),
+                try g.astype(try g.arange(0, 1, 1, .int32), .uint32),
+            };
+        }
+
         /// DENSE16 `outProj` after the prefill core: og f32 [g, S, in] -> bf16, the grouped o-LoRA as
         /// gather_qmm over wo_a's packed [g, rank, in] view (rhs = arange(g)), [S, g x rank], then
         /// wo_b's qmm, widened to f32.
@@ -1599,8 +1611,9 @@ pub fn Trunk(comptime G: type) type {
             const ss = g.shapeOf(w.wo_a.s);
             const wa = try g.reshape(w.wo_a.w, &.{ G_, R, ws.dim(-1) });
             const sa = try g.reshape(w.wo_a.s, &.{ G_, R, ss.dim(-1) });
-            const idx = try g.astype(try g.arange(0, @floatFromInt(G_), 1, .int32), .uint32);
-            const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, idx, w.wo_a.mode);
+            // The rhs indices, built once at construction (`W.oproj_idx`; the route sets them by construction).
+            const oi = w.oproj_idx.?;
+            const o2 = try g.gatherQmm(try g.astype(og, .bfloat16), wa, sa, oi[0], w.wo_a.mode);
             // [S, g x rank] (the bf16 copy), then wo_b as the lane does: one gather_qmm over its [1, out,
             // in / 4] view with rhs [0] (the NAX gather kernel at the chunk's rows), widened to f32.
             const flat = try g.reshape(try g.transposeAxes(o2, &.{ 1, 0, 2 }), &.{ 1, b * s, G_ * R });
@@ -1608,8 +1621,7 @@ pub fn Trunk(comptime G: type) type {
             const bss = g.shapeOf(w.wo_b.s);
             const wb = try g.reshape(w.wo_b.w, &.{ 1, bs_.dim(0), bs_.dim(1) });
             const sb = try g.reshape(w.wo_b.s, &.{ 1, bss.dim(0), bss.dim(1) });
-            const idx0 = try g.astype(try g.arange(0, 1, 1, .int32), .uint32);
-            const y = try g.gatherQmm(flat, wb, sb, idx0, w.wo_b.mode);
+            const y = try g.gatherQmm(flat, wb, sb, oi[1], w.wo_b.mode);
             return g.astype(try g.reshape(y, &.{ b, s, bs_.dim(0) }), .float32);
         }
 
@@ -2642,6 +2654,31 @@ test "dsv41 graph: the m1rows head takes rows 1..8, M 5 and 7 padded to M + 1, f
     try testing.expectError(error.RouteInput, kr.HeadRows(TraceOps).init(&g, &reg, try g.input(&.{ 4096, 5120 }, .bfloat16), null));
 }
 
+test "dsv41 graph: the DENSE16 o-projection takes its rhs index pair from construction (no per-call arange or u32 cast)" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    var w = try traceLayerW(&g, &c, c.layers[1]);
+    w.oproj_idx = try Tr.oprojIndices(&g, &c);
+    const s: c_int = 64;
+    const og = try g.input(&.{ @intCast(c.o_groups), s, @intCast(c.n_heads * c.head_dim / c.o_groups) }, .float32);
+    const from = g.nodes.items.len;
+    const out = try Tr.outProjDense16(&g, &c, og, &w, 1, s);
+    try testing.expectEqual(@as(u8, 3), g.shapeOf(out).n);
+    var aranges: usize = 0;
+    var u32_casts: usize = 0;
+    var gathers: usize = 0;
+    for (g.nodes.items[from..]) |nd| {
+        aranges += @intFromBool(nd.op == .arange);
+        u32_casts += @intFromBool(nd.op == .astype and nd.dtype == .uint32);
+        gathers += @intFromBool(nd.op == .gather_qmm);
+    }
+    try testing.expectEqual(@as(usize, 0), aranges);
+    try testing.expectEqual(@as(usize, 0), u32_casts);
+    // Both projections still gather through their packed views (wo_a's groups, wo_b's one expert).
+    try testing.expectEqual(@as(usize, 2), gathers);
+}
+
 test "dsv41 graph: the prefill attention core takes the prompt widths per layer kind; no gathered KVg; verify widths keep the chain" {
     var kd: xk.Diag = .{};
     var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
@@ -2696,6 +2733,8 @@ test "dsv41 graph: the prefill attention core takes the prompt widths per layer 
     defer ka.deinit(&g);
     var checks: [16]Tr.RouteCheck = undefined;
     const all_o: Routes = .{ .prefill_attn = true, .prefill_index = true, .prefill_hc = true, .prefill_combine = true, .prefill_oproj = true, .prefill_joinless = true, .selected_keys = true };
+    const oi = try Tr.oprojIndices(&g, &c);
+    for (ws[0..c.n_layers]) |*w| w.oproj_idx = oi;
     const n = try Tr.prefillRoutesCheck(&g, &c, &all_o, &ka, ws[0..c.n_layers], scratch, &checks);
     try testing.expectEqual(@as(usize, 12), n);
     for (checks[0..n]) |ck| {
