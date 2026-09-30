@@ -677,8 +677,9 @@ pub const PrefillGeometry = struct {
     index_head_dim: u32,
     n_experts_per_tok: u32,
     hidden: u32,
+    hc_mult: u32,
 
-    pub const derived: PrefillGeometry = .{ .n_heads = 64, .head_dim = 512, .rope_head_dim = 64, .window = 128, .index_topk = 512, .index_n_heads = 32, .index_head_dim = 128, .n_experts_per_tok = 6, .hidden = 5120 };
+    pub const derived: PrefillGeometry = .{ .n_heads = 64, .head_dim = 512, .rope_head_dim = 64, .window = 128, .index_topk = 512, .index_n_heads = 32, .index_head_dim = 128, .n_experts_per_tok = 6, .hidden = 5120, .hc_mult = 4 };
 
     /// `what` names the route; every field is compared (a subset would let a shape through).
     pub fn admit(got: *const PrefillGeometry, what: []const u8, diag: ?*xk.Diag) Refusal!void {
@@ -1093,7 +1094,8 @@ pub fn HcNorm(comptime G: type) type {
 
         /// `stream` the HC state's dtype (bf16 on the tier, f32 for an f32 stream); `eps` the
         /// model's rms_norm_eps: another value than the registered constant is refused.
-        pub fn init(g: *G, reg: *const xk.Registry, stream: Dtype, eps: f32, diag: ?*xk.Diag) !Self {
+        pub fn init(g: *G, reg: *const xk.Registry, geo: *const PrefillGeometry, stream: Dtype, eps: f32, diag: ?*xk.Diag) !Self {
+            try geo.admit("the pf_hc norms", diag);
             const rsq, const pre = switch (stream) {
                 .bfloat16 => .{ reg.get(.q3pf_hc_mix_rsqrt), reg.get(.q3pf_hc_pre_norm) },
                 .float32 => .{ reg.get(.q3pf_hc_mix_rsqrt__f32), reg.get(.q3pf_hc_pre_norm__f32) },
@@ -1527,7 +1529,7 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     }
     // the HC norms at the stream dtype, eps and the 1/numel constants from the registry
     for ([_]Dtype{ .bfloat16, .float32 }) |dt| {
-        var r = try HcNorm(Trace).init(&t, &reg, dt, 1e-20, null);
+        var r = try HcNorm(Trace).init(&t, &reg, &.derived, dt, 1e-20, null);
         defer r.deinit(&t);
         for (r.rsq.samples) |*s| {
             const x = try t.node(&.{ 1, @intCast(s.vars.get(.rows)), 4, 5120 }, dt, &.{});
@@ -1543,9 +1545,9 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         }
     }
     var diag: xk.Diag = .{};
-    try testing.expectError(error.RouteInput, HcNorm(Trace).init(&t, &reg, .bfloat16, 1e-6, &diag));
+    try testing.expectError(error.RouteInput, HcNorm(Trace).init(&t, &reg, &.derived, .bfloat16, 1e-6, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3pf_hc_mix_rsqrt") != null);
-    try testing.expectError(error.TemplateNotRegistered, HcNorm(Trace).init(&t, &reg, .float16, 1e-20, null));
+    try testing.expectError(error.TemplateNotRegistered, HcNorm(Trace).init(&t, &reg, &.derived, .float16, 1e-20, null));
     // the MoE combine
     {
         const e = reg.get(.q3sk_combine);
@@ -1583,6 +1585,8 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             try testing.expect(std.mem.indexOf(u8, d.message(), "q3_ph_index_score is derived for " ++ name) != null);
             try testing.expectError(error.RouteInput, IndexTopk(Trace).init(&t, &reg, &geo, &d));
             try testing.expectError(error.RouteInput, SmallKCombine(Trace).init(&reg, &geo, &d));
+            try testing.expectError(error.RouteInput, HcNorm(Trace).init(&t, &reg, &geo, .float32, 1e-20, &d));
+            try testing.expect(std.mem.indexOf(u8, d.message(), "pf_hc norms is derived for " ++ name) != null);
         }
         try testing.expectEqual(kept, t.keeps);
         // the native prompt pass's three layer kinds (the model lane, 09-29): layer 0 on the bf16

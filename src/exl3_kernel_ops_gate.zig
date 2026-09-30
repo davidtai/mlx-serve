@@ -408,7 +408,7 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
     }
     if (eq(u8, f, "hcnorm")) {
         const x = in(ins, "x");
-        var r = try tr.HcNorm(MlxG).init(g, reg, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
+        var r = try tr.HcNorm(MlxG).init(g, reg, &.derived, g.dtypeOf(x), @floatCast(c.eps orelse return error.FixtureEps), null);
         defer r.deinit(g);
         outs[0] = try r.rsqrt(g, x);
         outs[1] = try r.preNorm(g, x, in(ins, "pre"), in(ins, "w"));
