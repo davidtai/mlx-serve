@@ -804,6 +804,104 @@ fn invertPositions(pos: []const u32, inv: []u32) void {
     for (pos, 0..) |p, j| inv[p] = @intCast(j);
 }
 
+/// The most sources JOINLESS's combine reads (`dsv41_kernel_routes.JoinlessCombine.sources`).
+pub const joinless_sources = 24;
+
+/// JOINLESS's sources for outputs of `rows` rows each (join order), the minimal copy: up to
+/// `joinless_sources` outputs are each read in place; above, the smallest `n - 23` (earlier first among
+/// equals) are concatenated in join order into the last source and the rest are sources 0.. in join order.
+/// Per output: `src[i]` its source, `off[i]` its first row there; returns the sources. `order`: scratch.
+/// Exact: a concatenate copies words, and the combine folds each token's k products in k order.
+pub fn planJoinless(rows: []const u32, order: []u32, src: []u8, off: []u32) usize {
+    const n = rows.len;
+    @memset(off, 0);
+    if (n <= joinless_sources) {
+        for (src, 0..) |*s, i| s.* = @intCast(i);
+        return n;
+    }
+    for (order, 0..) |*x, i| x.* = @intCast(i);
+    std.sort.pdq(u32, order, rows, struct {
+        fn lt(r: []const u32, x: u32, y: u32) bool {
+            return if (r[x] != r[y]) r[x] < r[y] else x < y;
+        }
+    }.lt);
+    const merged: u8 = joinless_sources - 1;
+    @memset(src, 0);
+    for (order[0 .. n - merged]) |i| src[i] = merged;
+    var in_place: u8 = 0;
+    var at: u32 = 0;
+    for (rows, src, off) |r, *s, *o| {
+        if (s.* == merged) {
+            o.* = at;
+            at += r;
+        } else {
+            s.* = in_place;
+            in_place += 1;
+        }
+    }
+    return joinless_sources;
+}
+
+/// Each assignment's (source, row) under a `planJoinless` plan, as int32 pairs: output i's join-ordered
+/// rows (`pos`, the outputs' rows back to back) are rows `off[i]..` of source `src[i]`.
+pub fn fillJoinlessLoc(rows: []const u32, src: []const u8, off: []const u32, pos: []const u32, loc: []i32) void {
+    var j: usize = 0;
+    for (rows, src, off) |r, s, o| {
+        for (pos[j..][0..r], o..) |p, row| {
+            loc[2 * p] = s;
+            loc[2 * p + 1] = @intCast(row);
+        }
+        j += r;
+    }
+}
+
+/// The merge's host scratch, reused across calls.
+pub fn JoinlessScratch(comptime T: type) type {
+    return struct {
+        rows: std.ArrayList(u32) = .empty,
+        order: std.ArrayList(u32) = .empty,
+        src: std.ArrayList(u8) = .empty,
+        off: std.ArrayList(u32) = .empty,
+        merge_in: std.ArrayList(T) = .empty,
+
+        pub fn deinit(s: *@This(), a: std.mem.Allocator) void {
+            inline for (.{ &s.rows, &s.order, &s.src, &s.off, &s.merge_in }) |l| l.deinit(a);
+        }
+    };
+}
+
+/// JOINLESS's merge: `outs` (the KEPT outputs, join order; `pos`: each join-ordered row's assignment) becomes
+/// the combine's sources under `planJoinless` (the in-place outputs, then the merged one, KEPT; its inputs
+/// released) and `loc` each assignment's (source, row). Returns the rows copied.
+pub fn mergeJoinless(comptime G: type, g: *G, a: std.mem.Allocator, outs: *std.ArrayList(G.T), pos: []const u32, loc: []i32, sc: *JoinlessScratch(G.T)) !u64 {
+    const n_out = outs.items.len;
+    try sc.rows.resize(a, n_out);
+    try sc.order.resize(a, n_out);
+    try sc.src.resize(a, n_out);
+    try sc.off.resize(a, n_out);
+    for (outs.items, sc.rows.items) |x, *r| r.* = @intCast(g.shapeOf(x).dim(0));
+    const n_src = planJoinless(sc.rows.items, sc.order.items, sc.src.items, sc.off.items);
+    fillJoinlessLoc(sc.rows.items, sc.src.items, sc.off.items, pos, loc);
+    if (n_src == n_out) return 0;
+    const last: u8 = @intCast(n_src - 1);
+    sc.merge_in.clearRetainingCapacity();
+    var copied: u64 = 0;
+    for (outs.items, sc.src.items, sc.rows.items) |x, s, r| if (s == last) {
+        try sc.merge_in.append(a, x);
+        copied += r;
+    };
+    const cat = g.keep(try g.concat(sc.merge_in.items, 0));
+    for (sc.merge_in.items) |x| g.release(x);
+    var d: usize = 0;
+    for (outs.items, sc.src.items) |x, s| if (s != last) {
+        outs.items[d] = x;
+        d += 1;
+    };
+    outs.shrinkRetainingCapacity(d);
+    outs.appendAssumeCapacity(cat);
+    return copied;
+}
+
 /// Construction-time routes of the executor.
 pub const Routes = struct {
     /// Pass `route` the next routed layer's gate scores (the streamer's
@@ -917,8 +1015,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             pos: std.ArrayList(u32) = .empty,
             inv: std.ArrayList(u32) = .empty,
             kept: std.ArrayList(T) = .empty,
-            /// JOINLESS: each assignment's (output, row), int32 pairs.
+            /// JOINLESS: each assignment's (source, row), int32 pairs.
             loc: std.ArrayList(i32) = .empty,
+            /// JOINLESS: the merge's plan (`mergeJoinless`).
+            jl: JoinlessScratch(T) = .{},
             /// The deferred base-bank rows (`Wide.defer_base`): slots, act rows, routed positions.
             def_slot: std.ArrayList(u32) = .empty,
             def_act: std.ArrayList(u32) = .empty,
@@ -926,6 +1026,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
                 inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
+                w.jl.deinit(a);
             }
         };
 
@@ -1027,8 +1128,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 return h.ex.run(g, h.layer, xf, indices, hoist);
             }
 
-            /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs and
-            /// each assignment's (output, row); `releaseParts` after the combines are evaluated.
+            /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
+            /// combine's sources and each assignment's (source, row); `releaseParts` after the combines are evaluated.
             pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
                 if (comptime !routes.prefill) return error.PrefillLaneNotPorted;
                 const n: u32 = @intCast(g.shapeOf(xf).dim(0));
@@ -1318,50 +1419,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
 
-        /// JOINLESS: the wide call's outputs unjoined (at most `max_parts`, adjacent ones concatenated
-        /// beyond that) and each assignment's (output, row) as int32 [n, k, 2]; the combine reads the
-        /// rows in place. The outputs stay kept until `releaseParts`.
-        pub const max_parts = 24;
+        /// JOINLESS: the wide call's outputs unjoined (above `max_parts`, the smallest merged into one source:
+        /// `mergeJoinless`) and each assignment's (source, row) as int32 [n, k, 2]; the combine reads the
+        /// rows in place. The sources stay kept until `releaseParts`.
+        pub const max_parts = joinless_sources;
         pub const Parts = struct { outs: []const T, loc: T };
 
         fn runWideParts(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !Parts {
             // The math's unjoined prefill when it has one: the combine reads the waves' own outputs.
             try self.runWideCore(g, layer, xf, indices, n, k, comptime @hasDecl(M, "has_parts") and M.has_parts);
-            const a = self.a;
             const w = &self.wide;
-            const n_ids = n * k;
-            // Each output's rows, in join order; beyond max_parts, runs of adjacent outputs concatenated.
-            const n_out = w.kept.items.len;
-            const per = (n_out + max_parts - 1) / max_parts;
-            try w.loc.resize(a, 2 * n_ids);
-            var merged: std.ArrayList(T) = .empty;
-            defer merged.deinit(a);
-            var j: usize = 0;
-            var src: usize = 0;
-            var o: usize = 0;
-            while (o < n_out) : (src += 1) {
-                const end = @min(o + per, n_out);
-                var row: i32 = 0;
-                for (w.kept.items[o..end]) |x| {
-                    const r: usize = @intCast(g.shapeOf(x).dim(0));
-                    for (w.pos.items[j .. j + r]) |p| {
-                        w.loc.items[2 * p] = @intCast(src);
-                        w.loc.items[2 * p + 1] = row;
-                        row += 1;
-                    }
-                    j += r;
-                }
-                if (end - o == 1) {
-                    try merged.append(a, w.kept.items[o]);
-                } else {
-                    const cat = g.keep(try g.concat(w.kept.items[o..end], 0));
-                    for (w.kept.items[o..end]) |x| g.release(x);
-                    try merged.append(a, cat);
-                }
-                o = end;
-            }
-            w.kept.clearRetainingCapacity();
-            try w.kept.appendSlice(a, merged.items);
+            try w.loc.resize(self.a, 2 * n * k);
+            _ = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
             const loc = try g.hostArray(std.mem.sliceAsBytes(w.loc.items), &.{ @intCast(n), @intCast(k), 2 }, .int32);
             return .{ .outs = w.kept.items, .loc = loc };
         }
@@ -3133,4 +3202,412 @@ test "dsv41 experts: the unjoined prefill hands the combine each assignment's ow
         try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), row[1]);
         try testing.expectEqual(@as(f32, @floatFromInt(ex.banks[0][@backingInt(ref.bank)].?.gate.code)), row[2]);
     }
+}
+
+/// The adjacent runs JOINLESS merged in before the minimal copy (`per = ceil(n / 24)` adjacent outputs per
+/// source), as a plan: the reference the merge's tests resolve against.
+fn planAdjacentRuns(rows: []const u32, src: []u8, off: []u32) usize {
+    const per = (rows.len + joinless_sources - 1) / joinless_sources;
+    var at: u32 = 0;
+    for (rows, src, off, 0..) |r, *s, *o, i| {
+        if (i % per == 0) at = 0;
+        s.* = @intCast(i / per);
+        o.* = at;
+        at += r;
+    }
+    return (rows.len + per - 1) / per;
+}
+
+/// The (output, row) a plan's (source, row) names.
+fn resolvePlan(rows: []const u32, src: []const u8, off: []const u32, s: i32, row: i32) ?[2]u32 {
+    if (s < 0 or row < 0) return null;
+    const r_: u32 = @intCast(row);
+    for (rows, src, off, 0..) |r, si, o, i| {
+        if (si == s and r_ >= o and r_ < o + r) return .{ @intCast(i), r_ - o };
+    }
+    return null;
+}
+
+test "dsv41 experts: JOINLESS's merge at L1's counts: the 28 smallest of 51 outputs share one source, every assignment keeps its row" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(usize, @import("dsv41_kernel_routes.zig").JoinlessCombine(TraceOps).sources), joinless_sources);
+    // L1's layer at 16,384 tokens, modeled: 98,304 routed rows in 51 outputs (the deferred base call's 17
+    // waves, then six transient calls' 34, each call's last wave ragged).
+    const rows = [51]u32{
+        3382, 3457, 3614, 3771, 3328, 3485, 3642, 3799, 3356, 3513, 3670, 3827, 3384, 3541, 3698, 3855, 3412,
+        1237, 1298, 1359, 1120, 1181, 150,  1303, 1364, 1125, 1186, 1247, 240,  1369, 1130, 1191, 1252, 1313,
+        330,  1135, 1196, 1257, 1318, 1379, 420,  1201, 1262, 1323, 1384, 510,  1206, 1267, 1328, 1389, 600,
+    };
+    var total: u32 = 0;
+    for (rows) |r| total += r;
+    try testing.expectEqual(@as(u32, 98_304), total);
+    // The join order's assignments: a permutation (7919 is prime to 98,304).
+    const pos = try a.alloc(u32, total);
+    defer a.free(pos);
+    for (pos, 0..) |*p, j| p.* = @intCast((j * 7919) % total);
+    var order: [51]u32 = undefined;
+    var src: [51]u8 = undefined;
+    var off: [51]u32 = undefined;
+    try testing.expectEqual(@as(usize, joinless_sources), planJoinless(&rows, &order, &src, &off));
+    var n_merged: usize = 0;
+    var merged_rows: u64 = 0;
+    var max_merged: u32 = 0;
+    var min_in_place: u32 = std.math.maxInt(u32);
+    var next: u8 = 0;
+    for (rows, src, off) |r, s, o| {
+        if (s == joinless_sources - 1) {
+            n_merged += 1;
+            merged_rows += r;
+            max_merged = @max(max_merged, r);
+        } else {
+            try testing.expectEqual(next, s);
+            try testing.expectEqual(@as(u32, 0), o);
+            next += 1;
+            min_in_place = @min(min_in_place, r);
+        }
+    }
+    try testing.expectEqual(@as(usize, 51 - 23), n_merged);
+    try testing.expect(max_merged <= min_in_place);
+    // The copy: 29,326 rows (0.60 GB at 20,480 B a row), at most (n - 23) / n of the rows by construction;
+    // the adjacent runs (per 3) copied all 98,304.
+    try testing.expectEqual(@as(u64, 29_326), merged_rows);
+    try testing.expect(merged_rows * rows.len <= @as(u64, total) * (rows.len - 23));
+    var a_src: [51]u8 = undefined;
+    var a_off: [51]u32 = undefined;
+    try testing.expectEqual(@as(usize, 17), planAdjacentRuns(&rows, &a_src, &a_off));
+    // Every assignment reads its output's row, as under the adjacent runs.
+    const loc = try a.alloc(i32, 2 * total);
+    defer a.free(loc);
+    const a_loc = try a.alloc(i32, 2 * total);
+    defer a.free(a_loc);
+    fillJoinlessLoc(&rows, &src, &off, pos, loc);
+    fillJoinlessLoc(&rows, &a_src, &a_off, pos, a_loc);
+    var j: usize = 0;
+    for (rows, 0..) |r, i| for (0..r) |row| {
+        const p = pos[j];
+        j += 1;
+        const want: [2]u32 = .{ @intCast(i), @intCast(row) };
+        try testing.expectEqual(want, resolvePlan(&rows, &src, &off, loc[2 * p], loc[2 * p + 1]).?);
+        try testing.expectEqual(want, resolvePlan(&rows, &a_src, &a_off, a_loc[2 * p], a_loc[2 * p + 1]).?);
+    };
+}
+
+test "dsv41 experts: JOINLESS's merge at 24 outputs or fewer: every output its own source, read in place, nothing copied" {
+    const a = testing.allocator;
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var sc: JoinlessScratch(u32) = .{};
+    defer sc.deinit(a);
+    for ([_]usize{ 1, 7, 24 }) |n_out| {
+        var outs: std.ArrayList(u32) = .empty;
+        defer outs.deinit(a);
+        var n_rows: usize = 0;
+        for (0..n_out) |i| {
+            const r: c_int = @intCast(1 + (i * 5) % 9);
+            try outs.append(a, try g.input(&.{ r, 64 }, .float32));
+            n_rows += @intCast(r);
+        }
+        const before = try a.dupe(u32, outs.items);
+        defer a.free(before);
+        const pos = try a.alloc(u32, n_rows);
+        defer a.free(pos);
+        for (pos, 0..) |*p, j| p.* = @intCast(n_rows - 1 - j);
+        const loc = try a.alloc(i32, 2 * n_rows);
+        defer a.free(loc);
+        const n0 = g.nodes.items.len;
+        try testing.expectEqual(@as(u64, 0), try mergeJoinless(TraceOps, &g, a, &outs, pos, loc, &sc));
+        try testing.expectEqual(n0, g.nodes.items.len);
+        try testing.expectEqualSlices(u32, before, outs.items);
+        var j: usize = 0;
+        for (outs.items, 0..) |x, i| for (0..@intCast(g.shapeOf(x).dim(0))) |row| {
+            const p = pos[j];
+            j += 1;
+            try testing.expectEqual(@as(i32, @intCast(i)), loc[2 * p]);
+            try testing.expectEqual(@as(i32, @intCast(row)), loc[2 * p + 1]);
+        };
+    }
+}
+
+test "dsv41 experts: past 24 outputs the combine still reads each assignment's own row, in place or in the one merged source" {
+    const a = testing.allocator;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 30;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 30, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.record_host = true;
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, EncRoute);
+    var rr = [_]EncRoute{.{}};
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rr }, &c);
+    defer ex.deinit();
+    // 20 tokens x top-6 over 30 experts in waves of 3 rows: about 40 outputs.
+    const n: u32 = 20;
+    const k: u32 = 6;
+    var ids: [20 * 6]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i / k) * 5 + (i % k) * 7) % 30);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    const first = g.nodes.items.len;
+    const parts = try ex.at(0).routedParts(&g, try g.input(&.{ @intCast(n), 64 }, .bfloat16), try g.input(&.{ @intCast(n), @intCast(k) }, .int32));
+    defer ex.at(0).releaseParts(&g);
+    const jl = &ex.wide.jl;
+    const n_out = jl.rows.items.len;
+    try testing.expect(n_out > Ex.max_parts);
+    try testing.expectEqual(@as(usize, Ex.max_parts), parts.outs.len);
+    // One concatenate: the smallest n - 23 outputs' rows, the last source.
+    var merged_rows: c_int = 0;
+    var max_merged: u32 = 0;
+    var min_in_place: u32 = std.math.maxInt(u32);
+    for (jl.rows.items, jl.src.items) |r, s| {
+        if (s == Ex.max_parts - 1) {
+            merged_rows += @intCast(r);
+            max_merged = @max(max_merged, r);
+        } else min_in_place = @min(min_in_place, r);
+    }
+    try testing.expect(max_merged <= min_in_place);
+    var n_cat: usize = 0;
+    for (g.nodes.items[first..]) |nd| n_cat += @intFromBool(nd.op == .concat);
+    try testing.expectEqual(@as(usize, 1), n_cat);
+    try testing.expectEqual(merged_rows, g.shapeOf(parts.outs[Ex.max_parts - 1]).dim(0));
+    const call = for (&src.calls) |*cl| {
+        if (cl.plan.n_ids > 0 and cl.plan.n_ids == ex.wide.distinct.items.len) break cl;
+    } else return error.NoCall;
+    const loc = ex.wide.loc.items;
+    for (ids, 0..) |e, q| {
+        const s_: usize = @intCast(loc[2 * q]);
+        const r_: usize = @intCast(loc[2 * q + 1]);
+        const bytes = g.hostBytesOf(parts.outs[s_]) orelse return error.NoHostBytes;
+        const row = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(bytes)))[r_ * EncRoute.hidden ..][0..3];
+        const ref = call.refs[@intCast(ex.wide.first.items[e])];
+        try testing.expectEqual(@as(f32, @floatFromInt(q / k)), row[0]);
+        try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), row[1]);
+        try testing.expectEqual(@as(f32, @floatFromInt(ex.banks[0][@backingInt(ref.bank)].?.gate.code)), row[2]);
+    }
+}
+
+// Inside a guarded window only: DSV41_PHASE0B_MLX=1 and DSV41_BANK (the real records). Device memory under 3 GB:
+// 32 slot rows 0.43 GB, act 0.04 GB, the 51 outputs 0.50 GB, the three source sets at most 1.28 GB, the three
+// combines and the shared rows 0.34 GB.
+test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's sources equals the full concatenate's on real records, bit for bit" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse {
+        std.debug.print("\njoinless merge smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
+        return error.TestUnexpectedResult;
+    });
+    const ks = @import("kernel_set.zig");
+    const dkr = @import("dsv41_kernel_routes.zig");
+    const G = ops.MlxOps;
+    const T = G.T;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("kernel set refused: {s}\n", .{kd.message()});
+        return e;
+    };
+    defer set.deinit();
+    set.install(G, &g);
+    defer ks.Set.uninstall(G, &g);
+    // layer 0's first 16 experts, read by the stream into its 16 persistent MLX rows (the base bank)
+    var bdiag: expert_bank.Diag = .{};
+    var bank = expert_bank.Bank.open(a, testing.io, dir, expert_bank.dsv41, &bdiag) catch |e| {
+        std.debug.print("bank refused: {s}\n", .{bdiag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const n_experts = 16;
+    var base_rows: [40]u32 = @splat(0);
+    base_rows[0] = n_experts;
+    const st = try expert_stream.Stream.init(a, &bank, .{ .rows = &base_rows, .max_route_ids = n_experts, .transient_rows = n_experts, .slot_memory = .{ .mlx = s } });
+    defer st.deinit();
+    var ids: [n_experts]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(i);
+    const route = try st.route(0, &ids, &.{});
+    defer st.release(route);
+    for (0..route.n_parts) |p| {
+        try st.waitGu(route, @intCast(p));
+        try st.waitDown(route, @intCast(p));
+    }
+    var refs: [max_route_ids]SlotRef = undefined;
+    const rf = st.refsOf(route, &refs);
+    try testing.expectEqual(@as(usize, n_experts), rf.len);
+    for (rf) |r| try testing.expectEqual(BankKind.base, r.bank);
+    const sb = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    const bk: BankArraysOf(T) = .{
+        .gate = .{ .code = sb.gate.code, .rout = sb.gate.rout, .rin = sb.gate.rin },
+        .up = .{ .code = sb.up.code, .rout = sb.up.rout, .rin = sb.up.rin },
+        .down = .{ .code = sb.down.code, .rout = sb.down.rout, .rin = sb.down.rin },
+    };
+    // 4,096 tokens x top-6 in seven calls (a hot one, then six), waves of 2 experts: 51 outputs, L1's count.
+    const n_tok = 4096;
+    const n_ids = n_tok * 6;
+    const call_experts = [_]usize{ 16, 16, 16, 14, 12, 11, 15 };
+    var n_rows: [100]u32 = undefined;
+    {
+        var i: usize = 0;
+        var sum: u32 = 0;
+        for (call_experts, 0..) |ne, c| for (0..ne) |j| {
+            n_rows[i] = (if (c == 0) @as(u32, 420) else 160) + @as(u32, @intCast((c * 7 + j * 5) % 9)) * 11;
+            sum += n_rows[i];
+            i += 1;
+        };
+        n_rows[i - 1] = n_rows[i - 1] + n_ids - sum;
+    }
+    const xs = try a.alloc(f32, n_tok * 5120);
+    defer a.free(xs);
+    var h: u64 = 0x9e3779b97f4a7c15;
+    for (xs) |*v| {
+        h = h *% 6364136223846793005 +% 1442695040888963407;
+        const u_1: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 40)))) / 16777216.0;
+        const u_2: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 16)) & 0xffffff)) / 16777216.0;
+        v.* = (u_1 + u_2 - 1.0) * 2.0;
+    }
+    const act = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ n_tok, 5120 }, .float32), .bfloat16);
+    var dxp = try xq.DigXPrefill(G).init(a, &set.reg, .{ .wave = 2, .inflight = xq.PrefillShape.tier.inflight, .row_budget = xq.PrefillShape.tier.row_budget, .carry_rows = xq.PrefillShape.tier.carry_rows }, &kd);
+    defer dxp.deinit(&g);
+    var outs: std.ArrayList(T) = .empty;
+    defer {
+        for (outs.items) |x| g.release(x);
+        outs.deinit(a);
+    }
+    var jpos: std.ArrayList(u32) = .empty;
+    defer jpos.deinit(a);
+    {
+        var slot: std.ArrayList(u32) = .empty;
+        defer slot.deinit(a);
+        var act_row: std.ArrayList(u32) = .empty;
+        defer act_row.deinit(a);
+        var call_pos: std.ArrayList(u32) = .empty;
+        defer call_pos.deinit(a);
+        var wave_pos: std.ArrayList(u32) = .empty;
+        defer wave_pos.deinit(a);
+        // The assignments in a fixed permutation (7919 is prime to 24,576), each expert's run of them in turn.
+        var q: usize = 0;
+        var e: usize = 0;
+        for (call_experts) |ne| {
+            slot.clearRetainingCapacity();
+            act_row.clearRetainingCapacity();
+            call_pos.clearRetainingCapacity();
+            for (0..ne) |j| {
+                for (0..n_rows[e]) |_| {
+                    const p: u32 = @intCast((q * 7919) % n_ids);
+                    q += 1;
+                    try slot.append(a, rf[j].row);
+                    try act_row.append(a, p / 6);
+                    try call_pos.append(a, p);
+                }
+                e += 1;
+            }
+            wave_pos.clearRetainingCapacity();
+            try dxp.callParts(&g, act, .{ .slot = slot.items, .act_row = act_row.items }, bk, a, &outs, &wave_pos);
+            for (wave_pos.items) |wp| try jpos.append(a, call_pos.items[wp]);
+        }
+    }
+    try dxp.finish(&g);
+    try g.evalAll(outs.items);
+    const n_out = outs.items.len;
+    try testing.expectEqual(@as(usize, 51), n_out);
+    try testing.expectEqual(@as(usize, n_ids), jpos.items.len);
+    const rows = try a.alloc(u32, n_out);
+    defer a.free(rows);
+    for (outs.items, rows) |x, *r| r.* = @intCast(g.shapeOf(x).dim(0));
+    // 1. the full concatenate: one source, each assignment at its join row
+    const full = g.keep(try g.concat(outs.items, 0));
+    defer g.release(full);
+    const inv = try a.alloc(u32, n_ids);
+    defer a.free(inv);
+    invertPositions(jpos.items, inv);
+    const loc_full = try a.alloc(i32, 2 * n_ids);
+    defer a.free(loc_full);
+    for (inv, 0..) |r, p| {
+        loc_full[2 * p] = 0;
+        loc_full[2 * p + 1] = @intCast(r);
+    }
+    // 2. the adjacent runs (the merge before the minimal copy)
+    const a_src = try a.alloc(u8, n_out);
+    defer a.free(a_src);
+    const a_off = try a.alloc(u32, n_out);
+    defer a.free(a_off);
+    const n_old = planAdjacentRuns(rows, a_src, a_off);
+    var old: std.ArrayList(T) = .empty;
+    defer {
+        for (old.items) |x| g.release(x);
+        old.deinit(a);
+    }
+    var copied_old: u64 = 0;
+    {
+        var o: usize = 0;
+        while (o < n_out) {
+            var end = o + 1;
+            while (end < n_out and a_src[end] == a_src[o]) end += 1;
+            if (end - o == 1) {
+                try old.append(a, g.keep(outs.items[o]));
+            } else {
+                try old.append(a, g.keep(try g.concat(outs.items[o..end], 0)));
+                for (rows[o..end]) |r| copied_old += r;
+            }
+            o = end;
+        }
+    }
+    try testing.expectEqual(n_old, old.items.len);
+    const loc_old = try a.alloc(i32, 2 * n_ids);
+    defer a.free(loc_old);
+    fillJoinlessLoc(rows, a_src, a_off, jpos.items, loc_old);
+    // 3. the minimal copy: the lane's merge over its own handles of the same outputs
+    var cur: std.ArrayList(T) = .empty;
+    defer {
+        for (cur.items) |x| g.release(x);
+        cur.deinit(a);
+    }
+    for (outs.items) |x| try cur.append(a, g.keep(x));
+    var sc: JoinlessScratch(T) = .{};
+    defer sc.deinit(a);
+    const loc_new = try a.alloc(i32, 2 * n_ids);
+    defer a.free(loc_new);
+    const copied_new = try mergeJoinless(G, &g, a, &cur, jpos.items, loc_new, &sc);
+    try testing.expectEqual(@as(usize, joinless_sources), cur.items.len);
+    // The three combines over the same weights and shared rows.
+    const wv = try a.alloc(f32, n_ids);
+    defer a.free(wv);
+    for (wv, 0..) |*v, i| v.* = 0.05 + @as(f32, @floatFromInt((i * 2654435761) % 1000)) / 1100.0;
+    const shv = try a.alloc(f32, n_tok * 5120);
+    defer a.free(shv);
+    for (shv, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i64, @intCast((i * 40503) % 2001)) - 1000)) / 4096.0;
+    const w_arr = try g.hostArray(std.mem.sliceAsBytes(wv), &.{ n_tok, 6 }, .float32);
+    const sh_arr = try g.hostArray(std.mem.sliceAsBytes(shv), &.{ n_tok, 5120 }, .float32);
+    const jl = try dkr.JoinlessCombine(G).init(&set.reg, &.derived, &kd);
+    const locArr = struct {
+        fn f(gg: *G, l: []const i32) !T {
+            return gg.hostArray(std.mem.sliceAsBytes(l), &.{ n_tok, 6, 2 }, .int32);
+        }
+    }.f;
+    const y_full = try jl.call(&g, &.{full}, try locArr(&g, loc_full), w_arr, sh_arr);
+    const y_old = try jl.call(&g, old.items, try locArr(&g, loc_old), w_arr, sh_arr);
+    const y_new = try jl.call(&g, cur.items, try locArr(&g, loc_new), w_arr, sh_arr);
+    try g.evalAll(&.{ y_full, y_old, y_new });
+    const words = n_tok * 5120;
+    const buf = try a.alloc(f32, 3 * words);
+    defer a.free(buf);
+    const vf = try g.hostF32(y_full, buf[0..words]);
+    const vo = try g.hostF32(y_old, buf[words .. 2 * words]);
+    const vn = try g.hostF32(y_new, buf[2 * words ..]);
+    var bad_old: usize = 0;
+    var bad_new: usize = 0;
+    var finite: usize = 0;
+    for (vf, vo, vn) |x, y, z| {
+        bad_old += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+        bad_new += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(z)));
+        finite += @intFromBool(std.math.isFinite(x));
+    }
+    var merged: usize = 0;
+    for (sc.src.items) |sx| merged += @intFromBool(sx == joinless_sources - 1);
+    std.debug.print("\nJOINLESS_MERGE_SMOKE {{\"outputs\":{d},\"rows\":{d},\"sources_new\":{d},\"sources_old\":{d},\"merged_outputs\":{d},\"copied_rows_new\":{d},\"copied_rows_old\":{d},\"copied_bytes_new\":{d},\"copied_bytes_old\":{d},\"words\":{d},\"finite\":{d},\"mismatch_new_vs_full\":{d},\"mismatch_old_vs_full\":{d}}}\n", .{ n_out, n_ids, cur.items.len, old.items.len, merged, copied_new, copied_old, copied_new * 5120 * 4, copied_old * 5120 * 4, words, finite, bad_new, bad_old });
+    try testing.expectEqual(@as(usize, 0), bad_old);
+    try testing.expectEqual(@as(usize, 0), bad_new);
+    try testing.expectEqual(@as(usize, words), finite);
 }

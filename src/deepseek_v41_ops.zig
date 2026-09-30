@@ -1108,7 +1108,7 @@ pub const TraceOps = struct {
     /// The regions `prepareTape` compiled, by context.
     regions: [n_regions][contexts_per_region]?*const anyopaque = @splat(@splat(null)),
     /// When set, `hostArray` keeps a copy of its bytes (`hostBytesOf`), so a
-    /// test can compare what a graph was fed.
+    /// test can compare what a graph was fed; so does a row `concat` of such arrays.
     record_host: bool = false,
     host_data: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// Region traces: a region called with inputs of a signature (shapes and
@@ -1718,7 +1718,27 @@ pub const TraceOps = struct {
             out.d[a] += s.d[a];
             dt = promote(dt, g.dtypeOf(x));
         }
-        return g.push(.concat, dt, out);
+        const y = try g.push(.concat, dt, out);
+        if (g.record_host and a == 0) try g.recordRows(y, xs);
+        return y;
+    }
+
+    /// A row concatenate's bytes, when every input has recorded bytes of the output's dtype.
+    fn recordRows(g: *TraceOps, y: T, xs: []const T) !void {
+        var n: usize = 0;
+        for (xs) |x| {
+            if (g.dtypeOf(x) != g.dtypeOf(y)) return;
+            n += (g.host_data.get(x) orelse return).len;
+        }
+        const bytes = try g.gpa.alloc(u8, n);
+        errdefer g.gpa.free(bytes);
+        var at: usize = 0;
+        for (xs) |x| {
+            const b = g.host_data.get(x).?;
+            @memcpy(bytes[at..][0..b.len], b);
+            at += b.len;
+        }
+        try g.host_data.put(g.gpa, y, bytes);
     }
 
     pub fn stack(g: *TraceOps, xs: []const T, axis: c_int) !T {

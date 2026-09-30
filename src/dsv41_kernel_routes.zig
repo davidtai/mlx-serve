@@ -1168,10 +1168,9 @@ pub fn JoinlessCombine(comptime G: type) type {
             return .{ .e = reg.get(.q3jl_combine) };
         }
 
-        /// outs: the layer's routed call outputs in join order (1..24, each f32 [r_i, 5120]; a layer
-        /// with more concatenates adjacent outputs first, as the lane does), loc int32 [n, 6, 2] (the
-        /// (source, row) of each assignment: the inverse join order split by the outputs' row
-        /// offsets), weights f32 [n, 6], shared f32 [n, 5120] -> f32 [n, 5120].
+        /// outs: the layer's routed outputs as sources (1..24, each f32 [r_i, 5120]; a layer with more
+        /// merges its smallest first, `deepseek_v41_experts.mergeJoinless`), loc int32 [n, 6, 2] (the
+        /// (source, row) of each assignment), weights f32 [n, 6], shared f32 [n, 5120] -> f32 [n, 5120].
         pub fn call(self: *const Self, g: *G, outs: []const G.T, loc: G.T, weights: G.T, shared: G.T) !G.T {
             if (outs.len == 0 or outs.len > sources) return error.RouteInput;
             var ins: [sources + 3]G.T = undefined;
