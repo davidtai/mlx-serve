@@ -1463,6 +1463,9 @@ pub const Generator = struct {
     dspark_stochastic: bool = false,
     /// The armed lane `nextDspark` runs its rounds on (set with `dspark_enabled`).
     native_draft: ?NativeDraft = null,
+    /// The arch's prefill-to-decode handover is still due (`beginDecode`): set at construction from
+    /// `Transformer.decodeHandoverWanted` (dsv41's phase change), cleared by the request's first decode step.
+    decode_handover_due: bool = false,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
 
@@ -3239,6 +3242,7 @@ pub const Generator = struct {
             }
             var gen = Generator{
                 .xfm = xfm,
+                .decode_handover_due = xfm.decodeHandoverWanted(),
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3291,6 +3295,7 @@ pub const Generator = struct {
                 0;
             var gen = Generator{
                 .xfm = xfm,
+                .decode_handover_due = xfm.decodeHandoverWanted(),
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3359,7 +3364,7 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and the
         // PLD / drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward) {
+        if (options.skip_lazy_preforward or xfm.decodeHandoverWanted()) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -3373,6 +3378,7 @@ pub const Generator = struct {
 
             var gen = Generator{
                 .pending_logprob = first_lp,
+                .decode_handover_due = xfm.decodeHandoverWanted(),
                 .xfm = xfm,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
@@ -3430,6 +3436,7 @@ pub const Generator = struct {
 
         var gen = Generator{
             .pending_logprob = first_lp,
+            .decode_handover_due = xfm.decodeHandoverWanted(),
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
@@ -3944,8 +3951,22 @@ pub const Generator = struct {
     /// `deepseek_v4.dsparkRound`; this wrapper only keeps the Generator's
     /// bookkeeping (generated_ids, step accounting, the shell cache.step
     /// that forwardDsv4WithImpl keys fresh-vs-decode on) in sync.
+    /// The arch's prefill-to-decode handover (`Transformer.decodeHandover`), once, at the request's first decode
+    /// step: the first thing `next` and `nextDspark` do, the only decode entries a handover arch reaches (module
+    /// archs keep PLD, drafters, MTP and DFlash off). The prompt's clock (prefill_ns, TTFT) never includes it.
+    fn beginDecode(self: *Generator) !void {
+        if (!self.decode_handover_due) return;
+        self.decode_handover_due = false;
+        try self.xfm.decodeHandover(.{
+            .prompt_tokens = self.prompt_tokens,
+            .reserved_tokens = @as(u64, self.prompt_tokens) + self.max_tokens,
+            .native_draft = self.dspark_enabled,
+        });
+    }
+
     pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
+        try self.beginDecode();
         if (!self.dspark_enabled) {
             // Same defensive fallback as nextPld's disarmed arm: the
             // dispatching caller's flag alone must never run a draft.
@@ -11521,6 +11542,7 @@ pub const Generator = struct {
     ///   where y.item() is instant because async_eval forced y's computation.
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.done) return null;
+        try self.beginDecode();
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
@@ -21699,4 +21721,30 @@ test "keyed sampling draws the softmax distribution" {
         counts[@intCast(v)] += 1;
     }
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
+}
+
+test "dsv41 handover: every Generator construction reads the arch's handover, and the decode entries it reaches open with it" {
+    const src = @embedFile("generate.zig");
+    // Each Generator literal in init sets the flag from the arch (a construction without it would leave a
+    // handover arch refusing its first round by name). Needles are split with `++` so this test never matches itself.
+    const literal = "var gen = " ++ "Generator{";
+    const flag = ".decode_handover_due = xfm.decodeHandoverWanted(),";
+    var literals: usize = 0;
+    var flagged: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, literal)) |i| : (at = i + literal.len) {
+        literals += 1;
+        const body = src[i..@min(src.len, i + 400)];
+        if (std.mem.indexOf(u8, body, flag) != null) flagged += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), literals);
+    try std.testing.expectEqual(literals, flagged);
+    // The serial step and the native draft rounds run the handover before anything else they do.
+    inline for (.{ "pub fn next" ++ "(self: *Generator, allocator: std.mem.Allocator) !?u32 {", "pub fn nextDspark" ++ "(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {" }) |sig| {
+        const i = std.mem.indexOf(u8, src, sig) orelse return error.EntryMoved;
+        const head = src[i + sig.len ..][0..96];
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, head, " \n"), "if (self.done) return null;\n        try self.beginDecode();"));
+    }
+    // A handover arch never pre-forwards t1 inside init (its first forward follows the handover).
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (options.skip_lazy_preforward" ++ " or xfm.decodeHandoverWanted()) {") != null);
 }

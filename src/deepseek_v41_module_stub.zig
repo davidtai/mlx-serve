@@ -21,6 +21,9 @@ pub const Module = struct {
     pub fn extend(_: *Module, _: []const u32) !mlx.mlx_array {
         return error.Dsv41NotBuiltForThisTarget;
     }
+    pub fn decodeHandover(_: *Module, _: model_io.DecodeHandover) !void {
+        return error.Dsv41NotBuiltForThisTarget;
+    }
     pub const DsparkRound = struct {
         tokens: []u32,
         accepted: u32,

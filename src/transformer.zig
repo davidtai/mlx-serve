@@ -19421,6 +19421,32 @@ pub const Transformer = struct {
         return false;
     }
 
+    /// Upstream's prefill-to-decode handover (`model.DecodeHandover`) for the module-owned-state archs whose module
+    /// takes one (dsv41: its phase change); a no-op for every other arch. Once per request, at the request's first
+    /// decode step, from the Generator (`beginDecode`), never inside prefill.
+    pub fn decodeHandover(self: *Transformer, h: model_mod.DecodeHandover) !void {
+        inline for (module_owned_state_fields) |f| {
+            if (comptime takesDecodeHandover(f)) {
+                if (@field(self, f)) |m| return m.decodeHandover(h);
+            }
+        }
+    }
+
+    /// Whether this model's arch takes the handover: read once, at a Generator's construction.
+    pub fn decodeHandoverWanted(self: *const Transformer) bool {
+        inline for (module_owned_state_fields) |f| {
+            if (comptime takesDecodeHandover(f)) {
+                if (@field(self, f) != null) return true;
+            }
+        }
+        return false;
+    }
+
+    fn takesDecodeHandover(comptime f: []const u8) bool {
+        const Ptr = @typeInfo(@FieldType(Transformer, f)).optional.child;
+        return @hasDecl(@typeInfo(Ptr).pointer.child, "decodeHandover");
+    }
+
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
         inline for (module_shared_readonly_fields) |f| {
             if (@field(self, f) != null) return true;
@@ -61855,6 +61881,17 @@ test "every optional arch-module pointer on Transformer is a declared module-own
     }
     // A scan that matches nothing passes vacuously — pin the known count.
     try testing.expectEqual(Transformer.module_owned_state_fields.len + Transformer.module_shared_readonly_fields.len, found);
+}
+
+test "dsv41 handover: the decode handover dispatches to the module-owned archs that take one (dsv41), a no-op elsewhere" {
+    // dsv41's module takes it; dsv4's does not (its state has no phases).
+    try testing.expect(comptime Transformer.takesDecodeHandover("dsv41"));
+    try testing.expect(!(comptime Transformer.takesDecodeHandover("dsv4")));
+    // No module installed: nothing wants it and the call is a no-op.
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    try testing.expect(!xfm.decodeHandoverWanted());
+    try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = false });
 }
 
 test "every generative forward arm splices vision embeddings" {
