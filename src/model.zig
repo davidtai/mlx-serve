@@ -443,6 +443,9 @@ pub const ModelConfig = struct {
     /// P1b: the seed's deferred base call run as soon as the seed has landed (`expert_wide_base_at_seed`; null =
     /// on wherever the wide seed and the deferred base call both are).
     expert_wide_base_at_seed: ?bool = null,
+    /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group
+    /// (`expert_wide_seed_aligned`; null = on wherever P1b's base call at the seed and the hottest-first order are).
+    expert_wide_seed_aligned: ?bool = null,
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
@@ -710,7 +713,7 @@ pub const ModelConfig = struct {
 
     /// The served tier reads 3 groups ahead (P1's v1b: the SSD kept busy through the routed stage's drains).
     pub fn dsv41WideDepth(self: *const ModelConfig) u8 {
-        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 3 else 1;
+        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 5 else 1;
     }
 
     pub fn dsv41WideFeed(self: *const ModelConfig) bool {
@@ -739,6 +742,11 @@ pub const ModelConfig = struct {
     /// P1b's base call at the seed: the setting, else on wherever the wide seed and the deferred base call both are.
     pub fn dsv41WideBaseAtSeed(self: *const ModelConfig) bool {
         return self.expert_wide_base_at_seed orelse (self.dsv41WideSeed() and self.dsv41WideDeferBase());
+    }
+
+    /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
+    pub fn dsv41WideSeedAligned(self: *const ModelConfig) bool {
+        return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {

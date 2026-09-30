@@ -626,7 +626,7 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
 // DSV41_BANK=<bank> (host): the bill's transient rows are the arm's allocation. The stream allocates its transient
 // bank whole at construction, one max_route_ids window per wide read in flight (Arm.init: `.transient_rows =
 // wide_depth x max_route_ids`; the admission's record of the rows past the first window is `wideWindowBytes`). On
-// the served tier (wide depth 3, P1's v1b) that is 144 rows: 96 records more than the one window billed until c47001e.
+// the served tier (wide depth 5, P1c) that is 240 rows: 192 records more than the one window billed until c47001e.
 test "dsv41 memory: the bill's transient rows are the arm's allocation, every window (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -642,7 +642,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const opts = module.armOptions(&config, module.boxCeiling(ceiling, c.n_routed_experts), .host);
-    try testing.expectEqual(@as(u8, 3), opts.wide_depth);
+    try testing.expectEqual(@as(u8, 5), opts.wide_depth);
     try testing.expectEqual(@as(u64, opts.wide_depth) * xp.max_route_ids, b.transient_rows);
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
     try testing.expectEqual(@as(u64, 13_315_584), rec);
@@ -650,7 +650,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + 144) * rec, b.slot_prefill);
     // The windows past the first: 2 x 48 records, 1,278,296,064 B (the second, 639,148,032 B, was the 10b
     // construction's unbilled MLX active less ~3.8 MB; v1b's third is as large).
-    try testing.expectEqual(@as(u64, 1_278_296_064), arm_mod.wideWindowBytes(opts.wide_depth, rec));
+    try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
 }
 
 /// The fastest cell at the full admission (served-cell-typical-fastest-20260929-172908): the guard's

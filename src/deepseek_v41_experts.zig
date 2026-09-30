@@ -226,6 +226,11 @@ pub const StreamSource = struct {
         return self.stream.seedPrefill(layer, ids);
     }
 
+    /// The last seedPrefill's seed ranks (`LayerPolicy.seed_ranks`).
+    pub fn seedRanks(self: *const StreamSource, layer: u32) u32 {
+        return self.stream.seedRanks(layer);
+    }
+
     /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`).
     pub fn readAheadSeed(self: *StreamSource, layer: u32, experts: []const u16) !void {
         return self.stream.readAheadSeed(layer, experts);
@@ -433,6 +438,10 @@ pub const FakeSource = struct {
     pub fn seedPrefill(self: *FakeSource, layer: u32, ids: []const u16) !void {
         if (self.phase != .prefill) return error.NotPrefill;
         self.policies[layer].prepareSeed(ids);
+    }
+
+    pub fn seedRanks(self: *const FakeSource, layer: u32) u32 {
+        return self.policies[layer].seed_ranks;
     }
 
     /// P1: the Stream's admission (`LayerPolicy.admitReadAhead`), no reads; `part` = experts admitted.
@@ -947,6 +956,10 @@ pub const Wide = struct {
     /// group with a transient row), so the later groups' reads overlap its drain; later base rows run in a last call.
     /// Exact: the same rows, slots and kernels; only the call's place in the schedule changes.
     base_at_seed: bool = false,
+    /// With `base_at_seed`: the seed's ranks grouped apart from the stream's (the last seed group holds no stream
+    /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
+    /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
+    seed_aligned: bool = false,
     pub const max_cold_rows = 8;
 };
 
@@ -1051,6 +1064,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.defer_base and (wr.cold_rows > 0 or !routes.prefill or comptime !@hasDecl(S, "holdBase"))) return error.InvalidWideRoute;
             if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
+            if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1446,6 +1460,23 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.wide.kept.clearRetainingCapacity();
         }
 
+        /// A wide call's groups over its experts hottest first: the seed's ranks [0, sa) chunked apart from the stream's
+        /// (`Wide.seed_aligned`; sa 0: one run of `max_route_ids` chunks).
+        const Groups = struct {
+            d: []const u16,
+            sa: usize,
+            seed_groups: usize,
+
+            fn start(gs: Groups, gi: usize) usize {
+                return if (gi < gs.seed_groups) gi * max_route_ids else gs.sa + (gi - gs.seed_groups) * max_route_ids;
+            }
+
+            fn of(gs: Groups, gi: usize) []const u16 {
+                const s0 = gs.start(gi);
+                return gs.d[s0..@min(s0 + max_route_ids, if (gi < gs.seed_groups) gs.sa else gs.d.len)];
+            }
+        };
+
         /// The deferred base-bank rows gathered so far as one call's waves, drained; their slots stay held. `at_seed`:
         /// P1b's call at the seed (the profile's split charges it apart from the end call's).
         fn deferredBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool, at_seed: bool) !void {
@@ -1526,8 +1557,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_act.clearRetainingCapacity();
             w.def_pos.clearRetainingCapacity();
             const n_distinct = w.distinct.items.len;
-            const n_groups = (n_distinct + max_route_ids - 1) / max_route_ids;
-            // P1b: the seed's base call is due after its last group (the first with a transient row).
+            // Seed-aligned: the seed's ranks [0, sa) in groups of their own, the stream's after them (sa 0: one run).
+            const aligned = self.wide_route.seed_aligned;
+            const sa: usize = if (comptime @hasDecl(S, "seedRanks")) (if (aligned) @min(self.source.seedRanks(layer), n_distinct) else 0) else 0;
+            const groups: Groups = .{ .d = w.distinct.items, .sa = sa, .seed_groups = (sa + max_route_ids - 1) / max_route_ids };
+            const n_groups = groups.seed_groups + (n_distinct - sa + max_route_ids - 1) / max_route_ids;
+            // P1b: the seed's base call is due after its last group (aligned: the last seed group; else the first group
+            // with a transient row).
             var base_due = self.wide_route.base_at_seed;
             // The live groups' calls, by group index mod `depth` (read ahead up to `depth` groups).
             var calls: [expert_stream.max_wide_depth]?*S.Call = @splat(null);
@@ -1540,17 +1576,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 w.kept.clearRetainingCapacity();
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) self.source.releaseHeld();
             }
-            const groupOf = struct {
-                fn f(d: []const u16, gi: usize) []const u16 {
-                    return d[gi * max_route_ids .. @min((gi + 1) * max_route_ids, d.len)];
-                }
-            }.f;
             tp = prof.now();
-            for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi), &.{});
+            for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groups.of(gi), &.{});
             prof.charge(.route, tp);
             for (0..n_groups) |gi| {
-                const start = gi * max_route_ids;
-                const group = groupOf(w.distinct.items, gi);
+                const start = groups.start(gi);
+                const group = groups.of(gi);
                 const call = calls[gi % depth].?;
                 const sv = self.source.served(call);
                 tp = prof.now();
@@ -1640,10 +1671,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) try self.source.holdBase(call);
                 self.source.release(call);
                 calls[gi % depth] = null;
-                if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
+                if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groups.of(gi + depth), &.{});
                 prof.charge(.route, tp);
                 // P1b: the seed has landed (its groups read, the next routes' reads posted): its base call drains now.
-                if (base_due and streamed) {
+                if (base_due and (if (aligned) gi + 1 == groups.seed_groups else streamed)) {
                     base_due = false;
                     try self.deferredBase(g, layer, act, parts, true);
                 }
@@ -1743,7 +1774,7 @@ fn testConfig(hidden: u32, inter: u32, n_layers: u8) v41.Config {
 test "dsv41 experts: the fake and the stream adapter are expert sources" {
     comptime assertSource(StreamSource);
     comptime assertSource(FakeSource);
-    try testing.expectEqual(@as(usize, 4), StreamSource.n_routes);
+    try testing.expectEqual(@as(usize, expert_stream.max_wide_depth + 1), StreamSource.n_routes);
 }
 
 test "dsv41 experts: a decode call runs the residents, then each part's gate/up after waitGu and its down after waitDown" {
@@ -3142,6 +3173,122 @@ test "dsv41 experts: P1b at wide depth 3: the seed's base call runs with the lat
     };
     try testing.expectEqual(@as(usize, 1), n_base);
     try testing.expectEqual(@as(u64, 3), s.stats().route_calls);
+}
+
+test "dsv41 experts: wide depth 5 (the served default): five groups live, the read-ahead landed before the seed, every routed row served from its record" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(256);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 256;
+    // 120 tokens x top-6, token t's j-th expert (j * 40 + t) mod 240: every expert 3 rows, hottest first = by id; five
+    // groups of the feed, every one routed at the barrier (five windows).
+    const n = 120;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 40 + i / k) % 240);
+    const depth = expert_stream.max_wide_depth;
+    try testing.expectEqual(@as(u8, 5), depth);
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 1024 }, .wide_depth = depth, .transient_rows = depth * max_route_ids });
+    defer s.deinit();
+    StreamRec.stream = s;
+    defer StreamRec.stream = null;
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var rrs = [_]StreamRec{StreamRec.init(a)};
+    defer rrs[0].deinit(&g);
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .hot_first = true, .depth = depth, .read_ahead = true, .defer_base = true, .base_at_seed = true } });
+    defer ex.deinit();
+    StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+    StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+    var predicted: [16]u16 = undefined;
+    for (&predicted, 0..) |*e, i| e.* = @intCast(i * 7);
+    try ex.at(0).readAheadSeed(&predicted);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+    try ex.flush();
+    try testing.expect(!s.ahead.live);
+    // Exact: every routed row once, computed from its own expert's record with its token.
+    var seen: [n * k]bool = @splat(false);
+    for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+        const row = for (0..k) |j| {
+            const i = t * k + j;
+            if (ids[i] == e and !seen[i]) break i;
+        } else return error.RowNotRouted;
+        seen[row] = true;
+    };
+    for (seen) |x| try testing.expect(x);
+    // Five groups routed, all live before the first group's waves (the windows' reads in flight).
+    try testing.expectEqual(@as(u64, 5), s.stats().route_calls);
+    var max_live: u32 = 0;
+    for (rrs[0].recs.items) |r| max_live = @max(max_live, r.live);
+    try testing.expectEqual(@as(u32, 5), max_live);
+}
+
+test "dsv41 experts: P1c: the seed-aligned groups put the seed's base call ahead of every stream wave, every routed row from its record" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    // 60 tokens x top-6 over 120 experts, 3 rows each: hottest first = by id. The 16 persistent rows take the seed
+    // (experts 0-15). Aligned: the seed's group (0-15), then the stream's (16-63, 64-111, 112-119). P1b's one run: the
+    // first group (0-47) holds the seed and 32 stream records, whose waves precede its base call.
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 20 + i / k) % 120);
+    for ([_]bool{ false, true }) |aligned| {
+        const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = 3, .transient_rows = 3 * max_route_ids });
+        defer s.deinit();
+        StreamRec.stream = s;
+        defer StreamRec.stream = null;
+        var src = StreamSource.init(s);
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var rrs = [_]StreamRec{StreamRec.init(a)};
+        defer rrs[0].deinit(&g);
+        const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+        const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+        var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .base_at_seed = true, .seed_aligned = aligned } });
+        defer ex.deinit();
+        StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+        StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+        var script: Script = .{ .calls = &.{&ids} };
+        g.host_values = script.values();
+        _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+        try ex.flush();
+        try testing.expectEqual(@as(u32, 16), s.seedRanks(0));
+        // Exact: every routed row once, computed from its own expert's record with its token.
+        var seen: [n * k]bool = @splat(false);
+        for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+            const row = for (0..k) |j| {
+                const i = t * k + j;
+                if (ids[i] == e and !seen[i]) break i;
+            } else return error.RowNotRouted;
+            seen[row] = true;
+        };
+        for (seen) |x| try testing.expect(x);
+        // The one base call: aligned, the first call of all, with the three stream groups' routes live (their reads
+        // posted); P1b's one run, after the first group's stream waves, with the two later groups live.
+        const recs = rrs[0].recs.items;
+        var bi: usize = recs.len;
+        for (recs, 0..) |r, i| if (r.base) {
+            try testing.expectEqual(recs.len, bi);
+            bi = i;
+        };
+        try testing.expectEqual(@as(usize, if (aligned) 0 else 1), bi);
+        try testing.expectEqual(@as(u32, if (aligned) 3 else 2), recs[bi].live);
+        try testing.expectEqual(@as(u64, if (aligned) 4 else 3), s.stats().route_calls);
+    }
 }
 
 test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {

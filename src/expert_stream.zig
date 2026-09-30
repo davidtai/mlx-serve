@@ -392,10 +392,10 @@ pub const Route = struct {
     }
 };
 
-/// The route being served plus released ones awaiting the next flush.
-const route_capacity = 4;
-/// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1's v1b: 3, the served default).
-pub const max_wide_depth = 3;
+/// The route being served plus released ones awaiting the next flush: every wide window live, and one more.
+const route_capacity = max_wide_depth + 1;
+/// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default).
+pub const max_wide_depth = 5;
 const wait_timeout_ns: i64 = 60 * std.time.ns_per_s;
 
 /// Expert residency for one model: per-layer persistent slot pools at the
@@ -681,6 +681,24 @@ pub const Stream = struct {
     pub fn releaseHeld(self: *Stream) void {
         for (self.held_base.items) |s| self.locate(self.held_layer, s).meta.pins -= 1;
         self.held_base.clearRetainingCapacity();
+    }
+
+    /// Construction's end: every layer's residents and prompt state forgotten (`LayerPolicy.forgetAll`: the warm-up's),
+    /// so a first prompt's seed and read-ahead start from empty rows. Slot bytes stay: a later load reuses them only on
+    /// an exact (layer, expert, slot) match. Refused while anything is live; returns the residents forgotten.
+    pub fn forgetResidents(self: *Stream) !u32 {
+        if (self.phase != .prefill) return error.NotPrefill;
+        try self.flush();
+        for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+        if (self.ahead.live or self.held_base.items.len > 0) return error.RoutesLive;
+        var n: u32 = 0;
+        for (self.layers) |*ls| n += ls.policy.forgetAll();
+        return n;
+    }
+
+    /// The last `seedPrefill` of `layer`: its seed's ranks (the call's hottest experts, hottest first).
+    pub fn seedRanks(self: *const Stream, layer: u32) u32 {
+        return self.layers[layer].policy.seed_ranks;
     }
 
     /// prepare_prefill_seed: the prompt's routed ids of `layer`, before its
@@ -1548,7 +1566,7 @@ test "dsv41 stream: routes the caller never releases run out, by name" {
     defer sb.close();
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
     defer s.deinit();
-    for (0..4) |_| _ = try serve(s, 0, &.{ 1, 2 });
+    for (0..route_capacity) |_| _ = try serve(s, 0, &.{ 1, 2 });
     try testing.expectError(error.RoutesExhausted, s.route(0, &.{ 1, 2 }, &.{}));
 }
 
@@ -2006,6 +2024,39 @@ test "dsv41 growth 0b: new slot memory's cost on the inference thread, zeros vs 
         bytes, zeros_ms, wrap_untouched_ms, use_untouched_ms, helper_ms, wrap_touched_ms, use_touched_ms, wb.no_copy, wc.no_copy,
     });
     try testing.expect(wb.no_copy and wc.no_copy);
+}
+
+test "dsv41 stream: the construction's forget: the warm-up's seeded residents cleared, the first prompt's seed takes every row and its read-ahead fills them" {
+    var sb = try SynthBank.open(64);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 8, 8 }, .pool = test_pool });
+    defer s.deinit();
+    // The warm-up's wide call on layer 0: its 6 experts seeded (protected) and read into the rows.
+    try s.seedPrefill(0, &.{ 40, 41, 42, 43, 44, 45, 40, 41 });
+    s.release(try serve(s, 0, &.{ 40, 41, 42, 43, 44, 45 }));
+    try s.flush();
+    try testing.expectEqual(@as(u32, 6), s.layers[0].policy.occupancy);
+    try testing.expectEqual(@as(usize, 6), s.layers[0].policy.protected.count());
+    // Kept, they would hold 6 of layer 0's 8 rows through a prompt (a seed of 8 - 6 = 2). Forgotten once:
+    try testing.expectEqual(@as(u32, 6), try s.forgetResidents());
+    for (s.layers) |*ls| {
+        try testing.expectEqual(@as(u32, 0), ls.policy.occupancy);
+        try testing.expectEqual(@as(usize, 0), ls.policy.protected.count());
+    }
+    // The first prompt: each layer's read-ahead posts every row and each seed takes every row (1..8 twice, 9 and 10 once).
+    const prompt = [_]u16{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 10 };
+    for (0..2) |l| {
+        try s.readAheadSeed(@intCast(l), &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 });
+        try s.seedPrefill(@intCast(l), &prompt);
+        try testing.expectEqual(@as(u32, 8), s.seedRanks(@intCast(l)));
+    }
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 2 * 8), st.ahead_posted);
+    try testing.expectEqual(@as(u64, 0), st.ahead_demand);
+    // Refused while anything is live.
+    const r = try serve(s, 0, &.{ 1, 2 });
+    try testing.expectError(error.RoutesLive, s.forgetResidents());
+    s.release(r);
 }
 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: SERVED13's kill (12 GB outside the footprint late in decode; the grow's

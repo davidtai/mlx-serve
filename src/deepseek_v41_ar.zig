@@ -871,6 +871,8 @@ const CellReceipt = struct {
     wide_read_ahead: ?bool = null,
     /// P1b's base call at the seed, as installed.
     wide_base_at_seed: ?bool = null,
+    /// P1c's seed-aligned groups, as installed.
+    wide_seed_aligned: ?bool = null,
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
     prefill_index: ?bool = null,
@@ -1161,6 +1163,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_cold_rows = md.installed.wide.cold_rows,
         .wide_read_ahead = md.installed.wide.read_ahead,
         .wide_base_at_seed = md.installed.wide.base_at_seed,
+        .wide_seed_aligned = md.installed.wide.seed_aligned,
         .prefill_attn = md.installed.prefill_attn,
         .prefill_index = md.installed.prefill_index,
         .prefill_hc = md.installed.prefill_hc,
@@ -1268,6 +1271,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_WIDE_BASE_AT_SEED")) |v| config.expert_wide_base_at_seed = try cellBool("DSV41_CELL_WIDE_BASE_AT_SEED", v);
+    if (envStr("DSV41_CELL_WIDE_SEED_ALIGNED")) |v| config.expert_wide_seed_aligned = try cellBool("DSV41_CELL_WIDE_SEED_ALIGNED", v);
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);

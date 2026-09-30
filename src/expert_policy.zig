@@ -78,6 +78,8 @@ pub const LayerPolicy = struct {
     protected: std.DynamicBitSetUnmanaged,
     /// The last `prepareSeed` call's routed rows per expert (P1's barrier tally reads them).
     call_counts: []u32,
+    /// The last `prepareSeed`'s chosen ranks: the call's hottest `seed_ranks` experts (count desc, ties by id).
+    seed_ranks: u32 = 0,
     /// Pool clock stamp of each resident expert (0 = none).
     recency: []u64,
     clock: u64 = 0,
@@ -224,9 +226,11 @@ pub const LayerPolicy = struct {
         }
         const empty: i64 = @as(i64, p.capacity) - @as(i64, @intCast(p.protected.count()));
         p.seed.unsetAll();
+        p.seed_ranks = 0;
         if (empty <= 0) return;
         const ranked = rankHottest(counts, p.candidates);
         const chosen = ranked[0..@min(ranked.len, @as(usize, @intCast(empty)))];
+        p.seed_ranks = @intCast(chosen.len);
         // Resident choices: re-protected in ascending count order (stable).
         var n_res: usize = 0;
         for (chosen) |e| if (p.expert_to_slot[e] != no_slot) {
@@ -245,6 +249,24 @@ pub const LayerPolicy = struct {
             p.recency[e] = p.clock;
         }
         for (chosen) |e| if (p.expert_to_slot[e] == no_slot) p.seed.set(e);
+    }
+
+    /// Forgets every resident and the prompt state (protection, the seed, the prompt counts, recency): what the
+    /// construction's warm-up leaves belongs to no prompt. Called once, nothing live; returns the residents forgotten.
+    pub fn forgetAll(p: *LayerPolicy) u32 {
+        const n = p.occupancy;
+        for (p.slot_to_expert) |*e| if (e.* != no_expert) {
+            p.expert_to_slot[e.*] = no_slot;
+            e.* = no_expert;
+        };
+        p.occupancy = 0;
+        p.protected.unsetAll();
+        p.seed.unsetAll();
+        p.seed_ranks = 0;
+        @memset(p.prefill_freq, 0);
+        @memset(p.recency, 0);
+        p.clock = 0;
+        return n;
     }
 
     /// The one phase change: `capacity` persistent slots from now on, the new
