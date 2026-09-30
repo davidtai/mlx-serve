@@ -576,11 +576,11 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
         // JOINLESS's minimal-copy merge billed at its bound (28 / 51 of the routed rows; the wave -0.908 GB) returns
-        // prompt rows (this tree before it: 9.20 GB 136 / 166 off, 135 / 166 on; 9.55 GB 135 / 165 both; SERVED14's
-        // cell filled 136 / 166 at 8.985 GB).
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 138, .decode = 166 }, .on = .{ .prefill = 138, .decode = 166 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 137, .decode = 166 }, .on = .{ .prefill = 137, .decode = 166 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 137, .decode = 165 }, .on = .{ .prefill = 136, .decode = 165 } },
+        // prompt rows; P1c's wide depth 5 (240 transient rows, +1,278,296,064 B in both phases) takes 2-3 per phase
+        // (at depth 3: 8.99 GB 138 / 166 both; 9.20 GB 137 / 166 both; 9.55 GB 137 / 165 off, 136 / 165 on).
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 135, .decode = 164 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 163 }, .on = .{ .prefill = 135, .decode = 163 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -654,9 +654,9 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
     try testing.expectEqual(@as(u64, 13_315_584), rec);
     try testing.expectEqual(xp.max_route_ids * rec + arm_mod.wideWindowBytes(opts.wide_depth, rec), b.transient_rows * rec);
-    try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + 144) * rec, b.slot_prefill);
-    // The windows past the first: 2 x 48 records, 1,278,296,064 B (the second, 639,148,032 B, was the 10b
-    // construction's unbilled MLX active less ~3.8 MB; v1b's third is as large).
+    try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + 240) * rec, b.slot_prefill);
+    // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
+    // construction's unbilled MLX active less ~3.8 MB; v1b's third and P1c's fourth and fifth are as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
 }
 
