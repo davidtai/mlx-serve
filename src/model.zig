@@ -433,6 +433,9 @@ pub const ModelConfig = struct {
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
+    /// deepseek_v41's prefill attention core (ATTNHALF ropefuse) at prompt widths: null = the tier's
+    /// route (served: on), false = the stock chain by construction.
+    prefill_attn: ?bool = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

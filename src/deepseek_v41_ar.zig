@@ -795,6 +795,8 @@ const CellReceipt = struct {
     wide_feed: ?bool = null,
     wide_depth: ?u8 = null,
     wide_cold_rows: ?u8 = null,
+    /// The attention call sites the Module installed (read back from it).
+    prefill_attn: ?bool = null,
 };
 
 // Guarded window only (loads the bank and the served module): DSV41_CELL_PROMPT_IDS=<prompt-ids json
@@ -992,6 +994,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_feed = md.installed.wide.feed,
         .wide_depth = md.installed.wide.depth,
         .wide_cold_rows = md.installed.wide.cold_rows,
+        .prefill_attn = md.installed.prefill_attn,
     };
     if (profile) printDecodeProfile(prof.items);
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
@@ -1032,6 +1035,8 @@ fn cellConfig(config: *model.ModelConfig) !void {
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
+    // The attention call sites (the served tier's routes by default; 0 = the stock chain).
+    if (envStr("DSV41_CELL_PREFILL_ATTN")) |v| config.prefill_attn = try cellBool("DSV41_CELL_PREFILL_ATTN", v);
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > 2) return error.CellWideDepth;

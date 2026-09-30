@@ -87,6 +87,7 @@ pub const served: Tier = blk: {
     t.routes.rc_fused_proj = true; // A9 K36 ATTN_FUSED_PROJ (rows <= 8, beside C14)
     t.routes.rc_head = true; // C11 the verify head on m1rows + RCTAIL headpad (rows <= 8)
     t.routes.rc_draft = true; // C16 DRAFTRC all (the draft block's routes; draftRoutes carries it)
+    t.routes.prefill_attn = true; // ATTNHALF ropefuse: the prefill attention core (rows > 32)
     break :blk t;
 };
 
@@ -384,6 +385,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.rc_fused_proj = false;
     rc_off.rc_head = false;
     rc_off.rc_draft = false;
+    rc_off.prefill_attn = false;
     // C14 drops W97 (the dense f32 wo_a, 5.37 GB over 40 layers): the tier's arm keeps it.
     rc_off.wo_a_f32 = true;
     try testing.expectEqual(trunk.routes, rc_off);
