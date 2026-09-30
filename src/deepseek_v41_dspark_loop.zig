@@ -126,6 +126,12 @@ pub fn Loop(comptime G: type) type {
             return g.slice(x, &.{ 0, lo, 0 }, &.{ s.d[0], hi, s.d[2] }, &.{ 1, 1, 1 });
         }
 
+        /// Rows `lo..hi` (axis 1) as a gather: a fresh buffer of those rows alone (a slice is a view that
+        /// keeps its whole source buffer alive; a gather never aliases or takes over its input).
+        fn copyRows(g: *G, x: T, lo: c_int, hi: c_int) !T {
+            return g.take(x, try g.arange(@floatFromInt(lo), @floatFromInt(hi), 1, .int32), 1);
+        }
+
         fn evalWindows(self: *Self) !void {
             var ws: [8]T = undefined;
             var n: usize = 0;
@@ -209,7 +215,15 @@ pub fn Loop(comptime G: type) type {
             const all = if (mains.items.len == 1) mains.items[0] else try g.concat(mains.items, 1);
             try self.head.seedMain(g, all, self.caches);
             const n: c_int = @intCast(prompt.len);
-            self.setMain(try sliceRows(g, all, n - 1, n));
+            // The seed keeps copies, not views: the last row sliced from the prompt's main taps and each
+            // stage's window sliced from its main KV would hold those whole buffers (P x 67,584 B, 1.11 GB
+            // at 16K) until the first round replaces them, through the phase change. A gather writes fresh
+            // buffers of the views' own rows (the same bytes); the prompt's go at the reset below.
+            self.setMain(try copyRows(g, all, n - 1, n));
+            for (self.caches) |*c| if (c.window) |w| {
+                c.window = g.keep(try copyRows(g, w, 0, g.shapeOf(w).dim(1)));
+                g.release(w);
+            };
             try self.evalWindows();
             try g.evalAll(&.{self.main_h.?});
             g.reset();
