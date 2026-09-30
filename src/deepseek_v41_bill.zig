@@ -10,6 +10,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const xp = @import("deepseek_v41_experts.zig");
+const exl3 = @import("exl3_quant.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
@@ -275,7 +276,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
     // JOINLESS (the served default): the routed group's joined input is the minimal copy's bound (`joinedBytes`).
     const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(joinless);
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null);
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
@@ -297,8 +299,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .engram = em.totalBytes(),
         // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
         // JOINLESS (the served default) the combine reads the DIG-X waves' own outputs: no wide-lane copy, and
-        // the wave alone covers the pass, its routed group's joined input at the minimal copy's bound (28 / 51
-        // of the routed rows; SERVED14: 12.40 GB measured against 13.49 + 0.50 KV billed);
+        // the wave alone covers the pass, its routed group's joined input at the minimal copy's bound
+        // (`PrefillBill.joinedBytes`: 63 / 86 of the routed rows at 16K, the most outputs a call can make);
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
         .prefill_wave = if (config.dsv41LayerMajor())
             (if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
@@ -575,12 +577,11 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        // JOINLESS's minimal-copy merge billed at its bound (28 / 51 of the routed rows; the wave -0.908 GB) returns
-        // prompt rows (this tree before it: 9.20 GB 136 / 166 off, 135 / 166 on; 9.55 GB 135 / 165 both; SERVED14's
-        // cell filled 136 / 166 at 8.985 GB).
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 138, .decode = 166 }, .on = .{ .prefill = 138, .decode = 166 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 137, .decode = 166 }, .on = .{ .prefill = 137, .decode = 166 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 137, .decode = 165 }, .on = .{ .prefill = 136, .decode = 165 } },
+        // Wide depth 5 (P1c, 240 transient rows) and the minimal copy's bound at the most outputs a call can make
+        // (63 / 86 of the routed rows at 16K; the joined input 1.47 GB of the 2.01 GB join).
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 134, .decode = 164 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -654,9 +655,9 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_rows);
     try testing.expectEqual(@as(u64, 13_315_584), rec);
     try testing.expectEqual(xp.max_route_ids * rec + arm_mod.wideWindowBytes(opts.wide_depth, rec), b.transient_rows * rec);
-    try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + 144) * rec, b.slot_prefill);
-    // The windows past the first: 2 x 48 records, 1,278,296,064 B (the second, 639,148,032 B, was the 10b
-    // construction's unbilled MLX active less ~3.8 MB; v1b's third is as large).
+    try testing.expectEqual((@as(u64, b.layers) * b.prefill_rows + @as(u64, opts.wide_depth) * xp.max_route_ids) * rec, b.slot_prefill);
+    // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
+    // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
 }
 

@@ -55,17 +55,24 @@ pub const PrefillBill = struct {
     /// The served prefill indexer route (idxscore + INDEX_TOPK): an index source's score chain is one
     /// [rows, positions] f32 score (and the select's mask), not the per-head [rows, heads, positions].
     index_launch: bool = false,
-    /// The served JOINLESS route: the routed group's joined input is the minimal copy's bound
-    /// (`joinless_outputs`), not every routed row.
-    joinless: bool = false,
+    /// The served JOINLESS route (`withJoinless`): the routed group's joined input is the minimal copy's bound
+    /// (`joinedBytes`) at the wide lane's shape, not every routed row.
+    joinless: ?JoinlessShape = null,
+    /// The routed experts a layer has (`joinlessOutputsMax`).
+    n_experts: u64 = 0,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
     /// (into the last source) and reads the others in place, so it copies at most (n - 23) / n of the routed rows.
     pub const joinless_sources: u64 = 24;
-    /// The outputs a layer's wide call makes at L1 (16,384 tokens, modeled in 58d9fb1: the deferred base call's 17
-    /// waves and six transient calls' 34): the bill's bound is (51 - 23) / 51 = 28 / 51 of the routed rows.
-    pub const joinless_outputs: u64 = 51;
+    /// The wide lane's shape the outputs follow: the DIG-X prefill wave's experts and assignment-row budget
+    /// (`exl3_quant.PrefillShape.tier`) and a call's experts (a group: `experts.max_route_ids`).
+    pub const JoinlessShape = struct { wave_experts: u64, wave_rows: u64, group_experts: u64 };
+    /// A wide call's calls beyond its groups of `group_experts`: the seed-aligned split (the seed's ranks chunked
+    /// apart from the stream's, 8b534af) adds at most one group, and the base bank's rows run in at most two deferred
+    /// calls (P1b's at the seed, and the last).
+    pub const wide_split_groups: u64 = 1;
+    pub const wide_base_calls: u64 = 2;
 
     /// The tier's prefill allocator cache: what the module holds MLX's cache to through the prompt pass.
     pub fn cacheBytes(b: PrefillBill, tier: Tier) u64 {
@@ -81,17 +88,33 @@ pub const PrefillBill = struct {
         return x;
     }
 
-    pub fn withJoinless(b: PrefillBill, on: bool) PrefillBill {
+    pub fn withJoinless(b: PrefillBill, shape: ?JoinlessShape) PrefillBill {
         var x = b;
-        x.joinless = on;
+        x.joinless = shape;
         return x;
     }
 
-    /// The routed group's joined input for `routed` bytes of routed outputs: all of them joined, or under JOINLESS
-    /// the minimal copy's bound, (n - 23) / n of them at L1's n (rounded up).
-    pub fn joinedBytes(b: PrefillBill, routed: u64) u64 {
-        if (!b.joinless) return routed;
-        return std.math.divCeil(u64, routed * (joinless_outputs - (joinless_sources - 1)), joinless_outputs) catch unreachable;
+    /// The most outputs one wide call makes over `routed_rows` rows (every prompt's, by the wave packing's geometry).
+    /// Each call's experts pack greedily into waves of at most `wave_experts` experts and `wave_rows` rows; a wave
+    /// closes on its experts, on the rows, or as its call's last:
+    ///   closed on experts: each holds `wave_experts` experts of its own, at most n_experts / wave_experts;
+    ///   closed on rows: its rows and its successor's exceed `wave_rows` (a solo expert above the budget included),
+    ///     each wave in at most two such pairs, so fewer than 2 x routed_rows / wave_rows;
+    ///   a call's last: the groups of `group_experts` (plus the seed's split) and the deferred base calls.
+    pub fn joinlessOutputsMax(b: PrefillBill, shape: JoinlessShape, routed_rows: u64) u64 {
+        const groups = (std.math.divCeil(u64, b.n_experts, shape.group_experts) catch unreachable) + wide_split_groups;
+        return b.n_experts / shape.wave_experts + 2 * routed_rows / shape.wave_rows + groups + wide_base_calls;
+    }
+
+    /// The routed group's joined input over `g_rows` rows: every routed row joined, or under JOINLESS the minimal
+    /// copy's bound at the most outputs the call can make, (n_max - 23) / n_max of the routed rows (rounded up).
+    pub fn joinedBytes(b: PrefillBill, g_rows: u64) u64 {
+        const routed_rows = g_rows * b.top_k;
+        const routed = routed_rows * b.hidden * 4;
+        const shape = b.joinless orelse return routed;
+        const n = b.joinlessOutputsMax(shape, routed_rows);
+        if (n <= joinless_sources) return 0;
+        return std.math.divCeil(u64, routed * (n - (joinless_sources - 1)), n) catch unreachable;
     }
 
     /// The trunk's attention: the stock tier scores every position (masked full), the served tier the selected keys.
@@ -152,6 +175,7 @@ pub const PrefillBill = struct {
                 break :n_main n;
             },
             .index_topk = c.index_topk,
+            .n_experts = c.n_routed_experts,
         };
     }
 
@@ -198,7 +222,7 @@ pub const PrefillBill = struct {
         const g_rows = @min(seq, cap);
         // The group's routed outputs, their joined input (`joinedBytes`), the combine and the HC post.
         const routed = g_rows * b.top_k * d * 4;
-        const group = routed + b.joinedBytes(routed) + g_rows * (2 * d * 4 + 4 * b.hc * d * 4);
+        const group = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + 4 * b.hc * d * 4);
         return kept_stream + halves + selection + @max(attn, group);
     }
 
@@ -291,7 +315,7 @@ pub const PrefillBill = struct {
 /// The 3.0 bank's geometry as `PrefillBill.of` reads it (text_config: 64 heads, 32 index heads, window
 /// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets).
 fn bank30Bill() PrefillBill {
-    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512 };
+    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512, .n_experts = 384 };
 }
 
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
@@ -313,10 +337,17 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     // On the served indexer route (one score launch) the routed group is the layer's wider sub-wave, so the whole
     // saving reaches the wave; on the per-head score chain the attention side (9.26 GB) binds first.
     const served = b.withIndexLaunch(true);
-    const j = served.withJoinless(true);
-    try std.testing.expectEqual(@as(u64, 2_013_265_920), j.joinedBytes(0) + b.joinedBytes(2_013_265_920));
-    try std.testing.expectEqual(@as(u64, 1_105_322_466), j.joinedBytes(2_013_265_920));
-    try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_105_322_466), j.layerMajorWaveBytes(16384, .served));
+    // The served tier's wave shape (L1: 8 experts and 7,168 rows a wave; groups of 48 experts). At 16K over 384
+    // experts a call makes at most 48 + 27 + (8 + 1) + 2 = 86 outputs, so the copy is at most 63 / 86 of the routed
+    // rows, 1.47 GB of the 2.01 GB join (the modeled L1 layer makes 51 and copies 0.60 GB).
+    const shape: PrefillBill.JoinlessShape = .{ .wave_experts = 8, .wave_rows = 7168, .group_experts = 48 };
+    const j = served.withJoinless(shape);
+    try std.testing.expectEqual(@as(u64, 86), j.joinlessOutputsMax(shape, 16384 * 6));
+    try std.testing.expectEqual(@as(u64, 2_013_265_920), b.joinedBytes(16384));
+    try std.testing.expectEqual(@as(u64, 1_474_834_337), j.joinedBytes(16384));
+    try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_474_834_337), j.layerMajorWaveBytes(16384, .served));
+    // Longer prompts make more row-closed waves: at a 65,104-row group (the chunk target's cap) the bound is 167.
+    try std.testing.expectEqual(@as(u64, 48 + 108 + 9 + 2), j.joinlessOutputsMax(shape, 65_104 * 6));
 }
 
 /// Per-layer attention mode (Python `_derive_layer_modes`): ratio 0 is a pure
