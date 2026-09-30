@@ -23,6 +23,12 @@ const expert_policy = @import("expert_policy.zig");
 const prof = @import("dsv41_prefill_timers.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
+/// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
+/// not hold the layer's input stream (hc x the tap's bytes) to the forward's end. The bill reads this declaration
+/// (`@hasDecl`): with it, the routed group's live hc-width streams are one (the HC post's matmul output) on every
+/// layer; without it, the DSpark target layers keep their input streams through the prompt pass.
+pub const main_taps_in_chunk_fence = true;
+
 pub const Want = struct {
     /// Head rows: none, the last position (a prefill), or every row (decode, verify).
     logits: enum { none, last, all } = .all,
@@ -742,11 +748,19 @@ pub fn Model(comptime G: type) type {
                         // The profile's own stage for the Engram read and add (else it lands in attn.pre).
                         try probe.put("engram.add", h);
                     }
-                    if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
+                    const tap: ?T = if (want_main and li.dspark_target) g.keep(try mainOf(g, h)) else null;
+                    if (tap) |t| mains[i][n_main] = t;
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
-                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
+                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph. The main
+                    // tap too (`main_taps_in_chunk_fence`): its mean would hold the layer's input stream to the end.
                     const hf = halves[i];
-                    try fence(g, st, &.{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb });
+                    var settle: [6]T = .{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb, undefined };
+                    var n_settle: usize = 5;
+                    if (tap) |t| {
+                        settle[5] = t;
+                        n_settle = 6;
+                    }
+                    try fence(g, st, settle[0..n_settle]);
                     // The profile's split of the chunk's carry-over: the fence's evaluation, then the keeps and
                     // the wave's frees (each probe re-reads an evaluated kept array: its segment is the host work).
                     try probe.put("chunk.fence", hf.moe_in);
@@ -1126,6 +1140,35 @@ test "dsv41 model: ENGRAM=prefetch at decode width: the forward's posted Engram 
     try testing.expectEqual(@as(usize, 0), posting.src.recs.?.items.len);
     // The row caches saw the same gathers.
     for (0..blocking.c.engram.n_layers) |li| try testing.expectEqual(blocking.src.cacheStats(li), posting.src.cacheStats(li));
+}
+
+test "dsv41 model: K16 settles each chunk's DSpark main tap in its chunk fence (the tap holds no input stream)" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    const mark = g.nodes.items.len;
+    const e0 = g.evaluated.items.len;
+    _ = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+    // The taps: the stream's mean over its hc copies, [1, rows, hidden], one per chunk of the target layer (the
+    // mini config's layer 4: chunks of 8, 8 and 4 rows). Each is settled by an eval before the next chunk's.
+    const dim: c_int = @intCast(m.c.hidden_size);
+    var taps: usize = 0;
+    for (g.nodes.items[mark..], mark..) |nd, at| {
+        if (nd.op != .mean or nd.shape.n != 3 or nd.shape.d[2] != dim or nd.shape.d[0] != 1) continue;
+        taps += 1;
+        try testing.expect(std.mem.indexOfScalar(u32, g.evaluated.items[e0..], @intCast(at)) != null);
+    }
+    try testing.expectEqual(@as(usize, 3), taps);
+    try testing.expect(main_taps_in_chunk_fence);
 }
 
 test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one compiled combine per chunk" {

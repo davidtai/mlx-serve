@@ -1100,6 +1100,8 @@ pub const TraceOps = struct {
     freed: std.ArrayList(Freed) = .empty,
     /// The node count at each `evalAll` (where a host sync fell in the build).
     evals: std.ArrayList(usize) = .empty,
+    /// Every array handed to `evalAll`, in call order (which arrays a fence settled).
+    evaluated: std.ArrayList(T) = .empty,
     /// Launches of prepared configs, and the prepared configs not yet released.
     prepared_launches: usize = 0,
     prepared_live: usize = 0,
@@ -1126,6 +1128,7 @@ pub const TraceOps = struct {
         g.waits.deinit(g.gpa);
         g.freed.deinit(g.gpa);
         g.evals.deinit(g.gpa);
+        g.evaluated.deinit(g.gpa);
         var it = g.host_data.valueIterator();
         while (it.next()) |v| g.gpa.free(v.*);
         g.host_data.deinit(g.gpa);
@@ -1166,8 +1169,9 @@ pub const TraceOps = struct {
         return 0;
     }
 
-    pub fn evalAll(g: *TraceOps, _: []const T) !void {
+    pub fn evalAll(g: *TraceOps, xs: []const T) !void {
         try g.evals.append(g.gpa, g.nodes.items.len);
+        try g.evaluated.appendSlice(g.gpa, xs);
     }
     pub fn keep(_: *TraceOps, x: T) T {
         return x;
