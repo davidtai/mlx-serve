@@ -974,7 +974,11 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
         // Released score chains: the stock tier's masked-full chunk keeps two 8 GB score blocks of its
         // five (plus the indexer's), under half its layer wave; K30's gathered chain under 3 / 5 of it.
         // K16's forward is one call over every chunk: its held bytes are the reading here (no chain-share rule).
-        if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else if (!t.tier.layer_major) try testing.expect(5 * worst.wave < 3 * worst.layer);
+        // The prefill core (served) gathers nothing: the indexer's score chain is the widest wave left,
+        // still under the layer's.
+        if (std.mem.eql(u8, t.name, "stock")) try testing.expect(2 * worst.wave < worst.layer) else if (!t.tier.layer_major) {
+            if (t.tier.routes.prefill_attn) try testing.expect(worst.wave < worst.layer) else try testing.expect(5 * worst.wave < 3 * worst.layer);
+        }
         // A 5-row verify after the prompt: the served tier's head is C11's m1rows with the headpad
         // (a [6, dim] bf16 concat), the stock tier's the dense head.
         const n5 = g.nodes.items.len;

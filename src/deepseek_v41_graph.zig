@@ -110,6 +110,11 @@ pub const Routes = struct {
     /// tapes at the draft's stream dtypes, the 128-expert router, the premix, the Sinkhorn), bound
     /// by the draft head; the draft head's own head call stays MLX's (RCTAIL drafthead).
     rc_draft: bool = false,
+    /// The prefill attention core (ATTNHALF ropefuse): at rows above `attn_compile_max_rows` the
+    /// selected-keys attention of a layer as the kernel lane's QK / softmax / PV launches, the query
+    /// roped in the QK load and o handed on inverse-roped in the o-LoRA group layout (no gathered
+    /// KVg, no eager core); one route per (query dtype, window-store dtype, compressed) kind.
+    prefill_attn: bool = false,
     /// K30: each query gathers its window rows and the selected compressed rows.
     selected_keys: bool = false,
     /// W50 lean prefill score: the scale folded into q, the sink into the denominator.
@@ -242,6 +247,8 @@ pub fn LayerKernels(comptime G: type) type {
         /// The ffn prep's fused call on an f32 x over a bf16 residual (the draft's stage 0).
         tape_mixed: ?*const kr.HcTapeMixed(G) = null,
         fused: ?*const kr.FusedProj(G) = null,
+        /// The prefill attention core of this layer's kind (`Routes.prefill_attn`).
+        prefill_attn: ?*const kr.PrefillAttn(G) = null,
         /// C16: the shared expert's projections (the draft's; the trunk's shared expert is stock).
         shared: ?*const SharedRc(G) = null,
 
@@ -282,9 +289,13 @@ pub fn Trunk(comptime G: type) type {
             tape: ?kr.HcTape(G) = null,
             /// A9, per layer: the fused projection glue over its q / kv norm weights.
             fused: std.ArrayList(kr.FusedProj(G)) = .empty,
+            /// The prefill attention cores by kind (0: layer 0's bf16 query and window, window only;
+            /// 1: f32, window only; 2: f32, compressed) and each layer's kind.
+            prefill_attn: [3]?kr.PrefillAttn(G) = .{ null, null, null },
+            prefill_attn_kind: [v41.max_layers]u8 = @splat(0),
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -337,6 +348,22 @@ pub fn Trunk(comptime G: type) type {
                     if (eps != @as(f32, 1e-20)) return error.FusedProjEps;
                     for (layers) |*w| k.fused.appendAssumeCapacity(kr.FusedProj(G).init(g, reg, w.q_norm, w.kv_norm, eps, null) catch |e| return if (e == error.RouteInput) error.FusedProjGeometry else e);
                 }
+                if (rt.prefill_attn) {
+                    // The kernel lane admits only the geometry its texts were derived for (each field
+                    // compared by name, RouteInput): the model's, from its config.
+                    const geo = prefillGeometry(c);
+                    // The prompt pass's dtypes: layer 0 reads the bf16 embedding stream (bf16 query and
+                    // window rows), every later layer the f32 stream; compressed rows are f32.
+                    for (c.layers[0..c.n_layers], 0..) |li, l| {
+                        const kind: u8 = if (l == 0) 0 else if (li.ratio > 0) 2 else 1;
+                        if (l == 0 and li.ratio > 0) return error.RouteInput;
+                        k.prefill_attn_kind[l] = kind;
+                        if (k.prefill_attn[kind] == null) {
+                            const dt: ops.Dtype = if (kind == 0) .bfloat16 else .float32;
+                            k.prefill_attn[kind] = try kr.PrefillAttn(G).init(g, reg, &geo, .rope, dt, dt, kind == 2, null);
+                        }
+                    }
+                }
                 return k;
             }
 
@@ -347,6 +374,7 @@ pub fn Trunk(comptime G: type) type {
                 for (self.proj.items) |*x| x.deinit(g);
                 if (self.tape) |*x| x.deinit(g);
                 for (self.fused.items) |*x| x.deinit(g);
+                for (&self.prefill_attn) |*x| if (x.*) |*r| r.deinit(g);
                 if (self.gpa) |a| {
                     self.router.deinit(a);
                     self.premix.deinit(a);
@@ -366,6 +394,7 @@ pub fn Trunk(comptime G: type) type {
                     .tape = if (self.tape) |*x| x else null,
                     .tape_attn = if (self.tape) |*x| x else null,
                     .fused = if (self.fused.items.len > 0) &self.fused.items[l] else null,
+                    .prefill_attn = if (self.prefill_attn[self.prefill_attn_kind[l]]) |*x| x else null,
                 };
             }
         };
@@ -1020,6 +1049,19 @@ pub fn Trunk(comptime G: type) type {
             return qlinear(g, try g.reshape(o2, &.{ s0.d[0], s0.d[1], -1 }), wo_b);
         }
 
+        /// The model's prefill geometry, as the kernel lane's routes compare it.
+        fn prefillGeometry(c: *const v41.Config) kr.PrefillGeometry {
+            return .{ .n_heads = c.n_heads, .head_dim = c.head_dim, .rope_head_dim = c.rope_head_dim, .window = c.window, .index_topk = c.index_topk, .index_n_heads = c.index_n_heads, .index_head_dim = c.index_head_dim, .n_experts_per_tok = c.n_experts_per_tok, .hidden = c.hidden_size };
+        }
+
+        /// `outProj` after the prefill core: o already inverse-roped as [g, S, in] f32 -> the grouped
+        /// o-LoRA (the lane's einsum over its [1, S, g, in] view) and `wo_b`.
+        fn outProjGrouped(g: *G, c: *const v41.Config, og: T, w_ol: T, wo_b: Q(T), b: c_int, s: c_int) !T {
+            _ = c;
+            const o2 = try g.einsum("gsd,grd->sgr", &.{ og, try g.astype(w_ol, .float32) });
+            return qlinear(g, try g.reshape(o2, &.{ b, s, -1 }), wo_b);
+        }
+
         /// The grouped `wo_a` as `[g, rank, in]`: bound once in f32 (W97), else
         /// dequantized per call (bf16) as `_o_lora_dense_weight`.
         pub fn woaDense(g: *G, c: *const v41.Config, w: *const W) !T {
@@ -1047,6 +1089,8 @@ pub fn Trunk(comptime G: type) type {
             // every attention and MoE output of the route is bf16); K22 / eager above.
             const rc: ?*const RcProjs(G) = if (b * s <= rc_max_rows) lk.proj else null;
             const compiled = rc == null and b * s <= rt.attn_rows;
+            // The prefill attention core at prompt widths (above the compiled regions' rows; K30 keys).
+            const pa: ?*const kr.PrefillAttn(G) = if (rc == null and !compiled and b * s > attn_compile_max_rows and rt.selected_keys) lk.prefill_attn else null;
             const cs = try cosSin(g, inv_freq, positions);
             var q: T = undefined;
             var qr: T = undefined;
@@ -1073,7 +1117,9 @@ pub fn Trunk(comptime G: type) type {
                 kv_new = o[2];
             } else {
                 qr = try rmsnorm(g, try qlinear(g, x, w.wq_a), w.q_norm, c.rms_norm_eps);
-                q = try ropeLast(g, try g.reshape(try qlinear(g, qr, w.wq_b), &.{ b, s, H, hd }), cs, false);
+                const qb = try g.reshape(try qlinear(g, qr, w.wq_b), &.{ b, s, H, hd });
+                // The prefill core ropes q in its QK load: hand it the un-roped query.
+                q = if (pa != null) qb else try ropeLast(g, qb, cs, false);
                 kv_new = try ropeLast(g, try rmsnorm(g, try qlinear(g, x, w.wkv), w.kv_norm, c.rms_norm_eps), cs, false);
             }
             try p.put("attn.qr", qr);
@@ -1090,6 +1136,20 @@ pub fn Trunk(comptime G: type) type {
                     ckv = comp.kv;
                     cidx = shared.selected_idx;
                 };
+                if (pa) |core| {
+                    // o f32 [8, S, 4096]: inverse-roped, in the o-LoRA group layout.
+                    const sel = try windowSelectedIdx(g, c, positions, g.shapeOf(window).dim(1), drop);
+                    const cmp: ?[2]T = if (ckv) |kv| .{ kv, cidx.? } else null;
+                    const sink = try g.reshape(try g.astype(w.attn_sink, .float32), &.{ 1, 1, H, 1 });
+                    // The core's QK scores live inside the score wave, as the eager chain's do.
+                    const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
+                    var og = try core.attend(g, q, window, sel.idx, sel.valid, cmp, sink, .{ cs.cos, cs.sin });
+                    if (scores) |m| try closeScores(g, m, &.{&og});
+                    try p.put("attn.o_grouped", og);
+                    const out = try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, b, s);
+                    try p.put("attn.out", out);
+                    return out;
+                }
                 const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
                 o0 = try sparseAttendSelected(g, c, rt, w, q, window, drop, ckv, cidx, positions);
                 if (scores) |m| try closeScores(g, m, &.{&o0});
@@ -1963,6 +2023,48 @@ test "dsv41 graph: the m1rows head takes rows 1..8, M 5 and 7 padded to M + 1, f
     }
     // Another head shape is refused (the kernel's pinned [129280, 5120]).
     try testing.expectError(error.RouteInput, kr.HeadRows(TraceOps).init(&g, &reg, try g.input(&.{ 4096, 5120 }, .bfloat16), null));
+}
+
+test "dsv41 graph: the prefill attention core takes the prompt widths per layer kind; no gathered KVg; verify widths keep the chain" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var p: TraceProbe = .{ .a = testing.allocator };
+    defer p.deinit();
+    const c = try realConfig();
+    const rt: Routes = .{ .prefill_attn = true, .selected_keys = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+    defer k.deinit(&g);
+    // Layer 0 (the bf16 stream, window only), layer 1 (f32, window only), layer 2 (f32, compressed).
+    try testing.expectEqual(@as(u8, 0), k.prefill_attn_kind[0]);
+    try testing.expectEqual(@as(u8, 1), k.prefill_attn_kind[1]);
+    try testing.expectEqual(@as(u8, 2), k.prefill_attn_kind[2]);
+    const Case = struct { l: usize, dt: Dtype };
+    for ([_]Case{ .{ .l = 0, .dt = .bfloat16 }, .{ .l = 2, .dt = .float32 } }) |cs| {
+        const li = c.layers[cs.l];
+        const w = try traceLayerW(&g, &c, li);
+        const inv = if (li.ratio > 0) try Tr.yarnInvFreq(&g, &c) else try Tr.swaInvFreq(&g, &c);
+        var cache = Tr.Cache.init(li, c.window, .{});
+        defer cache.deinit(&g);
+        var shared: Tr.Share = .{};
+        // A prompt width (64 rows): the core's launches; nothing gathered.
+        const n0 = g.nodes.items.len;
+        const out = try Tr.attention(&g, &p, &c, &rt, k.at(cs.l), li, &w, inv, try g.input(&.{ 1, 64, 5120 }, cs.dt), try g.arange(0, 64, 1, .int32), &cache, &shared);
+        try expectShape(&g, out, &.{ 1, 64, 5120 }, .float32);
+        // The core's launches (QK, softmax, PV: kernel nodes); nothing gathered.
+        try testing.expect(!noneOf(&g, n0, .kernel));
+        try testing.expect(noneOf(&g, n0, .take));
+        try expectStage(&g, &p, "attn.o_grouped", &.{ 8, 64, 4096 }, .float32);
+        // A verify width (8 rows) keeps the eager selected-keys chain.
+        const n1 = g.nodes.items.len;
+        _ = try Tr.attention(&g, &p, &c, &rt, k.at(cs.l), li, &w, inv, try g.input(&.{ 1, 8, 5120 }, cs.dt), try g.arange(64, 72, 1, .int32), &cache, &shared);
+        try testing.expect(noneOf(&g, n1, .kernel));
+    }
+    var bad = c;
+    bad.window = 64;
+    try testing.expectError(error.RouteInput, Tr.Kernels.init(testing.allocator, &g, &reg, &bad, &rt, &.{}));
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {
