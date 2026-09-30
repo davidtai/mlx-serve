@@ -224,6 +224,15 @@ pub const StreamSource = struct {
         return self.stream.seedPrefill(layer, ids);
     }
 
+    /// A live prefill call's persistent slots kept pinned and held past its release (`Wide.defer_base`).
+    pub fn holdBase(self: *StreamSource, call: *Call) !void {
+        return self.stream.holdBase(call.route.?);
+    }
+
+    pub fn releaseHeld(self: *StreamSource) void {
+        self.stream.releaseHeld();
+    }
+
     /// Prefill routes one layer may hold live at once (`Stream.Options.wide_depth`).
     pub fn wideDepth(self: *const StreamSource) u8 {
         return self.stream.wide_depth;
@@ -285,6 +294,9 @@ pub const FakeSource = struct {
     phase: expert_policy.Phase = .prefill,
     calls: [4]Call = @splat(.{}),
     log: std.ArrayList(Event) = .empty,
+    /// Slots a deferred call still reads (`holdBase`): held in every later plan of `held_layer`.
+    held: std.ArrayList(u32) = .empty,
+    held_layer: u32 = 0,
     counters: Stats = .{},
     /// When set, events are stamped with its node count (op order checks).
     trace: ?*const ops.TraceOps = null,
@@ -359,6 +371,7 @@ pub const FakeSource = struct {
         self.a.free(self.base_rows);
         self.a.free(self.ext_rows);
         self.log.deinit(self.a);
+        self.held.deinit(self.a);
         self.* = undefined;
     }
 
@@ -366,6 +379,21 @@ pub const FakeSource = struct {
         var e = ev;
         if (self.trace) |t| e.at = t.nodes.items.len;
         self.log.append(self.a, e) catch @panic("fake source log: out of memory");
+    }
+
+    pub fn holdBase(self: *FakeSource, call: *Call) !void {
+        if (self.held.items.len > 0 and self.held_layer != call.layer) return error.HeldOtherLayer;
+        self.held_layer = call.layer;
+        const pol = &self.policies[call.layer];
+        for (call.plan.hitsOf()) |e| {
+            const s = pol.slotOf(e).?;
+            if (s < pol.capacity) try self.held.append(self.a, s);
+        }
+        for (call.plan.loadsOf()) |l| if (l.persistent) try self.held.append(self.a, l.slot);
+    }
+
+    pub fn releaseHeld(self: *FakeSource) void {
+        self.held.clearRetainingCapacity();
     }
 
     pub fn seedPrefill(self: *FakeSource, layer: u32, ids: []const u16) !void {
@@ -389,12 +417,16 @@ pub const FakeSource = struct {
         } else return error.RoutesExhausted;
         call.* = .{ .layer = layer };
         const plan = &call.plan;
-        self.policies[layer].plan(ids, self.phase, plan);
-        // A row a live call still serves from is never refilled.
-        for (plan.loadsOf()) |l| for (&self.calls) |*o| {
-            if (o == call or o.state != .live or o.layer != layer) continue;
-            if (std.mem.indexOfScalar(u32, o.plan.slotsOf(), l.slot) != null) return error.SlotStillPinned;
-        };
+        const held: []const u32 = if (self.held.items.len > 0 and self.held_layer == layer) self.held.items else &.{};
+        self.policies[layer].planWith(ids, self.phase, plan, .{ .held = held });
+        // A row a live call still serves from, or a deferred call still reads, is never refilled.
+        for (plan.loadsOf()) |l| {
+            if (std.mem.indexOfScalar(u32, held, l.slot) != null) return error.SlotStillPinned;
+            for (&self.calls) |*o| {
+                if (o == call or o.state != .live or o.layer != layer) continue;
+                if (std.mem.indexOfScalar(u32, o.plan.slotsOf(), l.slot) != null) return error.SlotStillPinned;
+            }
+        }
         // The Stream's parts: loads in file (expert) order; decode = bounded
         // parts of `records_per_part` (no two records touch), prefill = pool-job chunks.
         var order: [max_route_ids]Load = undefined;
@@ -750,6 +782,10 @@ pub const Wide = struct {
     /// bank's wide waves, not the wide route (0: none). ROUNDING-CLASS against
     /// the wide route: its own reference family.
     cold_rows: u8 = 0,
+    /// Every group's base-bank rows of a call built as ONE call's waves after the groups' transient
+    /// waves (their slots held until then): fewer, fuller waves. Exact: a wave's rows are
+    /// independent of its composition and the combine folds by routed position.
+    defer_base: bool = false,
     pub const max_cold_rows = 8;
 };
 
@@ -816,9 +852,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             kept: std.ArrayList(T) = .empty,
             /// JOINLESS: each assignment's (output, row), int32 pairs.
             loc: std.ArrayList(i32) = .empty,
+            /// The deferred base-bank rows (`Wide.defer_base`): slots, act rows, routed positions.
+            def_slot: std.ArrayList(u32) = .empty,
+            def_act: std.ArrayList(u32) = .empty,
+            def_pos: std.ArrayList(u32) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
             }
         };
 
@@ -836,6 +876,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if ((wr.seed or wr.hot_first or wr.depth > 1 or wr.cold_rows > 0) and !routes.prefill) return error.InvalidWideRoute;
             if (wr.cold_rows > Wide.max_cold_rows) return error.InvalidWideRoute;
             if (wr.seed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
+            if (wr.defer_base and (wr.cold_rows > 0 or !routes.prefill or comptime !@hasDecl(S, "holdBase"))) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1209,6 +1250,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const act = if (g.dtypeOf(xf) == .bfloat16) xf else try g.astype(xf, .bfloat16);
             w.pos.clearRetainingCapacity();
             w.kept.clearRetainingCapacity();
+            const defer_base = self.wide_route.defer_base;
+            w.def_slot.clearRetainingCapacity();
+            w.def_act.clearRetainingCapacity();
+            w.def_pos.clearRetainingCapacity();
             const n_distinct = w.distinct.items.len;
             const n_groups = (n_distinct + max_route_ids - 1) / max_route_ids;
             // The live groups' calls, by group index mod `depth` (read ahead up to `depth` groups).
@@ -1220,6 +1265,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 };
                 for (w.kept.items) |x| g.release(x);
                 w.kept.clearRetainingCapacity();
+                if (comptime @hasDecl(S, "holdBase")) if (defer_base) self.source.releaseHeld();
             }
             const groupOf = struct {
                 fn f(d: []const u16, gi: usize) []const u16 {
@@ -1250,6 +1296,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
                         const act_row: u32 = @intCast(row / @as(usize, k));
+                        if (defer_base and kind == .base) {
+                            try w.def_slot.append(a, ref.row);
+                            try w.def_act.append(a, act_row);
+                            try w.def_pos.append(a, @intCast(row));
+                            continue;
+                        }
                         if (cold > 0 and w.count.items[e] <= cold) {
                             try w.cold_slot.append(a, ref.row);
                             try w.cold_act.append(a, act_row);
@@ -1300,10 +1352,32 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     try self.math.finishPrefill(g);
                     try g.evalAll(w.kept.items[k0..]);
                 }
+                // The group's base-bank slots stay pinned and held for the deferred call past its release.
+                if (comptime @hasDecl(S, "holdBase")) if (defer_base) try self.source.holdBase(call);
                 self.source.release(call);
                 calls[gi % depth] = null;
                 if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
             }
+            // The deferred base-bank rows: one call's waves over every group's, then the slots let go.
+            if (comptime @hasDecl(S, "holdBase")) if (defer_base) {
+                if (w.def_slot.items.len > 0) {
+                    const kb = w.kept.items.len;
+                    const b = self.banks[layer][@backingInt(BankKind.base)].?;
+                    const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
+                    if (parts) {
+                        w.wave_pos.clearRetainingCapacity();
+                        try self.math.prefillParts(g, layer, act, rows_, b, a, &w.kept, &w.wave_pos);
+                        for (w.wave_pos.items) |p| try w.pos.append(a, w.def_pos.items[p]);
+                    } else {
+                        try w.kept.ensureUnusedCapacity(a, 1);
+                        w.kept.appendAssumeCapacity(try self.math.prefill(g, layer, act, rows_, b));
+                        try w.pos.appendSlice(a, w.def_pos.items);
+                    }
+                    try self.math.finishPrefill(g);
+                    try g.evalAll(w.kept.items[kb..]);
+                }
+                self.source.releaseHeld();
+            };
         }
     };
 }
@@ -1521,15 +1595,16 @@ const RecRoute = struct {
 
     pub fn call(self: *RecRoute, g: *TraceOps, act: u32, rows: quant.PrefillRows, bank: BankArraysOf(u32)) !u32 {
         const src = source.?;
-        const live = for (&src.calls) |*c| {
-            if (c.state == .live) break c;
-        } else return error.NoLiveRoute;
+        // A deferred base-bank call runs after its groups' routes are released: no refs to snapshot.
+        const live_refs: []const SlotRef = for (&src.calls) |*c| {
+            if (c.state == .live) break c.refs[0..c.plan.n_ids];
+        } else &.{};
         try self.calls.append(self.a, .{
             .slot = try self.a.dupe(u32, rows.slot),
             .act_row = try self.a.dupe(u32, rows.act_row.?),
             .bank_code = bank.gate.code,
             .route = src.counters.route_calls,
-            .refs = try self.a.dupe(SlotRef, live.refs[0..live.plan.n_ids]),
+            .refs = try self.a.dupe(SlotRef, live_refs),
             .at = src.log.items.len,
             .node = g.nodes.items.len,
             .act_dtype = g.dtypeOf(act),
@@ -1647,6 +1722,70 @@ test "dsv41 experts: a wide call routes its experts in groups and runs each bank
         rows_seen += rec.slot.len;
     }
     try testing.expectEqual(@as(usize, n * k), rows_seen);
+}
+
+test "dsv41 experts: the deferred base-bank call builds every group's base rows once, after the groups' transient calls, the slots held until then" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 128;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    // 40 tokens x top-6 over 128 experts: three groups, 32 persistent rows (the fake source holds one
+    // route window: depth 1). Split, each group loads its own persistent rows and pays a base call.
+    const n = 40;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 128);
+    var calls_total: [2]usize = .{ 0, 0 };
+    for ([_]bool{ false, true }, 0..) |deferred, run| {
+        var reg = try hostRegistry();
+        defer reg.deinit();
+        var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
+        defer src.deinit();
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        src.trace = &g;
+        RecRoute.source = &src;
+        defer RecRoute.source = null;
+        var rrs = [_]RecRoute{RecRoute.init(a)};
+        defer rrs[0].deinit(&g);
+        var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .defer_base = deferred } });
+        defer ex.deinit();
+        var script: Script = .{ .calls = &.{&ids} };
+        g.host_values = script.values();
+        _ = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
+        // Every routed position placed once, every row built once.
+        var seen: [n * k]bool = @splat(false);
+        for (ex.wide.pos.items) |p| {
+            try testing.expect(!seen[p]);
+            seen[p] = true;
+        }
+        try testing.expectEqual(@as(usize, n * k), ex.wide.pos.items.len);
+        var rows: usize = 0;
+        var base_calls: usize = 0;
+        for (rrs[0].calls.items, 0..) |rec, ci| {
+            rows += rec.slot.len;
+            const kind: BankKind = for ([_]BankKind{ .base, .ext, .transient }) |kd| {
+                if (ex.banks[0][@backingInt(kd)]) |b| if (b.gate.code == rec.bank_code) break kd;
+            } else return error.UnknownBank;
+            if (kind != .base) continue;
+            base_calls += 1;
+            if (!deferred) continue;
+            // The one deferred call comes last, and each of its slots still holds an expert its token
+            // routed (held since its group: never evicted, never refilled).
+            try testing.expectEqual(rrs[0].calls.items.len - 1, ci);
+            for (rec.slot, rec.act_row) |sl, t| {
+                const e = src.policies[0].slot_to_expert[sl];
+                try testing.expect(std.mem.indexOfScalar(u16, ids[t * k ..][0..k], e) != null);
+            }
+        }
+        try testing.expectEqual(@as(usize, n * k), rows);
+        try testing.expect(if (deferred) base_calls == 1 else base_calls >= 2);
+        try testing.expectEqual(@as(usize, 0), src.held.items.len);
+        calls_total[run] = rrs[0].calls.items.len;
+    }
+    try testing.expect(calls_total[1] < calls_total[0]);
 }
 
 /// dump_prefill_waves.route_rows: slot j repeated counts[j] times, then

@@ -368,6 +368,12 @@ pub const Stream = struct {
     route_lookahead: bool = false,
     route_preread: bool = false,
     counters: Stats = .{},
+    /// Persistent slots of released prefill routes still pinned for a deferred call's waves
+    /// (`holdBase`), held in every later route of `held_layer` until `releaseHeld`.
+    held_base: std.ArrayList(u32) = .empty,
+    held_layer: u32 = 0,
+    /// A route's held-slot scratch (live routes' slots and `held_base`).
+    held_scratch: std.ArrayList(u32) = .empty,
     read_ns: u64 = 0,
     selector: ?expert_lookahead.Selector = null,
     preread: bool = false,
@@ -507,6 +513,8 @@ pub const Stream = struct {
             a.free(ls.meta);
         }
         a.free(self.layers);
+        self.held_base.deinit(a);
+        self.held_scratch.deinit(a);
         self.transient.deinit();
         a.free(self.transient_meta);
         if (self.selector) |*sel| sel.deinit(a);
@@ -563,6 +571,30 @@ pub const Stream = struct {
         return .{ .gate = .{ .code = x[0], .rout = x[1], .rin = x[2] }, .up = .{ .code = x[3], .rout = x[4], .rin = x[5] }, .down = .{ .code = x[6], .rout = x[7], .rin = x[8] } };
     }
 
+    /// Keep a live prefill route's persistent slots (its hits and persistent loads) pinned and held past
+    /// its release, for a later call over them (the wide lane's deferred base-bank waves), until
+    /// `releaseHeld`. One layer at a time.
+    pub fn holdBase(self: *Stream, r: *const Route) !void {
+        std.debug.assert(r.state == .live and self.phase == .prefill);
+        if (self.held_base.items.len > 0 and self.held_layer != r.layer) return error.HeldOtherLayer;
+        self.held_layer = r.layer;
+        const cap = self.layers[r.layer].policy.capacity;
+        for (r.hit_slots[0..r.plan.n_hits]) |s| if (s < cap) {
+            try self.held_base.append(self.allocator, s);
+            self.locate(r.layer, s).meta.pins += 1;
+        };
+        for (r.plan.loadsOf()) |l| if (l.persistent) {
+            try self.held_base.append(self.allocator, l.slot);
+            self.locate(r.layer, l.slot).meta.pins += 1;
+        };
+    }
+
+    /// Unpin and stop holding what `holdBase` kept (after the deferred call's waves are evaluated).
+    pub fn releaseHeld(self: *Stream) void {
+        for (self.held_base.items) |s| self.locate(self.held_layer, s).meta.pins -= 1;
+        self.held_base.clearRetainingCapacity();
+    }
+
     /// prepare_prefill_seed: the prompt's routed ids of `layer`, before its
     /// prefill routes.
     pub fn seedPrefill(self: *Stream, layer: u32, ids: []const u16) !void {
@@ -592,28 +624,29 @@ pub const Stream = struct {
         self.n_free -= 1;
         const r = &self.routes[self.free[self.n_free]];
         // A prefill route beside live ones of its layer: their slots are held,
-        // its transient loads take the first window no route holds.
-        var held_buf: [route_capacity * 2 * max_route_ids]u32 = undefined;
-        var n_held: usize = 0;
+        // its transient loads take the first window no route holds; so are the
+        // slots a deferred call still reads (`holdBase`).
+        const held_set = &self.held_scratch;
+        held_set.clearRetainingCapacity();
         var used_windows: u8 = 0;
         if (self.wide_depth > 1) for (&self.routes) |*o| {
             if (o.state == .free) continue;
             used_windows |= @as(u8, 1) << @intCast(o.window);
             if (o.layer != layer) continue;
             for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
-                held_buf[n_held] = hs;
-                n_held += 1;
+                held_set.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);
             };
             for (o.plan.loadsOf()) |l| if (l.persistent) {
-                held_buf[n_held] = l.slot;
-                n_held += 1;
+                held_set.append(self.allocator, l.slot) catch return self.fail(error.RoutesExhausted);
             };
         };
+        if (self.held_base.items.len > 0 and self.held_layer == layer)
+            held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
         const window: u8 = @intCast(@ctz(~used_windows));
         if (window >= self.wide_depth) return self.fail(error.RoutesExhausted);
         r.* = .{ .layer = layer, .window = window };
         const ls = &self.layers[layer];
-        ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_buf[0..n_held] });
+        ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items });
         const plan = &r.plan;
         for (plan.hitsOf(), r.hit_slots[0..plan.n_hits]) |e, *s| {
             s.* = ls.policy.slotOf(e).?;
@@ -1291,6 +1324,36 @@ test "dsv41 stream: growth is the one phase change" {
     try testing.expectEqual(@as(u32, 0), r.plan.n_evictions);
     try expectServed(s, &sb, r, &.{ 1, 2, 3, 4 });
     s.release(r);
+}
+
+test "dsv41 stream: slots held for a deferred call are never refilled until released" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    var r = try serve(s, 0, &.{ 1, 2 });
+    const kept = [2]u32{ s.layers[0].policy.expert_to_slot[1], s.layers[0].policy.expert_to_slot[2] };
+    try testing.expect(kept[0] < 2 and kept[1] < 2);
+    try s.holdBase(r);
+    s.release(r);
+    // One layer at a time.
+    const other = try serve(s, 1, &.{7});
+    try testing.expectError(error.HeldOtherLayer, s.holdBase(other));
+    s.release(other);
+    // A later route of the layer: the held slots are neither evicted nor refilled; it is served right.
+    r = try serve(s, 0, &.{ 3, 4, 5 });
+    for (r.plan.slotsOf()) |sl| try testing.expect(sl != kept[0] and sl != kept[1]);
+    try expectServed(s, &sb, r, &.{ 3, 4, 5 });
+    try testing.expectEqual(kept[0], s.layers[0].policy.expert_to_slot[1]);
+    try testing.expectEqual(kept[1], s.layers[0].policy.expert_to_slot[2]);
+    s.release(r);
+    // Released: the slots take loads again.
+    s.releaseHeld();
+    r = try serve(s, 0, &.{ 6, 7, 8, 9 });
+    try expectServed(s, &sb, r, &.{ 6, 7, 8, 9 });
+    s.release(r);
+    try s.flush();
+    for (0..2) |sl| try testing.expectEqual(@as(u16, 0), s.layers[0].meta[sl].pins);
 }
 
 test "dsv41 stream: growth from any thread but the one that built the stream is refused" {

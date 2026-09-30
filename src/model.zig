@@ -434,6 +434,8 @@ pub const ModelConfig = struct {
     expert_wide_depth: ?u8 = null,
     /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
     expert_wide_cold_rows: ?u8 = null,
+    /// The wide call's base-bank rows as one deferred call (`expert_wide_defer_base`; null = the served tier's).
+    expert_wide_defer_base: ?bool = null,
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
@@ -736,6 +738,11 @@ pub const ModelConfig = struct {
 
     pub fn dsv41WideHotFirst(self: *const ModelConfig) bool {
         return self.expert_wide_hot_first orelse self.dsv41WideFeed();
+    }
+
+    /// The deferred base-bank call: the setting, else on for the served tier without cold rows.
+    pub fn dsv41WideDeferBase(self: *const ModelConfig) bool {
+        return self.expert_wide_defer_base orelse (self.dsv41ServedTier() and (self.expert_wide_cold_rows orelse 0) == 0);
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {

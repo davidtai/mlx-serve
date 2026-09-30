@@ -837,7 +837,7 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.
@@ -859,7 +859,7 @@ pub fn prefillIndexRoute(config: *const model_io.ModelConfig) !bool {
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0 };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -1141,11 +1141,15 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_hot_first = null;
     c.expert_wide_depth = null;
     c.expert_wide_cold_rows = null;
+    c.expert_wide_defer_base = null;
     try std.testing.expect(try layerMajor(&c));
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2 }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2, .defer_base = true }, wideRoute(&c));
     c.expert_wide_hot_first = false;
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 2 }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 2, .defer_base = true }, wideRoute(&c));
     c.expert_wide_hot_first = null;
+    c.expert_wide_defer_base = false;
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 2 }, wideRoute(&c));
+    c.expert_wide_defer_base = null;
     c.numeric_tier = .stock;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));
@@ -1157,6 +1161,7 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_depth = 1;
     c.expert_wide_cold_rows = 2;
     try std.testing.expect(!try layerMajor(&c));
+    // Cold rows keep the per-group base calls (the deferred call is off with them).
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
 }
 
