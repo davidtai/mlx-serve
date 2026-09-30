@@ -58,8 +58,10 @@ pub const Bill = struct {
     /// The prompt pass's transient: K16's layer-major wave + the wide lane's routed-output copy
     /// (`PrefillBill.layerMajorBilledBytes`), or the chunk-major widest wave x 5 / 4.
     prefill_wave: u64,
-    /// The request's bounded KV (the served ring + the sources' lanes) for prompt + max_tokens + a block.
+    /// The request's bounded KV for prompt + max_tokens + a block, per phase: every lane at its cap, the window ring
+    /// at its widest in the phase (`v41.PrefillBill.kvPromptBytes`, `kvDecodeBytes`).
     kv: u64,
+    kv_decode: u64,
     /// The served tier's prefill allocator cache (4 GiB, D5) and the decode charge.
     prefill_cache: u64,
     decode_cache: u64,
@@ -97,9 +99,10 @@ pub const Bill = struct {
         return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted };
     }
 
-    /// The decode phase's process terms (the embedding off at the fence; the verify and draft waves).
+    /// The decode phase's process terms (the embedding off at the fence; the larger of the verify and draft waves:
+    /// a round drafts, then verifies, so the two never hold their transients at once).
     pub fn decodeTerms(b: Bill) PhaseTerms {
-        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = b.decode_wave + b.draft_wave, .kv = b.kv, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state };
+        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state };
     }
 
     /// What the constructed module holds before any request (after the install warm-up released its
@@ -298,7 +301,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
             (if (config.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served))
         else
             bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
-        .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
+        .kv = bill.kvPromptBytes(prompt_tokens, positions),
+        .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
         .decode_wave = decode_wave,
@@ -432,6 +436,7 @@ pub fn cell4Bill() Bill {
         .engram = 480_000_000,
         .prefill_wave = 17_995_900_000,
         .kv = 160_000_000,
+        .kv_decode = 160_000_000,
         .prefill_cache = 4_294_967_296,
         .decode_cache = 270_000_000,
         .decode_wave = 350_000_000,
@@ -445,7 +450,7 @@ test "dsv41 memory: a phase's total is the baseline plus its terms; the construc
     const b = cell4Bill();
     try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window, b.prefillTotal());
     // The decode phase carries no unbilled overhead (what it covered there is the retained prompt state).
-    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv + b.decode_wave + b.draft_wave + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state, b.decodeTotal());
+    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv_decode + @max(b.decode_wave, b.draft_wave) + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state, b.decodeTotal());
     try testing.expectEqual(@as(u64, 0), b.decodeTerms().unbilled_overhead);
     const c = b.constructionTerms();
     try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache, c.sum());
@@ -569,7 +574,8 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 9_200_000_000, .off = .{ .prefill = 137, .decode = 165 }, .on = .{ .prefill = 137, .decode = 165 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 137, .decode = 164 }, .on = .{ .prefill = 137, .decode = 164 } },
+        // The KV lanes billed by owner (+0.343 GB in the prompt phase) take 9.55's prompt row (its slack was 0.18 GB).
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 136, .decode = 164 }, .on = .{ .prefill = 136, .decode = 164 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);
@@ -584,6 +590,39 @@ test "dsv41 memory: the fill's rows at the windows' inputs, ENGRAM=prefetch's po
         try testing.expectEqual(w.on, on);
     }
     std.debug.print("\n", .{});
+}
+
+// DSV41_BANK=<bank> (host): the bounded KV by owner at the fill's request (16,384 + 1,024 + one verify block of
+// positions). This is the model lane's reconciliation of SERVED11's 0.352 GB held after the prompt (receipt
+// served-cell-typical-fastest-20260930-124252): the frontier lanes of the ratio-2 kv sources were unbilled, the ring
+// was billed at one window, and the index lanes were counted on the index-only sources too.
+test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's request (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const pb = v41.PrefillBill.of(&c);
+    const positions = fill_prompt_tokens + fill_max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
+    // Frontier 214,106,112 (layers 2, 8, 14) + compressed 89,235,456 + index 22,308,864 (the four kv sources).
+    try testing.expectEqual(@as(u64, 325_650_432), pb.laneBytes(positions));
+    // The ring: 2,160 rows over the prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
+    try testing.expectEqual(@as(u64, 174_735_360), pb.ringPromptBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 41_904_128), pb.ringDecodeBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 500_385_792), pb.kvPromptBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 367_554_560), pb.kvDecodeBytes(fill_prompt_tokens, positions));
+    // At the phase change the ring holds the last chunk's 310 rows; SERVED11 measured 351,152,128 B there.
+    const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310;
+    try testing.expectEqual(@as(u64, 350_728_192), at_change);
+    try testing.expect(351_152_128 - at_change < 500_000);
+    // The bill carries them per phase.
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_ceiling_bytes = 120_259_084_288;
+    config.memory_baseline_bytes = 9_200_000_000;
+    const b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null);
+    try testing.expectEqual(pb.kvPromptBytes(fill_prompt_tokens, positions), b.kv);
+    try testing.expectEqual(pb.kvDecodeBytes(fill_prompt_tokens, positions), b.kv_decode);
 }
 
 // DSV41_BANK=<bank> (host): the bill's transient rows are the arm's allocation. The stream allocates its transient
