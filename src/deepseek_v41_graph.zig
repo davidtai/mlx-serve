@@ -202,9 +202,6 @@ pub const NoProbe = struct {
 /// forwards (prefill) keep the stock path.
 pub const rc_max_rows = 8;
 
-/// The most caller arrays `moeWith` hands a routed call beside the shared expert and gate weights.
-const max_hoist_tail = 4;
-
 /// The kernel routes one HC mix calls (null: the stock op chain).
 pub fn MixKernels(comptime G: type) type {
     return struct {
@@ -1871,7 +1868,7 @@ pub fn Trunk(comptime G: type) type {
         /// `MoE.__call__`: gate, routed experts (`routed.routed(g, xf, indices)`
         /// returns the unweighted `[n, k, dim]` outputs), shared expert, f32 combine.
         pub fn moe(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype) !T {
-            return moeWith(g, p, c, rt, lk, w, x, routed, &.{});
+            return moeWith(g, p, c, rt, lk, w, x, routed, null);
         }
 
         /// `routed.routed`, or, for a source that commits the arrays a call does not wait on once
@@ -1881,24 +1878,26 @@ pub fn Trunk(comptime G: type) type {
             return routed.routed(g, xf, indices);
         }
 
-        /// `moe` with the caller's arrays that do not wait on the routed call (`tail`): at decode rows
-        /// the shared expert is built first and handed over with the gate weights and `tail`, so a
-        /// streaming source runs them during its read wait instead of in the next routing barrier.
-        pub fn moeWith(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype, tail: []const T) !T {
+        /// `moe` with the caller's HC post and comb (`tail`), which do not wait on the routed call: at
+        /// decode rows the shared expert is built first and handed over with the gate weights and
+        /// `tail`, so a streaming source runs them during its read wait, not in the next routing barrier.
+        pub fn moeWith(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, x: T, routed: anytype, tail: ?[2]T) !T {
             const sh = g.shapeOf(x);
             const dim: c_int = @intCast(c.hidden_size);
             const xf = try g.reshape(x, &.{ -1, dim });
             const r = try router(g, p, c, rt, lk, w, xf);
             const decode_rows = g.shapeOf(xf).dim(0) <= rc_max_rows;
             const rc_shared: ?*const SharedRc(G) = if (decode_rows) lk.shared else null;
-            var hoist: [2 + max_hoist_tail]T = undefined;
+            var hoist: [4]T = undefined;
             var n_hoist: usize = 0;
             if (decode_rows) {
-                std.debug.assert(tail.len <= max_hoist_tail);
                 hoist[0] = try g.astype(if (rc_shared) |s| try sharedExpertRc(g, c, s, xf) else try sharedExpertMinv(g, c, w, lk.minv, xf), .float32);
                 hoist[1] = r.weights;
-                @memcpy(hoist[2..][0..tail.len], tail);
-                n_hoist = 2 + tail.len;
+                n_hoist = 2;
+                if (tail) |t| {
+                    hoist[2..4].* = t;
+                    n_hoist = 4;
+                }
             }
             const ro = try routedWith(routed, g, xf, r.indices, hoist[0..n_hoist]);
             try p.put("moe.routed", ro);
@@ -2075,7 +2074,7 @@ pub fn Trunk(comptime G: type) type {
                 return .{ .h = s3[0], .pre_mix = s2[7] };
             }
             const half = try attnAndMoeInput(g, p, c, rt, lk, li, w, inv_freq, h, pre_mix, positions, cache, shared);
-            const mo = try moeWith(g, p, c, rt, lk, w, half.moe_in, routed, &.{ half.post, half.comb });
+            const mo = try moeWith(g, p, c, rt, lk, w, half.moe_in, routed, .{ half.post, half.comb });
             try p.put("moe.y", mo);
             const out = try hcPostRoute(g, c, rt, lk, mo, half.h1, half.post, half.comb);
             try p.put("out.h", out);
