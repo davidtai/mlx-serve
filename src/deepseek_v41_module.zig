@@ -26,6 +26,7 @@ const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const status = @import("status.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -106,7 +107,7 @@ pub const Module = struct {
     bill: bill_mod.Bill = undefined,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
-    /// The fill's target (ceiling - `ceiling_stop_bytes`): each phase's billed total stays under it.
+    /// The fill's target (the ceiling less upstream's wired margin): each phase's billed total stays under it.
     fill_target: u64 = 0,
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
@@ -145,8 +146,12 @@ pub const Module = struct {
             return e;
         };
         try self.acceptKernels(gpa, &c0, s, &diag);
-        // The box the admission fits: the configured ceiling, else the GPU's working set (the wired limit).
-        const ceiling_bytes = config.memory_ceiling_bytes orelse mlx.maxRecommendedWorkingSet();
+        // The box the admission fits: upstream's static GPU ceiling (Metal's working set, or its static override:
+        // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB), unless a harness states its window's ceiling; the
+        // fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill's totals carry
+        // the baseline (the preflight's sample of the memory in use before the load, or `--memory-baseline-gb`).
+        const ceiling_bytes = config.memory_ceiling_bytes orelse gpu_ceiling.staticGpuMemoryCeiling();
+        const target = ceiling_bytes -| gpu_ceiling.wired_limit_margin_bytes;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
         // The served admission, one kind only (the native bill; the Python envelope planner never runs here):
         // rows filled up to the stop's target, or `--expert-rows R` as the decode rows with the prompt rows
@@ -156,14 +161,14 @@ pub const Module = struct {
             admitted.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired);
+            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, target);
             if (admitted.expert_rows) |forced| {
                 admitted.expert_prefill_rows = @min(nr.prefill, forced);
             } else {
                 admitted.expert_rows = nr.decode;
                 admitted.expert_prefill_rows = nr.prefill;
             }
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, fill_prompt_tokens, admitted.memory_baseline_bytes orelse 0, ceiling_bytes -| ceiling_stop_bytes });
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, fill_prompt_tokens, admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
@@ -178,7 +183,7 @@ pub const Module = struct {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
-            self.fill_target = ceiling_bytes -| ceiling_stop_bytes;
+            self.fill_target = target;
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             admitPhases(b, self.fill_target) catch |e| {
                 log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });

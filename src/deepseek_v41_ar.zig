@@ -1200,9 +1200,11 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
     return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, try harnessWired());
 }
 
-/// The harness's fill (`bill_mod.fill` at the window's wired bytes), refused by name on stdout.
+/// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less its 2.0 GB
+/// stop (the window's own numbers, passed explicitly), refused by name on stdout.
 pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
-    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, try harnessWired()) catch |e| {
+    const target = (config.memory_ceiling_bytes orelse return error.CellCeilingMissing) -| module.ceiling_stop_bytes;
+    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, try harnessWired(), target) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };

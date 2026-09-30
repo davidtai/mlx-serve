@@ -12,6 +12,7 @@ const mdl = @import("deepseek_v41_model.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const engram = @import("deepseek_v41_engram.zig");
 const status = @import("status.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -298,8 +299,10 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
 }
 
 /// The fill for `config`'s routes: the bill at the floor rows (both phases' rows-free totals by
-/// construction; no admission of another kind), then `fillRows` up to the target. `wired_bytes` as `billAt`.
-pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !arm_mod.NativeRows {
+/// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
+/// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
+/// `wired_bytes` as `billAt`.
+pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, target: u64) !arm_mod.NativeRows {
     const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes);
     const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
     const per_row = @as(u64, b0.layers) * rec;
@@ -307,7 +310,7 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_
         .prefill_fixed = b0.prefillTotal() - b0.prefill_rows * per_row,
         .decode_fixed = b0.decodeTotal() - b0.decode_rows * per_row,
         .per_row = per_row,
-    }, config.memory_ceiling_bytes orelse return error.CeilingMissing, b0.n_experts);
+    }, target, b0.n_experts);
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
@@ -324,7 +327,7 @@ fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prom
 pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig) !u64 {
     var c = config;
     c.memory_baseline_bytes = 0;
-    if (c.memory_ceiling_bytes == null) c.memory_ceiling_bytes = mlx.maxRecommendedWorkingSet();
+    if (c.memory_ceiling_bytes == null) c.memory_ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
     const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null);
     return b.processBound();
 }
@@ -335,12 +338,11 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.Mode
 pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
 
 /// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
-/// layer's experts) whose phase totals each stay within `module.ceiling_stop_bytes` of the ceiling. The slot banks
+/// layer's experts) whose phase totals each stay under `target` (the caller's box: the ceiling less its margin). The slot banks
 /// hold the prompt rows through the prompt pass and grow to the decode rows at the phase change, which
 /// grows only after the prompt's frees are proven complete (`Module.phaseChange`), so the process bound is
 /// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
-pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
-    const target = ceiling_bytes -| module.ceiling_stop_bytes;
+pub fn fillRows(b: FillBill, target: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
     const most = struct {
         fn f(fixed: u64, t: u64, per_row: u64) u64 {
             return if (fixed >= t) 0 else (t - fixed) / per_row;
@@ -427,8 +429,8 @@ test "dsv41 memory: with the embedding on its host rows no phase bills the devic
             return .{ .prefill_fixed = b.prefillTotal() - b.baseline + base - @as(u64, b.prefill_rows) * pr, .decode_fixed = b.decodeTotal() - b.baseline + base - @as(u64, b.decode_rows) * pr, .per_row = pr };
         }
     }.f;
-    const r_dev = try fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288, 384);
-    const r_host = try fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288, 384);
+    const r_dev = try fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
+    const r_host = try fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
     try testing.expectEqual(r_dev.prefill + 2, r_host.prefill);
 }
 
@@ -469,7 +471,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     config.memory_baseline_bytes = 8_548_761_600;
     config.memory_ceiling_bytes = 119_259_000_000;
     const wired: u64 = 3_380_379_648;
-    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired);
+    const nr = try fill(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, wired, config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
     try testing.expect(nr.prefill <= nr.decode);
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
@@ -512,17 +514,17 @@ test "dsv41 memory: the native fill takes two row counts, each phase at its targ
     const target = f.ceiling - module.ceiling_stop_bytes;
     for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
         const b = f.at(base);
-        const r = try fillRows(b, f.ceiling, 384);
+        const r = try fillRows(b, target, 384);
         try std.testing.expect(r.prefill <= r.decode);
         try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
         try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
         std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
     }
-    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), target, 384));
     // Capped at the layer's experts; refused by name when not even the floor fits.
-    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
+    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, target, 384);
     try std.testing.expectEqual(@as(u32, 384), cap.decode);
-    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
+    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, target, 384));
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
