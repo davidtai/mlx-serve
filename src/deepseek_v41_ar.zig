@@ -1604,6 +1604,9 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(nr.decode, b.decode_rows);
     try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
     try testing.expect(b.decodeTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
+    try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
+    try testing.expectEqual(@as(u64, 1 << 30), b.prefill_cache);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // The failure mode: the same bill with the constructed module's wired bytes read live.
     try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));
