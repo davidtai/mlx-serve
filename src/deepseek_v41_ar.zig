@@ -1156,10 +1156,16 @@ fn gbOf(x: u64) f64 {
 
 /// The fill for `config`'s routes (its bill at the envelope's rows).
 pub fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+    return fillAtWired(a, io, config, prompt_tokens, max_tokens, null);
+}
+
+/// `fillAt` at pinned wired bytes (null: DSV41_CELL_WIRED_GB, else read now): the fill and the bill
+/// that later checks it plan through the same `planRows` inputs only when they see the same wired bytes.
+pub fn fillAtWired(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !arm_mod.NativeRows {
     var c = config;
     c.expert_rows = null;
     c.expert_prefill_rows = null;
-    const b0 = try cellBill(a, io, &c, prompt_tokens, max_tokens);
+    const b0 = try cellBillWired(a, io, &c, prompt_tokens, max_tokens, wired_bytes);
     const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
     const per_row = @as(u64, b0.layers) * rec;
     return module.fillRows(.{
@@ -1344,6 +1350,14 @@ pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
 pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 
 pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !CellBill {
+    return cellBillWired(a, io, config, prompt_tokens, max_tokens, null);
+}
+
+/// `cellBill` at pinned wired bytes (the envelope admission inside `planRows` reads them). A bill taken
+/// after construction must pass the wired bytes the arm was planned with (`arm.inputs.wired_bytes`), never
+/// a live read: the constructed module's own banks and residents are wired by then (v6 211422 refused
+/// PrefillDoesNotFit that way at the fill's own rows).
+pub fn cellBillWired(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64) !CellBill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
     errdefer if (vd.len > 0) std.debug.print("dsv41 served cell bill: {s}\n", .{vd.message()});
@@ -1354,6 +1368,7 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
     // them after the guard unloaded the service and passes DSV41_CELL_WIRED_GB (unset: read now).
     var opts = module.armOptions(config, ceiling, .host);
     if (std.c.getenv("DSV41_CELL_WIRED_GB")) |v| opts.wired_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
+    if (wired_bytes) |w| opts.wired_bytes = w;
     var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
         std.debug.print("dsv41 served cell bill: refused: {s}\n", .{diag.message()});
         return e;
@@ -1482,6 +1497,31 @@ test "dsv41 memory: the phase record's residuals: billed less the interval peak,
     const json = try std.json.Stringify.valueAlloc(testing.allocator, r, .{});
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"footprint_interval_peak\":97000000000") != null);
+}
+
+// DSV41_BANK=<bank> (host): the fill and the bill that checks it agree at the same inputs (v6 211422's:
+// non-file 8.5487616 GB, box 119.259 GB, wired 3.380 GB), and a bill re-read with the constructed module's
+// wired bytes (live, +85 GB) is what refused v6: the check must take the arm's planned wired bytes.
+test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 8_548_761_600;
+    config.memory_ceiling_bytes = 119_259_000_000;
+    const wired: u64 = 3_380_379_648;
+    const nr = try fillAtWired(a, testing.io, config, module.fill_prompt_tokens, module.fill_max_tokens, wired);
+    try testing.expectEqual(nr.prefill, nr.decode);
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
+    const b = try cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired);
+    try testing.expectEqual(nr.prefill, b.prefill_rows);
+    try testing.expectEqual(nr.decode, b.decode_rows);
+    try testing.expect(b.prefillTotal() <= config.memory_ceiling_bytes.? - module.ceiling_stop_bytes);
+    std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
+    // The failure mode: the same bill with the constructed module's wired bytes read live.
+    try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));
 }
 
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
