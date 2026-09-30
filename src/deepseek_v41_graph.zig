@@ -2105,6 +2105,9 @@ pub fn Trunk(comptime G: type) type {
             if (hc_tape) {
                 try g.tape(HcAttnPrep, c, &.{ h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm }, &a);
             } else {
+                // The chunk's inputs (evaluated already): this stage takes whatever ran since the previous probe
+                // (the previous chunk's fence and frees, a layer's end), so attn.pre is the HC premix alone.
+                try p.put("attn.in", h);
                 a = try hcAttnPrep(g, c, lk, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
                 try p.put("attn.pre", a[1]);
                 try p.put("attn.post", a[2]);
