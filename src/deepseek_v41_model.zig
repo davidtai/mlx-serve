@@ -23,6 +23,12 @@ const expert_policy = @import("expert_policy.zig");
 const prof = @import("dsv41_prefill_timers.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
+/// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
+/// not hold the layer's input stream (hc x the tap's bytes) to the forward's end. The bill reads this declaration
+/// (`@hasDecl`): with it, the routed group's live hc-width streams are one (the HC post's matmul output) on every
+/// layer; without it, the DSpark target layers keep their input streams through the prompt pass.
+pub const main_taps_in_chunk_fence = true;
+
 pub const Want = struct {
     /// Head rows: none, the last position (a prefill), or every row (decode, verify).
     logits: enum { none, last, all } = .all,
@@ -620,6 +626,10 @@ pub fn Model(comptime G: type) type {
             }
         }
 
+        /// P1's predictor chunks per GPU round trip: their transients live together (about 25 MB a 953-row chunk, 100 MB
+        /// a batch), before the layer's wave opens, so under the wave's own bound.
+        pub const predict_batch = 4;
+
         /// P1: layer `l`'s predictor pass before its attention: per chunk `Tr.predictIds` and one host read; the counts'
         /// ranking (`expert_policy.rankHottest`, the seed's order) to the hook, which reads that seed ahead. Profile
         /// stage "moe.predict" ("moe.predict.in" before it: the previous layer's carried-over work).
@@ -640,12 +650,20 @@ pub fn Model(comptime G: type) type {
             const wave = g.mark();
             defer g.resetTo(wave);
             const wf = try g.astype(lw.gate_w, .float32);
-            for (hs, pms) |h, pm| {
-                const chunk = g.mark();
-                defer g.resetTo(chunk);
-                const idx = try Tr.predictIds(g, c, self.kx.at(l), lw, h, pm, wf);
-                const n: usize = @intCast(g.shapeOf(idx).numel());
-                for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
+            // `predict_batch` chunks' predictions evaluated together, one GPU round trip for all of them; their ids are
+            // then read in place (an evaluated array's host read makes no round trip).
+            var start: usize = 0;
+            while (start < hs.len) : (start += predict_batch) {
+                const end = @min(start + predict_batch, hs.len);
+                const batch = g.mark();
+                defer g.resetTo(batch);
+                var idxs: [predict_batch]T = undefined;
+                for (hs[start..end], pms[start..end], idxs[0 .. end - start]) |h, pm, *idx| idx.* = try Tr.predictIds(g, c, self.kx.at(l), lw, h, pm, wf);
+                try g.evalAll(idxs[0 .. end - start]);
+                for (idxs[0 .. end - start]) |idx| {
+                    const n: usize = @intCast(g.shapeOf(idx).numel());
+                    for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
+                }
             }
             prof.recordPrediction(l, counts);
             try hook.readAheadSeed(expert_policy.rankHottest(counts, ranked));
@@ -730,11 +748,19 @@ pub fn Model(comptime G: type) type {
                         // The profile's own stage for the Engram read and add (else it lands in attn.pre).
                         try probe.put("engram.add", h);
                     }
-                    if (want_main and li.dspark_target) mains[i][n_main] = g.keep(try mainOf(g, h));
+                    const tap: ?T = if (want_main and li.dspark_target) g.keep(try mainOf(g, h)) else null;
+                    if (tap) |t| mains[i][n_main] = t;
                     halves[i] = try Tr.attnAndMoeInput(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pms[i], poss[i], lc, &shareds[i]);
-                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph.
+                    // Every kept array evaluated before the reset: a lazy one would hold its whole graph. The main
+                    // tap too (`main_taps_in_chunk_fence`): its mean would hold the layer's input stream to the end.
                     const hf = halves[i];
-                    try fence(g, st, &.{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb });
+                    var settle: [6]T = .{ hf.moe_in, hf.ffn_pre, hf.h1, hf.post, hf.comb, undefined };
+                    var n_settle: usize = 5;
+                    if (tap) |t| {
+                        settle[5] = t;
+                        n_settle = 6;
+                    }
+                    try fence(g, st, settle[0..n_settle]);
                     // The profile's split of the chunk's carry-over: the fence's evaluation, then the keeps and
                     // the wave's frees (each probe re-reads an evaluated kept array: its segment is the host work).
                     try probe.put("chunk.fence", hf.moe_in);
@@ -779,6 +805,9 @@ pub fn Model(comptime G: type) type {
                         const started = try a.alloc(T, j - i);
                         for (pre_shared, started) |ps, *st_| st_.* = ps.?;
                         try g.asyncEval(started);
+                        // The profile's own stage for the group's shared experts (the last one's eval waits for all,
+                        // one queue), else their GPU time lands in the routed call's first drain (base_seed).
+                        try probe.put("moe.shared", started[started.len - 1]);
                     }
                     const hook = routed.at(@intCast(l));
                     const lk = self.kx.at(l);
@@ -1116,6 +1145,35 @@ test "dsv41 model: ENGRAM=prefetch at decode width: the forward's posted Engram 
     for (0..blocking.c.engram.n_layers) |li| try testing.expectEqual(blocking.src.cacheStats(li), posting.src.cacheStats(li));
 }
 
+test "dsv41 model: K16 settles each chunk's DSpark main tap in its chunk fence (the tap holds no input stream)" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var st = try model_.newState();
+    defer st.deinit(&g, testing.allocator);
+    var ids: [20]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+    const mark = g.nodes.items.len;
+    const e0 = g.evaluated.items.len;
+    _ = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+    // The taps: the stream's mean over its hc copies, [1, rows, hidden], one per chunk of the target layer (the
+    // mini config's layer 4: chunks of 8, 8 and 4 rows). Each is settled by an eval before the next chunk's.
+    const dim: c_int = @intCast(m.c.hidden_size);
+    var taps: usize = 0;
+    for (g.nodes.items[mark..], mark..) |nd, at| {
+        if (nd.op != .mean or nd.shape.n != 3 or nd.shape.d[2] != dim or nd.shape.d[0] != 1) continue;
+        taps += 1;
+        try testing.expect(std.mem.indexOfScalar(u32, g.evaluated.items[e0..], @intCast(at)) != null);
+    }
+    try testing.expectEqual(@as(usize, 3), taps);
+    try testing.expect(main_taps_in_chunk_fence);
+}
+
 test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one compiled combine per chunk" {
     const m = try Mini.init();
     defer m.deinit();
@@ -1414,6 +1472,68 @@ test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted 
     for (stage[0..nl]) |s_| try testing.expectEqual(@as(u8, 2), s_);
     // The seed the call chose is the read-ahead's pair: each layer's first route hits both.
     try testing.expectEqual(@as(u64, 2 * nl), src.stats().expert_cache_hits);
+}
+
+test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a batch of four, every chunk's ids counted" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    const n: u16 = @intCast(m.c.n_routed_experts);
+    // Every host read of ids: 0, 3, 6, ... mod n, the chunk's rows x top-k of them.
+    const Host = struct {
+        n: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i * 3) % h.n);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 0;
+        }
+    };
+    var host: Host = .{ .n = n };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    const Hook = struct {
+        ranked: std.ArrayList(u16) = .empty,
+        pub fn readAheadSeed(self: *@This(), r: []const u16) !void {
+            try self.ranked.appendSlice(testing.allocator, r);
+        }
+    };
+    var hook: Hook = .{};
+    defer hook.ranked.deinit(testing.allocator);
+    // Six chunks of 8, 8, 8, 8, 8 and 3 rows: two batches (4 + 2), six host reads.
+    const rows = [_]c_int{ 8, 8, 8, 8, 8, 3 };
+    var hs: [rows.len]u32 = undefined;
+    var pms: [rows.len]u32 = undefined;
+    for (rows, &hs, &pms) |r, *h, *pm| {
+        h.* = try g.input(&.{ 1, r, @intCast(m.c.hc_mult), @intCast(m.c.hidden_size) }, .float32);
+        pm.* = try g.input(&.{ 1, r, @intCast(m.c.hc_mult) }, .float32);
+    }
+    const e0 = g.evals.items.len;
+    const n0 = g.nodes.items.len;
+    try model_.predictSeed(&g, 0, &model_.layers[0], &hook, &hs, &pms, graph.NoProbe{});
+    try testing.expectEqual(@as(usize, 2), g.evals.items.len - e0);
+    // Every chunk's ids are read after its batch's eval (in place) and before the next batch's.
+    const ev = g.evals.items[e0..];
+    var reads: usize = 0;
+    for (g.nodes.items[n0..], n0..) |nd, at| if (nd.op == .host_read) {
+        const batch = reads / TM.predict_batch;
+        try testing.expect(at >= ev[batch]);
+        if (batch + 1 < ev.len) try testing.expect(at < ev[batch + 1]);
+        reads += 1;
+    };
+    try testing.expectEqual(@as(usize, rows.len), reads);
+    // The counts are every chunk's ids: the ranking the hook got is the one of the summed pattern.
+    var want: [512]u32 = @splat(0);
+    for (rows) |r| for (0..@as(usize, @intCast(r)) * m.c.n_experts_per_tok) |i| {
+        want[(i * 3) % n] += 1;
+    };
+    var buf: [512]u16 = undefined;
+    try testing.expectEqualSlices(u16, expert_policy.rankHottest(want[0..n], buf[0..n]), hook.ranked.items);
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
