@@ -159,8 +159,8 @@ fn printUsage(io: std.Io) void {
         \\                        (default: as many as its memory admission fits).
         \\  --memory-ceiling-gb <gb>  The GPU memory ceiling every memory plan fits under,
         \\                        decimal GB (default: Metal's working set); a
-        \\                        streamed-expert model's fill lands --wired-margin-gib
-        \\                        below it.
+        \\                        streamed-expert model's fill lands the wired margin
+        \\                        (--wired-margin-gib / --wired-margin) below it.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -339,6 +339,10 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
+        \\  --wired-margin <size>
+        \\                      --wired-margin-gib at byte granularity (bytes,
+        \\                        or KB/MB/GB; 1..32 GiB), e.g. 2000000000 for a
+        \\                        guard's 2.0 GB stop. The last margin flag wins.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -918,6 +922,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.gpu_ceiling_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--wired-margin") and i + 1 < args.len) {
+            i += 1;
+            const bytes = parseSizeArg(args[i]) catch {
+                log.err("--wired-margin: expected a size (bytes, or KB/MB/GB), got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            server_mod.gpu_ceiling_mod.wired_limit_margin_bytes = server_mod.gpu_ceiling_mod.wiredMarginFromBytes(bytes) catch {
+                log.err("--wired-margin: expected 1..32 GiB, got {d} B\n", .{bytes});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
