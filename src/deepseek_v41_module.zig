@@ -328,7 +328,15 @@ pub const Module = struct {
         // from both phases. Checked once: the rows equal the table's, byte for byte.
         if (config.embedding_host_rows orelse true) {
             try self.checkEmbeddingRows(gpa);
+            _ = mlx.mlx_synchronize(self.g.s);
+            const before = BoundaryMemory.now();
             try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
+            // The table's pages can trail its release in the footprint while the driver retires them (the
+            // 05:36 / 06:28 cells' constructions: out of MLX's active and cache, 1.32 GB still in the
+            // footprint). The phase change's settle waits for the footprint to show the release (bounded)
+            // before the construction check reads it.
+            const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes());
+            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
             self.fenced = true;
             self.installed.embedding_rows = true;
         }
