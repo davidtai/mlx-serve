@@ -620,6 +620,10 @@ pub fn Model(comptime G: type) type {
             }
         }
 
+        /// P1's predictor chunks per GPU round trip: their transients live together (about 25 MB a 953-row chunk, 100 MB
+        /// a batch), before the layer's wave opens, so under the wave's own bound.
+        pub const predict_batch = 4;
+
         /// P1: layer `l`'s predictor pass before its attention: per chunk `Tr.predictIds` and one host read; the counts'
         /// ranking (`expert_policy.rankHottest`, the seed's order) to the hook, which reads that seed ahead. Profile
         /// stage "moe.predict" ("moe.predict.in" before it: the previous layer's carried-over work).
@@ -640,12 +644,20 @@ pub fn Model(comptime G: type) type {
             const wave = g.mark();
             defer g.resetTo(wave);
             const wf = try g.astype(lw.gate_w, .float32);
-            for (hs, pms) |h, pm| {
-                const chunk = g.mark();
-                defer g.resetTo(chunk);
-                const idx = try Tr.predictIds(g, c, self.kx.at(l), lw, h, pm, wf);
-                const n: usize = @intCast(g.shapeOf(idx).numel());
-                for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
+            // `predict_batch` chunks' predictions evaluated together, one GPU round trip for all of them; their ids are
+            // then read in place (an evaluated array's host read makes no round trip).
+            var start: usize = 0;
+            while (start < hs.len) : (start += predict_batch) {
+                const end = @min(start + predict_batch, hs.len);
+                const batch = g.mark();
+                defer g.resetTo(batch);
+                var idxs: [predict_batch]T = undefined;
+                for (hs[start..end], pms[start..end], idxs[0 .. end - start]) |h, pm, *idx| idx.* = try Tr.predictIds(g, c, self.kx.at(l), lw, h, pm, wf);
+                try g.evalAll(idxs[0 .. end - start]);
+                for (idxs[0 .. end - start]) |idx| {
+                    const n: usize = @intCast(g.shapeOf(idx).numel());
+                    for (try g.hostIds(idx, ids[0..n])) |e| counts[e] += 1;
+                }
             }
             prof.recordPrediction(l, counts);
             try hook.readAheadSeed(expert_policy.rankHottest(counts, ranked));
@@ -1414,6 +1426,68 @@ test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted 
     for (stage[0..nl]) |s_| try testing.expectEqual(@as(u8, 2), s_);
     // The seed the call chose is the read-ahead's pair: each layer's first route hits both.
     try testing.expectEqual(@as(u64, 2 * nl), src.stats().expert_cache_hits);
+}
+
+test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a batch of four, every chunk's ids counted" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    const n: u16 = @intCast(m.c.n_routed_experts);
+    // Every host read of ids: 0, 3, 6, ... mod n, the chunk's rows x top-k of them.
+    const Host = struct {
+        n: u16,
+        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            for (out, 0..) |*o, i| o.* = @intCast((i * 3) % h.n);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return 0;
+        }
+    };
+    var host: Host = .{ .n = n };
+    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
+    const Hook = struct {
+        ranked: std.ArrayList(u16) = .empty,
+        pub fn readAheadSeed(self: *@This(), r: []const u16) !void {
+            try self.ranked.appendSlice(testing.allocator, r);
+        }
+    };
+    var hook: Hook = .{};
+    defer hook.ranked.deinit(testing.allocator);
+    // Six chunks of 8, 8, 8, 8, 8 and 3 rows: two batches (4 + 2), six host reads.
+    const rows = [_]c_int{ 8, 8, 8, 8, 8, 3 };
+    var hs: [rows.len]u32 = undefined;
+    var pms: [rows.len]u32 = undefined;
+    for (rows, &hs, &pms) |r, *h, *pm| {
+        h.* = try g.input(&.{ 1, r, @intCast(m.c.hc_mult), @intCast(m.c.hidden_size) }, .float32);
+        pm.* = try g.input(&.{ 1, r, @intCast(m.c.hc_mult) }, .float32);
+    }
+    const e0 = g.evals.items.len;
+    const n0 = g.nodes.items.len;
+    try model_.predictSeed(&g, 0, &model_.layers[0], &hook, &hs, &pms, graph.NoProbe{});
+    try testing.expectEqual(@as(usize, 2), g.evals.items.len - e0);
+    // Every chunk's ids are read after its batch's eval (in place) and before the next batch's.
+    const ev = g.evals.items[e0..];
+    var reads: usize = 0;
+    for (g.nodes.items[n0..], n0..) |nd, at| if (nd.op == .host_read) {
+        const batch = reads / TM.predict_batch;
+        try testing.expect(at >= ev[batch]);
+        if (batch + 1 < ev.len) try testing.expect(at < ev[batch + 1]);
+        reads += 1;
+    };
+    try testing.expectEqual(@as(usize, rows.len), reads);
+    // The counts are every chunk's ids: the ranking the hook got is the one of the summed pattern.
+    var want: [512]u32 = @splat(0);
+    for (rows) |r| for (0..@as(usize, @intCast(r)) * m.c.n_experts_per_tok) |i| {
+        want[(i * 3) % n] += 1;
+    };
+    var buf: [512]u16 = undefined;
+    try testing.expectEqualSlices(u16, expert_policy.rankHottest(want[0..n], buf[0..n]), hook.ranked.items);
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
