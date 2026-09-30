@@ -1202,7 +1202,8 @@ pub const CellBill = struct {
     embedding: u64,
     /// The Engram sidecar's residents and its row caches (host).
     engram: u64,
-    /// The prompt pass's widest wave x 5 / 4 (`PrefillBill.bytes`' margin).
+    /// The prompt pass's transient: K16's layer-major wave + the wide lane's routed-output copy
+    /// (`PrefillBill.layerMajorBilledBytes`), or the chunk-major widest wave x 5 / 4.
     prefill_wave: u64,
     /// The request's bounded KV (the served ring + the sources' lanes) for prompt + max_tokens + a block.
     kv: u64,
@@ -1387,8 +1388,9 @@ pub fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConf
         .residents = m.totalBytes(),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes() + engram.row_cache_host_bytes,
-        // K16 (the layer-major route) bills its own wave: every chunk's kept state + one sub-wave.
-        .prefill_wave = (if (config.dsv41LayerMajor()) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served)) / 4 * 5,
+        // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave) and the
+        // wide lane's routed-output copy; the chunk-major wave keeps its x 5/4 margin.
+        .prefill_wave = if (config.dsv41LayerMajor()) bill.layerMajorBilledBytes(prompt_tokens, .served) else bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5,
         .kv = bill.window_ring_bytes + positions * bill.kv_source_pos_bytes,
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
@@ -1413,7 +1415,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
         .{ .name = "residents (the embedding off at the fence)", .p = b.residents, .d = b.residents - b.embedding },
         .{ .name = "Engram residents + row caches", .p = b.engram, .d = b.engram },
-        .{ .name = "prompt wave x 5/4 (PrefillBill) / verify + draft waves", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
+        .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify + draft", .p = b.prefill_wave, .d = b.decode_wave + b.draft_wave },
         .{ .name = "KV (ring + source lanes, bounded)", .p = b.kv, .d = b.kv },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "host reserve (pools, tables, process)", .p = b.host_reserve, .d = b.host_reserve },
