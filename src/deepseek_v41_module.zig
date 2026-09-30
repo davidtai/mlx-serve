@@ -105,6 +105,10 @@ pub const Module = struct {
     bill: ar_bill.CellBill = undefined,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
+    /// The fill's target (ceiling - `ceiling_stop_bytes`): each phase's billed total stays under it.
+    fill_target: u64 = 0,
+    /// The shell's io (the phase change's bounded settle waits on it).
+    io: std.Io = undefined,
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
     /// windows). The construction log line and the receipts read these, never the settings.
     installed: Installed = .{},
@@ -128,6 +132,7 @@ pub const Module = struct {
         self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
+        self.io = io;
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
@@ -159,8 +164,14 @@ pub const Module = struct {
             cfg.memory_ceiling_bytes = ceiling_bytes;
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            _ = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, arm_mod.wiredBytes()) catch |e| {
+            const b = ar_bill.cellBillWired(arena.allocator(), io, &cfg, fill_prompt_tokens, fill_max_tokens, arm_mod.wiredBytes()) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
+                return e;
+            };
+            self.fill_target = ceiling_bytes -| ceiling_stop_bytes;
+            // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
+            admitPhases(b, self.fill_target) catch |e| {
+                log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
                 return e;
             };
         }
@@ -450,29 +461,45 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The prompt fence and the grown slot banks, once (a no-op after): the embedding to its host
-    /// rows, the prefill's parked buffers back, the decode cache charge, the banks at the decode rows.
+    /// The phase change, once (a no-op after): the prompt's frees, proven complete, then the grow.
+    /// 1. Every GPU command of the prompt retires (synchronize): MLX's completion handlers hand the buffers
+    ///    they held back to its allocator, so nothing the prompt used is still pending (v6b: a clear before
+    ///    the handlers ran left 4.1 GB in the footprint into decode).
+    /// 2. The frees: the device embedding if it is still there, MLX's buffer cache cleared, the decode cache
+    ///    limit set, synchronize.
+    /// 3. ONE boundary check from MLX's and the kernel's own counters (after a bounded settle of the
+    ///    footprint): the cache empty, MLX active down by the freed device bytes, the footprint down by the
+    ///    cache and those bytes. Refused by name otherwise: the grow never starts over unreleased buffers
+    ///    (SERVED7: 7.7 GB of them).
+    /// 4. The grow to the decode rows, admitted by the bill (the decode total within the fill's target).
     pub fn phaseChange(self: *Module) !void {
         if (self.grown()) return;
-        // The box's pages and this process's footprint at each step (once per process): what the
-        // guard's metric holds beyond the footprint at the frees (the banks are preallocated: grow
-        // only flips the phase).
+        try admitPhases(self.bill, self.fill_target);
         var marks: [4]VmMark = undefined;
         marks[0] = VmMark.now();
+        _ = mlx.mlx_synchronize(self.g.s);
+        const before = BoundaryMemory.now();
+        var freed_device: u64 = 0;
         if (!self.fenced) {
+            freed_device = self.model.embeddingBytes();
             try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
             self.fenced = true;
         }
         marks[1] = VmMark.now();
-        // The prefill's parked buffers go back before the slot banks grow; decode keeps its own charge.
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
+        _ = mlx.mlx_synchronize(self.g.s);
+        const after = BoundaryMemory.settled(self.io, before, freed_device);
         marks[2] = VmMark.now();
+        checkFreed(before, after, freed_device) catch |e| {
+            log.err("phase change refused before the grow: {s} (before: active {d} B, cache {d} B, footprint {d} B; after: active {d} B, cache {d} B, footprint {d} B; freed device bytes {d})", .{ @errorName(e), before.active, before.cache, before.footprint, after.active, after.cache, after.footprint, freed_device });
+            return e;
+        };
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
         marks[3] = VmMark.now();
-        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the cache release", "after the banks grew" }) |m, name|
+        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (settled)", "after the banks grew" }) |m, name|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d})", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
@@ -582,6 +609,60 @@ pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
 /// residual threshold; cell4 measured 0.59 GB UNDER them).
 pub const construction_tolerance_bytes: u64 = 250_000_000;
 
+/// Both phases' billed totals within the fill's target (the fill guarantees it; forced rows are checked
+/// here): the prompt phase before construction, the decode phase again before the grow.
+pub fn admitPhases(b: ar_bill.CellBill, target: u64) error{ PromptOverTarget, DecodeOverTarget }!void {
+    if (b.prefillTotal() > target) return error.PromptOverTarget;
+    if (b.decodeTotal() > target) return error.DecodeOverTarget;
+}
+
+/// MLX's allocator and the process footprint at the phase boundary (existing counters only).
+pub const BoundaryMemory = struct {
+    active: u64,
+    cache: u64,
+    footprint: u64,
+
+    fn now() BoundaryMemory {
+        var active: usize = 0;
+        var cache: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        _ = mlx.mlx_get_cache_memory(&cache);
+        return .{ .active = active, .cache = cache, .footprint = arm_mod.footprint().now };
+    }
+
+    /// After the frees: the footprint read until it has dropped by the released bytes, at most
+    /// `phase_change_settle_ms` (the kernel's ledger can trail a release by a few ms); the one check
+    /// then judges what it reads.
+    fn settled(io: std.Io, before: BoundaryMemory, freed_device: u64) BoundaryMemory {
+        var m = now();
+        var waited: u32 = 0;
+        while (!footprintFreed(before, m, freed_device) and waited < phase_change_settle_ms) : (waited += 1) {
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+            m = now();
+        }
+        if (waited > 0) log.info("NATIVE phase change: the footprint settled in {d} ms", .{waited});
+        return m;
+    }
+};
+
+/// The footprint may sit this far above its expected drop at the boundary (the ledger's page rounding
+/// and the host side's own movement).
+pub const phase_change_tolerance_bytes: u64 = 250_000_000;
+/// The longest the phase change waits for the footprint to show the frees before it refuses.
+pub const phase_change_settle_ms: u32 = 2000;
+
+fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
+    return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
+}
+
+/// The phase boundary's one check: the MLX cache empty (every prompt buffer released, none parked for the
+/// grow to miss), MLX active down by the freed device bytes, the footprint down by the cache and those bytes.
+pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed }!void {
+    if (after.cache != 0) return error.PhaseChangeCacheNotEmpty;
+    if (after.active + freed_device > before.active) return error.PhaseChangeActiveNotFreed;
+    if (!footprintFreed(before, after, freed_device)) return error.PhaseChangeFootprintNotFreed;
+}
+
 pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
     if (measured > billed + construction_tolerance_bytes) return error.ConstructionOverBill;
 }
@@ -602,7 +683,9 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         // Rows the caller's native bill filled (both set): the stream's rows, the envelope's record only.
         .native_rows = if (config.expert_prefill_rows) |p| .{ .prefill = p, .decode = config.expert_rows orelse p } else null,
         // No growth transient: the banks at their decode rows from construction (one row count).
-        .preallocate = true,
+        // The banks grow at the phase change (two row counts); `phaseChange` proves the prompt's frees
+        // complete before the grow, so the growth never meets unreleased buffers (SERVED7).
+        .preallocate = false,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
         .lookahead = lookahead,
@@ -616,12 +699,11 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
 /// r rows is `fixed + r * per_row`.
 pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
 
-/// The native admission's fill, the bill of record since SERVED7 (no grow): ONE row count for both
-/// phases, so the slot banks are allocated once, at construction, and the phase change adds none
-/// (`expert_stream.Stream.grow` allocates only rows above the capacity). There is no free-then-grow at
-/// the phase change, so the guard's physical metric has no transition term to carry (SERVED7: 7.2 GiB
-/// outside the footprint at the grow). The most rows whose billed total in BOTH phases stays within
-/// `ceiling_stop_bytes` of the ceiling (<= the layer's experts); refused by name under `min_fill_rows`.
+/// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
+/// layer's experts) whose phase totals each stay within `ceiling_stop_bytes` of the ceiling. The slot banks
+/// hold the prompt rows through the prompt pass and grow to the decode rows at the phase change, which
+/// grows only after the prompt's frees are proven complete (`Module.phaseChange`), so the process bound is
+/// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
 pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
     const target = ceiling_bytes -| ceiling_stop_bytes;
     const most = struct {
@@ -629,9 +711,10 @@ pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBil
             return if (fixed >= t) 0 else (t - fixed) / per_row;
         }
     }.f;
-    const rows = @min(@min(most(b.prefill_fixed, target, b.per_row), most(b.decode_fixed, target, b.per_row)), n_experts);
-    if (rows < min_fill_rows) return error.NativeBillDoesNotFit;
-    return .{ .prefill = @intCast(rows), .decode = @intCast(rows) };
+    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
+    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
+    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
+    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
 }
 
 /// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
@@ -1154,25 +1237,53 @@ const fill_fixture = struct {
     }
 };
 
-test "dsv41 memory: the native fill is one row count for both phases, at the binding phase's target within one row" {
+test "dsv41 memory: the native fill takes two row counts, each phase at its target within one row" {
     const f = fill_fixture;
     const target = f.ceiling - ceiling_stop_bytes;
     for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
         const b = f.at(base);
         const r = try fillRows(b, f.ceiling, 384);
-        try std.testing.expectEqual(r.prefill, r.decode);
-        // Both phases fit; the binding one (the larger fixed terms) takes no row more.
-        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.prefill_fixed + r.prefill * b.per_row <= target);
-        try std.testing.expect(@max(b.prefill_fixed, b.decode_fixed) + (r.decode + 1) * b.per_row > target);
+        try std.testing.expect(r.prefill <= r.decode);
+        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
+        try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
         std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
     }
-    // The measured baselines' rows (non-file ~9 GB, 11 GB, and the credited 13.4 GB).
-    // (The two-count fill admitted 127 / 168 here and grew 41 rows at the phase change.)
-    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 127 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
     // Capped at the layer's experts; refused by name when not even the floor fits.
     const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
     try std.testing.expectEqual(@as(u32, 384), cap.decode);
     try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
+}
+
+test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, by name" {
+    const gb: u64 = 1_000_000_000;
+    // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92 GB.
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
+    // Released: cache empty, footprint down by the cache.
+    try checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache }, 0);
+    // The embedding freed at the boundary: active and footprint down by it too.
+    try checkFreed(before, .{ .active = before.active - 1_323_827_200, .cache = 0, .footprint = before.footprint - before.cache - 1_323_827_200 }, 1_323_827_200);
+    // Cache bytes left: refused.
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, .{ .active = before.active, .cache = 16384, .footprint = before.footprint - before.cache }, 0));
+    // v6b as it ran (cache cleared before the handlers returned their buffers): the footprint 91.07 GB, 4.07 GB
+    // above the drop, refused.
+    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = 91_065_000_000 }, 0));
+    // Active not down by the embedding: refused.
+    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb }, 1_323_827_200));
+}
+
+test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
+    var b = ar_bill.cell4BillForTests();
+    const target: u64 = 118_259_084_288;
+    try admitPhases(b, target);
+    // Decode rows forced past the target (148 -> 168 rows: +10.65 GB).
+    b.decode_rows = 168;
+    b.slot_decode = (40 * 168 + 48) * 13_315_584;
+    try std.testing.expect(b.decodeTotal() > target);
+    try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
+    // The prompt phase over it is refused first.
+    b.prefill_wave += 20_000_000_000;
+    try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
 }
 
 test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
