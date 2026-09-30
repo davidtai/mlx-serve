@@ -1978,6 +1978,96 @@ test "dsv41 growth 0b: new slot memory's cost on the inference thread, zeros vs 
     try testing.expect(wb.no_copy and wc.no_copy);
 }
 
+// DSV41_PHASE0B_MLX=1, inside a guarded window: SERVED13's kill (12 GB outside the footprint late in decode; the grow's
+// wrapped rows its one new mechanism) at 2 GB: the box's pages around each step of the overlapped grow's mechanics.
+test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pages and its first GPU read of every page stay inside the footprint" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const ar = @import("deepseek_v41_ar.zig");
+    const status = @import("status.zig");
+    _ = mlx.applyWiredPolicy();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const bytes: usize = 2 << 30;
+    const elems: c_int = @intCast(bytes / 2);
+    const page = std.heap.pageSize();
+    const Box = struct {
+        pages: ar.VmStatPages,
+        fp: u64,
+        pm: status.ProcessMemory,
+
+        /// One moment's reading: the footprint on either side of a posix_spawn'd vm_stat, within the harnesses' bound.
+        fn mark(buf: []u8) !@This() {
+            var n: u32 = 0;
+            while (n < ar.box_mark_attempts) : (n += 1) {
+                if (n > 0) std.Io.sleep(testing.io, .fromMilliseconds(ar.box_mark_retry_ms), .awake) catch {};
+                const f0 = status.footprint().now;
+                const pages = try ar.vmStatPages(try ar.readVmStat(buf));
+                const f1 = status.footprint().now;
+                if (@max(f0, f1) - @min(f0, f1) <= ar.box_mark_stable_bytes) return .{ .pages = pages, .fp = @max(f0, f1), .pm = status.processMemory() };
+            }
+            return error.BoxMarkUnstable;
+        }
+        fn d(x: u64, y: u64) i64 {
+            return @as(i64, @intCast(y)) - @as(i64, @intCast(x));
+        }
+        /// Physical growth outside the footprint since `b0`, the file-backed pages excluded (the guard credits the cache).
+        fn outside(b0: @This(), b: @This()) i64 {
+            return d(b0.pages.physical(), b.pages.physical()) - d(b0.pages.file_backed, b.pages.file_backed) - d(b0.fp, b.fp);
+        }
+        fn line(b0: @This(), b: @This(), out: []u8) []const u8 {
+            return std.fmt.bufPrint(out, "{{\"d_footprint\": {d}, \"d_physical\": {d}, \"d_wired\": {d}, \"d_file_backed\": {d}, \"d_graphics_nofootprint\": {d}, \"d_internal\": {d}, \"outside\": {d}}}", .{
+                d(b0.fp, b.fp), d(b0.pages.physical(), b.pages.physical()), d(b0.pages.wired, b.pages.wired), d(b0.pages.file_backed, b.pages.file_backed),
+                d(b0.pm.graphics_nofootprint, b.pm.graphics_nofootprint), d(b0.pm.internal, b.pm.internal), outside(b0, b),
+            }) catch out[0..0];
+        }
+        const Payload = struct { m: []align(std.heap.page_size_min) u8 };
+        fn dtor(ctx: ?*anyopaque) callconv(.c) void {
+            const pl: *Payload = @ptrCast(@alignCast(ctx.?));
+            std.posix.munmap(pl.m);
+            std.heap.c_allocator.destroy(pl);
+        }
+        fn touch(m: []u8, step: usize) void {
+            var i: usize = 0;
+            while (i < m.len) : (i += step) @as(*volatile u8, &m[i]).* = 0;
+        }
+    };
+    var buf: [1 << 16]u8 = undefined;
+    const b0 = try Box.mark(&buf);
+    // The overlapped grow's mechanics: an untouched private anonymous mapping, a helper's touch of every page.
+    const m = try std.posix.mmap(null, bytes, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const helper = try std.Thread.spawn(.{}, Box.touch, .{ @as([]u8, m), page });
+    helper.join();
+    const b1 = try Box.mark(&buf);
+    // The no-copy wrap (its deleter unmaps), a view of it and one eval.
+    const pl = try std.heap.c_allocator.create(Box.Payload);
+    pl.* = .{ .m = m };
+    const arr = mlx.mlx_array_new_data_managed_payload(@ptrCast(m.ptr), &[_]c_int{elems}, 1, .int16, pl, Box.dtor);
+    const no_copy = if (mlx.mlx_array_data_uint8(arr)) |p| @intFromPtr(p) == @intFromPtr(m.ptr) else false;
+    var view = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&view, arr, &[_]c_int{ 1024, @divExact(elems, 1024) }, 2, s));
+    try evalArrays(&.{view});
+    const b2 = try Box.mark(&buf);
+    // The first GPU read of every page: a sum over the whole array.
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sum(&sum, view, false, s));
+    try evalArrays(&.{sum});
+    const b3 = try Box.mark(&buf);
+    // Released: the arrays freed (the wrap's deleter unmaps), MLX's cache cleared.
+    _ = mlx.mlx_array_free(sum);
+    _ = mlx.mlx_array_free(view);
+    _ = mlx.mlx_array_free(arr);
+    _ = mlx.mlx_clear_cache();
+    const b4 = try Box.mark(&buf);
+    const limit: i64 = @intCast(bytes / 10);
+    const out3 = Box.outside(b0, b3);
+    var l: [4][320]u8 = undefined;
+    std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"release\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
+        bytes, no_copy, Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b0, b4, &l[3]), limit, if (out3 > limit) "GrowWrapOutsideFootprint" else "inside",
+    });
+    try testing.expect(no_copy);
+    if (out3 > limit) return error.GrowWrapOutsideFootprint;
+}
+
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
 test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
