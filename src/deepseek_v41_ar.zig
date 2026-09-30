@@ -1037,15 +1037,56 @@ fn cellConfig(config: *model.ModelConfig) !void {
     _ = try module.layerMajor(config);
 }
 
-/// The native admission's fill (unless DSV41_CELL_ROWS forces the decode rows): the cell's own bill
-/// at the envelope's rows gives each phase's rows-free total, and `module.fillRows` takes rows up to
-/// the stop's target; the config then carries both row counts (the stream's, the bill's).
+/// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
+/// total and `module.fillRows` takes rows up to the stop's target; the config then carries both row
+/// counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
+/// later lines at its first line's rows): billed, and refused by name above the target. DSV41_CELL_ROWS
+/// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
+/// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt
+/// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
 fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !void {
+    const target = config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes;
+    if (std.c.getenv("DSV41_CELL_PREFILL_ROWS")) |v| {
+        const decode = config.expert_rows orelse return error.CellPrefillRowsWithoutRows;
+        config.expert_prefill_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellPrefillRowsValue;
+        const b = try cellBill(a, io, config, prompt_tokens, max_tokens);
+        std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"forced_rows\": [{d}, {d}], \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}}}\n", .{
+            gbOf(b.baseline), gbOf(target), config.expert_prefill_rows.?, decode, gbOf(b.prefillTotal()), gbOf(b.decodeTotal()),
+        });
+        if (b.prefillTotal() > target or b.decodeTotal() > target) return error.CellForcedRowsOverTarget;
+        return;
+    }
     if (config.expert_rows != null) return;
-    const b0 = try cellBill(a, io, config, prompt_tokens, max_tokens);
+    var nr = try fillAt(a, io, config.*, prompt_tokens, max_tokens);
+    if (std.c.getenv("DSV41_CELL_FILL_LADDER") != null) {
+        for ([_]bool{ false, true }) |lm| {
+            var wide = config.*;
+            wide.expert_wide_depth = 2;
+            wide.layer_major_prefill = lm;
+            const r = try fillAt(a, io, wide, prompt_tokens, max_tokens);
+            nr = .{ .prefill = @min(nr.prefill, r.prefill), .decode = @min(nr.decode, r.decode) };
+        }
+    }
+    std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"ladder\": {}, \"filled_rows\": [{d}, {d}]}}\n", .{
+        gbOf(config.memory_baseline_bytes.?), gbOf(target), std.c.getenv("DSV41_CELL_FILL_LADDER") != null, nr.prefill, nr.decode,
+    });
+    config.expert_rows = nr.decode;
+    config.expert_prefill_rows = nr.prefill;
+}
+
+fn gbOf(x: u64) f64 {
+    return @as(f64, @floatFromInt(x)) / 1e9;
+}
+
+/// The fill for `config`'s routes (its bill at the envelope's rows).
+fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+    var c = config;
+    c.expert_rows = null;
+    c.expert_prefill_rows = null;
+    const b0 = try cellBill(a, io, &c, prompt_tokens, max_tokens);
     const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_rows);
     const per_row = @as(u64, b0.layers) * rec;
-    const nr = module.fillRows(.{
+    return module.fillRows(.{
         .prefill_fixed = b0.prefillTotal() - b0.prefill_rows * per_row,
         .decode_fixed = b0.decodeTotal() - b0.decode_rows * per_row,
         .per_row = per_row,
@@ -1053,11 +1094,6 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, prompt
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };
-    std.debug.print("DSV41_CELL_FILL {{\"baseline_gb\": {d:.3}, \"target_gb\": {d:.3}, \"envelope_rows\": [{d}, {d}], \"filled_rows\": [{d}, {d}]}}\n", .{
-        @as(f64, @floatFromInt(b0.baseline)) / 1e9, @as(f64, @floatFromInt(config.memory_ceiling_bytes.? -| module.ceiling_stop_bytes)) / 1e9, b0.prefill_rows, b0.decode_rows, nr.prefill, nr.decode,
-    });
-    config.expert_rows = nr.decode;
-    config.expert_prefill_rows = nr.prefill;
 }
 
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
