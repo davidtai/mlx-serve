@@ -414,14 +414,20 @@ pub fn Model(comptime G: type) type {
 
         /// Device bytes the model builds at construction beyond the checkpoint's
         /// residents (the bill's resident term): W97's dense f32 wo_a per layer, an
-        /// mxfp8 head's codes and scales (the dense head stays resident). The
-        /// rotary tables (< 1 MB) aside.
+        /// mxfp8 head's codes and scales (the Module then drops the dense head:
+        /// `droppedBytes`). The rotary tables (< 1 MB) aside.
         pub fn builtBytes(self: *const Self) u64 {
             const c = &self.c;
             var n: u64 = 0;
             if (self.tier.routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
             if (self.tier.routes.head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
             return n;
+        }
+
+        /// Checkpoint residents the Module drops once the model is built: the dense bf16 head under HEAD_MODE
+        /// mxfp8 (its quantized codes and scales are in `builtBytes`). The bill's resident term less these.
+        pub fn droppedBytes(self: *const Self) u64 {
+            return if (self.tier.routes.head == .mxfp8) @as(u64, self.c.vocab_size) * self.c.hidden_size * 2 else 0;
         }
 
         /// The input table's bytes (bf16 `[vocab, dim]`): what retiring it frees,
