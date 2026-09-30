@@ -835,6 +835,9 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const out_path = std.mem.span(std.c.getenv("DSV41_CELL_OUT") orelse return error.SkipZigTest);
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
+    // The Module's construction / phase-change evidence lines (log.info: the routes installed, the
+    // construction check, the phase change's boundary marks) reach the window log; none is per token.
+    testing.log_level = .info;
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
