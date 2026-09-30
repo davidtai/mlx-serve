@@ -72,6 +72,14 @@ pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
 /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
+/// `--wired-margin <size>` (upstream's size syntax: bytes, or KB / MB / GB binary multiples): the margin at byte
+/// granularity, so a stop stated in decimal bytes (a guarded window's 2.0 GB) reaches the plan exactly. 1..32 GiB:
+/// `--wired-margin-gib`'s range with its floor at 1 GiB, since a 2.0 GB decimal stop is 1.86 GiB.
+pub fn wiredMarginFromBytes(bytes: u64) error{InvalidWiredMargin}!u64 {
+    if (bytes < 1 << 30 or bytes > 32 << 30) return error.InvalidWiredMargin;
+    return bytes;
+}
+
 /// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
 /// `physicalMemoryCeiling` byte for byte.
 pub fn gpuCeilingWithWiredFloor(
