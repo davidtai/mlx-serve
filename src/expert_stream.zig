@@ -1597,6 +1597,93 @@ test "dsv41 stream 0b: MLX slot memory is filled by the pool like host rows" {
     try s.flush();
 }
 
+// DSV41_PHASE0B_MLX=1 only (lock-held; 2 GB at a time, freed between). Growth-overlap step 2's premise, measured
+// before it is built: the inference thread's cost of 2 GB of new slot memory under the server's wired policy, (a) as
+// zeros + one eval (step 1), (b) as a page-aligned mapping wrapped no-copy while untouched, then its first GPU use,
+// (c) the same after a helper thread touched every page (the helper's time printed apart). Asserts only no-copy.
+test "dsv41 growth 0b: new slot memory's cost on the inference thread, zeros vs a no-copy wrap before and after a helper's touch" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const io = testing.io;
+    _ = mlx.applyWiredPolicy();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const bytes: usize = 2 << 30;
+    const elems: c_int = @intCast(bytes / 2);
+    const page = std.heap.pageSize();
+    const Probe = struct {
+        fn ms(t: std.Io.Timestamp) f64 {
+            return @as(f64, @floatFromInt(t.untilNow(testing.io, .boot).nanoseconds)) / 1e6;
+        }
+        const Payload = struct { m: []align(std.heap.page_size_min) u8 };
+        fn dtor(ctx: ?*anyopaque) callconv(.c) void {
+            const pl: *Payload = @ptrCast(@alignCast(ctx.?));
+            std.posix.munmap(pl.m);
+            std.heap.c_allocator.destroy(pl);
+        }
+        fn map(len: usize) ![]align(std.heap.page_size_min) u8 {
+            return std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        }
+        /// The mapping as an int16 array, no copy (MLX calls `dtor` at once when it had to copy).
+        fn wrap(m: []align(std.heap.page_size_min) u8, n: c_int) !struct { arr: mlx.mlx_array, no_copy: bool } {
+            const pl = try std.heap.c_allocator.create(Payload);
+            pl.* = .{ .m = m };
+            const base = m.ptr;
+            const arr = mlx.mlx_array_new_data_managed_payload(@ptrCast(base), &[_]c_int{n}, 1, .int16, pl, dtor);
+            const d = mlx.mlx_array_data_uint8(arr);
+            return .{ .arr = arr, .no_copy = if (d) |p| @intFromPtr(p) == @intFromPtr(base) else false };
+        }
+        /// One GPU command that reads the array (a sum over its first 1024 elements).
+        fn use(arr: mlx.mlx_array, st: mlx.mlx_stream) !void {
+            var sl = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sl);
+            try mlx.check(mlx.mlx_slice(&sl, arr, &[_]c_int{0}, 1, &[_]c_int{1024}, 1, &[_]c_int{1}, 1, st));
+            var r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(r);
+            try mlx.check(mlx.mlx_sum(&r, sl, false, st));
+            try mlx.check(mlx.mlx_array_eval(r));
+        }
+        fn touch(m: []u8, step: usize) void {
+            var i: usize = 0;
+            while (i < m.len) : (i += step) m[i] = 0;
+        }
+    };
+    // (a) step 1: zeros and one eval.
+    var t = std.Io.Timestamp.now(io, .boot);
+    var z = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{elems}, 1, .int16, s));
+    try evalArrays(&.{z});
+    const zeros_ms = Probe.ms(t);
+    _ = mlx.mlx_array_free(z);
+    _ = mlx.mlx_clear_cache();
+    // (b) an untouched mapping, wrapped, then its first use.
+    const mb = try Probe.map(bytes);
+    t = std.Io.Timestamp.now(io, .boot);
+    const wb = try Probe.wrap(mb, elems);
+    const wrap_untouched_ms = Probe.ms(t);
+    t = std.Io.Timestamp.now(io, .boot);
+    try Probe.use(wb.arr, s);
+    const use_untouched_ms = Probe.ms(t);
+    _ = mlx.mlx_array_free(wb.arr);
+    // (c) a helper touches every page first (off the timed thread), then the wrap and its first use.
+    const mc = try Probe.map(bytes);
+    t = std.Io.Timestamp.now(io, .boot);
+    const helper = try std.Thread.spawn(.{}, Probe.touch, .{ @as([]u8, mc), page });
+    helper.join();
+    const helper_ms = Probe.ms(t);
+    t = std.Io.Timestamp.now(io, .boot);
+    const wc = try Probe.wrap(mc, elems);
+    const wrap_touched_ms = Probe.ms(t);
+    t = std.Io.Timestamp.now(io, .boot);
+    try Probe.use(wc.arr, s);
+    const use_touched_ms = Probe.ms(t);
+    _ = mlx.mlx_array_free(wc.arr);
+    _ = mlx.mlx_clear_cache();
+    std.debug.print("\nGROWTH_OVERLAP_PROBE {{\"bytes\": {d}, \"zeros_eval_ms\": {d:.2}, \"wrap_untouched_ms\": {d:.2}, \"first_use_untouched_ms\": {d:.2}, \"helper_touch_ms\": {d:.2}, \"wrap_touched_ms\": {d:.2}, \"first_use_touched_ms\": {d:.2}, \"no_copy\": [{}, {}]}}\n", .{
+        bytes, zeros_ms, wrap_untouched_ms, use_untouched_ms, helper_ms, wrap_touched_ms, use_touched_ms, wb.no_copy, wc.no_copy,
+    });
+    try testing.expect(wb.no_copy and wc.no_copy);
+}
+
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
 test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
