@@ -74,6 +74,10 @@ pub const Options = struct {
     /// and decode rows per layer. The envelope admission still runs (AUTO, for its record); its rows
     /// are not used. Exclusive with `fixed_rows`.
     native_rows: ?NativeRows = null,
+    /// Every layer's slot banks at their decode rows from construction: the prompt phase holds the
+    /// same rows and the phase change allocates nothing (no bank growth, no transient beside the
+    /// frees). Native rows must then be one count (prefill == decode).
+    preallocate: bool = false,
     allocation: expert_admission.Allocation = .prefill_excess,
     phase_reserve_bytes: u64 = pass2_phase_reserve_bytes,
     host_reserve_bytes: u64 = pass2_host_reserve_bytes,
@@ -165,10 +169,13 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     if (opt.native_rows) |nr| {
         if (opt.fixed_rows != null) return refuse(diag, error.NativeRowsWithFixedRows, "admission: native rows and forced rows are exclusive", .{});
         if (nr.prefill == 0 or nr.prefill > nr.decode or nr.decode > n_experts) return refuse(diag, error.InvalidNativeRows, "admission: native rows {d} prefill / {d} decode (1..{d})", .{ nr.prefill, nr.decode, n_experts });
+        if (opt.preallocate and nr.prefill != nr.decode) return refuse(diag, error.NativeRowsNotOneCount, "admission: preallocated banks take one row count, native rows {d} prefill / {d} decode", .{ nr.prefill, nr.decode });
         prefill = nr.prefill;
         decode = nr.decode;
     }
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
+    // Preallocated: the decode rows in both phases (the prompt phase's bill holds them).
+    if (opt.preallocate) prefill = decode;
     return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
 }
 
@@ -639,29 +646,137 @@ extern "c" fn task_info(task: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
 extern "c" fn host_statistics64(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
 extern "c" fn host_page_size(host: u32, out: *usize) i32;
 
-/// task_vm_info through the rev3 ledger block (<mach/task_info.h> order).
+/// task_vm_info through the rev3 ledger block (<mach/task_info.h> order, every field named).
 const TaskVmInfo = extern struct {
     virtual_size: u64,
     region_count: i32,
     page_size: i32,
-    rest: [16]u64,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
     phys_footprint: u64,
     min_address: u64,
     max_address: u64,
     ledger_phys_footprint_peak: i64,
-    ledger_rest: [20]i64,
+    ledger_purgeable_nonvolatile: i64,
+    ledger_purgeable_novolatile_compressed: i64,
+    ledger_purgeable_volatile: i64,
+    ledger_purgeable_volatile_compressed: i64,
+    ledger_tag_network_nonvolatile: i64,
+    ledger_tag_network_nonvolatile_compressed: i64,
+    ledger_tag_network_volatile: i64,
+    ledger_tag_network_volatile_compressed: i64,
+    ledger_tag_media_footprint: i64,
+    ledger_tag_media_footprint_compressed: i64,
+    ledger_tag_media_nofootprint: i64,
+    ledger_tag_media_nofootprint_compressed: i64,
+    ledger_tag_graphics_footprint: i64,
+    ledger_tag_graphics_footprint_compressed: i64,
+    ledger_tag_graphics_nofootprint: i64,
+    ledger_tag_graphics_nofootprint_compressed: i64,
+    ledger_tag_neural_footprint: i64,
+    ledger_tag_neural_footprint_compressed: i64,
+    ledger_tag_neural_nofootprint: i64,
+    ledger_tag_neural_nofootprint_compressed: i64,
 };
+
+comptime {
+    // TASK_VM_INFO_REV3_COUNT (rev1 38 + rev2 4 + the rev3 ledger block 42) in natural_t units.
+    std.debug.assert(@sizeOf(TaskVmInfo) / @sizeOf(i32) == 84);
+}
+
+fn taskVmInfo() ?TaskVmInfo {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
+    var info = std.mem.zeroes(TaskVmInfo);
+    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32);
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return null;
+    // A kernel below rev3 leaves the ledger block zero (the reads below then report 0, never garbage).
+    return info;
+}
 
 pub const Footprint = struct { now: u64, peak: u64 };
 
 /// The process phys_footprint (Metal included) and its lifetime peak.
 pub fn footprint() Footprint {
-    if (comptime !builtin.os.tag.isDarwin()) return .{ .now = 0, .peak = 0 };
-    var info = std.mem.zeroes(TaskVmInfo);
-    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32);
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return .{ .now = 0, .peak = 0 };
-    const full = count * @sizeOf(i32) >= @offsetOf(TaskVmInfo, "ledger_rest");
-    return .{ .now = info.phys_footprint, .peak = if (full) @intCast(@max(info.ledger_phys_footprint_peak, 0)) else info.phys_footprint };
+    const info = taskVmInfo() orelse return .{ .now = 0, .peak = 0 };
+    return .{ .now = info.phys_footprint, .peak = if (info.ledger_phys_footprint_peak > 0) @intCast(info.ledger_phys_footprint_peak) else info.phys_footprint };
+}
+
+/// rusage_info_v4 (<sys/resource.h>): the footprint's interval high-water mark, which
+/// `proc_reset_footprint_interval` restarts (libsystem_kernel; the kernel's own ledger, no sampling).
+const RusageInfoV4 = extern struct {
+    uuid: [16]u8,
+    f: [35]u64,
+    const phys_footprint = 7;
+    const lifetime_max_phys_footprint = 28;
+    const interval_max_phys_footprint = 33;
+};
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *RusageInfoV4) c_int;
+extern "c" fn proc_reset_footprint_interval(pid: c_int) c_int;
+extern "c" fn getpid() c_int;
+
+/// This process's memory at a phase boundary, from the kernel's ledgers (task_vm_info rev3 and
+/// rusage v4): what the guard's footprint reads and how it splits. Bytes.
+pub const ProcessMemory = struct {
+    /// phys_footprint now: the guard's per-process number (Metal / IOAccelerator included).
+    footprint: u64 = 0,
+    /// The footprint's high-water mark since the previous `startInterval` (the phase's peak).
+    footprint_interval_peak: u64 = 0,
+    footprint_lifetime_peak: u64 = 0,
+    /// Anonymous (malloc, MLX host) pages resident; compressed pages this task owns.
+    internal: u64 = 0,
+    compressed: u64 = 0,
+    /// File-backed pages this task maps resident (not in the footprint; in the box's file cache).
+    external: u64 = 0,
+    /// IOKit graphics memory (Metal buffers): in the footprint / outside it.
+    graphics_footprint: u64 = 0,
+    graphics_nofootprint: u64 = 0,
+    /// Volatile purgeable memory (outside the footprint).
+    purgeable_volatile: u64 = 0,
+};
+
+pub fn processMemory() ProcessMemory {
+    const info = taskVmInfo() orelse return .{};
+    const pos = struct {
+        fn f(x: i64) u64 {
+            return if (x > 0) @intCast(x) else 0;
+        }
+    }.f;
+    var m: ProcessMemory = .{
+        .footprint = info.phys_footprint,
+        .footprint_lifetime_peak = pos(info.ledger_phys_footprint_peak),
+        .internal = info.internal,
+        .compressed = info.compressed,
+        .external = info.external,
+        .graphics_footprint = pos(info.ledger_tag_graphics_footprint),
+        .graphics_nofootprint = pos(info.ledger_tag_graphics_nofootprint),
+        .purgeable_volatile = pos(info.ledger_purgeable_volatile),
+    };
+    var ru = std.mem.zeroes(RusageInfoV4);
+    if (proc_pid_rusage(getpid(), 4, &ru) == 0) {
+        m.footprint_interval_peak = ru.f[RusageInfoV4.interval_max_phys_footprint];
+        m.footprint_lifetime_peak = @max(m.footprint_lifetime_peak, ru.f[RusageInfoV4.lifetime_max_phys_footprint]);
+    }
+    return m;
+}
+
+/// Restarts the footprint's interval high-water mark (one call per phase boundary, never in a phase).
+pub fn startInterval() void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    _ = proc_reset_footprint_interval(getpid());
 }
 
 /// vm_stat's "Pages wired down", in bytes.
@@ -712,6 +827,27 @@ test "dsv41 arm: the box's physical pages read as the guard reads them, and hold
     try testing.expect(v.wired > 0 and v.active > 0 and v.free > 0);
     // Every page of the box is in one of the counted states or free (within the uncounted ones).
     try testing.expect(physicalUsed(v) + v.free <= @as(u64, 1) << 40);
+}
+
+test "dsv41 memory: the process ledgers read at a boundary, and the interval peak restarts and then tracks a touched allocation" {
+    const m0 = processMemory();
+    try testing.expect(m0.footprint > 0 and m0.internal > 0);
+    try testing.expect(m0.footprint_lifetime_peak >= m0.footprint);
+    try testing.expectEqual(footprint().now > 0, true);
+    startInterval();
+    const m1 = processMemory();
+    // Restarted: the interval peak is the footprint at the restart (within this process's small drift).
+    try testing.expect(m1.footprint_interval_peak <= m1.footprint_lifetime_peak);
+    try testing.expect(m1.footprint_interval_peak + (8 << 20) >= m1.footprint);
+    // 64 MiB touched then freed: the interval peak holds it after the free.
+    const buf = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    @memset(buf, 1);
+    const touched = processMemory().footprint;
+    std.heap.page_allocator.free(buf);
+    const m2 = processMemory();
+    try testing.expect(touched >= m1.footprint + (60 << 20));
+    try testing.expect(m2.footprint_interval_peak >= touched);
+    try testing.expect(m2.footprint + (60 << 20) <= m2.footprint_interval_peak);
 }
 
 /// A mini deepseek_v41 directory for host tests: the model lane's mini config
@@ -833,6 +969,41 @@ test "dsv41 arm: the real bank plans a pass-2 receipt's rows and bounds" {
     std.debug.print("dsv41 arm on the real bank: {d} prefill / {d} decode rows per layer, slot banks {d} B, modeled peak {d} B\n", .{
         p.prefill_rows, p.decode_rows, adm.final_bank_bytes, p.plan.peak_fill.?.modeled_peak_bytes,
     });
+}
+
+// DSV41_BANK=<the 3.0 bank dir>: preallocated, one row count in both phases (the decode rows).
+test "dsv41 arm: the real bank's preallocated plan holds the decode rows in the prompt phase too" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var diag: Diag = .{};
+    var p = try planRows(testing.allocator, std.testing.io, .{
+        .model_dir = dir,
+        .baseline_bytes = 7_755_397_656,
+        .wired_bytes = 3_377_741_824,
+        .fixed_rows = 147,
+        .lookahead = .{},
+        .slot_memory = .host,
+        .preallocate = true,
+    }, &diag);
+    defer p.bank.deinit();
+    try testing.expectEqual(@as(u32, 147), p.decode_rows);
+    try testing.expectEqual(p.decode_rows, p.prefill_rows);
+}
+
+test "dsv41 arm: a preallocated arm grows nothing at the phase change; split native rows are refused" {
+    const tm = try TestModel.create(true);
+    defer tm.destroy();
+    var g = ops.TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var diag: Diag = .{};
+    var o = tm.options();
+    o.preallocate = true;
+    const arm = try TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag);
+    defer arm.deinit();
+    for (arm.prefill_rows, arm.decode_rows) |pr, d| try testing.expectEqual(d, pr);
+    try arm.grow(&g);
+    for (arm.stream.layers) |ls| try testing.expect(ls.ext == null);
+    o.native_rows = .{ .prefill = 2, .decode = 4 };
+    try testing.expectError(error.NativeRowsNotOneCount, TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag));
 }
 
 test "dsv41 arm: every construction refusal is named" {
