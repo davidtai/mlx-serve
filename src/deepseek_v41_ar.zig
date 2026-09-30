@@ -445,8 +445,6 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The prompt's calls; the last one's logits are generated id 0.
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
-    // The prompt's start: the box's pages outside this footprint, the reference the phase change's box proof uses.
-    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
     for (calls[1..]) |c| {
@@ -456,11 +454,19 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
     memProbe("dsv41 ar served", "the prompt's calls");
+    // The box's pages beside this footprint, read fresh (vm_stat) around the call that runs the phase change.
+    var box_before: ?BoxMark = null;
+    var box_grown: ?BoxMark = null;
     for (out, steps, 0..) |*o, *st, i| {
         if (i > 0) {
             _ = mlx.mlx_array_free(logits);
             const before = m.state.?.offset;
+            const pre: ?BoxMark = if (m.phase_change == null) try boxMark(a, io) else null;
             logits = try m.extend(&.{out[i - 1]});
+            if (pre != null and m.phase_change != null) {
+                box_before = pre;
+                box_grown = try boxMark(a, io);
+            }
             if (i <= 2) try readState(a, &state, m, probe, if (i == 1) "after_step1" else "after_step2", before);
         }
         st.* = try stepOf(a, logits, s);
@@ -472,7 +478,6 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), 0, vm_start.external));
     if (m.phase_change) |pc| {
         if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {}
-        try checkBoxReclaimed(pc, prompt_start_outside);
     }
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
@@ -514,6 +519,12 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
         i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
     });
+    // The window's box proof (the harness's), after the reference is written: the grow added no physical pages
+    // beyond its own footprint growth.
+    if (box_before) |bb| {
+        printBoxGrow(a, bb, box_grown.?);
+        try checkGrowResidency(bb, box_grown.?);
+    }
 }
 
 /// The readout's layers: the first kv source of each of the first two compression ratios (V4.1's
@@ -959,8 +970,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
-    // The prompt's start: the phase change's reclaim reference (the loop drives the prompt itself).
-    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
@@ -972,11 +981,13 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     printPhaseMemory(a, phases[1]);
     // The MLX peak over the request: each probe reads and resets it, so keep the max of its phases.
     var mlx_peak: usize = @max(phases[1].mlx_peak_bytes, memProbePeak("dsv41 served cell", "prompt (one pass)"));
+    // The box's pages beside this footprint, read fresh (vm_stat) before the phase change and after its grow,
+    // outside the timed span; judged after the receipt is written.
+    const box_before = try boxMark(a, io);
     const t1 = std.Io.Timestamp.now(io, .boot);
     try md.phaseChange();
-    // The window's box proof (the harness's): every release since the prompt began reclaimed in vm_stat too.
-    if (md.phase_change) |pc| try checkBoxReclaimed(pc, prompt_start_outside);
     const phase_s = secondsSince(io, t1);
+    const box_grown = try boxMark(a, io);
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
     printPhaseMemory(a, phases[2]);
@@ -1091,6 +1102,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         stt.accepted_drafts,        stt.drafted_tokens,     wall_s,                     rec.peak_footprint_gb,
         rec.mlx_peak_gb,            rec.finish,             rec.generated_ids_sha256,   out_path,
     });
+    // The window's box proof (the harness's), after the receipt: the grow added no physical pages beyond its
+    // own footprint growth.
+    printBoxGrow(a, box_before, box_grown);
+    try checkGrowResidency(box_before, box_grown);
 }
 
 /// The window's admission inputs on the shell's config, from the environment the runner sets:
@@ -1229,12 +1244,56 @@ pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
     if (created > @as(i64, @intCast(page_cache_tolerance_bytes))) return error.ConstructionLeftPageCache;
 }
 
-/// At the phase change: the box's physical pages (vm_stat, the guard's metric) down by the freed bytes, and
-/// nothing outside this footprint beyond the prompt's start (SERVED7: the pages stayed counted after they
-/// had left the footprint).
-pub fn checkBoxReclaimed(r: module.PhaseChangeRecord, prompt_start_outside: u64) error{PhaseChangeNotReclaimed}!void {
-    if (r.after.physical + r.freed_bytes > r.before.physical + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
-    if (module.outsideOf(r.after) > prompt_start_outside + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
+/// One fresh reading of the box's physical pages beside this process's footprint, for the harnesses' box proofs.
+/// Read through a vm_stat child: XNU rate-limits host_statistics64 for non-platform binaries (2-10 fresh calls
+/// per second box-wide, then the last reading: pass3an2's phase change read one value five times while the
+/// footprint grew 13.66 GB); vm_stat, a platform binary, is exempt. `status.vmBytes` stays for coarse
+/// once-per-phase marks.
+pub const BoxMark = struct {
+    /// vm_stat's wired + active + inactive + compressor-occupied pages (the guard's physical used), bytes.
+    physical: u64,
+    footprint: u64,
+};
+
+pub fn boxMark(a: std.mem.Allocator, io: std.Io) !BoxMark {
+    const footprint = status.footprint().now;
+    const res = try std.process.run(a, io, .{ .argv = &.{"/usr/bin/vm_stat"}, .stdout_limit = .limited(1 << 16) });
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    if (res.term != .exited or res.term.exited != 0) return error.VmStatFailed;
+    return .{ .physical = try vmStatPhysical(res.stdout), .footprint = footprint };
+}
+
+/// vm_stat's output: its header's page size times wired down + active + inactive + occupied by compressor.
+pub fn vmStatPhysical(out: []const u8) !u64 {
+    const hdr = "page size of ";
+    const at = std.mem.indexOf(u8, out, hdr) orelse return error.VmStatFormat;
+    const rest = out[at + hdr.len ..];
+    const page = try std.fmt.parseInt(u64, rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse return error.VmStatFormat], 10);
+    var pages: u64 = 0;
+    for ([_][]const u8{ "\nPages wired down:", "\nPages active:", "\nPages inactive:", "\nPages occupied by compressor:" }) |key| {
+        const k = std.mem.indexOf(u8, out, key) orelse return error.VmStatFormat;
+        const line = out[k + key.len ..];
+        pages += try std.fmt.parseInt(u64, std.mem.trim(u8, line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len], " .\t"), 10);
+    }
+    return pages * page;
+}
+
+/// At the phase change, judged at the grow on fresh readings: the box's physical pages rose by no more than this
+/// process's footprint did, from before the phase change to after its grow (+ `box_tolerance_bytes`). SERVED7's
+/// double residency fails it (the freed pages still counted while the grow added its own, and page cache aged
+/// in). The free alone proves nothing on a full box: the kernel keeps a small release's pages counted until
+/// there is pressure for them, and a grow that reuses them adds nothing, which is the property.
+pub fn checkGrowResidency(before: BoxMark, grown: BoxMark) error{PhaseChangeNotReclaimed}!void {
+    const physical_growth = @as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical));
+    const footprint_growth = @as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint));
+    if (physical_growth > footprint_growth + @as(i64, @intCast(box_tolerance_bytes))) return error.PhaseChangeNotReclaimed;
+}
+
+fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
+    const r = .{ .before = before, .grown = grown, .physical_growth = @as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical)), .footprint_growth = @as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint)), .tolerance = box_tolerance_bytes };
+    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
+    std.debug.print("NATIVE DSV41_BOX_GROW {s}\n", .{json});
 }
 
 fn printBill(b: CellBill) void {
@@ -1270,25 +1329,40 @@ test "dsv41 memory: the harness's window proofs: page cache left by the load, th
     try testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
     try checkPageCache(200_000_000);
     try checkPageCache(-300_000_000);
-    const ref: u64 = 13_933_000_000;
-    const before: module.BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 91_915_000_000 + ref };
-    const freed: module.BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
-    const ok: module.PhaseChangeRecord = .{ .before = before, .after = freed, .freed_bytes = before.cache, .settle_ms = 250 };
-    try checkBoxReclaimed(ok, ref);
-    // SERVED7's shape: the footprint dropped, the box's pages did not.
-    var served7 = ok;
-    served7.after.physical = before.physical;
-    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(served7, ref));
-    // A short prompt's older releases still counted at the boundary: outside the footprint above the prompt's start.
-    const lag: u64 = 2_100_000_000;
-    var lagged = ok;
-    lagged.before.physical += lag;
-    lagged.after.physical += lag;
-    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(lagged, ref));
-    // Within the tolerance (other processes' movement): passes.
-    var noisy = ok;
-    noisy.after.physical += box_tolerance_bytes;
-    try checkBoxReclaimed(noisy, ref);
+    // A phase change on a full box (pass3an2's served schedule: the 0.72 GB freed stays counted, the grow reuses
+    // it): physical +1.0 GB while the footprint grew 13.66 GB: passes.
+    const before: BoxMark = .{ .physical = 106_164_191_232, .footprint = 92_046_774_184 };
+    try checkGrowResidency(before, .{ .physical = before.physical + 1_000_000_000, .footprint = 105_708_343_184 });
+    // On a box with room: physical follows the footprint: passes.
+    const grown: BoxMark = .{ .physical = before.physical + 13_661_569_000, .footprint = 105_708_343_184 };
+    try checkGrowResidency(before, grown);
+    // SERVED7's shape: the grow's pages on top of freed pages still counted and page cache aged in, physical
+    // +7.7 GB beyond the footprint's growth: refused.
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(before, .{ .physical = grown.physical + 7_700_000_000, .footprint = grown.footprint }));
+    // Other processes' movement within the tolerance passes; beyond it, refused.
+    try checkGrowResidency(before, .{ .physical = grown.physical + box_tolerance_bytes, .footprint = grown.footprint });
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(before, .{ .physical = grown.physical + box_tolerance_bytes + 1, .footprint = grown.footprint }));
+}
+
+test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
+    const sample =
+        \\Mach Virtual Memory Statistics: (page size of 16384 bytes)
+        \\Pages free:                                    79329.
+        \\Pages active:                                 389561.
+        \\Pages inactive:                              2199103.
+        \\Pages speculative:                              3101.
+        \\Pages throttled:                                   0.
+        \\Pages wired down:                            5396050.
+        \\Pages purgeable:                                1318.
+        \\Pages stored in compressor:                   387671.
+        \\Pages occupied by compressor:                 107007.
+        \\
+    ;
+    try testing.expectEqual(@as(u64, (5_396_050 + 389_561 + 2_199_103 + 107_007) * 16_384), try vmStatPhysical(sample));
+    try testing.expectError(error.VmStatFormat, vmStatPhysical("Pages active: 1.\n"));
+    // The live child (host only: vm_stat reads the box, no MLX): within the box's RAM.
+    const m = try boxMark(testing.allocator, testing.io);
+    try testing.expect(m.physical > 0 and m.physical <= status.getTotalMemBytes());
 }
 
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
