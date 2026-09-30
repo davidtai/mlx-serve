@@ -1979,8 +1979,9 @@ test "dsv41 growth 0b: new slot memory's cost on the inference thread, zeros vs 
 }
 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: SERVED13's kill (12 GB outside the footprint late in decode; the grow's
-// wrapped rows its one new mechanism) at 2 GB: the box's pages around each step of the overlapped grow's mechanics.
-test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pages and its first GPU read of every page stay inside the footprint" {
+// wrapped rows its one new mechanism) at 2 GB: the box's pages around each step of the overlapped grow's mechanics,
+// the release included (SERVED14's probe: the release left 2.15 GB wired outside the footprint).
+test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pages, its first GPU read of every page and its release stay inside the footprint" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const ar = @import("deepseek_v41_ar.zig");
     const status = @import("status.zig");
@@ -1994,6 +1995,9 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
         pages: ar.VmStatPages,
         fp: u64,
         pm: status.ProcessMemory,
+
+        const Self = @This();
+        const Settled = struct { b: Self, ms: ?u64 };
 
         /// One moment's reading: the footprint on either side of a posix_spawn'd vm_stat, within the harnesses' bound.
         fn mark(buf: []u8) !@This() {
@@ -2013,6 +2017,21 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
         /// Physical growth outside the footprint since `b0`, the file-backed pages excluded (the guard credits the cache).
         fn outside(b0: @This(), b: @This()) i64 {
             return d(b0.pages.physical(), b.pages.physical()) - d(b0.pages.file_backed, b.pages.file_backed) - d(b0.fp, b.fp);
+        }
+        /// Marks every 50 ms until the growth outside the footprint since `b0` is within `limit`, at most `bound_ms`
+        /// (ms: null when it never is).
+        fn settle(b0: Self, buf: []u8, bound_ms: u64, limit: i64) !Settled {
+            const t0 = std.Io.Timestamp.now(testing.io, .boot);
+            while (true) {
+                const b = try mark(buf);
+                const ms: u64 = @intCast(@divTrunc(t0.untilNow(testing.io, .boot).nanoseconds, std.time.ns_per_ms));
+                if (outside(b0, b) <= limit) return .{ .b = b, .ms = ms };
+                if (ms >= bound_ms) return .{ .b = b, .ms = null };
+                std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+            }
+        }
+        fn msOf(x: ?u64, out: []u8) []const u8 {
+            return if (x) |v| std.fmt.bufPrint(out, "{d}", .{v}) catch out[0..0] else "null";
         }
         fn line(b0: @This(), b: @This(), out: []u8) []const u8 {
             return std.fmt.bufPrint(out, "{{\"d_footprint\": {d}, \"d_physical\": {d}, \"d_wired\": {d}, \"d_file_backed\": {d}, \"d_graphics_nofootprint\": {d}, \"d_internal\": {d}, \"outside\": {d}}}", .{
@@ -2052,20 +2071,52 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     try mlx.check(mlx.mlx_sum(&sum, view, false, s));
     try evalArrays(&.{sum});
     const b3 = try Box.mark(&buf);
-    // Released: the arrays freed (the wrap's deleter unmaps), MLX's cache cleared.
+    // Released: the arrays freed (the wrap's deleter unmaps), MLX's cache cleared, the box settled (2 s bound). Else one
+    // more GPU command and a second settle (1 s): a release the driver retires only at a later submission.
     _ = mlx.mlx_array_free(sum);
     _ = mlx.mlx_array_free(view);
     _ = mlx.mlx_array_free(arr);
     _ = mlx.mlx_clear_cache();
-    const b4 = try Box.mark(&buf);
     const limit: i64 = @intCast(bytes / 10);
+    const r1 = try Box.settle(b0, &buf, 2000, limit);
+    var r2: ?Box.Settled = null;
+    if (r1.ms == null) {
+        var z = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{1}, 1, .float32, s));
+        try evalArrays(&.{z});
+        _ = mlx.mlx_array_free(z);
+        r2 = try Box.settle(b0, &buf, 1000, limit);
+    }
+    const released = r1.ms != null or (r2 != null and r2.?.ms != null);
     const out3 = Box.outside(b0, b3);
-    var l: [4][320]u8 = undefined;
-    std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"release\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        bytes, no_copy, Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b0, b4, &l[3]), limit, if (out3 > limit) "GrowWrapOutsideFootprint" else "inside",
+    const verdict = if (out3 > limit) "GrowWrapOutsideFootprint" else if (!released) "GrowWrapReleaseOutsideFootprint" else "inside";
+    var l: [5][320]u8 = undefined;
+    var ms: [2][24]u8 = undefined;
+    std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"release\": {s}, \"release_settle_ms\": {s}, \"after_next_command\": {s}, \"after_next_command_settle_ms\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
+        bytes, no_copy, Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b0, r1.b, &l[3]), Box.msOf(r1.ms, &ms[0]),
+        if (r2) |x| Box.line(b0, x.b, &l[4]) else "null", if (r2) |x| Box.msOf(x.ms, &ms[1]) else "null", limit, verdict,
+    });
+    // Control (the growth's way back): an MLX-allocated array of the same bytes, written and read in full on the GPU,
+    // released through the allocator (cache cleared), marked from here; reported beside the wrap's, not judged.
+    const c0 = try Box.mark(&buf);
+    var za = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&za, &[_]c_int{elems}, 1, .int16, s));
+    var zs = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sum(&zs, za, false, s));
+    try evalArrays(&.{ za, zs });
+    const c1 = try Box.mark(&buf);
+    _ = mlx.mlx_array_free(zs);
+    _ = mlx.mlx_array_free(za);
+    _ = mlx.mlx_clear_cache();
+    const cr = try Box.settle(c0, &buf, 2000, limit);
+    var cl: [2][320]u8 = undefined;
+    var cms: [24]u8 = undefined;
+    std.debug.print("\nGROWTH_BOX_PROBE_CONTROL {{\"bytes\": {d}, \"written_read\": {s}, \"release\": {s}, \"release_settle_ms\": {s}}}\n", .{
+        bytes, Box.line(c0, c1, &cl[0]), Box.line(c0, cr.b, &cl[1]), Box.msOf(cr.ms, &cms),
     });
     try testing.expect(no_copy);
     if (out3 > limit) return error.GrowWrapOutsideFootprint;
+    if (!released) return error.GrowWrapReleaseOutsideFootprint;
 }
 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
