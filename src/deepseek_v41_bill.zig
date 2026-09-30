@@ -556,7 +556,8 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
 // DSV41_BANK=<bank> (host): this tree's rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB
 // stop; baselines 9.2 GB and pass3an's 9.55 GB), with the seed's copies as the retained prompt state (ac2121c:
 // 847,872 B) and every transient window billed (b4473fa; P1's v1b third window: one row less than depth 2's
-// 137 / 167 at 9.2 GB), the Engram posted gathers off and on (the served tier's route).
+// 137 / 167 at 9.2 GB), the served KV lanes by owner per phase (G7 57409c7: one prompt row at 9.2 GB with the posted
+// gathers on, one at 9.55 GB off), the Engram posted gathers off and on (the served tier's route).
 test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetch's posted gathers off and on (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -571,8 +572,8 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 136, .decode = 166 }, .on = .{ .prefill = 136, .decode = 166 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 136, .decode = 165 }, .on = .{ .prefill = 135, .decode = 165 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 136, .decode = 166 }, .on = .{ .prefill = 135, .decode = 166 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 135, .decode = 165 }, .on = .{ .prefill = 135, .decode = 165 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
