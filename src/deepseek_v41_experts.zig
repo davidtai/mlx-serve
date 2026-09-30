@@ -34,6 +34,7 @@ const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
 const xk = @import("exl3_kernels.zig");
 const quant = @import("quant.zig");
+const dt = @import("dsv41_decode_timers.zig");
 const xq = @import("exl3_quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
@@ -1061,6 +1062,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [expert_lookahead.max_rows * 512]f32 = undefined;
             var scores: []const f32 = &.{};
+            var tt = dt.now();
             if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| {
                 // The predictor joins the routing barrier's eval (the last layer predicts nothing).
                 const sc = try nextScores(g, xf, gate);
@@ -1068,7 +1070,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 scores = try g.hostF32(sc, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+            tt = dt.charge(.barrier, tt);
             const call = try self.source.route(layer, ids, scores);
+            _ = dt.charge(.route, tt);
+            dt.countCall();
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
@@ -1082,10 +1087,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (try self.source.gate(call)) |gates| try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
             } else for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
+                tt = dt.now();
                 try self.source.waitGu(call, part);
+                _ = dt.charge(.read_wait, tt);
                 const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
                 try g.asyncEval(wave.h[0..wave.n]);
+                tt = dt.now();
                 try self.source.waitDown(call, part);
+                _ = dt.charge(.read_wait, tt);
                 try g.asyncEval(try self.downWave(g, layer, &wave, &acc, null));
             }
             self.source.release(call);

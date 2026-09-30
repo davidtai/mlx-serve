@@ -27,6 +27,7 @@ const module = @import("deepseek_v41_module.zig");
 const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
+const dt = @import("dsv41_decode_timers.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -997,6 +998,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
     var cycles: std.ArrayList(CellCycle) = .empty;
+    // A profile build's decode timers count the cycles only (not the warm-up, not the prompt).
+    if (comptime dt.enabled) dt.reset();
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
     var prof: std.ArrayList(ProfCycle) = .empty;
@@ -1046,6 +1049,10 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         }
     }
     const decode_s = secondsSince(io, t2);
+    if (comptime dt.enabled) {
+        var lb: [2048]u8 = undefined;
+        std.debug.print("\nNATIVE {s}\n", .{dt.line(&lb)});
+    }
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
     phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), 0, cx.file_backed_start);

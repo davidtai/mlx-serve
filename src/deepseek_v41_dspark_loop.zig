@@ -13,6 +13,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
+const dt = @import("dsv41_decode_timers.zig");
 
 pub const Config = struct {
     /// Requested native draft depth (capped by the head's block size).
@@ -391,13 +392,16 @@ pub fn Loop(comptime G: type) type {
             var drafts: []const u32 = &.{};
             var k_eff: u32 = 0;
             var native: [ds.max_block]u32 = undefined;
+            var tt = dt.now();
             if (self.k_cap > 0) {
                 const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
                 // CYCLE_TRIM draftfold: the confidence sigmoid is realised by the draft's own eval (one
                 // sync), which also realises the main row and window update the previous commit left.
                 const sig = try g.sigmoid(try g.astype(d.conf, .float32));
+                tt = dt.charge(.draft_build, tt);
                 try g.evalAll(&.{ d.ids, sig });
+                tt = dt.charge(.draft_wait, tt);
                 _ = try g.hostU32(d.ids, native[0..bs]);
                 var conf: [ds.max_block]f32 = undefined;
                 _ = try g.hostF32(sig, conf[0..bs]);
@@ -416,6 +420,7 @@ pub fn Loop(comptime G: type) type {
                 }
                 k_eff = @intCast(drafts.len);
             }
+            tt = dt.charge(.draft_host, tt);
             mark(stamp, .draft);
             // Verify [primary, drafts] in chunks of max_rows, stopping at the correction.
             var block: [ds.max_block + 1]u32 = undefined;
@@ -429,7 +434,9 @@ pub fn Loop(comptime G: type) type {
             while (start < n_block) {
                 const end = @min(start + self.max_rows, n_block);
                 const r = try self.model.forward(g, self.st, block[start..end], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
+                tt = dt.charge(.verify, tt);
                 try g.evalAll(&.{ r.logits.?, r.main_hidden.? });
+                tt = dt.charge(.verify_eval, tt);
                 mark(stamp, .verify);
                 st.verify_calls += 1;
                 hiddens[n_hidden] = r.main_hidden.?;
@@ -447,6 +454,7 @@ pub fn Loop(comptime G: type) type {
                     }
                 }
                 const done = ds.acceptChunk(&o, st, drafts, k_eff, .{ start, end }, target[0 .. end - start], typ);
+                tt = dt.charge(.accept, tt);
                 mark(stamp, .decide);
                 start = end;
                 if (done) break;
@@ -461,8 +469,11 @@ pub fn Loop(comptime G: type) type {
             // the window update is dispatched, not waited; the round boundary's host work (the tail, the
             // caller's, the next draft's build) runs under it, and the next draft's eval waits for it.
             try self.model.trim(g, self.st, trimmed);
+            tt = dt.charge(.trim, tt);
             try self.head.seedMain(g, try sliceRows(g, verify_hidden, 0, @intCast(kept + 1)), self.caches);
+            tt = dt.charge(.seed, tt);
             try self.dispatchWindows();
+            _ = dt.charge(.window, tt);
             mark(stamp, .commit);
             if (log) |lg| {
                 lg.primary = self.primary;
@@ -484,6 +495,7 @@ pub fn Loop(comptime G: type) type {
             const g = self.g;
             const st = &self.stats;
             const c = try self.core(ex, log, stamp, std.math.maxInt(u32));
+            const tt = dt.now();
             var emitted: [ds.max_block + 1]u32 = undefined;
             @memcpy(emitted[0..c.kept], c.drafts[0..c.kept]);
             emitted[c.kept] = c.next;
@@ -507,6 +519,8 @@ pub fn Loop(comptime G: type) type {
             }
             try ex.flush();
             g.reset();
+            _ = dt.charge(.tail, tt);
+            dt.countCycle();
             mark(stamp, .tail);
             return finish;
         }
@@ -524,6 +538,7 @@ pub fn Loop(comptime G: type) type {
             self.lookup_has_primary = true;
             self.primary = t1;
             const c = try self.core(ex, log, stamp, accepted_cap);
+            const tt = dt.now();
             const tokens = try a.alloc(u32, c.kept + 1);
             errdefer a.free(tokens);
             tokens[0] = t1;
@@ -538,6 +553,8 @@ pub fn Loop(comptime G: type) type {
             self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
             try ex.flush();
             g.reset();
+            _ = dt.charge(.tail, tt);
+            dt.countCycle();
             mark(stamp, .tail);
             return .{ .tokens = tokens, .accepted = c.kept, .next_token = c.next };
         }
