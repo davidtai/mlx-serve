@@ -868,6 +868,8 @@ const CellReceipt = struct {
     /// The bill variant this process ran with (DSV41_BILL_VARIANT, read by the bill at construction): "conservative"
     /// when unset, or "tight" (the memory lane's one live stream per routed group, with `main_taps_in_chunk_fence`).
     bill_variant: []const u8 = "conservative",
+    /// The window's arm tag (DSV41_CELL_ARM: tight, fusedw, maxops40, mxfp8head), null for arm 1.
+    cell_arm: ?[]const u8 = null,
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -1169,6 +1171,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_lane = md.decodeLane(),
         .mlx_max_ops_per_buffer = envStr("MLX_MAX_OPS_PER_BUFFER"),
         .bill_variant = envStr("DSV41_BILL_VARIANT") orelse "conservative",
+        .cell_arm = envStr("DSV41_CELL_ARM"),
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
