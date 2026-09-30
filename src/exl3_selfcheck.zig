@@ -92,6 +92,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
     return switch (c) {
         .compile, .row_invariance => true,
         .join_equiv => k == .q3jl_combine,
+        .twin => twinOf(k) != null,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k),
@@ -110,7 +111,16 @@ pub fn implemented(k: Kernel, c: Check) bool {
 }
 
 fn isDigGemm(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null;
+}
+
+/// A 128-row DIG-X GEMM's 64-row text (its `twin` check's reference); null for every other kernel.
+fn twinOf(k: Kernel) ?Kernel {
+    return switch (k) {
+        .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 => .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 => .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
+        else => null,
+    };
 }
 
 /// Runs every check of every kernel's plan; a failing check is recorded (with the latched MLX
@@ -197,6 +207,7 @@ const H = struct {
             .layout_guard => try checkLayoutGuard(h, k),
             .composition => try checkComposition(h, k),
             .join_equiv => try checkJoinEquiv(h, k),
+            .twin => try checkTwin(h, k),
         }
     }
 };
@@ -300,8 +311,8 @@ const Wave = struct {
     }
 
     /// q3_prefill_dig_candidate.wave_table: slot, first row, rows, first threadgroup per expert
-    /// (unused threadgroup entries INT32_MAX), then [n, threadgroups]. Returns the threadgroups.
-    fn table(w: *const Wave, tiles: u32, out: *[80]i32) u64 {
+    /// (unused threadgroup entries INT32_MAX), then [n, threadgroups], at `bm`-row M tiles. Returns the threadgroups.
+    fn table(w: *const Wave, tiles: u32, bm: u32, out: *[80]i32) u64 {
         @memset(out, 0);
         var row0: i64 = 0;
         var tg: i64 = 0;
@@ -315,7 +326,7 @@ const Wave = struct {
             out[32 + j] = @intCast(w.rows[j]);
             out[48 + j] = @intCast(tg);
             row0 += w.rows[j];
-            tg += @as(i64, @intCast((w.rows[j] + 63) / 64)) * tiles;
+            tg += @as(i64, @intCast((w.rows[j] + bm - 1) / bm)) * tiles;
         }
         out[64] = @intCast(w.n);
         out[65] = @intCast(tg);
@@ -376,7 +387,7 @@ fn fillArg(h: *H, buf: []u8, n: usize, arg: *const xk.Arg, vars: *const Vars, wa
         },
         .wave_table => {
             var t: [80]i32 = undefined;
-            _ = wave.table(d.tiles, &t);
+            _ = wave.table(d.tiles, d.bm, &t);
             for (0..n) |i| putInt(buf, i, arg.dtype, t[i]);
         },
         .slots => for (0..n) |i| putInt(buf, i, arg.dtype, wave.slots[if (i < wave.n) i else 0]),
@@ -421,7 +432,7 @@ fn genAll(h: *H, sc: *Scope, e: *const Entry, vars: *Vars, site: ?*const xk.Site
     for (e.inputs) |*arg| {
         if (arg.domain.kind == .wave_table and arg.domain.tiles > 0) {
             var t: [80]i32 = undefined;
-            vars.set(.tgs, wave.table(arg.domain.tiles, &t));
+            vars.set(.tgs, wave.table(arg.domain.tiles, arg.domain.bm, &t));
         }
     }
     var ins: [inputs_max]mlx.mlx_array = @splat(.{});
@@ -1562,7 +1573,7 @@ fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
 const dig_rows = [_]u32{ 70, 37, 20, 17 };
 
 fn isGateUp(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128;
 }
 
 /// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand).
@@ -1570,7 +1581,7 @@ fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []c
     const e = h.reg.get(k);
     const tbl_arg = &e.inputs[e.inputs.len - 1];
     var t: [80]i32 = undefined;
-    const tgs = wave.table(tbl_arg.domain.tiles, &t);
+    const tgs = wave.table(tbl_arg.domain.tiles, tbl_arg.domain.bm, &t);
     const tbl = try fromHost(sc, std.mem.sliceAsBytes(&t), &.{80}, .int32);
     var vars: Vars = .initFill(0);
     vars.set(.rows, wave.total());
@@ -1602,9 +1613,14 @@ const DigFull = struct {
 };
 
 fn digFull(h: *H, sc: *Scope, k: Kernel) !DigFull {
+    return digFullAt(h, sc, k, &dig_rows);
+}
+
+/// `digFull` over experts of `rows_of` rows (slots 0, 1, ...).
+fn digFullAt(h: *H, sc: *Scope, k: Kernel, rows_of: []const u32) !DigFull {
     const e = h.reg.get(k);
-    var wave: Wave = .{ .n = dig_rows.len };
-    for (dig_rows, 0..) |r, j| {
+    var wave: Wave = .{ .n = rows_of.len };
+    for (rows_of, 0..) |r, j| {
         wave.slots[j] = @intCast(j);
         wave.rows[j] = r;
     }
@@ -1676,6 +1692,28 @@ fn checkComposition(h: *H, k: Kernel) !void {
         }
     }
     try h.record(.{ .kernel = k, .check = .composition, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
+}
+
+/// The 128-row texts' twin experts: full and partial 128-row tiles, a 64-row expert, a single row.
+const twin_rows = [_]u32{ 270, 129, 64, 1 };
+
+/// A 128-row DIG-X GEMM against its 64-row text on the same x, codes and wave: every z word.
+fn checkTwin(h: *H, k: Kernel) !void {
+    var sc: Scope = .{ .a = h.a };
+    defer sc.deinit();
+    const f = try digFullAt(h, &sc, k, &twin_rows);
+    const ref = try digLaunch(h, &sc, twinOf(k).?, f.xs[0..f.n_ops], f.codes[0..f.n_ops], &f.wave);
+    var words: u64 = 0;
+    var bad: u64 = 0;
+    for (0..f.n_ops) |o| {
+        const got = try hostCopy(h, f.outs[o]);
+        defer h.a.free(got);
+        const want = try hostCopy(h, ref[o]);
+        defer h.a.free(want);
+        words += got.len / 4;
+        bad += if (got.len == want.len) countDiff(want, got, 4) else got.len / 4;
+    }
+    try h.record(.{ .kernel = k, .check = .twin, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
 }
 
 /// f16(z) of the first and last rows of experts 0 and 3 vs x (f16) @ W_hat (exl3_ref decode)
