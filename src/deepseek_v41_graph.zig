@@ -2538,6 +2538,54 @@ fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
 
 // Inside a guarded window (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
 // selection on the GPU stream against the router's own (`gatePrefix` + `gateSelect`) over the same rows and gate.
+test "dsv41 smoke 0b: the prefill shared expert's three mxfp8 qmm at the K16 chunk shapes, against a bf16 matmul ceiling (MLX, GPU stream)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const mlx = @import("mlx.zig");
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    const c = try realConfig();
+    const TrM = Trunk(ops.MlxOps);
+    const io = testing.io;
+    const H: usize = c.hidden_size;
+    const I: usize = c.moe_intermediate_size;
+    var rng = std.Random.DefaultPrng.init(0x5eed_5a3d);
+    const r = rng.random();
+    const buf = try testing.allocator.alloc(f32, @max(H * I, 953 * @max(H, I)));
+    defer testing.allocator.free(buf);
+    const Proj = struct { name: []const u8, n: usize, k: usize };
+    const projs = [_]Proj{ .{ .name = "w1", .n = I, .k = H }, .{ .name = "w3", .n = I, .k = H }, .{ .name = "w2", .n = H, .k = I } };
+    // The K16 chunk's rows (17 x 953 and one 183-row chunk at 16K); 8 calls per timed run, the best of 5 after a warm-up.
+    for ([_]usize{ 953, 183 }) |rows| for (projs) |pj| {
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        for (buf[0 .. pj.n * pj.k]) |*v| v.* = r.floatNorm(f32) * 0.02;
+        const wd = try g.astype(try g.hostArray(std.mem.sliceAsBytes(buf[0 .. pj.n * pj.k]), &.{ @intCast(pj.n), @intCast(pj.k) }, .float32), .bfloat16);
+        const qw = try g.quantize(wd, .mxfp8);
+        const q: Q(ops.MlxOps.T) = .{ .w = qw.w, .s = qw.s, .mode = .mxfp8 };
+        for (buf[0 .. rows * pj.k]) |*v| v.* = r.floatNorm(f32);
+        const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(buf[0 .. rows * pj.k]), &.{ @intCast(rows), @intCast(pj.k) }, .float32), .bfloat16);
+        try g.evalAll(&.{ wd, q.w, q.s, x });
+        for ([_][]const u8{ "mxfp8", "bf16" }) |mode| {
+            var best: u64 = std.math.maxInt(u64);
+            for (0..6) |run| {
+                const m = g.mark();
+                defer g.resetTo(m);
+                var outs: [8]ops.MlxOps.T = undefined;
+                const t0 = std.Io.Timestamp.now(io, .boot);
+                for (&outs) |*o| o.* = if (mode[0] == 'm') try TrM.qlinear(&g, x, q) else try TrM.linear(&g, x, wd);
+                try g.evalAll(&outs);
+                const ns: u64 = @intCast(t0.untilNow(io, .boot).nanoseconds);
+                if (run > 0) best = @min(best, ns);
+            }
+            const us = @as(f64, @floatFromInt(best)) / 8000.0;
+            const tflops = 2.0 * @as(f64, @floatFromInt(rows * pj.n * pj.k)) / (us * 1e-6) / 1e12;
+            std.debug.print("SHARED_QMM_MICROBENCH {{\"proj\": \"{s}\", \"rows\": {d}, \"k\": {d}, \"n\": {d}, \"mode\": \"{s}\", \"us\": {d:.1}, \"tflops\": {d:.2}}}\n", .{ pj.name, rows, pj.k, pj.n, mode, us, tflops });
+        }
+    };
+}
+
 test "dsv41 smoke 0b: C22 moeshared: the compiled shared middle equals the op chain bit for bit at every decode row count (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const mlx = @import("mlx.zig");
