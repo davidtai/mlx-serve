@@ -939,6 +939,8 @@ const CellReceipt = struct {
     decode_mxfp8_rows: ?bool = null,
     /// C22 moeshared (installed): the shared expert's middle compiled at decode rows.
     decode_shared_mid: ?bool = null,
+    /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
+    head_mode: ?[]const u8 = null,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1241,6 +1243,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
         .decode_shared_mid = md.installed.decode_shared_mid,
+        .head_mode = @tagName(md.installed.head_mode),
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1338,6 +1341,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
+    if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
         if (d < 1 or d > expert_stream.max_wide_depth) return error.CellWideDepth;

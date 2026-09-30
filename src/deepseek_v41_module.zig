@@ -109,6 +109,10 @@ pub const RouteOverrides = struct {
     decode_mxfp8_rows: ?bool = null,
     /// C22 moeshared: the shared expert's middle compiled at decode rows.
     decode_shared_mid: ?bool = null,
+    /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
+    /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
+    /// Rounding-class: the ids change by design (the grader battery gates it).
+    head_mode: ?graph.Routes.Head = null,
 };
 
 /// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
@@ -308,6 +312,10 @@ pub const Module = struct {
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
+        if (ov.head_mode) |h| {
+            tier.routes.head = h;
+            if (h != .bf16) tier.routes.rc_head = false;
+        }
         if (ov.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -316,6 +324,12 @@ pub const Module = struct {
         log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
+        // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
+        // dense one (the draft head takes the model's), so the checkpoint's bf16 head leaves the device here.
+        if (tier.routes.head == .mxfp8) {
+            weights.drop("head.weight");
+            log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
+        }
         if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
@@ -342,8 +356,10 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
+        self.installed.head_mode = self.model.tier.routes.head;
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}", .{self.installed.decode_shared_mid});
+        log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -980,6 +996,8 @@ pub const Installed = struct {
     decode_mxfp8_rows: bool = false,
     /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
     decode_shared_mid: bool = false,
+    /// HEAD_MODE: the output head's codec as installed (target and draft).
+    head_mode: graph.Routes.Head = .f32,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.
