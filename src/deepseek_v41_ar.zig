@@ -1093,8 +1093,8 @@ fn cellConfig(config: *model.ModelConfig) !void {
 }
 
 /// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
-/// total and `module.fillRows` takes rows up to the stop's target; the config then carries both row
-/// counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
+/// total and `module.fillRows` takes ONE row count up to the binding phase's target (no grow at the phase
+/// change); the config then carries it as both row counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
 /// later lines at its first line's rows): billed, and refused by name above the target. DSV41_CELL_ROWS
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
 /// ladder's widest admission (two wide windows and the larger of the chunk-major and layer-major prompt

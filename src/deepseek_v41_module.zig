@@ -524,9 +524,12 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
 /// r rows is `fixed + r * per_row`.
 pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
 
-/// The native admission's fill: the most decode rows, and prefill rows under the prefill phase's
-/// bill, whose billed total stays within `ceiling_stop_bytes` of the ceiling (prefill <= decode <=
-/// the layer's experts). Refused by name when not even `min_fill_rows` fit.
+/// The native admission's fill, the bill of record since SERVED7 (no grow): ONE row count for both
+/// phases, so the slot banks are allocated once, at construction, and the phase change adds none
+/// (`expert_stream.Stream.grow` allocates only rows above the capacity). There is no free-then-grow at
+/// the phase change, so the guard's physical metric has no transition term to carry (SERVED7: 7.2 GiB
+/// outside the footprint at the grow). The most rows whose billed total in BOTH phases stays within
+/// `ceiling_stop_bytes` of the ceiling (<= the layer's experts); refused by name under `min_fill_rows`.
 pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
     const target = ceiling_bytes -| ceiling_stop_bytes;
     const most = struct {
@@ -534,10 +537,9 @@ pub fn fillRows(b: FillBill, ceiling_bytes: u64, n_experts: u32) error{NativeBil
             return if (fixed >= t) 0 else (t - fixed) / per_row;
         }
     }.f;
-    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
-    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
-    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
-    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
+    const rows = @min(@min(most(b.prefill_fixed, target, b.per_row), most(b.decode_fixed, target, b.per_row)), n_experts);
+    if (rows < min_fill_rows) return error.NativeBillDoesNotFit;
+    return .{ .prefill = @intCast(rows), .decode = @intCast(rows) };
 }
 
 /// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
@@ -1060,18 +1062,21 @@ const fill_fixture = struct {
     }
 };
 
-test "dsv41 module: the native fill reaches the stop's target within one row and never passes it" {
+test "dsv41 memory: the native fill is one row count for both phases, at the binding phase's target within one row" {
     const f = fill_fixture;
     const target = f.ceiling - ceiling_stop_bytes;
     for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
         const b = f.at(base);
         const r = try fillRows(b, f.ceiling, 384);
-        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
-        try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
+        try std.testing.expectEqual(r.prefill, r.decode);
+        // Both phases fit; the binding one (the larger fixed terms) takes no row more.
+        try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.prefill_fixed + r.prefill * b.per_row <= target);
+        try std.testing.expect(@max(b.prefill_fixed, b.decode_fixed) + (r.decode + 1) * b.per_row > target);
         std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
     }
     // The measured baselines' rows (non-file ~9 GB, 11 GB, and the credited 13.4 GB).
-    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
+    // (The two-count fill admitted 127 / 168 here and grew 41 rows at the phase change.)
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 127 }, try fillRows(f.at(9_000_000_000), f.ceiling, 384));
     // Capped at the layer's experts; refused by name when not even the floor fits.
     const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, f.ceiling, 384);
     try std.testing.expectEqual(@as(u32, 384), cap.decode);
