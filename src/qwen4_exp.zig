@@ -14,6 +14,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
+const nocache_reader = @import("nocache_reader.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -210,6 +211,14 @@ pub const NgramTable = struct {
     cache: ?*RowCache = null,
     /// The table's posted gathers (`enablePosting`): one thread runs them in post order.
     poster: ?*Poster = null,
+    /// A raw BF16 table's aligned parallel row reads (`openTensor`; `gatherRaw`): its stages and readers, built once.
+    row_gather: ?*nocache_reader.RowGather = null,
+
+    /// `gatherRaw`'s readers: 15 helpers and the caller; pieces of 1,024 ids; the caller alone below 32 ids (a decode
+    /// or verify block). Built once per table (`RowGather.persistentBytes`: the bill's named term).
+    pub const raw_gather_helpers: usize = 15;
+    pub const raw_gather_max_ids: usize = 1024;
+    pub const raw_gather_parallel_min: usize = 32;
 
     /// A gather handed to the table's poster thread: exactly `gatherRecords(rows, out)`, run in post
     /// order (the cache included), ready once `wait` returns. The caller keeps `rows` and `out` alive and
@@ -336,18 +345,18 @@ pub const NgramTable = struct {
         const size: usize = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
         if (size < 8) return error.NgramTableTruncated;
         var len_bytes: [8]u8 = undefined;
-        try preadAll(fd, &len_bytes, 0);
+        try nocache_reader.readAligned(fd, &len_bytes, 0);
         const hlen: usize = @intCast(std.mem.readInt(u64, &len_bytes, .little));
         if (hlen > size - 8) return error.NgramTableTruncated;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const header = try a.alloc(u8, hlen);
-        try preadAll(fd, header, 8);
+        try nocache_reader.readAligned(fd, header, 8);
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, header, .{}) catch return error.NgramTableHeader;
         if (parsed != .object) return error.NgramTableHeader;
         const w = try headerRegion(parsed.object, name, "BF16", 2, size, 8 + hlen);
-        return .{
+        var t: NgramTable = .{
             .map = &empty_map,
             .rows = w.rows,
             .dim = @intCast(w.cols),
@@ -361,34 +370,25 @@ pub const NgramTable = struct {
             .fd = fd,
             .nocache = true,
         };
+        t.row_gather = try nocache_reader.RowGather.init(fd, t.w_off, @as(usize, t.dim) * 2, t.rows, raw_gather_helpers, raw_gather_max_ids, raw_gather_parallel_min);
+        return t;
     }
 
     const empty_map: [0]u8 align(std.heap.page_size_min) = .{};
 
     /// Raw BF16 rows `row_ids`, in order, into `out` (`row_ids.len * dim * 2`
-    /// bytes): the table's bytes, no conversion (a bits-16 table).
+    /// bytes): the table's bytes, no conversion (a bits-16 table). A no-cache table reads through its row gather:
+    /// whole aligned pages only (an unaligned read would leave its pages in the page cache), each distinct row once,
+    /// in parallel at prompt widths.
     pub fn gatherRaw(self: *const NgramTable, row_ids: []const u32, out: []u8) !void {
         std.debug.assert(self.bits == 16);
         const rb: usize = @as(usize, self.dim) * 2;
         if (out.len != row_ids.len * rb) return error.NgramTableRegion;
+        for (row_ids) |r| if (r >= self.rows) return error.NgramTableRegion;
+        if (self.nocache) return self.row_gather.?.gather(row_ids, out);
         for (row_ids, 0..) |r, i| {
-            if (r >= self.rows) return error.NgramTableRegion;
-            const dst = out[i * rb ..][0..rb];
             const off = self.w_off + @as(usize, r) * rb;
-            if (self.nocache) try preadAll(self.fd, dst, off) else @memcpy(dst, self.map[off..][0..rb]);
-        }
-    }
-
-    fn preadAll(fd: std.c.fd_t, dst: []u8, off: usize) !void {
-        var done: usize = 0;
-        while (done < dst.len) {
-            const r = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(off + done));
-            if (r < 0) {
-                if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
-                return error.NgramTableRead;
-            }
-            if (r == 0) return error.NgramTableTruncated;
-            done += @intCast(r);
+            @memcpy(out[i * rb ..][0..rb], self.map[off..][0..rb]);
         }
     }
 
@@ -536,6 +536,8 @@ pub const NgramTable = struct {
         live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
+        if (self.row_gather) |g| g.deinit();
+        self.row_gather = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
         if (self.cache) |c| {
