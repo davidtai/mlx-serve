@@ -1879,3 +1879,25 @@ test "dsv41 dspark loop: the fixture's mini config builds the model and head, an
     try testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 1, 1, 1 }, lp.stats.drafted_by_depth[0..7]);
     try testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 1, 1, 0 }, lp.stats.accepted_by_depth[0..7]);
 }
+
+// DSV41_PHASE0B_MLX=1 only (a GPU-lock-held run: any MLX array creates the Metal device).
+test "dsv41 smoke 0b: the seed's row copy owns its rows and equals the view (MLX)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const mlx = @import("mlx.zig");
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    var vals: [2 * 5 * 3]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{ 2, 5, 3 }, .float32);
+    const L = Loop(ops.MlxOps);
+    const view = try L.sliceRows(&g, x, 1, 4);
+    const copy = try L.copyRows(&g, x, 1, 4);
+    try g.evalAll(&.{ view, copy });
+    var a: [2 * 3 * 3]f32 = undefined;
+    var b: [2 * 3 * 3]f32 = undefined;
+    try testing.expectEqualSlices(f32, try g.hostF32(view, &a), try g.hostF32(copy, &b));
+    // The copy's data is its own buffer, not the source's (a view keeps the whole source alive).
+    try testing.expect(mlx.mlx_array_data_float32(copy) != mlx.mlx_array_data_float32(view));
+}

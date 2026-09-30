@@ -1969,6 +1969,56 @@ test "dsv41 ops: resetTo frees exactly what was tracked after its mark" {
 
 // Guarded window only (_GPU_WINDOW_LOCKED=1): a wave's intermediates go back at
 // resetTo while its kept output still evaluates.
+// DSV41_PHASE0B_MLX=1 only (a GPU-lock-held run: any MLX array creates the Metal device). The served path's
+// first-time defaults through the mlx-c shim with initialized handles, before any model window.
+test "dsv41 smoke 0b: MlxOps reads an evaluated view in place through its strides (READBACK)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    const vals = [_]i32{ 0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23 };
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{ 3, 4 }, .int32);
+    // The router's top-k view (row stride 4), then transposes (column-major strides), each read in place.
+    const cols = try g.slice(x, &.{ 0, 1 }, &.{ 3, 3 }, &.{ 1, 1 });
+    var ids: [6]u16 = undefined;
+    try testing.expectEqualSlices(u16, &.{ 1, 2, 11, 12, 21, 22 }, try g.hostIds(cols, &ids));
+    const tr = [_]u32{ 0, 10, 20, 1, 11, 21, 2, 12, 22, 3, 13, 23 };
+    var uo: [12]u32 = undefined;
+    try testing.expectEqualSlices(u32, &tr, try g.hostU32(try g.transposeAxes(try g.astype(x, .uint32), &.{ 1, 0 }), &uo));
+    var fo: [12]f32 = undefined;
+    _ = try g.hostF32(try g.transposeAxes(try g.astype(x, .float32), &.{ 1, 0 }), &fo);
+    for (tr, fo) |w, v| try testing.expectEqual(@as(f32, @floatFromInt(w)), v);
+}
+
+test "dsv41 smoke 0b: the o-projection's wo_b as one gather_qmm over its [1, out, in / 4] view matches its qmm" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    // A bf16 activation [1, 8, 256] and an mxfp8 wo_b [64, 256] (the served tier's projection mode).
+    var xs: [8 * 256]f32 = undefined;
+    for (&xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 8.0;
+    var ws: [64 * 256]f32 = undefined;
+    for (&ws, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 13)) - 6)) / 16.0;
+    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ 1, 8, 256 }, .float32), .bfloat16);
+    const q = try g.quantize(try g.astype(try g.hostArray(std.mem.sliceAsBytes(&ws), &.{ 64, 256 }, .float32), .bfloat16), .mxfp8);
+    const ref = try g.astype(try g.qmm(x, q.w, q.s, .mxfp8), .float32);
+    // The served route (Trunk.outProj): the weight as one expert [1, out, in / 4], rhs index 0.
+    const wsh = g.shapeOf(q.w);
+    const ssh = g.shapeOf(q.s);
+    const wb = try g.reshape(q.w, &.{ 1, wsh.dim(0), wsh.dim(1) });
+    const sb = try g.reshape(q.s, &.{ 1, ssh.dim(0), ssh.dim(1) });
+    const idx0 = try g.astype(try g.arange(0, 1, 1, .int32), .uint32);
+    const got = try g.astype(try g.reshape(try g.gatherQmm(x, wb, sb, idx0, .mxfp8), &.{ 1, 8, 64 }), .float32);
+    var a: [8 * 64]f32 = undefined;
+    var b: [8 * 64]f32 = undefined;
+    _ = try g.hostF32(ref, &a);
+    _ = try g.hostF32(got, &b);
+    for (a, b) |r, v| try testing.expect(@abs(r - v) <= 1e-2 * (1 + @abs(r)));
+}
+
 test "dsv41 ops: an MLX wave scope frees its intermediates and keeps its output" {
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
     const s = mlx.mlx_default_cpu_stream_new();
