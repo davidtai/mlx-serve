@@ -12,7 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86";
+pub const manifest_sha256 = "230f778d9db6d66789316f10d45f9d445ba95dab4e888e7ec7539986708f0912";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -107,6 +107,9 @@ pub const Kernel = enum {
     // JOINLESS (09-30, port-exported: R/mlx-serve-kernels/tools/export_joinless.py): SMALLK's combine reading the
     // routed rows from the fused call outputs through a (source, row) table
     q3jl_combine,
+    // The take2 retune (09-30, mlx-serve native; its lane pin is its own text): q3_prefill_dig_rot_take2_5120's values
+    // with both outputs per simdgroup from one act load (the same butterfly pairs in the same bit order)
+    dsv41_prefill_dig_take2v_5120,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -1101,7 +1104,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 74), n_kernels);
+    try testing.expectEqual(@as(usize, 75), n_kernels);
     try testing.expectEqual(@as(usize, 15), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1116,8 +1119,10 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 4), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 5), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
+    // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
+    try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each

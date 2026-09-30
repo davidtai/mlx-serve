@@ -47911,6 +47911,365 @@
      "name": "src"
     }
    ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": false,
+   "family": "prefill_digx",
+   "grid": [
+    {
+     "m": 1280
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "act",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "a_rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "a_rows"
+     },
+     "dtype": "int32",
+     "name": "ridx",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "experts"
+     },
+     "dtype": "uint32",
+     "name": "rhs",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "wave_table",
+      "of": "experts",
+      "tiles": 0
+     },
+     "dtype": "int32",
+     "name": "slots",
+     "role": "table",
+     "shape": [
+      {
+       "m": 80
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rin_g",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rin_u",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "q3_prefill_dig_rot_take2_5120",
+    "native": "mlx-serve dsv41-decode (2026-09-30): the take2 retune, both outputs per simdgroup from one act load"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "8faabe3aa162ddcfd8538b99a8cbaf72b3b09cc9feb864e3375f322c850d1cf1",
+     "symbol": "mlx-serve native text (dsv41-decode, 2026-09-30): q3_prefill_dig_rot_take2_5120 arithmetic in a lane layout that writes both outputs per simdgroup; exact by construction (the same butterfly pairs in the same bit order) and by the mlx_chain device self-check (bitwise)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1280,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float16",
+      "float16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       1,
+       5120
+      ],
+      [
+       1,
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "a_rows",
+       "value": 300
+      },
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "experts",
+       "value": 2
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      17,
+      1
+     ],
+     "output_dtypes": [
+      "float16",
+      "float16"
+     ],
+     "output_shapes": [
+      [
+       17,
+       1,
+       5120
+      ],
+      [
+       17,
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "a_rows",
+       "value": 300
+      },
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "experts",
+       "value": 2
+      },
+      {
+       "name": "rows",
+       "value": 17
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      270,
+      1
+     ],
+     "output_dtypes": [
+      "float16",
+      "float16"
+     ],
+     "output_shapes": [
+      [
+       270,
+       1,
+       5120
+      ],
+      [
+       270,
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "a_rows",
+       "value": 300
+      },
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "experts",
+       "value": 2
+      },
+      {
+       "name": "rows",
+       "value": 270
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_prefill_dig_take2v_5120",
+   "outputs": [
+    {
+     "dtype": "float16",
+     "name": "out_g",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "dtype": "float16",
+     "name": "out_u",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "mlx_chain"
+    ],
+    "lane_install_check": "none (mlx-serve native): the device mlx_chain self-check at construction, and the 0b smoke comparing it with q3_prefill_dig_rot_take2_5120 bit for bit on real records",
+    "mlx_chain": "out_p = f16(t128(take(act, ridx).f32 * take(rin_p, take(slots, rhs)).f32)): bitwise (the reference of q3_prefill_dig_rot_take2_5120)",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 2560,
+    "file": "dsv41_prefill_dig_take2v_5120.metal",
+    "sha256": "8faabe3aa162ddcfd8538b99a8cbaf72b3b09cc9feb864e3375f322c850d1cf1"
+   },
+   "template": [],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "prefill-dx"
+   ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    },
+    {
+     "hi": 16,
+     "lo": 1,
+     "name": "experts"
+    },
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "a_rows"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -48249,6 +48608,102 @@
    ],
    "manifest_sha256": "6811a8bbad51fcc0ddea845c83b1f75a7156bae04aabeed999e5262e31fcb786",
    "widened": []
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3",
+    "joinless"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine",
+    "q3jl_combine"
+   ],
+   "manifest_sha256": "88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"
   }
  ],
  "sources": {

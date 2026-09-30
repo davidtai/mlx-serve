@@ -97,7 +97,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .composition => isDigGemm(k),
         .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
         .mlx_chain => switch (k) {
-            .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
+            .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
             else => false,
         },
         .f64 => switch (k) {
@@ -811,8 +811,8 @@ fn checkChain(h: *H, k: Kernel) !void {
             refs[0] = try mul(&sc, try t128(&sc, in_.at("zd"), &.{ rows, 5120 }, s), r, s);
             n_ref = 1;
         },
-        // f16(t128(take(act, ridx).f32 * rin[slots[rhs]]))   (RotOpsX.take2)
-        .q3_prefill_dig_rot_take2_5120 => {
+        // f16(t128(take(act, ridx).f32 * rin[slots[rhs]]))   (RotOpsX.take2; the retune checks against the same chain)
+        .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120 => {
             const xs = try reshape(&sc, try f32Of(&sc, try take0(&sc, in_.at("act"), in_.at("ridx"), s), s), &.{ rows, 1, 5120 }, s);
             for ([_][]const u8{ "rin_g", "rin_u" }) |name| {
                 const r = try slotRows(&sc, in_.at(name), in_.at("slots"), in_.at("rhs"), rows, 5120, s);

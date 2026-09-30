@@ -71,7 +71,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 18), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 19), eq.kernels.len);
     try testing.expectEqual(@as(usize, 56), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
@@ -113,6 +113,9 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), t.launcher.?);
     var plan: usize = 0;
     for (&set.reg.entries) |*e| plan += e.checks.count();
+    // the take2 retune's checks run in its 0b smoke, not at accept, until its route flips
+    const retune_checks = set.reg.get(.dsv41_prefill_dig_take2v_5120).checks.count();
+    try testing.expectEqual(@as(usize, 3), retune_checks);
     // the EXL3 quant: exactly its 49 checks, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set }, v41_spec, &diag);
     try testing.expectEqual(@as(usize, 49), acc.report.results.items.len);
@@ -124,7 +127,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
-    try testing.expectEqual(plan - 49, rep.results.items.len);
+    try testing.expectEqual(plan - 49 - retune_checks, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
@@ -562,9 +565,11 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     }
     for (t.launches.items) |l| hit.insert(l.k);
     // every kernel of record is a route's except the DIG-X golden-tile texts (install self-check
-    // only), the DRAFTRC entries and decode / prefill batch 2 (their routes' own tests cover those)
+    // only), the DRAFTRC entries and decode / prefill batch 2 (their routes' own tests cover those),
+    // and the take2 retune until its route flips (its 0b smoke launches it; the registry's round
+    // trip covers its geometry)
     for (reg.entries) |e| {
-        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e);
+        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .dsv41_prefill_dig_take2v_5120;
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
