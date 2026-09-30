@@ -42425,6 +42425,20 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
 }
 
+/// A module-owned arch's own load requirement for the load preflight: the bytes it needs free, in place
+/// of the shards' disk bytes (null: the preflight bills the shards). deepseek_v41: its native memory bill at
+/// the fill's floor rows (the streamed experts' slot banks, residents, prompt wave and caches), so the
+/// preflight is the one load gate and its message and `--skip-mem-preflight` apply.
+pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig) ?u64 {
+    if (std.mem.eql(u8, config.model_type, "deepseek_v41")) {
+        return dsv41_mod.loadRequirementBytes(allocator, io, config) catch |e| {
+            std.log.warn("[preflight] deepseek_v41 bill unavailable ({s}); billing the shards", .{@errorName(e)});
+            return null;
+        };
+    }
+    return null;
+}
+
 /// deepseek_v41: the module over the loaded residents; the shell is dsv4's (a 0-layer KVCache,
 /// empty standard fields).
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {

@@ -330,9 +330,9 @@ test "dsv41 cell: a stand-in cell on a synthetic model writes the tier's receipt
     try testing.expectEqual(@as(u32, 4), b.stats.cycles);
     try testing.expectEqual(@as(f64, @floatFromInt(r.generated.len)) / 4.0, b.stats.tokens_per_cycle);
     try testing.expectEqual(@as(f64, @floatFromInt(r.generated.len - 1)) / r.decode_wall_s, b.decode_tok_s);
-    try testing.expectEqual(c.arm.plan.admission.decode_rows, b.admission.decode_slots_per_layer);
+    try testing.expectEqual(c.arm.plan.?.admission.decode_rows, b.admission.decode_slots_per_layer);
     try testing.expectEqual(@as(u32, 4), b.admission.stream_decode_rows_per_layer);
-    try testing.expectEqual(c.arm.plan.peak_fill.?.modeled_peak_bytes, b.admission.tcq3_peak_fill.modeled_peak_physical_bytes);
+    try testing.expectEqual(c.arm.plan.?.peak_fill.?.modeled_peak_bytes, b.admission.tcq3_peak_fill.modeled_peak_physical_bytes);
     try testing.expectEqualSlices(u32, r.generated, b.generated_ids);
     try testing.expectEqualStrings(&try idsSha256(a, r.generated), b.generated_ids_sha256);
     try testing.expectEqual(r.io_end.expert_bytes_read, b.stream_end.io.read_bytes);
@@ -409,7 +409,7 @@ test "dsv41 cell: report_pairs reads a stand-in cell's receipt and log as the ti
     try testing.expectEqual(r.pass_wall_s, m.wall_s);
     try testing.expectEqual(@as(u32, 4), m.cycles);
     try testing.expectEqual(n / 4.0, m.tok_per_cycle);
-    try testing.expectEqual(c.arm.plan.admission.decode_rows, m.rows);
+    try testing.expectEqual(c.arm.plan.?.admission.decode_rows, m.rows);
     try testing.expectEqual(@as(f64, @floatFromInt(r.footprint.peak)) / 1e9, m.peak_gb);
     try testing.expectEqualStrings(&try idsSha256(a, r.generated), m.ids);
     try testing.expectEqual(@as(u32, 10), m.prompt_tokens);
@@ -444,6 +444,8 @@ test "dsv41 cell: the stand-in cell on the bank at the admitted rows (the arm's 
     if (envOf("DSV41_CELL_CYCLES")) |v| spec.cycles = try std.fmt.parseInt(u32, v, 10);
     if (envOf("DSV41_CELL_PROMPT_TOKENS")) |v| spec.prompt_tokens = try std.fmt.parseInt(u32, v, 10);
     var opt: arm_mod.Options = .{
+        // The cell's receipts pair with Python's envelope admission.
+        .envelope_record = true,
         .model_dir = model_dir,
         .baseline_bytes = if (baseline_gb) |v| @intFromFloat(@round(try std.fmt.parseFloat(f64, v) * 1e9)) else null,
         .fixed_rows = if (envOf("DSV41_CELL_ROWS")) |v| try std.fmt.parseInt(u32, v, 10) else null,
@@ -472,9 +474,9 @@ test "dsv41 cell: the stand-in cell on the bank at the admitted rows (the arm's 
         return e;
     };
     defer arm.deinit();
-    const adm = arm.plan.admission;
+    const adm = arm.plan.?.admission;
     std.debug.print("DSV41_CELL_PLAN {{\"prefill_rows\": {d}, \"decode_rows\": {d}, \"slot_bank_bytes\": {d}, \"expected_mlx_peak_bytes\": {d}, \"modeled_peak_physical_bytes\": {d}}}\n", .{
-        arm.prefill_rows[0], arm.decode_rows[0], adm.final_bank_bytes, adm.final_bank_bytes, if (arm.plan.peak_fill) |pf| pf.modeled_peak_bytes else adm.physical_bound_bytes,
+        arm.prefill_rows[0], arm.decode_rows[0], adm.final_bank_bytes, adm.final_bank_bytes, if (arm.plan.?.peak_fill) |pf| pf.modeled_peak_bytes else adm.physical_bound_bytes,
     });
     var decode = arm_mod.StandIn(A).init(spec.seed, spec.rows, spec.cycles);
     var r = try run(A, a, io, arm, &g, &decode, spec);
