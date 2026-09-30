@@ -111,9 +111,6 @@ pub const Module = struct {
     phase_change: ?PhaseChangeRecord = null,
     /// The prompt-start reference and the terminal refusal (`PhaseGate`).
     gate: PhaseGate = .{},
-    /// The file-backed pages the construction check measures the step's page cache from: the guard's
-    /// credited start cache when it runs the step (_GPU_WINDOW_FILE_START_BYTES), else this Module's entry.
-    file_backed_ref: u64 = 0,
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -140,7 +137,6 @@ pub const Module = struct {
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
-        self.file_backed_ref = fileBackedRef();
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
@@ -298,15 +294,6 @@ pub const Module = struct {
             log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
             return e;
         };
-        // The bill's assumption: the step creates no page cache (the guard credits only its start cache and
-        // counts speculative pages once the kernel ages them, which it can do at the grow).
-        const v = arm_mod.vmBytes();
-        const created = v.external -| self.file_backed_ref;
-        log.info("NATIVE construction check: page cache created {d} B (file-backed {d} B, reference {d} B, speculative {d} B; tolerance {d} B)", .{ created, v.external, self.file_backed_ref, v.speculative, page_cache_tolerance_bytes });
-        checkPageCache(created) catch |e| {
-            log.err("construction check: construction left {d} B of page cache ({d} B speculative); the bill assumes none", .{ created, v.speculative });
-            return e;
-        };
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
@@ -413,7 +400,6 @@ pub const Module = struct {
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
         try self.gate.request();
-        self.promptStart();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
         self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
@@ -481,14 +467,6 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The prompt's start (before it allocates anything): while the banks have not grown, every prompt
-    /// records the reference the phase change judges its reclaim against (`PhaseGate.startPrompt`), so the
-    /// shell's warm-up forwards (a prefill at load) never pin it for a request that comes much later. The
-    /// served path calls it from `prefill`; a harness that drives the loop itself calls it before its prompt.
-    pub fn promptStart(self: *Module) void {
-        self.gate.startPrompt(self.grown(), outsideOf(BoundaryMemory.now()));
-    }
-
     /// The reading `reclaimShrink` judges against, taken before the caller frees the grown rows: every
     /// command of the previous request retired first, so nothing it still held is missing from it.
     pub fn boundaryBefore(self: *Module) BoundaryMemory {
@@ -498,11 +476,10 @@ pub const Module = struct {
 
     /// The served path's return to the prompt phase before a later prompt, after the caller freed the grown
     /// rows (the arm's shrink; `before` read just before it): the MLX cache cleared (the freed rows' buffers
-    /// go back to the driver, not into the cache), synchronize, then the same reclaim wait and one check as
-    /// the phase change (the footprint and the box's physical pages down by the freed bytes, nothing more
-    /// outside the footprint than at `before`), terminal on refusal. The proven reading becomes the next
-    /// prompt's reference, so its own phase change judges its reclaim from a clean start. Bill: every prompt
-    /// pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
+    /// go back to the driver, not into the cache), synchronize, then the same settle and one check as the
+    /// phase change on this process's own ledgers (the footprint down by the freed bytes, MLX's cache empty
+    /// and active down); a refusal is a typed error and every later request is refused by name. Bill: every
+    /// prompt pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
     pub fn reclaimShrink(self: *Module, before: BoundaryMemory, freed_bytes: u64) !void {
         try self.gate.request();
         // Every command that still held the freed rows retires first (its completion handlers hand them to
@@ -510,11 +487,9 @@ pub const Module = struct {
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         _ = mlx.mlx_synchronize(self.g.s);
-        const outside_before = outsideOf(before);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes, outside_before);
-        self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .outside_ref = outside_before, .settle_ms = st.waited_ms };
-        checkFreed(before, st.after, freed_bytes, outside_before) catch |e| return self.refuseTerminally(e);
-        self.gate.outside_ref = outsideOf(st.after);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes);
+        self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .settle_ms = st.waited_ms };
+        checkFreed(before, st.after, freed_bytes) catch |e| return self.refuseBoundary(e);
         self.logPhaseChange();
     }
 
@@ -524,19 +499,16 @@ pub const Module = struct {
     ///    buffers complete (v6b: a clear before the handlers ran left 4.1 GB in the footprint into decode).
     /// 2. The frees: the device embedding if it is still there, MLX's buffer cache cleared, the decode cache
     ///    limit set, synchronize.
-    /// 3. The reclaim wait on the guard's own metric (read every `phase_change_poll_ms`, at most
-    ///    `phase_change_settle_ms`) and ONE check: the cache empty, MLX active and the footprint down by the
-    ///    freed bytes, the box's physical pages down by them too, and nothing outside the footprint beyond the
-    ///    prompt-start reference (every release since the prompt began reclaimed: SERVED7's pages stayed
-    ///    counted in vm_stat after they had left the footprint, and a short prompt's own releases are only
-    ///    moments old at the boundary).
+    /// 3. The settle (read every `phase_change_poll_ms`, at most `phase_change_settle_ms`) and ONE check on
+    ///    this process's own ledgers: MLX's cache empty, MLX active and the footprint down by the freed bytes.
+    ///    The whole box's pages (the guard's metric, other processes included) are the harness's and the
+    ///    guard's to judge: the record carries them.
     /// 4. The grow to the decode rows (the bill admitted both phases at construction).
-    /// A refusal is terminal: the Module refuses every later request by name and the process exits non-zero
-    /// (`refuseTerminally`): no retry can sample its own unreclaimed pages as the new baseline.
+    /// A refusal is a typed error (upstream's slotFailure reports it; the server stays up) and the Module
+    /// refuses every later request by name: no retry grows over what the refused check saw.
     pub fn phaseChange(self: *Module) !void {
         try self.gate.request();
         if (self.grown()) return;
-        const outside_ref = self.gate.outside_ref orelse return self.refuseTerminally(error.PhaseChangeWithoutPromptStart);
         var marks: [4]VmMark = undefined;
         marks[0] = VmMark.now();
         _ = mlx.mlx_synchronize(self.g.s);
@@ -551,17 +523,17 @@ pub const Module = struct {
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_device, outside_ref);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_device);
         marks[2] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .outside_ref = outside_ref, .settle_ms = st.waited_ms };
-        checkFreed(before, st.after, freed_device, outside_ref) catch |e| return self.refuseTerminally(e);
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .settle_ms = st.waited_ms };
+        checkFreed(before, st.after, freed_device) catch |e| return self.refuseBoundary(e);
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
         marks[3] = VmMark.now();
         self.phase_change.?.grown = BoundaryMemory.now();
         self.logPhaseChange();
-        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (reclaimed)", "after the banks grew" }) |m, name|
+        for (marks, [_][]const u8{ "start", "after the embedding fence", "after the frees (settled)", "after the banks grew" }) |m, name|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d})", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
@@ -574,15 +546,15 @@ pub const Module = struct {
         log.info("NATIVE DSV41_PHASE_CHANGE {s}", .{json});
     }
 
-    /// The refusal is terminal: recorded in the gate (every later request refused by name), logged with the
-    /// phase change's readings, and the process exits non-zero (`phase_change_refused_exit`): the server
-    /// never retries the grow and a harness's run fails before timed generation.
-    fn refuseTerminally(self: *Module, e: anyerror) error{PhaseChangeRefused} {
+    /// A refused boundary: recorded in the gate (every later request refused by name, PhaseChangeRefused),
+    /// logged with its readings, and returned as its typed error, which upstream's slotFailure reports for
+    /// the request while the server stays up; a harness fails its run on it.
+    fn refuseBoundary(self: *Module, e: anyerror) anyerror {
         self.gate.refuse(e);
         if (self.phase_change) |*r| r.refused = @errorName(e);
         self.logPhaseChange();
-        log.err("NATIVE {s} refused: {s}; the module is terminal, exiting {d}", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e), phase_change_refused_exit });
-        std.process.exit(phase_change_refused_exit);
+        log.err("NATIVE {s} refused: {s}; every later request is refused by name", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e) });
+        return e;
     }
 
     fn grown(self: *const Module) bool {
@@ -725,24 +697,15 @@ pub const PhaseChangeRecord = struct {
     after: BoundaryMemory,
     grown: ?BoundaryMemory = null,
     freed_bytes: u64,
-    /// The box's pages outside this process's footprint at the prompt's start (the reclaim reference).
-    outside_ref: u64,
     settle_ms: u32,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
 };
 
-/// The phase change's gate: the prompt-start reference (taken at every prompt start while the banks have not
-/// grown: the latest prompt's own start, so the drift the check sees is one prompt's, never the idle time
-/// since a warm-up at load; a refused phase change is terminal, so no retry can take a reference over its own
-/// unreclaimed pages) and the terminal refusal (every later request refused by name).
+/// The phase change's gate: a refused boundary is kept (every later request refused by name), so no retry
+/// grows over what the refused check saw.
 pub const PhaseGate = struct {
-    outside_ref: ?u64 = null,
     refused: ?anyerror = null,
-
-    pub fn startPrompt(g: *PhaseGate, grown: bool, outside: u64) void {
-        if (!grown) g.outside_ref = outside;
-    }
 
     pub fn request(g: *const PhaseGate) error{PhaseChangeRefused}!void {
         if (g.refused != null) return error.PhaseChangeRefused;
@@ -753,10 +716,8 @@ pub const PhaseGate = struct {
     }
 };
 
-/// The process exit code of a refused phase change.
-pub const phase_change_refused_exit: u8 = 87;
-
-/// The box's physical pages outside this process's footprint (vm_stat's used less the footprint).
+/// The box's physical pages outside this process's footprint (vm_stat's used less the footprint): recorded
+/// for the harness and the guard, never judged by the served path.
 pub fn outsideOf(m: BoundaryMemory) u64 {
     return m.physical -| m.footprint;
 }
@@ -777,9 +738,6 @@ const LiveReader = struct {
 /// The footprint may sit this far above its expected drop at the boundary (the ledger's page rounding
 /// and the host side's own movement).
 pub const phase_change_tolerance_bytes: u64 = 250_000_000;
-/// The box's physical pages may sit this far above their expected drop (they are the whole box's: other
-/// processes move them too, within a guarded window by little).
-pub const phase_change_physical_tolerance_bytes: u64 = 500_000_000;
 /// The reclaim wait: read every `phase_change_poll_ms`, refuse after `phase_change_settle_ms`.
 pub const phase_change_poll_ms: u32 = 250;
 pub const phase_change_settle_ms: u32 = 10_000;
@@ -788,30 +746,13 @@ fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
 }
 
-/// The guard's metric: vm physical used minus the credited start cache has dropped by the freed bytes (the
-/// credit is the window's constant, so the drop is physical used's own).
-fn physicalFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
-    return after.physical + before.cache + freed_device <= before.physical + phase_change_physical_tolerance_bytes;
-}
-
-/// Nothing outside the footprint beyond the prompt-start reference: every release since the prompt began
-/// (its own waves beyond the cache, the boundary's frees) reclaimed.
-fn outsideReclaimed(outside_ref: u64, m: BoundaryMemory) bool {
-    return outsideOf(m) <= outside_ref + phase_change_physical_tolerance_bytes;
-}
-
-fn allReclaimed(before: BoundaryMemory, m: BoundaryMemory, freed_device: u64, outside_ref: u64) bool {
-    return footprintFreed(before, m, freed_device) and physicalFreed(before, m, freed_device) and outsideReclaimed(outside_ref, m);
-}
-
-/// After the frees: `reader` read every `phase_change_poll_ms` until the footprint AND the box's physical
-/// pages show them and nothing sits outside the footprint beyond the prompt-start reference (SERVED7: the
-/// footprint dropped at once, vm_stat still counted the pages when the grow took fresh ones), at most
-/// `phase_change_settle_ms`; the one check then judges the last reading.
-pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64, outside_ref: u64) struct { after: BoundaryMemory, waited_ms: u32 } {
+/// After the frees: `reader` read every `phase_change_poll_ms` until this process's footprint shows them
+/// (its ledger can trail a release while the driver retires it), at most `phase_change_settle_ms`; the one
+/// check then judges the last reading.
+pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64) struct { after: BoundaryMemory, waited_ms: u32 } {
     var m = reader.now();
     var waited: u32 = 0;
-    while (!allReclaimed(before, m, freed_device, outside_ref) and waited < phase_change_settle_ms) {
+    while (!footprintFreed(before, m, freed_device) and waited < phase_change_settle_ms) {
         reader.sleep(phase_change_poll_ms);
         waited += phase_change_poll_ms;
         m = reader.now();
@@ -819,33 +760,13 @@ pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64, outsid
     return .{ .after = m, .waited_ms = waited };
 }
 
-/// The phase boundary's one check, before the grow: the MLX cache empty (every prompt buffer released, none
-/// parked for the grow to miss), MLX active down by the freed device bytes, the footprint down by the cache
-/// and those bytes, and the guard's metric (the box's physical pages) down by them too; else refused by name
-/// and the run fails before timed generation.
-pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64, outside_ref: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed, PhaseChangeNotReclaimed }!void {
+/// The phase boundary's one check, before the grow, on this process's own ledgers: the MLX cache empty (every
+/// prompt buffer released, none parked for the grow to miss), MLX active down by the freed device bytes, the
+/// footprint down by the cache and those bytes; else a typed error.
+pub fn checkFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) error{ PhaseChangeCacheNotEmpty, PhaseChangeActiveNotFreed, PhaseChangeFootprintNotFreed }!void {
     if (after.cache != 0) return error.PhaseChangeCacheNotEmpty;
     if (after.active + freed_device > before.active) return error.PhaseChangeActiveNotFreed;
     if (!footprintFreed(before, after, freed_device)) return error.PhaseChangeFootprintNotFreed;
-    if (!physicalFreed(before, after, freed_device) or !outsideReclaimed(outside_ref, after)) return error.PhaseChangeNotReclaimed;
-}
-
-/// How much page cache the step may have created by the end of construction (other processes' file reads
-/// within a guarded window included).
-pub const page_cache_tolerance_bytes: u64 = 500_000_000;
-
-pub fn checkPageCache(created: u64) error{ConstructionLeftPageCache}!void {
-    if (created > page_cache_tolerance_bytes) return error.ConstructionLeftPageCache;
-}
-
-/// The construction check's page-cache reference, read once at `Module.init`: the guard's credited start
-/// file cache when the step runs under it (the loads before `Module.init` count too), else the box's
-/// file-backed pages now.
-fn fileBackedRef() u64 {
-    if (std.c.getenv("_GPU_WINDOW_FILE_START_BYTES")) |v| {
-        if (std.fmt.parseInt(u64, std.mem.span(v), 10)) |n| return n else |_| {}
-    }
-    return arm_mod.vmBytes().external;
 }
 
 pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
@@ -1057,8 +978,7 @@ test "dsv41 module: the module's construction and forwards analyse (host, nothin
     const shrink_reclaim: *const fn (*Module, BoundaryMemory, u64) anyerror!void = &Module.reclaimShrink;
     const boundary_before: *const fn (*Module) BoundaryMemory = &Module.boundaryBefore;
     try std.testing.expect(@intFromPtr(boundary_before) != 0);
-    const prompt_start: *const fn (*Module) void = &Module.promptStart;
-    try std.testing.expect(@intFromPtr(shrink_reclaim) != 0 and @intFromPtr(prompt_start) != 0);
+    try std.testing.expect(@intFromPtr(shrink_reclaim) != 0);
 }
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
@@ -1450,37 +1370,31 @@ test "dsv41 memory: the native fill takes two row counts, each phase at its targ
     try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, f.ceiling, 384));
 }
 
-test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, by name" {
+test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, by name (this process's ledgers)" {
     const gb: u64 = 1_000_000_000;
     const emb: u64 = 1_323_827_200;
-    // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92, box physical 105.85 GB.
+    // v6b's prompt end after the synchronize: active 85.36, cache 4.63, footprint 91.92 GB.
     const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
-    // The prompt-start reference: nothing outside the footprint beyond what the box held then.
-    const ref = outsideOf(before);
     const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
-    // Released: cache empty, footprint and physical pages down by the cache.
-    try checkFreed(before, freed, 0, ref);
-    // The embedding freed at the boundary: active, footprint and physical down by it too.
-    try checkFreed(before, .{ .active = before.active - emb, .cache = 0, .footprint = freed.footprint - emb, .physical = freed.physical - emb }, emb, ref);
+    // Released: cache empty, footprint down by the cache.
+    try checkFreed(before, freed, 0);
+    // The embedding freed at the boundary: active and footprint down by it too.
+    try checkFreed(before, .{ .active = before.active - emb, .cache = 0, .footprint = freed.footprint - emb, .physical = freed.physical - emb }, emb);
     // Cache bytes left: refused.
     var left = freed;
     left.cache = 16384;
-    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, left, 0, ref));
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, left, 0));
     // v6b as it ran (the cache cleared before the handlers returned their buffers): the footprint 91.07 GB,
     // 4.07 GB above the drop: refused.
     var v6b = freed;
     v6b.footprint = 91_065_000_000;
-    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, v6b, 0, ref));
-    // SERVED7's shape: the footprint dropped, the box's physical pages did not (the guard's metric): refused.
-    var served7 = freed;
-    served7.physical = before.physical;
-    try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, served7, 0, ref));
-    // Within the physical tolerance (other processes' movement): passes.
-    var noisy = freed;
-    noisy.physical += phase_change_physical_tolerance_bytes;
-    try checkFreed(before, noisy, 0, ref);
+    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, v6b, 0));
+    // The box's pages are not the served path's to judge: other processes' growth never refuses the grow.
+    var busy_box = freed;
+    busy_box.physical = before.physical + 5 * gb;
+    try checkFreed(before, busy_box, 0);
     // Active not down by the embedding: refused.
-    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb, .physical = before.physical - before.cache - 2 * gb }, emb, ref));
+    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkFreed(before, .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache - 2 * gb, .physical = before.physical - before.cache - 2 * gb }, emb));
 }
 
 /// A scripted boundary reader: `readings[i]` at the i-th read (the last one repeats), no real sleep.
@@ -1500,68 +1414,42 @@ const FakeReader = struct {
     }
 };
 
-test "dsv41 memory: the reclaim wait refuses the grow when the guard's metric does not drop, and waits it out when it does" {
+test "dsv41 memory: the settle waits for the footprint to show the frees, then the one check judges the last reading" {
     const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 105_848_000_000 };
-    // The prompt-start reference: nothing outside the footprint beyond what the box held then.
-    const ref = outsideOf(before);
-    const footprint_freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical };
-    const reclaimed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
-    // SERVED7: the footprint drops at once, vm_stat never does: the full 10 s wait, then refused by name.
+    const lagging: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint, .physical = before.physical };
+    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    // The footprint never shows the frees: the full wait, then refused by name.
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{footprint_freed}, .i = &i, .slept_ms = &slept }, before, 0, ref);
+        const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, 0);
         try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
         try std.testing.expectEqual(phase_change_settle_ms, slept);
         try std.testing.expectEqual(@as(usize, phase_change_settle_ms / phase_change_poll_ms + 1), i);
-        try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, st.after, 0, ref));
+        try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, 0));
     }
-    // The pages come back on the third reading: two polls (500 ms), then the check passes.
+    // The frees show on the third reading: two polls (500 ms), then the check passes.
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{ footprint_freed, footprint_freed, reclaimed }, .i = &i, .slept_ms = &slept }, before, 0, ref);
+        const st = settle(FakeReader{ .readings = &.{ lagging, lagging, freed }, .i = &i, .slept_ms = &slept }, before, 0);
         try std.testing.expectEqual(@as(u32, 2 * phase_change_poll_ms), st.waited_ms);
-        try checkFreed(before, st.after, 0, ref);
+        try checkFreed(before, st.after, 0);
     }
-    // Already reclaimed at the first reading: no wait.
+    // Already freed at the first reading: no wait.
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{reclaimed}, .i = &i, .slept_ms = &slept }, before, 0, ref);
+        const st = settle(FakeReader{ .readings = &.{freed}, .i = &i, .slept_ms = &slept }, before, 0);
         try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
-        try checkFreed(before, st.after, 0, ref);
+        try checkFreed(before, st.after, 0);
     }
 }
 
-test "dsv41 memory: the prompt-start reference catches releases older than the boundary (a short prompt's), and the refusal is terminal" {
-    const gb: u64 = 1_000_000_000;
-    // The prompt started with 13.933 GB of the box outside this footprint.
-    const ref: u64 = 13_933_000_000;
-    // At the boundary the prompt's own earlier releases (beyond the cache) still count: 2.1 GB lag outside.
-    const lag: u64 = 2_100_000_000;
-    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 91_915_000_000 + ref + lag };
-    // The boundary's own frees reclaimed (the drop tests pass), the older lag not yet: refused.
-    const drop_only: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
-    try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, drop_only, 0, ref));
-    // The lag reclaimed on the fourth read: three polls, then it passes.
-    const clean: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = drop_only.footprint, .physical = drop_only.physical - lag };
-    var i: usize = 0;
-    var slept: u32 = 0;
-    const st = settle(FakeReader{ .readings = &.{ drop_only, drop_only, drop_only, clean }, .i = &i, .slept_ms = &slept }, before, 0, ref);
-    try std.testing.expectEqual(@as(u32, 3 * phase_change_poll_ms), st.waited_ms);
-    try checkFreed(before, st.after, 0, ref);
-    // The gate: every prompt start while not grown takes the reference (a warm-up prefill at load never pins
-    // it for the first real request), none is taken once grown, and a refusal refuses every later request.
+test "dsv41 memory: a refused boundary refuses every later request by name (no retry grows over it)" {
     var g: PhaseGate = .{};
     try g.request();
-    g.startPrompt(false, ref + 3 * gb);
-    g.startPrompt(false, ref);
-    try std.testing.expectEqual(@as(?u64, ref), g.outside_ref);
-    var grown: PhaseGate = .{};
-    grown.startPrompt(true, ref);
-    try std.testing.expectEqual(@as(?u64, null), grown.outside_ref);
-    g.refuse(error.PhaseChangeNotReclaimed);
+    g.refuse(error.PhaseChangeFootprintNotFreed);
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
 }
@@ -1570,22 +1458,21 @@ test "dsv41 memory: the return to the prompt rows (shrink) is judged like the ph
     // v6b-scale decode state: the grown rows (31 x 40 x 13.3 MB = 16.5 GB) resident, a 0.27 GB decode cache.
     const grown_rows: u64 = 31 * 40 * 13_315_584;
     const before: BoundaryMemory = .{ .active = 101_000_000_000, .cache = 268_000_000, .footprint = 102_900_000_000, .physical = 116_800_000_000 };
-    const ref = outsideOf(before);
-    // The rows and the cache released and reclaimed: passes.
+    // The rows and the cache released: passes.
     const freed: BoundaryMemory = .{ .active = before.active - grown_rows, .cache = 0, .footprint = before.footprint - before.cache - grown_rows, .physical = before.physical - before.cache - grown_rows };
-    try checkFreed(before, freed, grown_rows, ref);
+    try checkFreed(before, freed, grown_rows);
     // The rows' buffers parked in MLX's cache instead of released: refused (the cache is cleared first by design).
     var parked = freed;
     parked.cache = grown_rows;
-    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, parked, grown_rows, ref));
-    // Released from the footprint but still counted in vm_stat: waited out, then refused if it never clears.
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkFreed(before, parked, grown_rows));
+    // Released by MLX but still in this footprint: waited out, then refused if it never clears.
     var lagging = freed;
-    lagging.physical = before.physical;
+    lagging.footprint = before.footprint;
     var i: usize = 0;
     var slept: u32 = 0;
-    const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, grown_rows, ref);
+    const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, grown_rows);
     try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
-    try std.testing.expectError(error.PhaseChangeNotReclaimed, checkFreed(before, st.after, grown_rows, ref));
+    try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, grown_rows));
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
@@ -1600,15 +1487,6 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     // The prompt phase over it is refused first.
     b.prefill_wave += 20_000_000_000;
     try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
-}
-
-test "dsv41 memory: the construction check refuses the page cache the bill assumes away, by name" {
-    // v6c2's construction: file-backed 4.87 -> 19.95 GB (15.94 GB speculative): refused.
-    try std.testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
-    // A few configs, tokenizer and the metallib's pages: within the tolerance.
-    try checkPageCache(200_000_000);
-    try checkPageCache(page_cache_tolerance_bytes);
-    try std.testing.expectError(error.ConstructionLeftPageCache, checkPageCache(page_cache_tolerance_bytes + 1));
 }
 
 test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {

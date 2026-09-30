@@ -411,7 +411,10 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     defer weights.deinit();
     const m = try module.Module.init(gpa, io, &config, &weights, s);
     defer m.deinit();
-    printPhaseMemory(a, phaseMemory("module constructed", m.bill.constructionTerms(), 0, vm_start.external));
+    const constructed = phaseMemory("module constructed", m.bill.constructionTerms(), 0, vm_start.external);
+    printPhaseMemory(a, constructed);
+    // The window's own proofs (the harness's, never the served path's): no page cache left by the load.
+    try checkPageCache(constructed.file_cache_created_bytes);
     memProbe("dsv41 ar served", "module constructed (kernels, arm, residents, warm-up)");
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -436,6 +439,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The prompt's calls; the last one's logits are generated id 0.
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
+    // The prompt's start: the box's pages outside this footprint, the reference the phase change's box proof uses.
+    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
     for (calls[1..]) |c| {
@@ -459,7 +464,10 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const wall_ms: i64 = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
     // The phase change ran inside the first decode-width extend: this interval spans it and the decode.
     printPhaseMemory(a, phaseMemory("phase change + decode", m.bill.decodeTerms(), 0, vm_start.external));
-    if (m.phase_change) |pc| if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {};
+    if (m.phase_change) |pc| {
+        if (std.json.Stringify.valueAlloc(a, pc, .{})) |j| std.debug.print("NATIVE DSV41_PHASE_CHANGE {s}\n", .{j}) else |_| {}
+        try checkBoxReclaimed(pc, prompt_start_outside);
+    }
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
     var d: [32]u8 = undefined;
@@ -881,6 +889,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const md = try module.Module.init(gpa, io, &config, &weights, s);
     defer md.deinit();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
+    // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
+    try checkPageCache(constructed.file_cache_created_bytes);
     printPhaseMemory(a, constructed);
     memProbe("dsv41 served cell", "module constructed (kernels, arm, residents, warm-up)");
 
@@ -944,7 +954,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
     // The prompt's start: the phase change's reclaim reference (the loop drives the prompt itself).
-    md.promptStart();
+    const prompt_start_outside = module.outsideOf(module.BoundaryMemory.now());
     const t0 = std.Io.Timestamp.now(io, .boot);
     const primary = try lp.prefill(gpa, &arm.hook, prompt);
     const ttft_s = secondsSince(io, t0);
@@ -958,6 +968,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     var mlx_peak: usize = @max(phases[1].mlx_peak_bytes, memProbePeak("dsv41 served cell", "prompt (one pass)"));
     const t1 = std.Io.Timestamp.now(io, .boot);
     try md.phaseChange();
+    // The window's box proof (the harness's): every release since the prompt began reclaimed in vm_stat too.
+    if (md.phase_change) |pc| try checkBoxReclaimed(pc, prompt_start_outside);
     const phase_s = secondsSince(io, t1);
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
@@ -1201,10 +1213,30 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     return error.CellBoolValue;
 }
 
+/// The window's proofs, the harness's to assert (the served path judges only its own ledgers): the page
+/// cache the step created by the end of construction, and the box's pages at the phase change. A guarded
+/// window's guard counts the whole box (other processes included), so these hold the harness's run to it.
+pub const page_cache_tolerance_bytes: u64 = 500_000_000;
+pub const box_tolerance_bytes: u64 = 500_000_000;
+
+/// The load left no page cache to be aged into the guard's count later (v6c2: 15 GB of speculative pages from
+/// unaligned F_NOCACHE reads, 7.7 GB aged in at the grow).
+pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
+    if (created > @as(i64, @intCast(page_cache_tolerance_bytes))) return error.ConstructionLeftPageCache;
+}
+
+/// At the phase change: the box's physical pages (vm_stat, the guard's metric) down by the freed bytes, and
+/// nothing outside this footprint beyond the prompt's start (SERVED7: the pages stayed counted after they
+/// had left the footprint).
+pub fn checkBoxReclaimed(r: module.PhaseChangeRecord, prompt_start_outside: u64) error{PhaseChangeNotReclaimed}!void {
+    if (r.after.physical + r.freed_bytes > r.before.physical + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
+    if (module.outsideOf(r.after) > prompt_start_outside + box_tolerance_bytes) return error.PhaseChangeNotReclaimed;
+}
+
 /// ASSUMPTION the bill rests on: the step creates no page cache. The guard credits only the file cache present
 /// at its start and does not count speculative pages until the kernel ages them into inactive, so page cache
 /// the step creates is unbilled memory that can land at any later allocation (v6c2: 15 GB of it from
-/// construction, 7.7 GB aged in at the grow). `Module.init` enforces it (ConstructionLeftPageCache), and each
+/// construction, 7.7 GB aged in at the grow). The harnesses assert it (`checkPageCache`), and each
 /// phase record carries `file_cache_created_bytes` and `box_speculative_bytes`.
 ///
 /// Every prompt pass is billed at the prompt rows: the first one before the phase change grows the banks,
@@ -1633,6 +1665,32 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // The failure mode: the same bill with the constructed module's wired bytes read live.
     try testing.expectError(error.PrefillDoesNotFit, cellBillWired(a, testing.io, &config, module.fill_prompt_tokens, module.fill_max_tokens, wired + 85_000_000_000));
+}
+
+test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {
+    // v6c2's construction: file-backed 4.87 -> 19.95 GB: refused; configs and the metallib's pages: within it.
+    try testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
+    try checkPageCache(200_000_000);
+    try checkPageCache(-300_000_000);
+    const ref: u64 = 13_933_000_000;
+    const before: module.BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000, .physical = 91_915_000_000 + ref };
+    const freed: module.BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache, .physical = before.physical - before.cache };
+    const ok: module.PhaseChangeRecord = .{ .before = before, .after = freed, .freed_bytes = before.cache, .settle_ms = 250 };
+    try checkBoxReclaimed(ok, ref);
+    // SERVED7's shape: the footprint dropped, the box's pages did not.
+    var served7 = ok;
+    served7.after.physical = before.physical;
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(served7, ref));
+    // A short prompt's older releases still counted at the boundary: outside the footprint above the prompt's start.
+    const lag: u64 = 2_100_000_000;
+    var lagged = ok;
+    lagged.before.physical += lag;
+    lagged.after.physical += lag;
+    try testing.expectError(error.PhaseChangeNotReclaimed, checkBoxReclaimed(lagged, ref));
+    // Within the tolerance (other processes' movement): passes.
+    var noisy = ok;
+    noisy.after.physical += box_tolerance_bytes;
+    try checkBoxReclaimed(noisy, ref);
 }
 
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
