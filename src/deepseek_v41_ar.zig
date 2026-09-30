@@ -1611,12 +1611,18 @@ const PrefillProbe = struct {
     ns: [n_max]u64 = @splat(0),
     n: usize = 0,
     layers_done: u64 = 0,
+    /// K16's chunk of the stages that follow (set by the layer-major pass), else the chunk-major count.
+    cur_chunk: ?usize = null,
     chunk_ns: [64]u64 = @splat(0),
     chunk_rows: [64]u32 = @splat(0),
     read_wall_ns: u64 = 0,
     read_bytes: u64 = 0,
     misses: u64 = 0,
     before: expert_stream.Stats = .{},
+
+    pub fn atChunk(self: *PrefillProbe, i: usize) void {
+        self.cur_chunk = i;
+    }
 
     fn slot(self: *PrefillProbe, name: []const u8) usize {
         for (self.names[0..self.n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return i;
@@ -1633,16 +1639,20 @@ const PrefillProbe = struct {
         const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
         self.ns[self.slot(name)] += d;
-        const chunk: usize = @min(self.layers_done / self.n_layers, self.chunk_ns.len - 1);
+        const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
         if (is_routed) {
             const after = self.stats_of(self.stats_ctx);
             self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
             self.read_bytes += after.expert_bytes_read -| self.before.expert_bytes_read;
             self.misses += after.expert_cache_misses -| self.before.expert_cache_misses;
-            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(self.g.shapeOf(x).dim(0));
         }
-        if (std.mem.eql(u8, name, "out.h")) self.layers_done += 1;
+        // Every pass puts out.h once per chunk and layer ([b, s, hc, dim]): the header's chunks and each chunk's rows.
+        if (std.mem.eql(u8, name, "out.h")) {
+            self.layers_done += 1;
+            const sh = self.g.shapeOf(x);
+            if (self.chunk_rows[chunk] == 0) self.chunk_rows[chunk] = @intCast(sh.dim(0) * sh.dim(1));
+        }
     }
 };
 
