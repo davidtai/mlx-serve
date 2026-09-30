@@ -577,11 +577,12 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     try testing.expectEqual(@as(u64, 106_954_752), posted);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        // Wide depth 5 (P1c, 240 transient rows) and the minimal copy's bound at the most outputs a call can make
-        // (63 / 86 of the routed rows at 16K; the joined input 1.47 GB of the 2.01 GB join).
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 134, .decode = 164 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
+        // Wide depth 5 (P1c, 240 transient rows), the minimal copy's bound at the most outputs a call can make (63 / 86
+        // of the routed rows at 16K), and the frontier as rings (3ebd8a7: -0.191 GB in the prompt, -0.211 GB in decode;
+        // before it 8.99 GB 135 / 164 off, 134 / 164 on; 9.20 GB 134 / 163 both; 9.55 GB 134 / 163 off, 133 / 163 on).
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 135, .decode = 164 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 134, .decode = 164 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -599,9 +600,9 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
 }
 
 // DSV41_BANK=<bank> (host): the bounded KV by owner at the fill's request (16,384 + 1,024 + one verify block of
-// positions). This is the model lane's reconciliation of SERVED11's 0.352 GB held after the prompt (receipt
-// served-cell-typical-fastest-20260930-124252): the frontier lanes of the ratio-2 kv sources were unbilled, the ring
-// was billed at one window, and the index lanes were counted on the index-only sources too.
+// positions). SERVED11 (full-length frontier lanes) held 351,152,128 B after the prompt, the lanes, ring and frontier
+// of 57409c7's bill within 0.42 MB. Since 3ebd8a7 the frontier of each ratio-2 kv source (layers 2, 8, 14) is two rings
+// of window 2, so it is billed as rings, per phase.
 test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's request (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -611,17 +612,21 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const pb = v41.PrefillBill.of(&c);
     const positions = fill_prompt_tokens + fill_max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
-    // Frontier 214,106,112 (layers 2, 8, 14) + compressed 89,235,456 + index 22,308,864 (the four kv sources).
-    try testing.expectEqual(@as(u64, 325_650_432), pb.laneBytes(positions));
-    // The ring: 2,160 rows over the prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
+    // Compressed 89,235,456 + index 22,308,864 (the four kv sources).
+    try testing.expectEqual(@as(u64, 111_544_320), pb.laneBytes(positions));
+    // The window ring: 2,160 rows over the prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
     try testing.expectEqual(@as(u64, 174_735_360), pb.ringPromptBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 41_904_128), pb.ringDecodeBytes(fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 500_385_792), pb.kvPromptBytes(fill_prompt_tokens, positions));
-    try testing.expectEqual(@as(u64, 367_554_560), pb.kvDecodeBytes(fill_prompt_tokens, positions));
-    // At the phase change the ring holds the last chunk's 310 rows; SERVED11 measured 351,152,128 B there.
-    const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310;
-    try testing.expectEqual(@as(u64, 350_728_192), at_change);
-    try testing.expect(351_152_128 - at_change < 500_000);
+    // The frontier rings (window 2, 2,048 B a row, two a source, three sources): 1,908 rows a ring over the prompt
+    // (2 x (953 + 1)), 266 at decode's first step (184 + 82), against 214,106,112 B of full-length lanes.
+    try testing.expectEqual(@as(u64, 954), v41.PrefillBill.ringBase(2) + 872);
+    try testing.expectEqual(@as(u64, 23_445_504), pb.frontierPromptBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 3_268_608), pb.frontierDecodeBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 309_725_184), pb.kvPromptBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 156_717_056), pb.kvDecodeBytes(fill_prompt_tokens, positions));
+    // At the phase change: the lanes, the window ring's last chunk (310 rows) and the frontier's (184 a ring).
+    const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310 + 3 * 2 * 2048 * 184;
+    try testing.expectEqual(@as(u64, 138_883_072), at_change);
     // The bill carries them per phase.
     var config = try model.parseConfig(testing.io, a, bank_dir);
     // Option B: the ceiling is the bill's argument, not a config field.

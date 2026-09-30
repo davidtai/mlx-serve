@@ -243,47 +243,77 @@ pub const PrefillBill = struct {
         return b.layerMajorWaveBytes(seq, tier) + b.wideLaneBytes(seq);
     }
 
-    /// The served tier's bounded KV lanes outside the window ring, for a request of `positions` (its prompt, its
-    /// tokens and one verify block): each allocated at its cap at its first write and held to the request's end
-    /// (`deepseek_v41_cache.LayerState`, W107). Every kv source holds its compressed lane and its index lane,
-    /// `boundedCompCap` rows of head_dim and index_head_dim f32 (an index-only source reads its kv source's lane);
-    /// a ratio > 1 kv source also holds its compressor frontier, raw_kv and raw_score, `boundedLatentCap` rows of
-    /// head_dim f32 each.
+    /// The served tier's bounded KV lanes, for a request of `positions` (its prompt, its tokens and one verify block):
+    /// each allocated at its cap at its first write and held to the request's end (`deepseek_v41_cache.LayerState`,
+    /// W107). Every kv source holds its compressed lane and its index lane, `boundedCompCap` rows of head_dim and
+    /// index_head_dim f32 (an index-only source reads its kv source's lane). The compressor frontier is a ring
+    /// (`frontierPromptBytes`, 3ebd8a7), not a lane.
     pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
         const m: u32 = @intCast(positions);
         var n: u64 = 0;
-        for (b.kv_sources[0..b.n_kv_sources]) |r| {
-            n += @as(u64, kvc.boundedCompCap(m, r).?) * (b.head_dim + b.index_head_dim) * 4;
-            if (r > 1) n += 2 * @as(u64, kvc.boundedLatentCap(m).?) * b.head_dim * 4;
-        }
+        for (b.kv_sources[0..b.n_kv_sources]) |r| n += @as(u64, kvc.boundedCompCap(m, r).?) * (b.head_dim + b.index_head_dim) * 4;
         return n;
     }
 
-    /// The window ring through the prompt pass: both of its slots at the compaction size, a chunk plus the window
-    /// less one row, on every layer.
-    pub fn ringPromptBytes(b: PrefillBill, seq: u64) u64 {
-        return b.ring_row_bytes * 2 * (@min(b.chunkRows(seq), @max(seq, 1)) + b.window -| 1);
+    /// A `deepseek_v41_cache` Ring of `window` rows (the window ring: the model's window; the compressor frontier: the
+    /// source's ratio): its base, the window plus a verify block, its slack and the headroom.
+    pub fn ringBase(window: u64) u64 {
+        const geo: kvc.Geometry = .{};
+        return window + geo.max_verify + geo.slack + geo.headroom;
     }
 
-    /// The window ring in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows
-    /// plus the window less one) beside the base (the window, a verify block, its slack and the headroom); steady
-    /// decode holds two bases.
-    pub fn ringDecodeBytes(b: PrefillBill, seq: u64) u64 {
-        const geo: kvc.Geometry = .{};
-        const base = b.window + geo.max_verify + geo.slack + geo.headroom;
+    /// A ring's rows through the prompt pass: from the third chunk on both of its slots at the compaction size (a
+    /// chunk plus the window less one, at least the base); a shorter prompt holds one.
+    pub fn ringPromptRows(b: PrefillBill, window: u64, seq: u64) u64 {
+        const chunk = @min(b.chunkRows(seq), @max(seq, 1));
+        const chunks = std.math.divCeil(u64, @max(seq, 1), chunk) catch unreachable;
+        const slot = @max(ringBase(window), chunk + window -| 1);
+        return (if (chunks >= 3) @as(u64, 2) else 1) * slot;
+    }
+
+    /// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus
+    /// the window less one, at least the base) beside a new base; steady decode holds two bases.
+    pub fn ringDecodeRows(b: PrefillBill, window: u64, seq: u64) u64 {
         const chunk = @min(b.chunkRows(seq), @max(seq, 1));
         const n_last = ((@max(seq, 1) - 1) % chunk) + 1;
-        return b.ring_row_bytes * @max(n_last + (b.window -| 1) + base, 2 * base);
+        return @max(ringBase(window), n_last + window -| 1) + ringBase(window);
     }
 
-    /// The served tier's KV in the prompt phase (the lanes and the prompt's ring) and in decode (the lanes and the
-    /// decode ring), for a prompt of `seq` in a request of `positions`.
+    /// The window ring (one row over every layer: bf16 on layer 0, f32 after) through the prompt and in decode.
+    pub fn ringPromptBytes(b: PrefillBill, seq: u64) u64 {
+        return b.ring_row_bytes * b.ringPromptRows(b.window, seq);
+    }
+
+    pub fn ringDecodeBytes(b: PrefillBill, seq: u64) u64 {
+        return b.ring_row_bytes * b.ringDecodeRows(b.window, seq);
+    }
+
+    /// The compressor frontier of every ratio > 1 kv source: two rings (raw_kv, raw_score) of window `ratio`, head_dim
+    /// f32 rows (`LayerState.frontier`, 3ebd8a7), through the prompt and in decode.
+    pub fn frontierPromptBytes(b: PrefillBill, seq: u64) u64 {
+        var n: u64 = 0;
+        for (b.kv_sources[0..b.n_kv_sources]) |r| if (r > 1) {
+            n += 2 * b.head_dim * 4 * b.ringPromptRows(r, seq);
+        };
+        return n;
+    }
+
+    pub fn frontierDecodeBytes(b: PrefillBill, seq: u64) u64 {
+        var n: u64 = 0;
+        for (b.kv_sources[0..b.n_kv_sources]) |r| if (r > 1) {
+            n += 2 * b.head_dim * 4 * b.ringDecodeRows(r, seq);
+        };
+        return n;
+    }
+
+    /// The served tier's KV for a prompt of `seq` in a request of `positions`: the lanes, and the window ring and the
+    /// frontier rings at their widest in the phase.
     pub fn kvPromptBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
-        return b.laneBytes(positions) + b.ringPromptBytes(seq);
+        return b.laneBytes(positions) + b.ringPromptBytes(seq) + b.frontierPromptBytes(seq);
     }
 
     pub fn kvDecodeBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
-        return b.laneBytes(positions) + b.ringDecodeBytes(seq);
+        return b.laneBytes(positions) + b.ringDecodeBytes(seq) + b.frontierDecodeBytes(seq);
     }
 
     /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
