@@ -943,6 +943,10 @@ pub const Wide = struct {
     /// model's predictor pass hands it over, `Hook.readAheadSeed`), landed at the routing barrier before
     /// the seed. Exact: it chooses reads and rows only. Needs `seed`.
     read_ahead: bool = false,
+    /// P1b: with `defer_base` and the seed, the deferred base call runs once the seed's groups are read (after the first
+    /// group with a transient row), so the later groups' reads overlap its drain; later base rows run in a last call.
+    /// Exact: the same rows, slots and kernels; only the call's place in the schedule changes.
+    base_at_seed: bool = false,
     pub const max_cold_rows = 8;
 };
 
@@ -1046,6 +1050,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.seed and comptime !@hasDecl(S, "seedPrefill")) return error.InvalidWideRoute;
             if (wr.defer_base and (wr.cold_rows > 0 or !routes.prefill or comptime !@hasDecl(S, "holdBase"))) return error.InvalidWideRoute;
             if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
+            if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1441,6 +1446,32 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.wide.kept.clearRetainingCapacity();
         }
 
+        /// The deferred base-bank rows gathered so far as one call's waves, drained; their slots stay held.
+        fn deferredBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool) !void {
+            const a = self.a;
+            const w = &self.wide;
+            if (w.def_slot.items.len == 0) return;
+            const kb = w.kept.items.len;
+            const b = self.banks[layer][@backingInt(BankKind.base)].?;
+            const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
+            if (parts) {
+                w.wave_pos.clearRetainingCapacity();
+                try self.math.prefillParts(g, layer, act, rows_, b, a, &w.kept, &w.wave_pos);
+                for (w.wave_pos.items) |p| try w.pos.append(a, w.def_pos.items[p]);
+            } else {
+                try w.kept.ensureUnusedCapacity(a, 1);
+                w.kept.appendAssumeCapacity(try self.math.prefill(g, layer, act, rows_, b));
+                try w.pos.appendSlice(a, w.def_pos.items);
+            }
+            try self.math.finishPrefill(g);
+            const td = prof.now();
+            try g.evalAll(w.kept.items[kb..]);
+            prof.charge(.drain, td);
+            w.def_slot.clearRetainingCapacity();
+            w.def_act.clearRetainingCapacity();
+            w.def_pos.clearRetainingCapacity();
+        }
+
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
@@ -1492,6 +1523,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_pos.clearRetainingCapacity();
             const n_distinct = w.distinct.items.len;
             const n_groups = (n_distinct + max_route_ids - 1) / max_route_ids;
+            // P1b: the seed's base call is due after its last group (the first with a transient row).
+            var base_due = self.wide_route.base_at_seed;
             // The live groups' calls, by group index mod `depth` (read ahead up to `depth` groups).
             var calls: [expert_stream.max_wide_depth]?*S.Call = @splat(null);
             errdefer {
@@ -1523,6 +1556,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 }
                 prof.charge(.read_wait, tp);
                 const k0 = w.kept.items.len;
+                var streamed = false;
                 for ([_]BankKind{ .base, .ext, .transient }) |kind| {
                     const kb = w.kept.items.len;
                     w.slot.clearRetainingCapacity();
@@ -1553,6 +1587,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         if (parts) try w.call_pos.append(a, @intCast(row)) else try w.pos.append(a, @intCast(row));
                     }
                     if (w.slot.items.len == 0 and w.cold_slot.items.len == 0) continue;
+                    streamed = streamed or kind == .transient;
                     const b = self.banks[layer][@backingInt(kind)].?;
                     const hot = w.slot.items.len > 0;
                     if (hot) {
@@ -1603,27 +1638,16 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 calls[gi % depth] = null;
                 if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groupOf(w.distinct.items, gi + depth), &.{});
                 prof.charge(.route, tp);
-            }
-            // The deferred base-bank rows: one call's waves over every group's, then the slots let go.
-            if (comptime @hasDecl(S, "holdBase")) if (defer_base) {
-                if (w.def_slot.items.len > 0) {
-                    const kb = w.kept.items.len;
-                    const b = self.banks[layer][@backingInt(BankKind.base)].?;
-                    const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
-                    if (parts) {
-                        w.wave_pos.clearRetainingCapacity();
-                        try self.math.prefillParts(g, layer, act, rows_, b, a, &w.kept, &w.wave_pos);
-                        for (w.wave_pos.items) |p| try w.pos.append(a, w.def_pos.items[p]);
-                    } else {
-                        try w.kept.ensureUnusedCapacity(a, 1);
-                        w.kept.appendAssumeCapacity(try self.math.prefill(g, layer, act, rows_, b));
-                        try w.pos.appendSlice(a, w.def_pos.items);
-                    }
-                    try self.math.finishPrefill(g);
-                    const td = prof.now();
-                    try g.evalAll(w.kept.items[kb..]);
-                    prof.charge(.drain, td);
+                // P1b: the seed has landed (its groups read, the next routes' reads posted): its base call drains now.
+                if (base_due and streamed) {
+                    base_due = false;
+                    try self.deferredBase(g, layer, act, parts);
                 }
+            }
+            // The deferred base-bank rows: one call's waves over every group's (with P1b, the later ones'), then the
+            // slots let go.
+            if (comptime @hasDecl(S, "holdBase")) if (defer_base) {
+                try self.deferredBase(g, layer, act, parts);
                 self.source.releaseHeld();
             };
         }
@@ -2974,6 +2998,146 @@ test "dsv41 experts: P1 at wide depth 3: three groups live, the read-ahead lande
     const rec = sb.bank.layers[0].logical_bytes;
     try testing.expectEqual(16 * rec, st.ahead_bytes);
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped + st.ahead_posted) * rec, st.expert_bytes_read);
+}
+
+test "dsv41 experts: P1b: the seed's base call drains once the seed has landed, before the next group's read wait; every routed row keeps its slot" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 128;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    // 40 tokens x top-6 over 128 experts, hottest first: the 32 persistent rows take the seed (the first group's
+    // top 32); the rest of that group and the two after it stream through the transient window (depth 1).
+    const n = 40;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 128);
+    const Row = struct { code: u32, slot: u32, act: u32 };
+    var rows: [2]std.ArrayList(Row) = .{ .empty, .empty };
+    defer for (&rows) |*r| r.deinit(a);
+    for ([_]bool{ false, true }, 0..) |at_seed, run| {
+        var reg = try hostRegistry();
+        defer reg.deinit();
+        var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
+        defer src.deinit();
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        src.trace = &g;
+        RecRoute.source = &src;
+        defer RecRoute.source = null;
+        var rrs = [_]RecRoute{RecRoute.init(a)};
+        defer rrs[0].deinit(&g);
+        const wide: Wide = .{ .seed = true, .hot_first = true, .defer_base = true, .base_at_seed = at_seed };
+        var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = wide });
+        defer ex.deinit();
+        var script: Script = .{ .calls = &.{&ids} };
+        g.host_values = script.values();
+        _ = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
+        var seen: [n * k]bool = @splat(false);
+        for (ex.wide.pos.items) |p| {
+            try testing.expect(!seen[p]);
+            seen[p] = true;
+        }
+        try testing.expectEqual(@as(usize, n * k), ex.wide.pos.items.len);
+        const base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+        var buf: [4096]u8 = undefined;
+        const kinds = kindsOf(src.log.items, &buf);
+        var n_base: usize = 0;
+        for (rrs[0].calls.items, 0..) |rec, ci| {
+            for (rec.slot, rec.act_row) |sl, t| try rows[run].append(a, .{ .code = rec.bank_code, .slot = sl, .act = t });
+            if (rec.bank_code != base_code) continue;
+            n_base += 1;
+            if (!at_seed) {
+                // Without P1b: after every group's call.
+                try testing.expectEqual(rrs[0].calls.items.len - 1, ci);
+                continue;
+            }
+            // P1b: after the seed's group is released and the next route has posted its reads, before that group's
+            // read wait and calls.
+            try testing.expect(ci + 1 < rrs[0].calls.items.len);
+            try testing.expectEqualStrings("rfR", kinds[rec.at - 3 .. rec.at]);
+            try testing.expect(std.mem.indexOfScalar(u8, kinds[rec.at..], 'g') != null);
+        }
+        // One base call either way: the seed's rows (every base row is a seed row here).
+        try testing.expectEqual(@as(usize, 1), n_base);
+        try testing.expectEqual(@as(usize, 0), src.held.items.len);
+    }
+    // Every routed row resolves to the same bank and slot either way: the schedule moved, not the routes.
+    const lt = struct {
+        fn f(_: void, x: Row, y: Row) bool {
+            if (x.code != y.code) return x.code < y.code;
+            if (x.slot != y.slot) return x.slot < y.slot;
+            return x.act < y.act;
+        }
+    }.f;
+    for (&rows) |*r| std.sort.pdq(Row, r.items, {}, lt);
+    try testing.expectEqual(rows[0].items.len, rows[1].items.len);
+    for (rows[0].items, rows[1].items) |x, y| try testing.expectEqual(x, y);
+    // P1b needs the seed and the deferred base call: refused at construction without them.
+    var reg = try hostRegistry();
+    defer reg.deinit();
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var rrs = [_]RecRoute{RecRoute.init(a)};
+    defer rrs[0].deinit(&g);
+    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .base_at_seed = true } }));
+}
+
+test "dsv41 experts: P1b at wide depth 3: the seed's base call runs with the later groups' reads live, every routed row from its record" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    // 60 tokens x top-6, token t's j-th expert (j * 20 + t) mod 120: every expert 3 rows, hottest first = by id; the
+    // 16 persistent rows take the seed (experts 0-15), the first group's other 32 and two more groups stream.
+    const n = 60;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast(((i % k) * 20 + i / k) % 120);
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = 3, .transient_rows = 3 * max_route_ids });
+    defer s.deinit();
+    StreamRec.stream = s;
+    defer StreamRec.stream = null;
+    var src = StreamSource.init(s);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var rrs = [_]StreamRec{StreamRec.init(a)};
+    defer rrs[0].deinit(&g);
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .base_at_seed = true } });
+    defer ex.deinit();
+    StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+    StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+    try ex.flush();
+    // Exact: every routed row once, computed from its own expert's record with its token.
+    var seen: [n * k]bool = @splat(false);
+    for (rrs[0].recs.items) |r| for (r.experts, r.act_row) |e, t| {
+        const row = for (0..k) |j| {
+            const i = t * k + j;
+            if (ids[i] == e and !seen[i]) break i;
+        } else return error.RowNotRouted;
+        seen[row] = true;
+    };
+    for (seen) |x| try testing.expect(x);
+    // The seed's one base call follows the first group's transient call, the two later groups live (reads posted).
+    var n_base: usize = 0;
+    for (rrs[0].recs.items, 0..) |r, i| if (r.base) {
+        n_base += 1;
+        try testing.expectEqual(@as(u32, 2), r.live);
+        try testing.expect(i >= 1 and !rrs[0].recs.items[i - 1].base and i + 1 < rrs[0].recs.items.len);
+    };
+    try testing.expectEqual(@as(usize, 1), n_base);
+    try testing.expectEqual(@as(u64, 3), s.stats().route_calls);
 }
 
 test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {

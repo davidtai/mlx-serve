@@ -458,6 +458,8 @@ pub const Module = struct {
                 return refused(refuse(diag, e, "read-ahead: a record read ahead differs from its demand read, or a read failed", .{}), diag);
             log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)", .{n});
         }
+        // P1b: exact by construction (the base call's rows and slots are the seed's; only its place moves).
+        if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)", .{});
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -970,7 +972,7 @@ pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead() };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -1301,22 +1303,27 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     c.expert_wide_cold_rows = null;
     c.expert_wide_defer_base = null;
     c.expert_wide_read_ahead = null;
+    c.expert_wide_base_at_seed = null;
     try std.testing.expect(try layerMajor(&c));
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .read_ahead = true }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .read_ahead = true, .base_at_seed = true }, wideRoute(&c));
     c.expert_wide_hot_first = false;
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 3, .defer_base = true, .read_ahead = true }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .depth = 3, .defer_base = true, .read_ahead = true, .base_at_seed = true }, wideRoute(&c));
     c.expert_wide_hot_first = null;
     c.expert_wide_defer_base = false;
     try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .read_ahead = true }, wideRoute(&c));
     c.expert_wide_defer_base = null;
     // P1 off by its setting (the A/B's other arm); on without the layer-major seed, refused by name.
     c.expert_wide_read_ahead = false;
-    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true }, wideRoute(&c));
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .base_at_seed = true }, wideRoute(&c));
     c.expert_wide_read_ahead = true;
     c.expert_wide_seed = false;
     try std.testing.expectError(error.ReadAheadNeedsLayerMajor, layerMajor(&c));
     c.expert_wide_seed = null;
     c.expert_wide_read_ahead = null;
+    // P1b off by its setting (the base call after the last group, as before).
+    c.expert_wide_base_at_seed = false;
+    try std.testing.expectEqual(xp.Wide{ .seed = true, .hot_first = true, .depth = 3, .defer_base = true, .read_ahead = true }, wideRoute(&c));
+    c.expert_wide_base_at_seed = null;
     c.numeric_tier = .stock;
     try std.testing.expect(!try layerMajor(&c));
     try std.testing.expectEqual(xp.Wide{}, wideRoute(&c));

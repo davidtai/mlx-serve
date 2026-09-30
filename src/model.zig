@@ -440,6 +440,9 @@ pub const ModelConfig = struct {
     /// P1: each layer's predicted seed read ahead during its attention (`expert_wide_read_ahead`; null = on
     /// wherever the prompt pass is layer-major with the wide seed).
     expert_wide_read_ahead: ?bool = null,
+    /// P1b: the seed's deferred base call run as soon as the seed has landed (`expert_wide_base_at_seed`; null =
+    /// on wherever the wide seed and the deferred base call both are).
+    expert_wide_base_at_seed: ?bool = null,
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
@@ -731,6 +734,11 @@ pub const ModelConfig = struct {
     /// P1's read-ahead: the setting, else on wherever the prompt pass is layer-major with the wide seed.
     pub fn dsv41WideReadAhead(self: *const ModelConfig) bool {
         return self.expert_wide_read_ahead orelse (self.dsv41LayerMajor() and self.dsv41WideSeed());
+    }
+
+    /// P1b's base call at the seed: the setting, else on wherever the wide seed and the deferred base call both are.
+    pub fn dsv41WideBaseAtSeed(self: *const ModelConfig) bool {
+        return self.expert_wide_base_at_seed orelse (self.dsv41WideSeed() and self.dsv41WideDeferBase());
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {
