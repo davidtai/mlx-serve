@@ -179,6 +179,11 @@ pub const Module = struct {
         if (config.prefill_combine) |v| tier.routes.prefill_combine = v;
         if (config.prefill_host_shared) |v| tier.routes.prefill_host_shared = v;
         if (config.prefill_joinless) |v| tier.routes.prefill_joinless = v;
+        // The verify-row routes (C23, C27-C29): a setting overrides the tier's route.
+        if (config.decode_attn_softmax) |v| tier.routes.rc_attn_softmax = v;
+        if (config.decode_index_topk) |v| tier.routes.rc_index_topk = v;
+        if (config.decode_smallm) |v| tier.routes.rc_smallm = v;
+        if (config.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         if (config.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -194,6 +199,11 @@ pub const Module = struct {
         var line_buf: [192]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
         log.info("{s}", .{self.installed.callSites(&line_buf)});
+        self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
+        self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
+        self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
+        self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
+        log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -457,8 +467,18 @@ pub const Installed = struct {
     /// PREFILL_HOST shared and JOINLESS (K16's routed group; installed).
     prefill_host_shared: bool = false,
     prefill_joinless: bool = false,
+    /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows; installed).
+    decode_attn_softmax: bool = false,
+    decode_index_topk: bool = false,
+    decode_smallm: bool = false,
+    decode_mxfp8_rows: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
+    /// The verify-row routes' construction line.
+    pub fn decodeSites(self: Installed, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "NATIVE decode sites installed: softmax {}, select {}, smallm {}, mxfp8 rows {}", .{ self.decode_attn_softmax, self.decode_index_topk, self.decode_smallm, self.decode_mxfp8_rows }) catch buf[0..0];
+    }
+
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless }) catch buf[0..0];
     }
