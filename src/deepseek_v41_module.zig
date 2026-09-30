@@ -544,15 +544,16 @@ pub const Module = struct {
     /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
-        try self.gate.request();
+        try self.gate.begin(.prefill);
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
         self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
         self.prompt_stats0 = self.streamStats();
         self.prompt_tokens = ids.len;
-        if (self.dspark_cfg) |cfg| return self.prefillSeeded(ids, cfg);
-        return self.forward(ids);
+        const logits = if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg) else try self.forward(ids);
+        self.gate.completePrefill(self.dspark != null);
+        return logits;
     }
 
     /// ENGRAM=prefetch's construction check: a fixed span's rows hashed, every Engram slot's posted gather
@@ -655,9 +656,8 @@ pub const Module = struct {
 
     /// `dsparkRound` with the loop's cycle log and a stamper (the cell's receipts; `{}` compiles them out).
     pub fn dsparkRoundLogged(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, cycle_log: ?*dsl.CycleLog, stamp: anytype) !DsparkRound {
-        try self.gate.request();
-        // The phase change is upstream's decode handover (`decodeHandover`), never taken here.
-        if (!self.grown()) return error.PhaseChangeNotRun;
+        // The phase change is upstream's decode handover (`decodeHandover`), never taken here (`PhaseGate`).
+        try self.gate.begin(.decode_step);
         const d: *Dspark = if (self.dspark) |*x| x else {
             const logits = try self.forward(&.{t1});
             defer _ = mlx.mlx_array_free(logits);
@@ -701,17 +701,14 @@ pub const Module = struct {
     /// decode handover's, `decodeHandover`): refused by name before the handover, so a driver that skips it
     /// never decodes at the prompt rows.
     pub fn extend(self: *Module, ids: []const u32) !mlx.mlx_array {
-        try self.gate.request();
-        if (!self.grown()) return error.PhaseChangeNotRun;
+        try self.gate.begin(.decode_step);
         return self.step(ids);
     }
 
     /// The prompt's continuation: a split prompt runs `prefill` over its first part, then this over each
     /// later part, all before the decode handover (refused by name after it: the prompt's rows are gone).
     pub fn prefillContinue(self: *Module, ids: []const u32) !mlx.mlx_array {
-        try self.gate.request();
-        if (self.state == null) return error.ContinueWithoutPrompt;
-        if (self.grown()) return error.PromptAfterHandover;
+        try self.gate.begin(.prefill_continue);
         return self.step(ids);
     }
 
@@ -757,12 +754,11 @@ pub const Module = struct {
     /// when the shell drives native draft rounds, without the strategy the prompt seeded. The only entry to
     /// the phase change: no forward width or round triggers it.
     pub fn decodeHandover(self: *Module, h: model_io.DecodeHandover) !void {
-        try self.gate.request();
-        if (self.state == null) return error.HandoverWithoutPrompt;
-        if (h.native_draft and self.dspark == null) return error.HandoverWithoutSeed;
+        try self.gate.begin(.{ .handover = .{ .native_draft = h.native_draft } });
         // The prompt pass is complete (a split prompt's continuations included): its reads, once.
         self.reportPrompt();
         try self.phaseChange();
+        self.gate.completeHandover();
     }
 
     /// The phase change, once (a no-op after): the prompt's frees, proven reclaimed, then the grow.
@@ -991,17 +987,70 @@ pub const PhaseChangeRecord = struct {
     refused: ?[]const u8 = null,
 };
 
-/// The phase change's gate: a refused boundary is kept (every later request refused by name), so no retry
-/// grows over what the refused check saw.
+/// The request's phase gate: every public Module entry asks it first, so the order of a request's entries is
+/// proven by construction here, with no model and no device (host-tested below).
+/// - A refused boundary is kept: every later entry is refused by name (PhaseChangeRefused) before any phase check,
+///   so no retry grows over what the refused check saw.
+/// - The request's phase orders its entries:
+///   - `prefill` (a new request, at any phase): the phase is `idle` until the prompt's forward completes, then
+///     `prompt` (seeded or not: whether the DSpark strategy took the prompt);
+///   - `prefill_continue` (a split prompt's later parts): `prompt` only (ContinueWithoutPrompt before any
+///     completed prefill, PromptAfterHandover after the handover);
+///   - `handover` (upstream's decode handover): from `prompt` to `decode` (HandoverWithoutPrompt before any completed
+///     prefill; HandoverWithoutSeed when the shell drives native draft rounds over an unseeded prompt); again in
+///     `decode`, a no-op;
+///   - `decode_step` (extend, a round): `decode` only (PhaseChangeNotRun before the handover).
 pub const PhaseGate = struct {
     refused: ?anyerror = null,
+    phase: Phase = .idle,
+    /// The completed prompt seeded the DSpark strategy.
+    seeded: bool = false,
 
+    pub const Phase = enum { idle, prompt, decode };
+    pub const Entry = union(enum) { prefill, prefill_continue, handover: struct { native_draft: bool }, decode_step };
+    pub const Error = error{ PhaseChangeRefused, PhaseChangeNotRun, ContinueWithoutPrompt, PromptAfterHandover, HandoverWithoutPrompt, HandoverWithoutSeed };
+
+    /// The refused boundary only (the entries that are no request phase's: the shrink, the phase change itself).
     pub fn request(g: *const PhaseGate) error{PhaseChangeRefused}!void {
         if (g.refused != null) return error.PhaseChangeRefused;
     }
 
     pub fn refuse(g: *PhaseGate, e: anyerror) void {
         g.refused = e;
+    }
+
+    /// The entry's refusals, the refused boundary first; a prefill drops the previous request (`idle` until
+    /// `completePrefill`).
+    pub fn begin(g: *PhaseGate, e: Entry) Error!void {
+        try g.request();
+        switch (e) {
+            .prefill => {
+                g.phase = .idle;
+                g.seeded = false;
+            },
+            .prefill_continue => switch (g.phase) {
+                .idle => return error.ContinueWithoutPrompt,
+                .prompt => {},
+                .decode => return error.PromptAfterHandover,
+            },
+            .handover => |h| switch (g.phase) {
+                .idle => return error.HandoverWithoutPrompt,
+                .prompt => if (h.native_draft and !g.seeded) return error.HandoverWithoutSeed,
+                .decode => {},
+            },
+            .decode_step => if (g.phase != .decode) return error.PhaseChangeNotRun,
+        }
+    }
+
+    /// The prompt's forward completed (`seeded`: the DSpark strategy took it).
+    pub fn completePrefill(g: *PhaseGate, seeded: bool) void {
+        g.phase = .prompt;
+        g.seeded = seeded;
+    }
+
+    /// The handover's phase change completed: the request decodes.
+    pub fn completeHandover(g: *PhaseGate) void {
+        g.phase = .decode;
     }
 };
 
@@ -1682,6 +1731,79 @@ test "dsv41 memory: a refused boundary refuses every later request by name (no r
     g.refuse(error.PhaseChangeFootprintNotFreed);
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
     try std.testing.expectError(error.PhaseChangeRefused, g.request());
+}
+
+test "dsv41 module: the phase gate admits a request's legal sequence, and the next request's" {
+    var g: PhaseGate = .{};
+    for (0..2) |_| {
+        try g.begin(.prefill);
+        g.completePrefill(true);
+        try std.testing.expectEqual(PhaseGate.Phase.prompt, g.phase);
+        try g.begin(.{ .handover = .{ .native_draft = true } });
+        g.completeHandover();
+        try std.testing.expectEqual(PhaseGate.Phase.decode, g.phase);
+        for (0..3) |_| try g.begin(.decode_step);
+        // A second handover in the same request is a no-op.
+        try g.begin(.{ .handover = .{ .native_draft = true } });
+        g.completeHandover();
+        try g.begin(.decode_step);
+    }
+    // A serial request (no strategy) hands over without native draft rounds.
+    try g.begin(.prefill);
+    g.completePrefill(false);
+    try g.begin(.{ .handover = .{ .native_draft = false } });
+    g.completeHandover();
+    try g.begin(.decode_step);
+}
+
+test "dsv41 module: the phase gate refuses each out-of-order entry by name" {
+    var g: PhaseGate = .{};
+    // Before any prefill: no continuation, no handover, no decode step.
+    try std.testing.expectError(error.ContinueWithoutPrompt, g.begin(.prefill_continue));
+    try std.testing.expectError(error.HandoverWithoutPrompt, g.begin(.{ .handover = .{ .native_draft = false } }));
+    try std.testing.expectError(error.PhaseChangeNotRun, g.begin(.decode_step));
+    // A prefill that never completed (its forward failed): still no prompt.
+    try g.begin(.prefill);
+    try std.testing.expectError(error.ContinueWithoutPrompt, g.begin(.prefill_continue));
+    try std.testing.expectError(error.HandoverWithoutPrompt, g.begin(.{ .handover = .{ .native_draft = true } }));
+    try std.testing.expectError(error.PhaseChangeNotRun, g.begin(.decode_step));
+    // After the prompt, before the handover: no decode step (extend and the round alike).
+    g.completePrefill(false);
+    try std.testing.expectError(error.PhaseChangeNotRun, g.begin(.decode_step));
+    // Native draft rounds over a prompt the strategy did not take.
+    try std.testing.expectError(error.HandoverWithoutSeed, g.begin(.{ .handover = .{ .native_draft = true } }));
+    // After the handover: no more prompt.
+    try g.begin(.{ .handover = .{ .native_draft = false } });
+    g.completeHandover();
+    try std.testing.expectError(error.PromptAfterHandover, g.begin(.prefill_continue));
+    // A new request's prefill drops the decoding one: its steps wait for its own handover.
+    try g.begin(.prefill);
+    g.completePrefill(true);
+    try std.testing.expectError(error.PhaseChangeNotRun, g.begin(.decode_step));
+}
+
+test "dsv41 module: the phase gate carries a split prompt: prefill, its continuations, the handover, then decode" {
+    var g: PhaseGate = .{};
+    try g.begin(.prefill);
+    g.completePrefill(true);
+    for (0..3) |_| try g.begin(.prefill_continue);
+    try std.testing.expectEqual(PhaseGate.Phase.prompt, g.phase);
+    try g.begin(.{ .handover = .{ .native_draft = true } });
+    g.completeHandover();
+    try g.begin(.decode_step);
+    try std.testing.expectError(error.PromptAfterHandover, g.begin(.prefill_continue));
+}
+
+test "dsv41 module: a refused boundary refuses every entry by name before any phase check" {
+    for ([_]PhaseGate.Phase{ .idle, .prompt, .decode }) |phase| {
+        var g: PhaseGate = .{ .phase = phase, .seeded = true };
+        g.refuse(error.PhaseChangeFootprintNotFreed);
+        const entries = [_]PhaseGate.Entry{ .prefill, .prefill_continue, .{ .handover = .{ .native_draft = true } }, .{ .handover = .{ .native_draft = false } }, .decode_step };
+        for (entries) |e| try std.testing.expectError(error.PhaseChangeRefused, g.begin(e));
+        try std.testing.expectError(error.PhaseChangeRefused, g.request());
+        // The refused gate keeps the request's phase (no entry moved it).
+        try std.testing.expectEqual(phase, g.phase);
+    }
 }
 
 test "dsv41 memory: the return to the prompt rows (shrink) is judged like the phase change" {
