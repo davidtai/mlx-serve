@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx");
 const nocache_reader = @import("nocache_reader.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const log = @import("log");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -821,7 +822,7 @@ pub const ModelConfig = struct {
 
     /// The host's generic streamed-expert facts a registered arch loads with.
     pub fn loadFacts(self: *const ModelConfig) sdk.LoadFacts {
-        return .{ .memory_baseline_bytes = self.memory_baseline_bytes, .expert_rows = self.expert_rows, .expert_prefill_rows = self.expert_prefill_rows, .nocache_weights = self.nocache_weights };
+        return .{ .memory_baseline_bytes = self.memory_baseline_bytes, .expert_rows = self.expert_rows, .expert_prefill_rows = self.expert_prefill_rows, .nocache_weights = self.nocache_weights, .wired_margin_bytes = gpu_ceiling.wired_limit_margin_bytes };
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {

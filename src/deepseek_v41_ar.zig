@@ -432,7 +432,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const m = try module.Module.init(gpa, io, &config, &weights, s);
+    const m = try module.Module.init(gpa, io, &config, &weights, s, hostBox());
     defer m.deinit();
     const constructed = phaseMemory("module constructed", m.bill.constructionTerms(), 0, vm_start.external);
     printPhaseMemory(a, constructed);
@@ -1192,7 +1192,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), args.ov);
     defer md.deinit();
     const wired = applyServerWiredPolicy();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
@@ -1878,6 +1878,12 @@ const WindowStop = struct {
         gpu_ceiling.static_ceiling_override = w.prev_ceiling;
     }
 };
+
+/// The Module's box as the host's load states it: the static ceiling and the wired margin (a window's, once
+/// `WindowStop.set` has put them there).
+fn hostBox() module.Box {
+    return .{ .ceiling = gpu_ceiling.staticGpuMemoryCeiling(), .wired_margin = gpu_ceiling.wired_limit_margin_bytes };
+}
 
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1")) return true;
@@ -3215,7 +3221,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer _ = mlx.mlx_stream_free(s);
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), args.ov);
     defer md.deinit();
     _ = applyServerWiredPolicy();
     const arm = switch (md.arm) {

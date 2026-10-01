@@ -89,7 +89,7 @@ pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
 
 pub fn init(load: *const sdk.LoadCtx, c: *const Config) !*Module {
     const built = c.withFacts(&load.facts);
-    return Module.init(load.gpa, load.io, &built, @ptrCast(@alignCast(load.weights)), load.stream);
+    return Module.init(load.gpa, load.io, &built, @ptrCast(@alignCast(load.weights)), load.stream, .{ .ceiling = load.ceiling, .wired_margin = load.facts.wired_margin_bytes });
 }
 
 pub fn deinit(m: *Module) void {

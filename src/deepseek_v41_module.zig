@@ -28,7 +28,6 @@ const xq = @import("exl3_quant.zig");
 const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
-const gpu_ceiling = @import("gpu_ceiling.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
@@ -544,12 +543,12 @@ pub const Module = struct {
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream) !*Module {
-        return initWith(gpa, io, config, weights, s, .{});
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, box: Box) !*Module {
+        return initWith(gpa, io, config, weights, s, box, .{});
     }
 
     /// `init` with a harness's route overrides (the served path passes none).
-    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, ov: RouteOverrides) !*Module {
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, box: Box, ov: RouteOverrides) !*Module {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -579,13 +578,13 @@ pub const Module = struct {
         };
         claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
         try self.acceptKernels(gpa, &c0, s, &diag);
-        // The box the admission fits: upstream's static GPU ceiling (Metal's working set, or its static override:
-        // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling through the same
-        // override); the fill's target lands upstream's wired margin (`--wired-margin-gib`) under it, and the bill
-        // (which reads the same ceiling) carries the baseline (the preflight's sample of the memory in use before
-        // the load, or `--memory-baseline-gb`). Read once here and passed to the bill explicitly.
-        const ceiling_bytes = gpu_ceiling.staticGpuMemoryCeiling();
-        const target = ceiling_bytes -| gpu_ceiling.wired_limit_margin_bytes;
+        // The box the admission fits (`box`, read once by the host at load): its static GPU ceiling (Metal's working
+        // set, or `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling the same
+        // way); the fill's target lands the wired margin (`--wired-margin-gib`) under it, and the bill (which reads
+        // the same ceiling) carries the baseline (the preflight's sample of the memory in use before the load, or
+        // `--memory-baseline-gb`). Passed to the bill explicitly.
+        const ceiling_bytes = box.ceiling;
+        const target = ceiling_bytes -| box.wired_margin;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
         // The served admission, one kind only (the native bill; the Python envelope planner never runs here):
         // rows filled up to the stop's target, or `--expert-rows R` as the decode rows with the prompt rows
@@ -2104,6 +2103,10 @@ pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 pub const fill_max_tokens = bill_mod.fill_max_tokens;
 pub const min_fill_rows = bill_mod.min_fill_rows;
+
+/// The box a Module admits in, stated by its builder once: the GPU memory ceiling and the wired margin the fill's
+/// target stays under (the served load passes the host's `sdk.LoadCtx.ceiling` and `LoadFacts.wired_margin_bytes`).
+pub const Box = struct { ceiling: u64, wired_margin: u64 };
 
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);

@@ -45,6 +45,9 @@ pub const LoadFacts = struct {
     expert_prefill_rows: ?u32 = null,
     /// The loader's page-cache setting for resident weights (`nocache_weights`; null = the arch's default).
     nocache_weights: ?bool = null,
+    /// What a plan leaves unplanned under the GPU memory ceiling (`--wired-margin-gib` / `--wired-margin`), stamped
+    /// once at load; the arch never reads the host's flag.
+    wired_margin_bytes: u64,
 };
 
 /// What `init` builds the module from.
