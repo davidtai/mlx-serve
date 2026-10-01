@@ -112,6 +112,9 @@ pub const served: Tier = blk: {
     // one-factor arm (DSV41_CELL_DECODE_SHARED_MID=1, DSV41_CELL_DECODE_MEMOS=1) until a measured win flips it.
     t.routes.shared_mid = false;
     t.routes.decode_memos = false;
+    // K16's input streams released at each chunk fence: a one-factor arm (DSV41_CELL_INPUT_STREAM_EARLY_RELEASE=1); the
+    // memory lane's tight bill counts one routed-group stream when it is installed (`module.inputStreamEarlyRelease`).
+    t.routes.input_stream_early_release = false;
     break :blk t;
 };
 
