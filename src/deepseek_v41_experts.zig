@@ -1102,7 +1102,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
-            if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts or comptime !@hasDecl(S, "isResident"))) return error.InvalidWideRoute;
+            if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1135,16 +1135,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             for (ids[(n - r) * k .. n * k]) |e| set.set(e);
         }
 
-        /// A0 (a): layer `layer`'s warm set less its residents now, ascending, at most `out.len` (the reads the first
-        /// verify's warm class issues at the grow); empty without `Wide.warm_tail`.
+        /// A0 (a): layer `layer`'s warm set, ascending, at most `out.len`: the experts the first verify's warm class may
+        /// read at the grow. The stream's issue skips the residents itself (its no-evict admission), so the warm route
+        /// needs no residency query of the source. Empty without `Wide.warm_tail`.
         pub fn warmSet(self: *const Self, layer: u32, out: []u16) []u16 {
-            if (comptime !@hasDecl(S, "isResident")) return out[0..0];
             if (layer >= self.warm_tail.len) return out[0..0];
             var n: usize = 0;
             var it = self.warm_tail[layer].iterator(.{});
             while (it.next()) |e| {
                 if (n == out.len) break;
-                if (self.source.isResident(layer, @intCast(e))) continue;
                 out[n] = @intCast(e);
                 n += 1;
             }
@@ -2273,7 +2272,7 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
 }
 
-test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the warm set is them less the residents" {
+test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the warm set is them, ascending, residents included" {
     const a = testing.allocator;
     var c = testConfig(256, 128, 1);
     c.n_routed_experts = 64;
@@ -2303,12 +2302,15 @@ test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the w
     for (ids[(n - warm_tail_rows) * k ..]) |e| tail.set(e);
     var buf: [64]u16 = undefined;
     const got = ex.warmSet(0, &buf);
-    var want: usize = 0;
-    var it = tail.iterator(.{});
-    while (it.next()) |e| want += @intFromBool(!src.isResident(0, @intCast(e)));
-    try testing.expect(want > 0 and want < tail.count());
-    try testing.expectEqual(want, got.len);
-    for (got) |e| try testing.expect(tail.isSet(e) and !src.isResident(0, e));
+    // the whole set, ascending, residents included (the stream's issue skips those)
+    try testing.expectEqual(tail.count(), got.len);
+    for (got, 0..) |e, i| {
+        try testing.expect(tail.isSet(e));
+        if (i > 0) try testing.expect(got[i - 1] < e);
+    }
+    var resident: usize = 0;
+    for (got) |e| resident += @intFromBool(src.isResident(0, e));
+    try testing.expect(resident > 0 and resident < got.len);
     // the route needs the prefill lane; without it the warm set is empty
     const Dec = ExpertsWith(TraceOps, FakeSource, Chain, .{});
     try testing.expectError(error.InvalidWideRoute, Dec.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .wide = .{ .warm_tail = true } }));
