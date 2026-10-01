@@ -1972,6 +1972,7 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
         applyModelSettings(owned.config, owned.chat_config, &settings);
+        if (owned.config.arch) |vt| model_settings.applyArch(self.allocator, self.io, entry.path, vt, owned.config.arch_cfg.?);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2706,16 +2707,6 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     if (o.nocache_weights) |n| config.nocache_weights = n;
-    if (o.expert_event_gates) |n| config.expert_event_gates = n;
-    if (o.expert_reader_sched) |n| config.expert_reader_sched = n;
-    if (o.numeric_tier) |n| config.numeric_tier = n;
-    if (o.layer_major_prefill) |n| config.layer_major_prefill = n;
-    if (o.expert_wide_feed) |n| config.expert_wide_feed = n;
-    if (o.expert_wide_depth) |n| config.expert_wide_depth = n;
-    if (o.expert_wide_seed) |n| config.expert_wide_seed = n;
-    if (o.embedding_host_rows) |n| config.embedding_host_rows = n;
-    if (o.expert_wide_hot_first) |n| config.expert_wide_hot_first = n;
-    if (o.expert_wide_cold_rows) |n| config.expert_wide_cold_rows = n;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;

@@ -1,5 +1,6 @@
-//! DeepSeek-V4.1 as a module-owned arch of mlx-serve (the deepseek_v4 pattern): `Transformer.dsv41`
-//! holds a `Module` that `Transformer.init` builds from the loaded residents and `forwardWith` runs,
+//! DeepSeek-V4.1 as a module-owned arch of mlx-serve (the deepseek_v4 pattern), registered as an `arch` plugin
+//! (deepseek_v41_plugin.zig): `Transformer.arch` holds a `Module` that `Transformer.init` builds from the loaded
+//! residents and `forwardWith` runs,
 //! its per-request state rebuilt at `cache.step == 0`. Construction refuses by name, in order:
 //!   1. the kernels (C2, kernels note sec. 19: the load context's `kernel_set.Set`, the registry against the pinned manifest,
 //!      every kernel built on the device, the device self-check judged);
@@ -1689,15 +1690,6 @@ pub const Module = struct {
     }
 };
 
-/// The load preflight's requirement (`transformer.archLoadRequirementBytes`): the native bill at the fill's
-/// floor rows (`deepseek_v41_bill.loadRequirementBytes`).
-pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const settings.Config) !u64 {
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    // Upstream's load preflight (the server, the device in hand): its static GPU ceiling, read here at the call site.
-    return bill_mod.loadRequirementBytes(arena.allocator(), io, config.*, gpu_ceiling.staticGpuMemoryCeiling());
-}
-
 /// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
 /// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
 pub const layer_major_billed = true;
@@ -2124,7 +2116,7 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
 /// the limit. The served tier holds 2 GiB, what pass3ak (v6c3) actually held at its prompt peak under 4 GiB:
 /// at 1 GiB (pass3am, v7) the prompt read the same 186.0 GB in the same 14.4 s of read-busy time while TTFT
 /// rose 37.64 -> 39.14 s, the allocator churning in the prompt pass. The stock tier the envelope's own.
-pub fn prefillCacheLimit(t: @import("model_settings.zig").NumericTier) usize {
+pub fn prefillCacheLimit(t: settings.NumericTier) usize {
     return switch (t) {
         .served => v41.served_prefill_cache_bytes,
         .stock => envelope.prefill_cache_bytes,

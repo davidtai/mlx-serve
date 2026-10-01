@@ -1,10 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
-const dsv41_mod = if (@import("build_options").macos_engines) @import("deepseek_v41_module.zig") else @import("deepseek_v41_module_stub.zig");
-const dsv41_settings = @import("deepseek_v41_settings.zig");
-/// The deepseek_v41 module as this build links it (the generator's draft-lane dispatch names it).
-pub const Dsv41Module = dsv41_mod.Module;
+const sdk = @import("sdk");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -14612,6 +14610,9 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
+    /// The request's shape, set once by the Generator before its first forward: a registered arch's prompt pass
+    /// derives its reservation from it (and refuses by name without it).
+    request: ?sdk.RequestShape = null,
     /// An additive attention term composed into the standard PREFILL path's
     /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
     /// "causal"-mode layer swaps to an array mask carrying this verbatim, so
@@ -16208,9 +16209,9 @@ pub const Transformer = struct {
     // and the forward dispatches to the module. v0 decode = full re-forward.
     dsv4: ?*dsv4_mod.Dsv4Model = null,
 
-    // DeepSeek-V4.1 (deepseek_v41): the module (deepseek_v41_module.zig) owns the trunk, the
-    // streamed experts and the per-request state, as dsv4 does; the shell stays empty.
-    dsv41: ?*dsv41_mod.Module = null,
+    // A registered arch (src/plugins.zig): its module owns the trunk and whatever state its caps say, as dsv4
+    // does; the shell stays empty. Reached through its table once per prompt, step, handover or round.
+    arch: ?sdk.ArchInstance = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -16358,7 +16359,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
-        if (std.mem.eql(u8, config.model_type, "deepseek_v41")) return initDsv41(io, allocator, config, weights, s);
+        if (config.arch) |vt| return initArch(io, allocator, config, weights, s, vt);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -17764,9 +17765,9 @@ pub const Transformer = struct {
             self.allocator.destroy(mdl);
             self.dsv4 = null;
         }
-        if (self.dsv41) |mdl| {
-            mdl.deinit();
-            self.dsv41 = null;
+        if (self.arch) |a| {
+            a.vt.deinit(a.module);
+            self.arch = null;
         }
         if (self.rht) |reg| {
             reg.deinit();
@@ -19405,7 +19406,8 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41" };
+    /// A registered arch says the same through its caps (`owns_decode_state`).
+    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -19416,21 +19418,19 @@ pub const Transformer = struct {
     pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
+        if (self.arch) |a| if (a.vt.caps.owns_decode_state) return true;
         inline for (module_owned_state_fields) |f| {
             if (@field(self, f) != null) return true;
         }
         return false;
     }
 
-    /// Upstream's prefill-to-decode handover (`model.DecodeHandover`) for the module-owned-state archs whose module
-    /// takes one (dsv41: its phase change); a no-op for every other arch. Once per request, at the request's first
-    /// decode step, from the Generator (`beginDecode`), never inside prefill.
+    /// Upstream's prefill-to-decode handover (`model.DecodeHandover`) for a registered arch that takes one (its
+    /// phase change); a no-op for every other arch. Once per request, at the request's first decode step, from the
+    /// Generator (`beginDecode`), never inside prefill.
     pub fn decodeHandover(self: *Transformer, h: model_mod.DecodeHandover) !void {
-        inline for (module_owned_state_fields) |f| {
-            if (comptime takesDecodeHandover(f)) {
-                if (@field(self, f)) |m| return m.decodeHandover(h);
-            }
-        }
+        const a = self.arch orelse return;
+        if (a.vt.handover) |f| return f(a.module, h);
     }
 
     /// The request's end for the module-owned-state archs whose module takes one (dsv41: its reverse phase change, back
@@ -19447,17 +19447,8 @@ pub const Transformer = struct {
 
     /// Whether this model's arch takes the handover: read once, at a Generator's construction.
     pub fn decodeHandoverWanted(self: *const Transformer) bool {
-        inline for (module_owned_state_fields) |f| {
-            if (comptime takesDecodeHandover(f)) {
-                if (@field(self, f) != null) return true;
-            }
-        }
-        return false;
-    }
-
-    fn takesDecodeHandover(comptime f: []const u8) bool {
-        const Ptr = @typeInfo(@FieldType(Transformer, f)).optional.child;
-        return @hasDecl(@typeInfo(Ptr).pointer.child, "decodeHandover");
+        const a = self.arch orelse return false;
+        return a.vt.handover != null;
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
@@ -19480,7 +19471,10 @@ pub const Transformer = struct {
     /// that arms, defaults or dispatches the lane reads this one answer.
     pub fn nativeDraftBlock(self: *const Transformer) u32 {
         if (self.dsv4) |m| return if (m.n_mtp > 0) @intCast(m.ds_block) else 0;
-        if (self.dsv41) |m| return m.draftBlockSize();
+        if (self.arch) |a| return switch (a.vt.spec) {
+            .draft_lane => |l| l.block_size(a.module),
+            else => 0,
+        };
         return 0;
     }
 
@@ -19525,7 +19519,7 @@ pub const Transformer = struct {
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
-        if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
+        if (self.arch) |a| return forwardArch(self, ctx, token_ids, a);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
@@ -42475,35 +42469,33 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
 }
 
-/// A module-owned arch's own load requirement for the load preflight: the bytes it needs free, in place
-/// of the shards' disk bytes (null: the preflight bills the shards). deepseek_v41: its native memory bill at
-/// the fill's floor rows (the streamed experts' slot banks, residents, prompt wave and caches), so the
-/// preflight is the one load gate and its message and `--skip-mem-preflight` apply.
+/// A registered arch's own load requirement for the load preflight: the bytes it needs free, in place of the
+/// shards' disk bytes (null: the preflight bills the shards). A streamed-expert arch bills its native memory at
+/// the fill's floor rows (the slot banks, residents, prompt wave and caches), so the preflight is the one load gate
+/// and its message and `--skip-mem-preflight` apply.
 pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig) ?u64 {
-    if (std.mem.eql(u8, config.model_type, "deepseek_v41")) {
-        const c = dsv41_settings.Config.fromHost(config);
-        return dsv41_mod.loadRequirementBytes(allocator, io, &c) catch |e| {
-            std.log.warn("[preflight] deepseek_v41 bill unavailable ({s}); billing the shards", .{@errorName(e)});
-            return null;
-        };
-    }
-    return null;
+    const vt = config.arch orelse return null;
+    const facts = config.loadFacts();
+    return vt.load_bytes(allocator, io, config.arch_cfg.?, &facts, gpu_ceiling.staticGpuMemoryCeiling()) catch |e| {
+        std.log.warn("[preflight] {s} bill unavailable ({s}); billing the shards", .{ vt.name, @errorName(e) });
+        return null;
+    };
 }
 
-/// deepseek_v41: the module over the loaded residents; the shell is dsv4's (a 0-layer KVCache,
-/// empty standard fields).
-fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
-    const c = dsv41_settings.Config.fromHost(&config);
-    const mdl = try dsv41_mod.Module.init(allocator, io, &c, weights, s);
-    errdefer mdl.deinit();
+/// A registered arch: its module over the loaded residents; the shell is dsv4's (a 0-layer KVCache, empty
+/// standard fields).
+fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream, vt: *const sdk.Arch) !Transformer {
+    const load: sdk.LoadCtx = .{ .gpa = allocator, .io = io, .stream = s, .weights = weights, .facts = config.loadFacts(), .ceiling = gpu_ceiling.staticGpuMemoryCeiling() };
+    const m = try vt.init(&load, config.arch_cfg.?);
+    errdefer vt.deinit(m);
     var t = try initDsv4Shell(allocator, config, s);
-    t.dsv41 = mdl;
+    t.arch = .{ .vt = vt, .cfg = config.arch_cfg.?, .module = m };
     return t;
 }
 
-/// The prompt at `cache.step == 0` (a fresh request), later positions after it; the last row's
-/// logits as rank-3 [1, 1, vocab] f32 (callers slice the last position).
-fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *dsv41_mod.Module) !mlx.mlx_array {
+/// The prompt at `cache.step == 0` (a fresh request, its shape set by the Generator), later positions after it;
+/// the last row's logits as rank-3 [1, 1, vocab] f32 (callers slice the last position).
+fn forwardArch(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, a: sdk.ArchInstance) !mlx.mlx_array {
     const n = mlx.mlx_array_size(token_ids);
     var ids32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids32);
@@ -42513,7 +42505,10 @@ fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     const ids = try self.allocator.alloc(u32, n);
     defer self.allocator.free(ids);
     for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
-    const logits = if (ctx.cache.step == 0) try mdl.prefill(ids, ctx.cache.reserve_tokens) else try mdl.extend(ids);
+    const logits = if (ctx.cache.step == 0)
+        try a.vt.prefill(a.module, ids, ctx.request orelse return error.RequestShapeMissing)
+    else
+        try a.vt.step(a.module, ids);
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;
     var f32_logits = mlx.mlx_array_new();
@@ -61844,7 +61839,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     var t: Transformer = undefined;
     t.rht = null;
     t.dsv4 = null;
-    t.dsv41 = null;
+    t.arch = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
@@ -61852,10 +61847,15 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv4 = &fake_dsv4;
     try testing.expect(t.ownsModuleDecodeState());
 
-    var fake_dsv41: dsv41_mod.Module = undefined;
+    // A registered arch says it through its caps.
+    const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const sharing = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .caps = .{} }));
+    var module: u8 = 0;
     t.dsv4 = null;
-    t.dsv41 = &fake_dsv41;
+    t.arch = .{ .vt = &owning, .cfg = &module, .module = &module };
     try testing.expect(t.ownsModuleDecodeState());
+    t.arch = .{ .vt = &sharing, .cfg = &module, .module = &module };
+    try testing.expect(!t.ownsModuleDecodeState());
 }
 
 test "every optional arch-module pointer on Transformer is a declared module-owned arch" {
@@ -61898,15 +61898,31 @@ test "every optional arch-module pointer on Transformer is a declared module-own
     try testing.expectEqual(Transformer.module_owned_state_fields.len + Transformer.module_shared_readonly_fields.len, found);
 }
 
-test "dsv41 handover: the decode handover dispatches to the module-owned archs that take one (dsv41), a no-op elsewhere" {
-    // dsv41's module takes it; dsv4's does not (its state has no phases).
-    try testing.expect(comptime Transformer.takesDecodeHandover("dsv41"));
-    try testing.expect(!(comptime Transformer.takesDecodeHandover("dsv4")));
+test "dsv41 handover: the decode handover reaches a registered arch that takes one, once, with its fields; a no-op elsewhere" {
     // No module installed: nothing wants it and the call is a no-op.
     var xfm: Transformer = undefined;
     inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
     try testing.expect(!xfm.decodeHandoverWanted());
     try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = false });
+    // An arch with a handover: wanted, and each call reaches its module with the same fields.
+    const Fake = sdk.testing.FakeArch(.{});
+    Fake.calls = .{};
+    const vt = comptime sdk.Arch.of(Fake);
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+    var cfg: Fake.Config = .{};
+    xfm.arch = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+    try testing.expect(xfm.decodeHandoverWanted());
+    const h: model_mod.DecodeHandover = .{ .prompt_tokens = 16384, .reserved_tokens = 17408, .native_draft = true };
+    try xfm.decodeHandover(h);
+    try testing.expectEqual(@as(u32, 1), Fake.calls.handover);
+    try testing.expectEqual(h, m.last_handover.?);
+    // An arch without one (dsv4's state has no phases either): not wanted, and the call is a no-op.
+    const bare = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .handover = false }));
+    xfm.arch = .{ .vt = &bare, .cfg = &cfg, .module = &m };
+    try testing.expect(!xfm.decodeHandoverWanted());
+    try xfm.decodeHandover(h);
+    try testing.expectEqual(@as(u32, 1), Fake.calls.handover);
 }
 
 test "every generative forward arm splices vision embeddings" {

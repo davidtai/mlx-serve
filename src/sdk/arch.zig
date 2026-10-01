@@ -39,6 +39,8 @@ pub const LoadFacts = struct {
     expert_rows: ?u32 = null,
     /// Prompt slot rows per layer (a harness's); null = the fill's.
     expert_prefill_rows: ?u32 = null,
+    /// The loader's page-cache setting for resident weights (`nocache_weights`; null = the arch's default).
+    nocache_weights: ?bool = null,
 };
 
 /// What `init` builds the module from.
@@ -53,7 +55,9 @@ pub const LoadCtx = struct {
     ceiling: u64,
 };
 
-/// A request as the host sees it at its prompt: each arch derives its own reservation from it.
+/// A request as the host sees it at its prompt, set once per request before its first forward: each arch derives
+/// its own reservation from it. `prompt_tokens` counts absolute positions; `host_context` is the window the host
+/// serves the model within.
 pub const RequestShape = struct { prompt_tokens: u64, max_tokens: u32, host_context: u64 };
 
 /// The prefill-to-decode handover (G2: the phase change), once per request at its first decode step, serial or

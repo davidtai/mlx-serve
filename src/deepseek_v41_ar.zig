@@ -3359,7 +3359,7 @@ fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
 fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: settings.Config, eos: []const u32 } {
     const prompt = try cellPrompt(a, io, prompt_path, case_id);
     const host = try model.parseConfig(io, a, bank_dir);
-    const config = settings.Config.fromHost(&host);
+    const config = try settings.Config.ofHost(&host);
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
     if (host.num_eos_tokens == 0) return error.NoEosIds;
     return .{ .prompt = prompt, .config = config, .eos = try a.dupe(u32, host.eos_token_ids[0..host.num_eos_tokens]) };

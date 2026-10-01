@@ -241,50 +241,8 @@ pub fn build(b: *std.Build) void {
     b.step("check", "Check that the server graph compiles, without codegen (with -Dslim: the slim host)").dependOn(&check_exe.step);
 
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libcpp = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = test_options.createModule() },
-            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
-            .{ .name = "opencode2_plugin", .module = opencode2_plugin },
-            .{ .name = "agent_skills", .module = agent_skills },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
-        },
-    });
-
-    shared.importInto(test_mod);
-    test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    test_mod.addIncludePath(b.path("lib/jinja_cpp"));
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
-    test_mod.addIncludePath(b.path("lib"));
-    test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    test_mod.addIncludePath(b.path("lib/xatlas"));
-    addDs4Sources(b, test_mod);
-    test_mod.addIncludePath(b.path("lib/ds4"));
-    addExpertIoSources(b, test_mod, true, dsv41_decode_timers);
-    addAneSources(b, test_mod);
-    addLlamaLib(b, test_mod);
-    test_mod.linkSystemLibrary("c++", .{});
-    addMlxLib(b, test_mod);
-    test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.linkSystemLibrary("webp", .{});
-
-    if (macos_sdk_frameworks) |fw_path| {
-        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    test_mod.linkFramework("IOKit", .{});
-    test_mod.linkFramework("CoreFoundation", .{});
-    test_mod.linkFramework("Foundation", .{});
-    test_mod.linkFramework("Metal", .{});
-    test_mod.linkFramework("IOSurface", .{});
+    const test_deps: TestDeps = .{ .options = test_options, .shared = shared, .ds4_metal_sources = ds4_metal_sources, .opencode2_plugin = opencode2_plugin, .agent_skills = agent_skills, .frameworks = macos_sdk_frameworks, .timeline = dsv41_decode_timers };
+    const test_mod = test_deps.module(b, b.path("src/tests.zig"), target, optimize);
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
@@ -328,18 +286,13 @@ pub fn build(b: *std.Build) void {
     };
     for (shared_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
 
-    // The plugin SDK's tests and the conformance suite's CPU lane (docs/plugins.md): sdk.testing over every
-    // registered plugin, rooted at the registry. No device: neither links MLX.
-    const registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/plugins.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "build_options", .module = test_options.createModule() }},
-    });
-    shared.importInto(registry_mod);
+    // The plugin SDK's tests (no MLX linked) and the conformance suite's CPU lane (docs/plugins.md): sdk.testing over
+    // every registered plugin, rooted at the registry, linked like the unit tests; its last check is that no Metal
+    // device was created.
+    const registry_mod = test_deps.module(b, b.path("src/plugins.zig"), target, optimize);
     const sdk_tests = b.addTest(.{ .name = "sdk-test", .root_module = shared.sdk, .filters = if (test_filter) |f| &.{f} else &.{} });
-    const conformance_tests = b.addTest(.{ .name = "conformance", .root_module = registry_mod, .filters = if (test_filter) |f| &.{f} else &.{} });
+    // Only the registry's own tests: the files a registered plugin reaches keep theirs in the unit tests.
+    const conformance_tests = b.addTest(.{ .name = "conformance", .root_module = registry_mod, .filters = &.{"plugins "} });
     const conformance = b.step("conformance", "Run the SDK's tests and the plugin conformance suite (CPU lane, no device)");
     conformance.dependOn(&b.addRunArtifact(sdk_tests).step);
     conformance.dependOn(&b.addRunArtifact(conformance_tests).step);
@@ -798,6 +751,62 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
     module.addIncludePath(b.path("lib/ane"));
 }
+
+/// What the macOS unit-test graphs link and import: the unit tests and the conformance suite share it.
+const TestDeps = struct {
+    options: *std.Build.Step.Options,
+    shared: Shared,
+    ds4_metal_sources: *std.Build.Module,
+    opencode2_plugin: *std.Build.Module,
+    agent_skills: *std.Build.Module,
+    frameworks: ?[]const u8,
+    /// The decode profile's command-buffer timeline sources (the dsv41-decode-timers profile option).
+    timeline: bool,
+
+    fn module(d: TestDeps, b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+        const m = b.createModule(.{
+            .root_source_file = root,
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+            .imports = &.{
+                .{ .name = "build_options", .module = d.options.createModule() },
+                .{ .name = "ds4_metal_sources", .module = d.ds4_metal_sources },
+                .{ .name = "opencode2_plugin", .module = d.opencode2_plugin },
+                .{ .name = "agent_skills", .module = d.agent_skills },
+                .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+                .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+                .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+            },
+        });
+        d.shared.importInto(m);
+        m.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+        m.addIncludePath(b.path("lib/jinja_cpp"));
+        m.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+        m.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
+        m.addIncludePath(b.path("lib"));
+        m.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+        m.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+        m.addIncludePath(b.path("lib/xatlas"));
+        addDs4Sources(b, m);
+        m.addIncludePath(b.path("lib/ds4"));
+        addExpertIoSources(b, m, true, d.timeline);
+        addAneSources(b, m);
+        addLlamaLib(b, m);
+        m.linkSystemLibrary("c++", .{});
+        addMlxLib(b, m);
+        m.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        m.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        m.linkSystemLibrary("webp", .{});
+        if (d.frameworks) |fw_path| m.addFrameworkPath(.{ .cwd_relative = fw_path });
+        m.linkFramework("IOKit", .{});
+        m.linkFramework("CoreFoundation", .{});
+        m.linkFramework("Foundation", .{});
+        m.linkFramework("Metal", .{});
+        m.linkFramework("IOSurface", .{});
+        return m;
+    }
+};
 
 /// The build options a macOS graph's sources read. The server and the test graph differ only in
 /// `embedded_engines` (the slim host's switch).

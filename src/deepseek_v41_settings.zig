@@ -3,11 +3,14 @@
 //! ModelConfig gave them, so every reader in the package reads them unchanged.
 
 const std = @import("std");
+const sdk = @import("sdk");
+const log = @import("log");
 const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 
-/// The arch's construction-time numerics (`numeric_tier`).
-pub const NumericTier = @import("model_settings.zig").NumericTier;
+/// The arch's numerics, chosen at construction (`numeric_tier`): "stock" (the exact reference math, the prompt in
+/// decode-width forwards) or "served" (the tier of record, its rounding-class prefill).
+pub const NumericTier = enum { stock, served };
 
 pub const Config = struct {
     /// The model directory (config.json, the resident shards, the expert bank) and the exported Engram token map
@@ -16,6 +19,8 @@ pub const Config = struct {
     engram_token_map_path: ?[]const u8 = null,
     /// The prompt pass's bill for the prefill admission.
     dsv41_prefill: ?v41.PrefillBill = null,
+    /// The shell's facts: routed experts and layers.
+    num_experts: u32 = 0,
     num_hidden_layers: u32 = 0,
     /// The load's facts: the memory in use before the load (`--memory-baseline-gb`, else the preflight's reading),
     /// the decode and prompt slot rows per layer (`--expert-rows`, a harness's; null = the admission's fill), the
@@ -54,16 +59,75 @@ pub const Config = struct {
     /// The input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
 
-    /// The host's config, field for field.
-    pub fn fromHost(c: *const model.ModelConfig) Config {
-        var out: Config = .{};
-        inline for (@typeInfo(Config).@"struct".field_names) |f| @field(out, f) = @field(c, f);
+    /// The host's load facts onto this config (the module and the bill read them under these names).
+    pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
+        var out = c;
+        out.memory_baseline_bytes = facts.memory_baseline_bytes;
+        out.expert_rows = facts.expert_rows;
+        out.expert_prefill_rows = facts.expert_prefill_rows;
+        out.nocache_weights = facts.nocache_weights;
         return out;
     }
 
-    /// A model directory's config as the host parses it, as this arch's config (its strings in `a`).
+    /// The host's parsed config of this arch's model (its registry entry's config), with the host's load facts.
+    pub fn ofHost(host: *const model.ModelConfig) error{NotDeepseekV41}!Config {
+        const vt = host.arch orelse return error.NotDeepseekV41;
+        if (!std.mem.eql(u8, vt.name, "deepseek_v41")) return error.NotDeepseekV41;
+        const c: *const Config = @ptrCast(@alignCast(host.arch_cfg.?));
+        return c.withFacts(&host.loadFacts());
+    }
+
+    /// A model directory's config as the host parses it (config.json through the registry), as this arch's config;
+    /// its strings live in `a`.
     pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !Config {
-        return fromHost(&try model.parseConfig(io, a, model_dir));
+        return ofHost(&try model.parseConfig(io, a, model_dir));
+    }
+
+    /// This model's model-settings.json object: each key this arch takes, set when present and valid (anything
+    /// else is unset), and one `[model-settings]` line when any was.
+    pub fn applySettings(c: *Config, raw: std.json.Value) void {
+        const obj = switch (raw) {
+            .object => |o| o,
+            else => return,
+        };
+        var any = false;
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows" }) |key| {
+            if (obj.get(key)) |v| if (v == .bool) {
+                @field(c, key) = v.bool;
+                any = true;
+            };
+        }
+        if (obj.get("numeric_tier")) |v| if (v == .string) {
+            if (std.meta.stringToEnum(NumericTier, v.string)) |t| {
+                c.numeric_tier = t;
+                any = true;
+            }
+        };
+        if (obj.get("expert_reader_sched")) |v| if (v == .string) {
+            if (@import("model_settings.zig").ReaderSched.parse(v.string)) |rs| {
+                c.expert_reader_sched = rs;
+                any = true;
+            }
+        };
+        if (obj.get("expert_wide_cold_rows")) |v| if (v == .integer and v.integer >= 1 and v.integer <= 8) {
+            c.expert_wide_cold_rows = @intCast(v.integer);
+            any = true;
+        };
+        if (obj.get("expert_wide_depth")) |v| if (v == .integer and v.integer >= 1 and v.integer <= 2) {
+            c.expert_wide_depth = @intCast(v.integer);
+            any = true;
+        };
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s}\n", .{
+            onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
+            onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
+            onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
+            c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
+            onOff(c.embedding_host_rows),
+        });
+    }
+
+    fn onOff(v: ?bool) []const u8 {
+        return if (v) |b| (if (b) "on" else "off") else "default";
     }
 
     /// The prefill routes as the module builds them: a setting when given, else the tier's default (the served
@@ -125,3 +189,40 @@ pub const Config = struct {
         return (self.numeric_tier orelse .served) == .served;
     }
 };
+
+const testing = std.testing;
+
+fn settingsOf(json: []const u8) !Config {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c: Config = .{};
+    c.applySettings(try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}));
+    return c;
+}
+
+test "dsv41 settings: numeric_tier names stock or served, anything else is unset" {
+    try testing.expectEqual(@as(?NumericTier, .stock), (try settingsOf("{\"numeric_tier\": \"stock\"}")).numeric_tier);
+    try testing.expectEqual(@as(?NumericTier, .served), (try settingsOf("{\"numeric_tier\": \"served\"}")).numeric_tier);
+    try testing.expectEqual(@as(?NumericTier, null), (try settingsOf("{\"numeric_tier\": \"fast\"}")).numeric_tier);
+}
+
+test "dsv41 settings: expert_event_gates and embedding_host_rows are bools, anything else is unset" {
+    try testing.expectEqual(@as(?bool, true), (try settingsOf("{\"expert_event_gates\": true}")).expert_event_gates);
+    try testing.expectEqual(@as(?bool, null), (try settingsOf("{\"expert_event_gates\": 1}")).expert_event_gates);
+    try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"embedding_host_rows\": false}")).embedding_host_rows);
+}
+
+test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 or 2; cold rows 1 to 8; anything else is unset" {
+    const a = try settingsOf("{\"layer_major_prefill\": true, \"expert_wide_feed\": false, \"expert_wide_depth\": 2, \"expert_wide_cold_rows\": 8}");
+    try testing.expectEqual(@as(?bool, true), a.layer_major_prefill);
+    try testing.expectEqual(@as(?bool, false), a.expert_wide_feed);
+    try testing.expectEqual(@as(?u8, 2), a.expert_wide_depth);
+    try testing.expectEqual(@as(?u8, 8), a.expert_wide_cold_rows);
+    const c = try settingsOf("{\"layer_major_prefill\": 1, \"expert_wide_depth\": 3, \"expert_wide_cold_rows\": 9, \"expert_wide_seed\": \"on\"}");
+    try testing.expectEqual(@as(?bool, null), c.layer_major_prefill);
+    try testing.expectEqual(@as(?u8, null), c.expert_wide_depth);
+    try testing.expectEqual(@as(?u8, null), c.expert_wide_cold_rows);
+    try testing.expectEqual(@as(?bool, null), c.expert_wide_seed);
+    // Not an object: nothing set.
+    try testing.expectEqual(Config{}, try settingsOf("[1]"));
+}

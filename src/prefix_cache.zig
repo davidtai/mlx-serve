@@ -2950,16 +2950,19 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: shouldUse rejects deepseek_v4 and deepseek_v41 (module-owned decode state)" {
+test "HotPrefixCache: shouldUse rejects deepseek_v4 and a registered arch that owns its decode state" {
     // dsv4's per-request state (raw-kv rings, compressed caches, compressor
     // pending windows) lives on the Dsv4Model, NOT in the 0-entry KVCache
     // shell — a snapshot restore would set cache.step without rebuilding that
     // state, silently serving a stale ring (or crashing on a null dec_state).
-    var cfg = model_mod.ModelConfig{};
-    for ([_][]const u8{ "deepseek_v4", "deepseek_v41" }) |t| {
-        cfg.model_type = t;
-        try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
-        try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
+    // A registered arch (deepseek_v41) says the same through its caps.
+    const sdk = @import("sdk");
+    const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const dsv4 = model_mod.ModelConfig{ .model_type = "deepseek_v4" };
+    const arch = model_mod.ModelConfig{ .model_type = "fake_arch", .arch = &owning };
+    for ([_]*const model_mod.ModelConfig{ &dsv4, &arch }) |cfg| {
+        try testing.expect(!HotPrefixCache.shouldUse(cfg, false));
+        try testing.expect(!HotPrefixCache.shouldUse(cfg, true));
     }
 }
 

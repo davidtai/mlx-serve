@@ -7,7 +7,9 @@ const sdk = @import("sdk");
 const build_options = @import("build_options");
 
 /// One line per plugin: `@import("<its root file>").plugin`.
-pub const all = [_]sdk.Plugin{};
+pub const all = [_]sdk.Plugin{
+    @import("mlx_stream.zig").plugin,
+};
 
 /// This build's registry. A macOS-only plugin registers nothing on graphs without the macOS-only sources.
 pub const registry = Registry(&all, .{ .macos = build_options.macos_engines });

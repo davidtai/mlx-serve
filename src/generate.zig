@@ -3,6 +3,7 @@ const mlx = @import("mlx");
 const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
+const sdk = @import("sdk");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log");
@@ -302,7 +303,8 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// `Transformer.nativeDraftBlock`).
 pub const NativeDraft = union(enum) {
     dsv4: *dsv4_mod.Dsv4Model,
-    dsv41: *transformer_mod.Dsv41Module,
+    /// A registered arch's draft lane (its `spec.draft_lane`).
+    lane: sdk.ArchInstance,
 
     /// One round's commit, whichever module ran it: `tokens` = [t1, accepted drafts] (owned by the
     /// round's allocator), `next_token` the next round's trunk token (not yet in the state).
@@ -320,7 +322,7 @@ pub const NativeDraft = union(enum) {
     pub fn of(xfm: *Transformer) ?NativeDraft {
         if (xfm.nativeDraftBlock() == 0) return null;
         if (xfm.dsv4) |m| return .{ .dsv4 = m };
-        if (xfm.dsv41) |m| return .{ .dsv41 = m };
+        if (xfm.arch) |a| return .{ .lane = a };
         return null;
     }
 
@@ -328,7 +330,7 @@ pub const NativeDraft = union(enum) {
     pub fn position(self: NativeDraft) usize {
         return switch (self) {
             .dsv4 => |m| m.dec_state.?.n,
-            .dsv41 => |m| @intCast(m.position()),
+            .lane => |a| @intCast(a.vt.position(a.module)),
         };
     }
 };
@@ -1464,7 +1466,7 @@ pub const Generator = struct {
     /// The armed lane `nextDspark` runs its rounds on (set with `dspark_enabled`).
     native_draft: ?NativeDraft = null,
     /// The arch's prefill-to-decode handover is still due (`beginDecode`): set at construction from
-    /// `Transformer.decodeHandoverWanted` (dsv41's phase change), cleared by the request's first decode step.
+    /// `Transformer.decodeHandoverWanted` (a registered arch's phase change), cleared by the request's first decode step.
     decode_handover_due: bool = false,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
@@ -2346,20 +2348,22 @@ pub const Generator = struct {
     /// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
     /// gating.
     pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
-        const clean = sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            logprobs_n == 0;
-        if (!clean) return .off;
-        const greedy = sampling.temperature < 0.01 or sampling.top_k == 1;
-        if (greedy) return .greedy;
+        const req = armRequest(sampling, logprobs_n);
+        if (!req.clean) return .off;
+        if (req.greedy) return .greedy;
         return if (stoch_enabled) .stochastic else .off;
     }
 
-    /// The deepseek_v41 draft head's arm: a clean greedy request takes the tier's typical acceptance
-    /// (with the greedy correction, inside the module); sampled requests stay serial this round.
-    pub fn dsparkArmTypical(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
-        return if (dsparkArmFor(sampling, logprobs_n, false) == .greedy) .typical else .off;
+    /// What a draft lane arms on: clean (no penalties, grammar or logprobs: they consume logits a draft never
+    /// shapes) and greedy.
+    pub fn armRequest(sampling: SamplingParams, logprobs_n: u32) sdk.ArmRequest {
+        return .{
+            .clean = sampling.repeat_penalty == 1.0 and
+                sampling.presence_penalty == 0.0 and
+                sampling.constraint == null and
+                logprobs_n == 0,
+            .greedy = sampling.temperature < 0.01 or sampling.top_k == 1,
+        };
     }
 
     /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
@@ -2450,19 +2454,20 @@ pub const Generator = struct {
                             log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
                         }
                     },
-                    .dsv41 => |m| {
-                        if (!dspark_env_off and dsparkArmTypical(sampling, options.logprobs_n) == .typical) {
+                    .lane => |a| {
+                        const l = a.vt.spec.draft_lane;
+                        if (!dspark_env_off and l.arm(a.module, armRequest(sampling, options.logprobs_n)) != .off) {
                             dspark_active = true;
-                            log.info("  decode lane: {s} (deepseek_v41 draft head, block={d})\n", .{ m.decodeLane(), m.draftBlockSize() });
+                            log.info("  decode lane: {s} ({s} draft head, block={d})\n", .{ l.lane_name(a.module), a.vt.name, l.block_size(a.module) });
                         } else {
-                            log.info("  decode lane: serial (deepseek_v41: {s})\n", .{if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalty requests stay serial"});
+                            log.info("  decode lane: serial ({s}: {s})\n", .{ a.vt.name, if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalty requests stay serial" });
                         }
                     },
                 }
             } else if (xfm.dsv4 != null) {
                 log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
-            } else {
-                log.info("  decode lane: serial (deepseek_v41: no draft head installed)\n", .{});
+            } else if (xfm.arch) |a| {
+                log.info("  decode lane: serial ({s}: no draft head installed)\n", .{a.vt.name});
             }
             if (dspark_active) native_draft = lane;
             options.pld_enabled = false;
@@ -2480,6 +2485,8 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+        // The request's shape, before its first forward: a registered arch's prompt pass reserves from it.
+        ctx.request = .{ .prompt_tokens = options.ssm_checkpoint_pos_offset + prompt_ids.len, .max_tokens = max_tokens, .host_context = xfm.config.max_position_embeddings };
 
         // Certified lm_head prune gate: the pruned projection proves the
         // ARGMAX, not the tail distribution, so it may engage only when this
@@ -3989,7 +3996,7 @@ pub const Generator = struct {
                 try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
             else
                 try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap)),
-            .dsv41 => |m| NativeDraft.Round.of(try m.dsparkRound(allocator, t1, accepted_cap)),
+            .lane => |a| NativeDraft.Round.of(try a.vt.spec.draft_lane.round(a.module, allocator, t1, accepted_cap)),
         };
         errdefer allocator.free(round.tokens);
         // The round advanced the module state — mirror it on the shell
@@ -18557,16 +18564,16 @@ test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill swit
     try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
 }
 
-test "native draft lane: deepseek_v41's head takes clean greedy requests (dsparkArmTypical); sampled and shaped ones stay serial" {
-    try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.0 }, 0));
-    try testing.expectEqual(Generator.DsparkArm.typical, Generator.dsparkArmTypical(.{ .temperature = 0.6, .top_k = 1 }, 0));
-    // Sampled requests stay serial this round (no stochastic arm on this head yet).
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.6, .top_p = 0.95 }, 0));
+test "native draft lane: the request a lane arms on: clean (no penalties, logprobs or grammar), greedy at temperature 0 or top_k 1" {
+    // The deepseek_v41 head arms {greedy, clean} only (its own table, deepseek_v41_plugin.zig).
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = true }, Generator.armRequest(.{ .temperature = 0.0 }, 0));
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = true }, Generator.armRequest(.{ .temperature = 0.6, .top_k = 1 }, 0));
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = false, .clean = true }, Generator.armRequest(.{ .temperature = 0.6, .top_p = 0.95 }, 0));
     // Penalties, logprobs and grammar consume logits the draft path never shapes.
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0 }, 5));
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0 }, 5));
     var c: Constraint = undefined;
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmTypical(.{ .temperature = 0.0, .constraint = &c }, 0));
+    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0, .constraint = &c }, 0));
 }
 
 test "native draft lane: the chokepoint arms every module arch through NativeDraft, never one hardcoded arch" {

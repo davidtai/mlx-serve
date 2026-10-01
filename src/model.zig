@@ -8,7 +8,8 @@ const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
-const deepseek_v41 = @import("deepseek_v41.zig");
+const sdk = @import("sdk");
+const plugins = @import("plugins.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -382,58 +383,20 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
-    /// deepseek_v41: the model directory (config.json, the resident shards, the expert bank) and
-    /// the exported Engram token map beside it, stamped by `parseConfig` as `ngram_table_path`; owned.
-    expert_bank_dir: ?[]const u8 = null,
-    engram_token_map_path: ?[]const u8 = null,
     /// The memory in use before a streamed-expert model loads: `--memory-baseline-gb`, else the load
     /// preflight's own reading (total less available), stamped before the weights load.
     memory_baseline_bytes: ?u64 = null,
     /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
     expert_rows: ?u32 = null,
-    /// deepseek_v41's prompt-pass bill for the prefill admission (its own estimator, as deepseek_v4 has one).
-    dsv41_prefill: ?deepseek_v41.PrefillBill = null,
+    /// A streamed-expert model's prompt slot rows per layer (a harness's, with `expert_rows` the decode rows);
+    /// null = its admission's fill.
+    expert_prefill_rows: ?u32 = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
-    /// A streamed-expert model's routed waves wait on the reads' events instead of the host (the
-    /// `expert_event_gates` model setting; null = the arch's default).
-    expert_event_gates: ?bool = null,
-    /// deepseek_v41: the read pool threads' scheduling (`expert_reader_sched` model setting; null = off).
-    expert_reader_sched: ?@import("model_settings.zig").ReaderSched = null,
-    /// A module-owned arch's numerics, chosen at construction (the `numeric_tier` model setting; null = served).
-    numeric_tier: ?@import("model_settings.zig").NumericTier = null,
-    /// A module-owned arch's prompt pass layer by layer (the `layer_major_prefill` model setting; null = off).
-    layer_major_prefill: ?bool = null,
-    /// A streamed-expert model's wide prefill read schedule (`expert_wide_feed` / `expert_wide_depth`; null = off / 1).
-    expert_wide_feed: ?bool = null,
-    /// The wide feed's halves on their own (`expert_wide_seed` / `expert_wide_hot_first`; null = the feed's value).
-    expert_wide_seed: ?bool = null,
-    expert_wide_hot_first: ?bool = null,
-    expert_wide_depth: ?u8 = null,
-    /// Wide-call experts of at most this many rows on the decode GEMV (`expert_wide_cold_rows`; null = none).
-    expert_wide_cold_rows: ?u8 = null,
-    /// The wide call's base-bank rows as one deferred call (`expert_wide_defer_base`; null = the served tier's).
-    expert_wide_defer_base: ?bool = null,
-    /// P1: each layer's predicted seed read ahead during its attention (`expert_wide_read_ahead`; null = on
-    /// wherever the prompt pass is layer-major with the wide seed).
-    expert_wide_read_ahead: ?bool = null,
-    /// P1b: the seed's deferred base call run as soon as the seed has landed (`expert_wide_base_at_seed`; null =
-    /// on wherever the wide seed and the deferred base call both are).
-    expert_wide_base_at_seed: ?bool = null,
-    /// The decode read-ahead's speculative records per layer call (`expert_lookahead_budget`, 1..4; null = 2).
-    expert_lookahead_budget: ?u8 = null,
-    /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group
-    /// (`expert_wide_seed_aligned`; null = on wherever P1b's base call at the seed and the hottest-first order are).
-    expert_wide_seed_aligned: ?bool = null,
-    /// P1d: the base rows resident at the barrier drain first, in their own call (`expert_wide_resident_first`;
-    /// null = off: the one deferred base call at the seed).
-    expert_wide_resident_first: ?bool = null,
-    /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
-    /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
-    expert_prefill_rows: ?u32 = null,
-    /// deepseek_v41's input embedding read from its host rows from construction (null = on).
-    embedding_host_rows: ?bool = null,
+    /// The registered arch that claimed this model (src/plugins.zig) and its parsed config, freed with this one.
+    arch: ?*const sdk.Arch = null,
+    arch_cfg: ?*anyopaque = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -687,65 +650,6 @@ pub const ModelConfig = struct {
     /// the top-k arm at long context and the bound must track it rather than
     /// freezing at `index_topk`. A checkpoint declaring no ratios stays dense —
     /// an arch we cannot bound must never be billed as though we had.
-    /// deepseek_v41's prefill routes as the module builds them: a setting when given, else the tier's
-    /// default (the served tier: K16 layer-major, two wide groups in flight, the wide feed; the stock
-    /// tier, whose prompt forwards are decode-width: none).
-    pub fn dsv41LayerMajor(self: *const ModelConfig) bool {
-        return self.layer_major_prefill orelse self.dsv41ServedTier();
-    }
-
-    /// The decode read-ahead's speculative records per layer call: 2 unless set.
-    pub fn dsv41LookaheadBudget(self: *const ModelConfig) u8 {
-        return self.expert_lookahead_budget orelse 2;
-    }
-
-    /// The served tier reads 3 groups ahead (P1's v1b: the SSD kept busy through the routed stage's drains).
-    pub fn dsv41WideDepth(self: *const ModelConfig) u8 {
-        return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 5 else 1;
-    }
-
-    pub fn dsv41WideFeed(self: *const ModelConfig) bool {
-        return self.expert_wide_feed orelse self.dsv41ServedTier();
-    }
-
-    /// The feed's halves: each its own setting, else the feed's value (the feed = seed + hot-first).
-    pub fn dsv41WideSeed(self: *const ModelConfig) bool {
-        return self.expert_wide_seed orelse self.dsv41WideFeed();
-    }
-
-    pub fn dsv41WideHotFirst(self: *const ModelConfig) bool {
-        return self.expert_wide_hot_first orelse self.dsv41WideFeed();
-    }
-
-    /// The deferred base-bank call: the setting, else on for the served tier without cold rows.
-    pub fn dsv41WideDeferBase(self: *const ModelConfig) bool {
-        return self.expert_wide_defer_base orelse (self.dsv41ServedTier() and (self.expert_wide_cold_rows orelse 0) == 0);
-    }
-
-    /// P1's read-ahead: the setting, else on wherever the prompt pass is layer-major with the wide seed.
-    pub fn dsv41WideReadAhead(self: *const ModelConfig) bool {
-        return self.expert_wide_read_ahead orelse (self.dsv41LayerMajor() and self.dsv41WideSeed());
-    }
-
-    /// P1b's base call at the seed: the setting, else on wherever the wide seed and the deferred base call both are.
-    pub fn dsv41WideBaseAtSeed(self: *const ModelConfig) bool {
-        return self.expert_wide_base_at_seed orelse (self.dsv41WideSeed() and self.dsv41WideDeferBase());
-    }
-
-    /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
-    pub fn dsv41WideSeedAligned(self: *const ModelConfig) bool {
-        return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
-    }
-
-    /// P1d's resident-first base call: the setting, else off.
-    pub fn dsv41WideResidentFirst(self: *const ModelConfig) bool {
-        return self.expert_wide_resident_first orelse false;
-    }
-
-    fn dsv41ServedTier(self: *const ModelConfig) bool {
-        return (self.numeric_tier orelse .served) == .served;
-    }
-
     pub fn prefillAttnKeys(self: *const ModelConfig, seq: u64) u64 {
         if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return seq;
         const n = @min(self.dsv4_n_compress_ratios, self.dsv4_compress_ratios.len);
@@ -896,23 +800,28 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
-    /// The arch keeps its per-request decode state on its own module (deepseek_v4, deepseek_v41):
-    /// no prefix-cache restore rebuilds it and no batch merges it.
+    /// The arch keeps its per-request decode state on its own module (deepseek_v4; a registered arch whose caps
+    /// say so): no prefix-cache restore rebuilds it and no batch merges it.
     pub fn moduleOwnsDecodeState(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "deepseek_v4") or std.mem.eql(u8, self.model_type, "deepseek_v41");
+        if (self.arch) |a| if (a.caps.owns_decode_state) return true;
+        return std.mem.eql(u8, self.model_type, "deepseek_v4");
     }
 
-    /// The arch chunks the prompt itself (deepseek_v41's layer-major prefill), so it takes the
-    /// whole prompt in one forward.
+    /// The arch chunks the prompt itself, so it takes the whole prompt in one forward.
     pub fn prefillWholePrompt(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+        return if (self.arch) |a| a.caps.prefill_whole_prompt else false;
     }
 
     /// The arch's prompt forward yields the last row's logits (a module that owns its prompt pass), so
     /// the generator sends the whole prompt in ONE forward and takes the first token from it (no
     /// separate 1-row logits forward, no decode-width last row).
     pub fn prefillYieldsLastLogits(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+        return if (self.arch) |a| a.caps.prefill_yields_last_logits else false;
+    }
+
+    /// The host's generic streamed-expert facts a registered arch loads with.
+    pub fn loadFacts(self: *const ModelConfig) sdk.LoadFacts {
+        return .{ .memory_baseline_bytes = self.memory_baseline_bytes, .expert_rows = self.expert_rows, .expert_prefill_rows = self.expert_prefill_rows, .nocache_weights = self.nocache_weights };
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
@@ -1456,16 +1365,14 @@ pub const ModelConfig = struct {
     }
 
     /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
-    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// `parseConfig`, the registered arch's config, and `drafter_override`); everything else is plain data or a
+    /// borrowed slice. Every `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
     /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
-        if (self.expert_bank_dir) |p| allocator.free(p);
-        self.expert_bank_dir = null;
-        if (self.engram_token_map_path) |p| allocator.free(p);
-        self.engram_token_map_path = null;
+        if (self.arch_cfg) |c| self.arch.?.free_config(allocator, c);
+        self.arch_cfg = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
@@ -1483,13 +1390,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
-    var config = try parseConfigFromJson(allocator, content);
+    var config = try parseConfigFromJsonIn(allocator, content, model_dir);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
-    }
-    if (std.mem.eql(u8, config.model_type, "deepseek_v41")) {
-        config.expert_bank_dir = try allocator.dupe(u8, model_dir);
-        config.engram_token_map_path = try std.fmt.allocPrint(allocator, "{s}/engram-token-map.u32", .{model_dir});
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -1980,6 +1883,11 @@ fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.Ob
 }
 
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
+    return parseConfigFromJsonIn(allocator, content, "");
+}
+
+/// `parseConfigFromJson` for the model in `model_dir` ("" for none): a registered arch's own parse sees it.
+pub fn parseConfigFromJsonIn(allocator: std.mem.Allocator, content: []const u8, model_dir: []const u8) !ModelConfig {
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
@@ -3249,21 +3157,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
-    } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
-        // Native DeepSeek-V4.1: the arch's own parse refuses by name; the module
-        // (deepseek_v41_module.zig) owns everything past the shell's generic fields.
-        var diag: deepseek_v41.Diag = .{};
-        const v41c = deepseek_v41.Config.parse(allocator, merged orelse content, &diag) catch |e| {
-            log.err("deepseek_v41: {s}\n", .{diag.message()});
-            return e;
+    } else if (plugins.registry.arch(&.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, null)) |e| {
+        // A registered arch (src/plugins.zig): its own parse refuses by name; its module owns everything past the
+        // shell's generic fields, which it states (`shell`).
+        var diag: sdk.Diag = .{};
+        const cfg = e.kind.parse(allocator, &.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, &diag) catch |err| {
+            log.err("{s}: {s}\n", .{ e.kind.name, diag.message() });
+            return err;
         };
-        config.model_type = "deepseek_v41";
-        // Routed experts, as deepseek_v4's arm states them: not a batched-decode model.
-        config.num_experts = v41c.n_routed_experts;
-        config.num_hidden_layers = v41c.n_layers;
-        config.dsv41_prefill = .of(&v41c);
+        config.arch = &e.kind;
+        config.arch_cfg = cfg;
+        config.model_type = e.kind.name;
+        const sh = e.kind.shell(cfg);
+        config.num_experts = sh.num_experts;
+        config.num_hidden_layers = sh.num_layers;
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
-        config.nocache_weights = true;
+        if (e.kind.caps.residents_past_page_cache) config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -7688,7 +7597,7 @@ test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setti
 }
 
 test "dsv41 model: a deepseek_v41 config parses by its own refusals into the module arch's shell" {
-    const ok = try deepseek_v41.testConfigJson(testing.allocator, .real);
+    const ok = try @import("deepseek_v41.zig").testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(ok);
     var c = try parseConfigFromJson(testing.allocator, ok);
     defer c.deinit(testing.allocator);
@@ -7696,7 +7605,8 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     try testing.expect(c.moduleOwnsDecodeState() and c.prefillWholePrompt() and c.nocache_weights.?);
     try testing.expect(c.prefillYieldsLastLogits());
     try testing.expect(!c.perRequestPrefillChunk());
-    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.dsv41_prefill != null);
+    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode() and c.arch != null and c.arch_cfg != null);
+    try testing.expectEqualStrings("deepseek_v41", c.arch.?.name);
     try testing.expectEqual(@as(u32, 40), c.num_hidden_layers);
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);

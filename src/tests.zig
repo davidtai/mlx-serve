@@ -63,6 +63,10 @@ test {
     _ = @import("deepseek_v41_cell.zig");
     _ = @import("deepseek_v41_dspark_serve.zig");
     _ = @import("deepseek_v41_module.zig");
+    _ = @import("deepseek_v41_settings.zig");
+    _ = @import("deepseek_v41_plugin.zig");
+    _ = @import("mlx_stream.zig");
+    _ = @import("plugins.zig");
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("dsv41_decode_timers.zig");
     _ = @import("dsv41_decode_first.zig");
