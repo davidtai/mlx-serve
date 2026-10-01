@@ -733,7 +733,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
         .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     };
-    // The release route as the Module resolves it: the default (off), then each override.
+    // The release route as the Module resolves it: the default (on), then each override.
     for ([_]?bool{ null, false, true }) |route| {
         const ov: module.RouteOverrides = .{ .transient_release = route };
         for (if (module.transientRelease(ov)) window_0 else every_window) |w| {
@@ -821,11 +821,11 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
     // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
-    // Decode's transient rows follow the route the Module installs (`module.transientRelease`): the default (off)
-    // keeps every window; through billAt, the override off bills 240 rows and on bills window 0 (48, no staging rows),
+    // Decode's transient rows follow the route the Module installs (`module.transientRelease`): the default (on)
+    // bills window 0; through billAt, the override off bills 240 rows and on bills window 0 (48, no staging rows),
     // 2,556,592,128 B apart; the prompt's transient rows are the same on both routes.
     try testing.expectEqual(transientDecodeRows(opts.wide_depth, module.transientRelease(.{}), stream_decode_staging_rows), b.transient_decode_rows);
-    try testing.expect(!module.transientRelease(.{}));
+    try testing.expect(module.transientRelease(.{}));
     const route_off = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = false });
     const route_on = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = true });
     try testing.expectEqual(@as(u64, 240), route_off.transient_decode_rows);
@@ -868,11 +868,11 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
-        // The default route (the transient release off: every window through decode, SERVED17's arm 1 and -tight); the
-        // fence at two streams (-2.68 GB) adds 5 prompt rows.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 163 }, .tight = .{ .prefill = 139, .decode = 163 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 163 }, .tight = .{ .prefill = 139, .decode = 163 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 162 }, .tight = .{ .prefill = 138, .decode = 162 } },
+        // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
+        // 5 prompt rows.
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -920,9 +920,9 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
-        .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 162 }, .one = .{ .prefill = 140, .decode = 162 } },
+        .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 168 }, .one = .{ .prefill = 141, .decode = 168 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 168 }, .one = .{ .prefill = 141, .decode = 168 } },
+        .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 140, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -949,7 +949,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
 // DSV41_BANK=<bank> (host): HEAD_MODE mxfp8 (cell arm 5) bills the head it runs: the dense bf16 head the Module drops
 // after construction (1,323,827,200 B) out of the residents, its codes and scales (682,598,400 B) in, net -641,228,800 B.
 // Arm 5's own fill therefore sits about a row a phase above the bf16 arm's. Both at the default route (the transient
-// release off: every window through decode), as SERVED17's -mxfp8head arm runs.
+// release on: decode bills window 0).
 test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -970,9 +970,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 163 }, .mxfp8 = .{ .prefill = 135, .decode = 165 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 163 }, .mxfp8 = .{ .prefill = 135, .decode = 164 } },
-        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 162 }, .mxfp8 = .{ .prefill = 134, .decode = 164 } },
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});

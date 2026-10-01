@@ -122,7 +122,7 @@ pub const RouteOverrides = struct {
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
     head_mode: ?graph.Routes.Head = null,
-    /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, off.
+    /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
     /// the grow below demand). null: the default, off.
@@ -204,7 +204,7 @@ pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decod
 pub const grow_alloc_round_bytes: u64 = 16_384;
 
 /// The release route the Module installs and the bill charges (one resolver: the stream's capability and the setting
-/// over the default, off).
+/// over the default, on).
 pub fn transientRelease(ov: RouteOverrides) bool {
     return expert_stream.phase_change_releases_wide_windows and (ov.transient_release orelse expert_stream.transient_release_default);
 }

@@ -927,7 +927,7 @@ const CellReceipt = struct {
     wide_depth: ?u8 = null,
     /// Decode's transient rows after the phase change (window 0 + `decode_staging_rows`; the bill's name).
     transient_decode_rows: ?u32 = null,
-    /// The phase change's transient release as installed (the route; off by default since SERVED17).
+    /// The phase change's transient release as installed (the route; on by default since SERVED19E).
     transient_release: ?bool = null,
     wide_cold_rows: ?u8 = null,
     /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
