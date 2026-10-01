@@ -981,8 +981,16 @@ pub const Wide = struct {
     /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
     /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
     seed_aligned: bool = false,
+    /// A0 (a): each wide call records its last `warm_tail_rows` rows' experts per layer (the prompt's last call
+    /// stands), the first verify's warm set (`warmSet`, read at the grow). Exact: it chooses reads only.
+    warm_tail: bool = false,
     pub const max_cold_rows = 8;
 };
+
+/// The prompt rows whose routed experts make a layer's warm set (`Wide.warm_tail`).
+pub const warm_tail_rows = 8;
+/// The most routed experts a layer's warm set addresses.
+pub const warm_max_experts = 512;
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
@@ -1035,6 +1043,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         transient_released: bool = false,
         /// A1's recall check (profile builds): the next call's predicted ids, handed over before its layer's attention.
         recall_pred: if (recall.enabled) ?T else void = if (recall.enabled) null else {},
+        /// A0 (a): per layer, the last wide call's last `warm_tail_rows` rows' experts (`Wide.warm_tail`; empty
+        /// without it), and the wide call's record, prebound at construction.
+        warm_tail: []std.StaticBitSet(warm_max_experts) = &.{},
+        tail_record: *const fn (*Self, u32, []const u16, u32, u32) void = recordNoTail,
 
         pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{} };
 
@@ -1090,6 +1102,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
+            if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts or comptime !@hasDecl(S, "isResident"))) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -1103,7 +1116,39 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g, .wide_route = wr };
             if (opt.event) |e| self.event = e;
+            if (wr.warm_tail) {
+                self.warm_tail = try a.alloc(std.StaticBitSet(warm_max_experts), c.n_layers);
+                @memset(self.warm_tail, .empty);
+                self.tail_record = recordTail;
+            }
             return self;
+        }
+
+        fn recordNoTail(_: *Self, _: u32, _: []const u16, _: u32, _: u32) void {}
+
+        /// A wide call's routed ids (`n` rows x `k`, row order): its last `warm_tail_rows` rows' experts become the
+        /// layer's warm set.
+        fn recordTail(self: *Self, layer: u32, ids: []const u16, n: u32, k: u32) void {
+            const r = @min(n, warm_tail_rows);
+            const set = &self.warm_tail[layer];
+            set.* = .empty;
+            for (ids[(n - r) * k .. n * k]) |e| set.set(e);
+        }
+
+        /// A0 (a): layer `layer`'s warm set less its residents now, ascending, at most `out.len` (the reads the first
+        /// verify's warm class issues at the grow); empty without `Wide.warm_tail`.
+        pub fn warmSet(self: *const Self, layer: u32, out: []u16) []u16 {
+            if (comptime !@hasDecl(S, "isResident")) return out[0..0];
+            if (layer >= self.warm_tail.len) return out[0..0];
+            var n: usize = 0;
+            var it = self.warm_tail[layer].iterator(.{});
+            while (it.next()) |e| {
+                if (n == out.len) break;
+                if (self.source.isResident(layer, @intCast(e))) continue;
+                out[n] = @intCast(e);
+                n += 1;
+            }
+            return out[0..n];
         }
 
         /// The router that scores layer `layer`'s read-ahead: the NEXT layer's
@@ -1136,6 +1181,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         pub fn deinit(self: *Self) void {
             self.wide.deinit(self.a);
             self.a.free(self.banks);
+            self.a.free(self.warm_tail);
             self.* = undefined;
         }
 
@@ -1604,7 +1650,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var tp = prof.now();
             _ = try g.hostIds(indices, w.ids.items);
             prof.charge(.barrier, tp);
-            // A0 (profile builds): the prompt's last rows' experts, the layer's tail set
+            // A0: the prompt's last rows' experts, the layer's warm set (a no-op unless `Wide.warm_tail`); the profile
+            // builds' own tail set
+            self.tail_record(self, layer, w.ids.items, n, k);
             if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
@@ -2223,6 +2271,50 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     var inv: [5]u32 = undefined;
     invertPositions(&.{ 3, 0, 4, 1, 2 }, &inv);
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
+}
+
+test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the warm set is them less the residents" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 64;
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    src.trace = &g;
+    RecRoute.source = &src;
+    defer RecRoute.source = null;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    var rrs = [_]RecRoute{RecRoute.init(a)};
+    defer rrs[0].deinit(&g);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
+    var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .warm_tail = true } });
+    defer ex.deinit();
+    // 20 tokens x top-6 over 64 experts; the last 8 rows' experts are the warm set
+    const n = 20;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 64);
+    var script: Script = .{ .calls = &.{&ids} };
+    g.host_values = script.values();
+    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
+    var tail: std.StaticBitSet(64) = .empty;
+    for (ids[(n - warm_tail_rows) * k ..]) |e| tail.set(e);
+    var buf: [64]u16 = undefined;
+    const got = ex.warmSet(0, &buf);
+    var want: usize = 0;
+    var it = tail.iterator(.{});
+    while (it.next()) |e| want += @intFromBool(!src.isResident(0, @intCast(e)));
+    try testing.expect(want > 0 and want < tail.count());
+    try testing.expectEqual(want, got.len);
+    for (got) |e| try testing.expect(tail.isSet(e) and !src.isResident(0, e));
+    // the route needs the prefill lane; without it the warm set is empty
+    const Dec = ExpertsWith(TraceOps, FakeSource, Chain, .{});
+    try testing.expectError(error.InvalidWideRoute, Dec.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .wide = .{ .warm_tail = true } }));
+    var plain = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 0), plain.warmSet(0, &buf).len);
 }
 
 test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route, the wide lane refuses it by name" {
