@@ -336,8 +336,9 @@ pub const NativeDraft = union(enum) {
 };
 
 /// The arch's prefill-to-decode handover (`Transformer.decodeHandover`), due once per request at its first decode
-/// step. Built only from the transformer, so no Generator is constructed without its answer.
+/// step. Built only from the transformer (`of(xfm)`), so no Generator is constructed without its answer.
 pub const HandoverClock = struct {
+    /// Public for the clock's own unit test only; everywhere else construct it with `of(xfm)`.
     due: bool,
 
     pub fn of(xfm: *const Transformer) HandoverClock {

@@ -2524,6 +2524,14 @@ fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
+/// The spec wiring's `has_native_draft`: the model's arch drafts its own tokens (`Transformer.nativeDraftBlock`,
+/// dsv4's DSpark stages or a registered arch's draft lane). Ask the transformer, never one arch by name: this line
+/// once read `dsv4 != null`, so deepseek_v41's draft head never reached the chokepoint and served plain AR.
+fn modelHasNativeDraft(model: *const model_registry_mod.LoadedModel) bool {
+    const t = model.transformer orelse return false;
+    return t.nativeDraftBlock() > 0;
+}
+
 /// Pure core of `slotExclusiveDecode`. `model_owns_state` (dsv4) wins outright and is never
 /// released; the head clause is qwen4_exp's per-model head, released for good once the
 /// adaptive switch moved the slot to serial (`Generator.mtpModuleHeadReleased`).
@@ -6492,8 +6500,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // batches its plain slots but its spec wiring stays the module one.
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
-    const has_native_draft = slot.model.transformer != null and
-        slot.model.transformer.?.nativeDraftBlock() > 0;
+    const has_native_draft = modelHasNativeDraft(slot.model);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -9915,7 +9922,7 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     }
 }
 
-test "native draft lane: has_native_draft is the arch's own draft block; a lane of 5 drafts wires the native intent, none stays serial" {
+test "native draft lane: has_native_draft is the model's own draft block (modelHasNativeDraft); a lane of 5 drafts wires the native intent, none stays serial" {
     const sdk = @import("sdk");
     var t: transformer_mod.Transformer = undefined;
     inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
@@ -9923,12 +9930,20 @@ test "native draft lane: has_native_draft is the arch's own draft block; a lane 
     const lane = comptime sdk.Arch.of(Lane);
     const serial = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
     var module: Lane.Module = .{ .gpa = testing.allocator, .calls = &Lane.calls };
+    var lm: model_registry_mod.LoadedModel = undefined;
+    lm.transformer = &t;
     t.arch = .{ .vt = &lane, .cfg = &module, .module = &module };
     try testing.expectEqual(@as(u32, 5), t.nativeDraftBlock());
-    try testing.expect(specInitWiring(true, false, t.nativeDraftBlock() > 0, true, false, false, false, false, false).native_intent);
+    try testing.expect(modelHasNativeDraft(&lm));
+    try testing.expect(specInitWiring(true, false, modelHasNativeDraft(&lm), true, false, false, false, false, false).native_intent);
+    // No draft lane, no arch, no transformer: serial.
     t.arch = .{ .vt = &serial, .cfg = &module, .module = &module };
-    try testing.expectEqual(@as(u32, 0), t.nativeDraftBlock());
-    try testing.expect(!specInitWiring(true, false, t.nativeDraftBlock() > 0, true, false, false, false, false, false).native_intent);
+    try testing.expect(!modelHasNativeDraft(&lm));
+    try testing.expect(!specInitWiring(true, false, modelHasNativeDraft(&lm), true, false, false, false, false, false).native_intent);
+    t.arch = null;
+    try testing.expect(!modelHasNativeDraft(&lm));
+    lm.transformer = null;
+    try testing.expect(!modelHasNativeDraft(&lm));
 }
 
 test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
