@@ -26,9 +26,9 @@ pub const Event = event.Event;
 /// The residency policy every source plans with (one admission and replacement policy for every source).
 pub const policy = @import("expert/policy.zig");
 
-/// The one reader per process: an arch whose source declares `uses_reader` takes it at the top of its construction,
-/// before reading anything, and gives it back at its deinit (or when the construction fails). A second is refused by
-/// name, never at the pool's start.
+/// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
+/// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model
+/// goes or the load fails. A second is refused by name, never at the pool's start.
 var reader_taken = std.atomic.Value(bool).init(false);
 
 pub fn takeReader() error{ExpertReaderInUse}!void {

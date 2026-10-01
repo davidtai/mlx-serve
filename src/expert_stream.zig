@@ -267,7 +267,7 @@ const Rows = struct {
 /// (`Options`).
 pub const source_caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
 
-/// It reads through the process's one reader: its arch takes it at construction (`sdk.expert.takeReader`).
+/// It reads through the process's one reader: the host takes it at its arch's load claim (`sdk.expert.takeReader`).
 pub const uses_reader = true;
 
 /// The source contract's slot types (`sdk.expert`).

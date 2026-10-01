@@ -26,6 +26,10 @@ pub const Caps = struct {
     batches_decode: bool = false,
     /// The loader reads the resident weights past the page cache unless the model setting says otherwise.
     residents_past_page_cache: bool = false,
+    /// G6: the arch's expert source reads through the process's one expert reader. The host takes it at the load
+    /// claim, before the preflight and the weights (`sdk.expert.takeReader`), and gives it back when the loaded
+    /// model goes (or the load fails).
+    uses_expert_reader: bool = false,
 };
 
 /// The parsed model's facts the host keeps on its own config.

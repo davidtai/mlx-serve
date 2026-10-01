@@ -101,9 +101,11 @@ For each capability in `S.caps` (`two_phase`, `transient_release`, `prompt_seed`
 `preread`, `event_gates`, `construction_reset`), it also checks that capability's methods. An instance installs a
 subset of its capabilities at construction and reports which.
 
-There is one expert reader per process. An arch whose source declares `uses_reader` takes the reader
-(`sdk.expert.takeReader`) at the start of its construction, before it reads anything; a second model that needs the
-reader fails there with `ExpertReaderInUse`.
+There is one expert reader per process. An arch whose source declares `uses_reader` says so in its caps
+(`uses_expert_reader`). The host takes the reader (`sdk.expert.takeReader`) when it claims that arch for a load, before
+the memory preflight and the weights; the loaded model gives it back when it is unloaded, and a failed load gives it
+back at once. A second load that needs the reader fails at its claim with `ExpertReaderInUse`. A harness that builds
+the arch's module directly takes no reader.
 
 A source reads with one record layout, fixed when it is built: `sdk.expert.Records(components, gate_up)`. Each expert
 record has `components` tensors, the first `gate_up` of them for the gate and up projections and the rest for down
@@ -149,7 +151,7 @@ The migration changes these behaviors; each fails with a named error:
    side this way (`measured_host_side_bytes`): a load whose host side exceeds it fails with `ConstructionOverBill`.
 3. The load fails with `QuantNotClaimed` when its bound quant does not claim the bank. The claim reads the bank's
    manifest once more at construction, streamed past the page cache with the records skipped.
-4. A second model whose expert source uses the reader fails at the start of its construction with
+4. A second model whose expert source uses the reader fails at its load claim, before its weights load, with
    `ExpertReaderInUse`.
 
 ## MiMo, the second plugin

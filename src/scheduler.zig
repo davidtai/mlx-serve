@@ -3742,6 +3742,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // A module-owned arch that bills its own load (streamed experts: the bill, not the shards) sizes itself
     // against the memory already in use: sampled here, before the weights load (after, it would count them),
     // unless `--memory-baseline-gb` stated it.
+    // The registry's load claim of the process's one expert reader (G6), before the preflight and the weights; the
+    // loaded Transformer owns it from its construction on (given back at its deinit).
+    var arch_reader = transformer_mod.archTakeReader(params.config) catch |e| {
+        log.err("{s}: refused: {s} (the process's expert reader belongs to a loaded model)\n", .{ params.config.model_type, @errorName(e) });
+        return e;
+    };
+    errdefer if (arch_reader) @import("sdk").expert.giveReader();
     const arch_load_bytes = transformer_mod.archLoadRequirementBytes(sch.io, sch.allocator, params.config);
     if (arch_load_bytes != null and params.config.memory_baseline_bytes == null)
         params.config.memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes();
@@ -3785,6 +3792,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.arch_reader = arch_reader;
+    arch_reader = false;
     errdefer xfm_ptr.deinit();
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class

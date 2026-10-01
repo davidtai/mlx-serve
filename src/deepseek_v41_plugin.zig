@@ -16,6 +16,7 @@ pub const caps: sdk.Caps = .{
     .prefill_whole_prompt = true,
     .prefill_yields_last_logits = true,
     .residents_past_page_cache = true,
+    .uses_expert_reader = @import("expert_stream.zig").uses_reader,
 };
 
 pub const Config = settings.Config;
