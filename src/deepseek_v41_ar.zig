@@ -438,7 +438,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const sentinel = try Sentinel.start(gpa, "harness");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = m.installed.transient_release };
     m.phase_observer = marks.observer();
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -537,8 +537,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     });
     // The window's box proofs (the harness's), after the reference is written: the release left the box, and the
     // grow added no physical pages beyond its own footprint growth.
-    if (m.phase_change != null) {
-        printBoxPhase(a, &marks);
+    if (m.phase_change) |pc| {
+        printBoxPhase(a, &marks, pc.before.cache);
         try marks.judge();
     }
 }
@@ -1022,7 +1022,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const sentinel = try Sentinel.start(gpa, "cell");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release };
     md.phase_observer = marks.observer();
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
@@ -1285,7 +1285,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     });
     // The window's box proofs (the harness's), after the receipt: the release left the box, and the grow added no
     // physical pages beyond its own footprint growth.
-    printBoxPhase(a, cx.marks);
+    printBoxPhase(a, cx.marks, if (cx.md.phase_change) |pc| pc.before.cache else null);
     try cx.marks.judge();
 }
 
@@ -1594,6 +1594,64 @@ pub fn checkReleaseResidency(start: BoxMark, released: BoxMark) error{TransientR
     if (outside_released - outside_start > @as(i64, @intCast(box_tolerance_bytes))) return error.TransientReleaseNotReclaimed;
 }
 
+/// The release proof's released mark waits for the box (SERVED17, pass3ay). With the transient release off the Module's
+/// settle had none of its own bytes to wait for (settle_ms 0), and the released mark read the box mid-reclaim of the
+/// cache clear: the footprint down 1.406 GB from the start mark, the box's pages down 0.858 GB, outside +547.8 MB; by the
+/// grown mark the box had caught up (start + 10 MB). SERVED16 (release on: a 250 ms settle for the scratch) read -6.4 MB,
+/// and the box probe's control arm (an allocator-owned buffer and a cache clear) needed 301 ms, then read clean.
+/// - The release route off: nothing is released, so the release proof is NA by construction (the record names it, with
+///   the cache clear's bytes); the released mark is the grow proof's before mark, taken once.
+/// - The route on: the released mark is retaken every `release_settle_poll_ms` until the outside rise from the start mark
+///   is within `box_tolerance_bytes`, at most `release_settle_bound_ms`, with no allocation in between. A lag settles; a
+///   reclaim that needs new demand (SERVED13's no-copy class: the pages stay wired until an allocation reclaims them)
+///   does not, and the release proof refuses it by name (TransientReleaseNotReclaimed).
+pub const release_settle_bound_ms: u32 = 2000;
+pub const release_settle_poll_ms: u32 = 50;
+
+/// The released mark as settled: the first reading's outside rise from the start mark, the last reading, the wait and the
+/// readings taken (the first included).
+pub const ReleaseSettle = struct { first_rise: i64, mark: BoxMark, waited_ms: u32, polls: u32 };
+
+/// Retakes the released mark through `r` (`mark() !BoxMark`, `sleep(ms)`, `elapsedMs() u32` since the first) until the
+/// outside rise from `start` is within the tolerance or `release_settle_bound_ms` has passed.
+pub fn settleRelease(r: anytype, start: BoxMark, first: BoxMark) !ReleaseSettle {
+    const tol: i64 = @intCast(box_tolerance_bytes);
+    var out: ReleaseSettle = .{ .first_rise = outsideRise(start, first), .mark = first, .waited_ms = 0, .polls = 1 };
+    while (outsideRise(start, out.mark) > tol and out.waited_ms < release_settle_bound_ms) {
+        r.sleep(release_settle_poll_ms);
+        out.mark = try r.mark();
+        out.polls += 1;
+        out.waited_ms = r.elapsedMs();
+    }
+    return out;
+}
+
+/// The pages outside this process's footprint at `to` less those at `from`.
+fn outsideRise(from: BoxMark, to: BoxMark) i64 {
+    const o_from = @as(i64, @intCast(from.physical)) - @as(i64, @intCast(from.footprint));
+    const o_to = @as(i64, @intCast(to.physical)) - @as(i64, @intCast(to.footprint));
+    return o_to - o_from;
+}
+
+/// The live retakes: a stable fresh mark each (`boxMark`), the clock from the first.
+const LiveSettle = struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+    t0: std.Io.Timestamp,
+
+    fn mark(self: LiveSettle) !BoxMark {
+        return boxMark(self.a, self.io);
+    }
+
+    fn sleep(self: LiveSettle, ms: u32) void {
+        std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
+    }
+
+    fn elapsedMs(self: LiveSettle) u32 {
+        return @intCast(@max(@divTrunc(self.t0.untilNow(self.io, .boot).nanoseconds, std.time.ns_per_ms), 0));
+    }
+};
+
 /// The harnesses' observer of the phase change (`module.PhaseObserver`): one stable fresh box mark at each proof point
 /// (start, released, grown), recorded only, never an error inside the phase change. The release proof and the grow
 /// proof are judged after the receipt is written (`judge`); a mark that could not be taken is recorded and fails the
@@ -1601,9 +1659,15 @@ pub fn checkReleaseResidency(start: BoxMark, released: BoxMark) error{TransientR
 pub const PhaseMarks = struct {
     a: std.mem.Allocator,
     io: std.Io,
+    /// The transient release as the Module installed it (`Module.installed.transient_release`): the release proof is
+    /// judged only when the phase change releases the scratch; off, it is NA.
+    release_route: bool,
     marks: [3]?BoxMark = @splat(null),
     failed: [3]?anyerror = @splat(null),
     spent_ns: u64 = 0,
+    /// The released mark's settle (`settleRelease`): null when it did not run (no start mark, or the first released
+    /// mark failed).
+    release_settle: ?ReleaseSettle = null,
 
     pub fn observer(self: *PhaseMarks) module.PhaseObserver {
         return .{ .ctx = self, .mark = mark };
@@ -1617,6 +1681,17 @@ pub const PhaseMarks = struct {
             self.failed[i] = e;
             break :blk null;
         };
+        if (stage == .released and self.release_route) if (self.marks[0]) |start| if (self.marks[1]) |first| {
+            const settled: ?ReleaseSettle = settleRelease(LiveSettle{ .a = self.a, .io = self.io, .t0 = std.Io.Timestamp.now(self.io, .boot) }, start, first) catch |e| blk: {
+                self.failed[1] = e;
+                self.marks[1] = null;
+                break :blk null;
+            };
+            if (settled) |st| {
+                self.release_settle = st;
+                self.marks[1] = st.mark;
+            }
+        };
         self.spent_ns += @intCast(@max(t0.untilNow(self.io, .boot).nanoseconds, 0));
     }
 
@@ -1624,41 +1699,63 @@ pub const PhaseMarks = struct {
         return @as(f64, @floatFromInt(self.spent_ns)) / 1e9;
     }
 
-    /// After the receipt: the release proof (start -> released) and the grow proof (released -> grown).
+    /// After the receipt: the release proof (start -> the settled released mark) when the route released the scratch,
+    /// and the grow proof (released -> grown) on both routes.
     pub fn judge(self: *const PhaseMarks) !void {
         for (self.failed) |f| if (f) |e| return e;
         const start = self.marks[0] orelse return error.PhaseMarkMissing;
         const released = self.marks[1] orelse return error.PhaseMarkMissing;
         const grown = self.marks[2] orelse return error.PhaseMarkMissing;
-        try checkReleaseResidency(start, released);
+        if (self.release_route) try checkReleaseResidency(start, released);
         try checkGrowResidency(released, grown);
     }
 };
 
-/// One `NATIVE DSV41_BOX_PHASE {json}` line: the three marks, the release's and the grow's outside-the-footprint rise,
-/// and the observer's own time.
-fn printBoxPhase(a: std.mem.Allocator, pm: *const PhaseMarks) void {
-    const outside = struct {
-        fn f(m: ?BoxMark) ?i64 {
-            const x = m orelse return null;
-            return @as(i64, @intCast(x.physical)) - @as(i64, @intCast(x.footprint));
+/// The `DSV41_BOX_PHASE` record: the three marks; the release proof (NA with the route off, with the cache clear's
+/// bytes; else its verdict on the settled mark, the settled and the first outside rise, the wait and the readings); the
+/// grow's outside rise; the observer's own time.
+pub const BoxPhaseRecord = struct {
+    start: ?BoxMark,
+    released: ?BoxMark,
+    grown: ?BoxMark,
+    release_proof: []const u8,
+    cache_clear_bytes: ?u64,
+    release_outside_rise: ?i64,
+    release_first_rise: ?i64,
+    release_settle_ms: ?u32,
+    release_polls: ?u32,
+    grow_outside_rise: ?i64,
+    tolerance: u64 = box_tolerance_bytes,
+    observer_ms: u64,
+};
+
+/// The record of `pm`; `cache_clear_bytes` from the Module's phase change record (its cache before the clear).
+pub fn boxPhaseRecord(pm: *const PhaseMarks, cache_clear_bytes: ?u64) BoxPhaseRecord {
+    const both = struct {
+        fn f(x: ?BoxMark, y: ?BoxMark) ?i64 {
+            return if (x != null and y != null) outsideRise(x.?, y.?) else null;
         }
     }.f;
-    const rise = struct {
-        fn f(x: ?i64, y: ?i64) ?i64 {
-            return if (x != null and y != null) y.? - x.? else null;
-        }
-    }.f;
-    const r = .{
+    const verdict: []const u8 = if (!pm.release_route) "NA" else if (pm.marks[0] == null or pm.marks[1] == null) "MISSING" else if (checkReleaseResidency(pm.marks[0].?, pm.marks[1].?)) |_| "PASS" else |_| "FAIL";
+    const st = pm.release_settle;
+    return .{
         .start = pm.marks[0],
         .released = pm.marks[1],
         .grown = pm.marks[2],
-        .release_outside_rise = rise(outside(pm.marks[0]), outside(pm.marks[1])),
-        .grow_outside_rise = rise(outside(pm.marks[1]), outside(pm.marks[2])),
-        .tolerance = box_tolerance_bytes,
+        .release_proof = verdict,
+        .cache_clear_bytes = if (pm.release_route) null else cache_clear_bytes,
+        .release_outside_rise = if (pm.release_route) both(pm.marks[0], pm.marks[1]) else null,
+        .release_first_rise = if (st) |x| x.first_rise else null,
+        .release_settle_ms = if (st) |x| x.waited_ms else null,
+        .release_polls = if (st) |x| x.polls else null,
+        .grow_outside_rise = both(pm.marks[1], pm.marks[2]),
         .observer_ms = pm.spent_ns / std.time.ns_per_ms,
     };
-    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
+}
+
+/// One `NATIVE DSV41_BOX_PHASE {json}` line (`boxPhaseRecord`).
+fn printBoxPhase(a: std.mem.Allocator, pm: *const PhaseMarks, cache_clear_bytes: ?u64) void {
+    const json = std.json.Stringify.valueAlloc(a, boxPhaseRecord(pm, cache_clear_bytes), .{}) catch return;
     std.debug.print("NATIVE DSV41_BOX_PHASE {s}\n", .{json});
 }
 
@@ -2111,7 +2208,7 @@ test "dsv41 memory: the release proof and the grow proof from the observer's mar
     try checkReleaseResidency(start, .{ .physical = released.physical + box_tolerance_bytes, .footprint = released.footprint });
     try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(start, .{ .physical = released.physical + box_tolerance_bytes + 1, .footprint = released.footprint }));
     // The judgment: every mark needed, a mark that could not be taken fails by its own name, full marks judge both.
-    var pm: PhaseMarks = .{ .a = testing.allocator, .io = testing.io };
+    var pm: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true };
     try testing.expectError(error.PhaseMarkMissing, pm.judge());
     const grown: BoxMark = .{ .physical = released.physical + 12_000_000_000, .footprint = released.footprint + 11_990_000_000 };
     pm.marks = .{ start, released, grown };
@@ -2121,11 +2218,109 @@ test "dsv41 memory: the release proof and the grow proof from the observer's mar
     pm.marks[2] = grown;
     pm.failed[1] = error.BoxMarkUnstable;
     try testing.expectError(error.BoxMarkUnstable, pm.judge());
-    // The observer records a live mark (host: a posix_spawn vm_stat, no MLX) and its own time; it never errs.
-    var live: PhaseMarks = .{ .a = testing.allocator, .io = testing.io };
+    // The observer records a live mark (host: a posix_spawn vm_stat, no MLX) and its own time; it never errs. A live
+    // released mark right after it settles at once (nothing was freed between them) or within the bound.
+    var live: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true };
     const o = live.observer();
     try o.mark(o.ctx, .start);
     try testing.expect(live.marks[0] != null and live.failed[0] == null and live.spent_ns > 0);
+    try o.mark(o.ctx, .released);
+    try testing.expect(live.marks[1] != null and live.failed[1] == null and live.release_settle != null);
+    try testing.expect(live.release_settle.?.polls >= 1 and live.release_settle.?.waited_ms <= release_settle_bound_ms + 1000);
+}
+
+/// The injected retakes for `settleRelease`: a recorded sequence (its last reading repeated), a clock the sleeps advance,
+/// and an optional failing read.
+const SettleReplay = struct {
+    seq: []const BoxMark,
+    i: usize = 0,
+    clock_ms: u32 = 0,
+    fail_at: ?usize = null,
+
+    fn mark(self: *SettleReplay) !BoxMark {
+        if (self.fail_at) |f| if (self.i == f) return error.BoxMarkUnstable;
+        const m = self.seq[@min(self.i, self.seq.len - 1)];
+        self.i += 1;
+        return m;
+    }
+
+    fn sleep(self: *SettleReplay, ms: u32) void {
+        self.clock_ms += ms;
+    }
+
+    fn elapsedMs(self: *SettleReplay) u32 {
+        return self.clock_ms;
+    }
+};
+
+// SERVED17 (pass3ay): the release proof waits for the box on the release route, and is NA off it. Recorded marks:
+// SERVED17's (the release off; the cache clear's 2,108,224,908 B; the first released mark +547.8 MB outside, the box
+// caught up by the grown mark) and SERVED16's (the release on; -6.4 MB at once).
+test "dsv41 memory: the released mark settles a lag, refuses a reclaim that needs demand, and is NA with the route off" {
+    const s17_start: BoxMark = .{ .physical = 108_457_197_568, .footprint = 94_360_761_496 };
+    const s17_first: BoxMark = .{ .physical = 107_599_052_800, .footprint = 92_954_784_920 };
+    const s17_grown: BoxMark = .{ .physical = 120_939_872_256, .footprint = 106_832_999_576 };
+    try testing.expectEqual(@as(i64, 547_831_808), outsideRise(s17_start, s17_first));
+    try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(s17_start, s17_first));
+    // 1. A lag: the first mark over the tolerance, the next one within it (the box 10.4 MB over the start, as at the
+    //    grown mark); one poll, 50 ms, and the proof passes on the settled mark.
+    const settled: BoxMark = .{ .physical = 107_061_657_600, .footprint = 92_954_784_920 };
+    try testing.expectEqual(@as(i64, 10_436_608), outsideRise(s17_start, settled));
+    var lag: SettleReplay = .{ .seq = &.{settled} };
+    const r1 = try settleRelease(&lag, s17_start, s17_first);
+    try testing.expectEqual(@as(i64, 547_831_808), r1.first_rise);
+    try testing.expectEqual(settled, r1.mark);
+    try testing.expectEqual(@as(u32, 2), r1.polls);
+    try testing.expectEqual(@as(u32, release_settle_poll_ms), r1.waited_ms);
+    try checkReleaseResidency(s17_start, r1.mark);
+    // 2. SERVED13's class: the footprint fell 2.15 GB, the box did not, and nothing reclaims it without demand: polled to
+    //    the bound, then refused by name.
+    const s16_start: BoxMark = .{ .physical = 108_970_672_128, .footprint = 94_914_459_064 };
+    const stuck: BoxMark = .{ .physical = s16_start.physical, .footprint = s16_start.footprint - 2_150_000_000 };
+    var demand: SettleReplay = .{ .seq = &.{stuck} };
+    const r2 = try settleRelease(&demand, s16_start, stuck);
+    try testing.expect(r2.waited_ms >= release_settle_bound_ms);
+    try testing.expectEqual(@as(u32, 1 + release_settle_bound_ms / release_settle_poll_ms), r2.polls);
+    try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(s16_start, r2.mark));
+    // 3. SERVED16's clean release: no retake, no wait.
+    const s16_released: BoxMark = .{ .physical = 102_238_257_152, .footprint = 88_188_480_744 };
+    var clean: SettleReplay = .{ .seq = &.{s16_start} };
+    const r3 = try settleRelease(&clean, s16_start, s16_released);
+    try testing.expectEqual(@as(i64, -6_436_656), r3.first_rise);
+    try testing.expectEqual(@as(u32, 1), r3.polls);
+    try testing.expectEqual(@as(u32, 0), r3.waited_ms);
+    try testing.expectEqual(@as(usize, 0), clean.i);
+    // 4. A retake that cannot be taken fails by its own name.
+    var unstable: SettleReplay = .{ .seq = &.{settled}, .fail_at = 0 };
+    try testing.expectError(error.BoxMarkUnstable, settleRelease(&unstable, s17_start, s17_first));
+    // 5. The release route off (SERVED17's arm 1): the release proof is NA (the record names it, with the cache clear's
+    //    bytes, and no rise), and the grow proof still runs from the released mark.
+    var off: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = false };
+    off.marks = .{ s17_start, s17_first, s17_grown };
+    try off.judge();
+    const rec_off = boxPhaseRecord(&off, 2_108_224_908);
+    try testing.expectEqualStrings("NA", rec_off.release_proof);
+    try testing.expectEqual(@as(?u64, 2_108_224_908), rec_off.cache_clear_bytes);
+    try testing.expectEqual(@as(?i64, null), rec_off.release_outside_rise);
+    try testing.expectEqual(@as(?i64, -537_395_200), rec_off.grow_outside_rise);
+    off.marks[2] = .{ .physical = s17_grown.physical + box_tolerance_bytes + 600_000_000, .footprint = s17_grown.footprint };
+    try testing.expectError(error.PhaseChangeNotReclaimed, off.judge());
+    // The route on, SERVED17's first mark unsettled: judged and refused; the record says FAIL with its rise.
+    var on: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true };
+    on.marks = .{ s17_start, s17_first, s17_grown };
+    try testing.expectError(error.TransientReleaseNotReclaimed, on.judge());
+    const rec_on = boxPhaseRecord(&on, 2_108_224_908);
+    try testing.expectEqualStrings("FAIL", rec_on.release_proof);
+    try testing.expectEqual(@as(?u64, null), rec_on.cache_clear_bytes);
+    try testing.expectEqual(@as(?i64, 547_831_808), rec_on.release_outside_rise);
+    // Settled, it passes.
+    on.marks[1] = r1.mark;
+    on.release_settle = r1;
+    try on.judge();
+    const rec_set = boxPhaseRecord(&on, null);
+    try testing.expectEqualStrings("PASS", rec_set.release_proof);
+    try testing.expectEqual(@as(?i64, 547_831_808), rec_set.release_first_rise);
+    try testing.expectEqual(@as(?u32, 2), rec_set.release_polls);
 }
 
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
