@@ -964,7 +964,7 @@ const CellReceipt = struct {
     phase_change: ?module.PhaseChangeRecord = null,
     /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default interval).
+    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
     /// until_freed's bound, grow and margin ride in `phase_change`.
     phase_change_settle: ?module.PhaseChangeSettle = null,
     /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
