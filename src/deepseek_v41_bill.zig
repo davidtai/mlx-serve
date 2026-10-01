@@ -293,6 +293,14 @@ pub fn transientDecodeRows(wide_depth: u8, releases: bool, staging_rows: u64) u6
     return if (releases) xp.max_route_ids + staging_rows else @as(u64, wide_depth) * xp.max_route_ids;
 }
 
+/// The wired bytes the bill's row plan reads. Only the envelope planner (a harness's forced decode rows alone,
+/// `envelope_record`) reads the box's wired bytes; the native bill's numbers never do (the fill test's +85 GB pin). So a
+/// native bill given none takes 0, not a live read: the load preflight's bill and the plugin's G4 hook are functions of
+/// their inputs. The envelope path keeps the caller's value, or the live read when it passes none.
+pub fn billWired(wired_bytes: ?u64, envelope_record: bool) ?u64 {
+    return wired_bytes orelse if (envelope_record) null else 0;
+}
+
 /// The request's bounded KV positions the bill charges: what the Module allocates (`Module.maxPositions`, the lanes'
 /// bound at the prompt): on the served path the shell declares no reservation (0), so the prompt plus the generation
 /// headroom (8,192) plus a verify block; a harness that reserves the prompt plus its tokens holds the larger of the two
@@ -304,8 +312,9 @@ pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
 
 /// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
 /// admission a harness asks for) for a request of `prompt_tokens` + `max_tokens`. `wired_bytes` pins the wired
-/// bytes `planRows` reads (null: now). A bill taken after construction passes the wired bytes the arm was
-/// planned with (`arm.inputs.wired_bytes`), never a live read: the module's own banks are wired by then.
+/// bytes `planRows` reads (null: none for a native bill, `billWired`; the live read for the envelope planner). A bill
+/// taken after construction passes the wired bytes the arm was planned with (`arm.inputs.wired_bytes`), never a live
+/// read: the module's own banks are wired by then.
 pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
@@ -316,7 +325,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const ceiling = module.boxCeiling(ceiling_bytes, c.n_routed_experts);
     var diag: arm_mod.Diag = .{};
     var opts = module.armOptions(config, ceiling, .host);
-    if (wired_bytes) |w| opts.wired_bytes = w;
+    opts.wired_bytes = billWired(wired_bytes, opts.envelope_record);
     var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
         log.err("bill: refused: {s}", .{diag.message()});
         return e;
@@ -653,6 +662,11 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     const b_live = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, wired + 85_000_000_000, ceiling_bytes, .{});
     try testing.expectEqual(b.prefillTotal(), b_live.prefillTotal());
     try testing.expectEqual(b.decodeTotal(), b_live.decodeTotal());
+    // Given no wired value (the load preflight, the plugin's hook), the native bill reads none and bills the same.
+    const b_none = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+    try testing.expectEqual(b.prefillTotal(), b_none.prefillTotal());
+    try testing.expectEqual(b.decodeTotal(), b_none.decodeTotal());
+    try testing.expectEqual(b.processBound(), b_none.processBound());
 }
 
 // DSV41_BANK=<bank> (host): this tree's rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB
@@ -840,6 +854,14 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         try testing.expectEqual(w.tight, tight);
     }
     std.debug.print("\n", .{});
+}
+
+// The native bill takes no wired reading (`billWired`); the envelope planner keeps its caller's value or the live read.
+test "dsv41 memory: the native bill reads no wired bytes; the envelope planner keeps its caller's or the live read" {
+    try testing.expectEqual(@as(?u64, 0), billWired(null, false));
+    try testing.expectEqual(@as(?u64, null), billWired(null, true));
+    try testing.expectEqual(@as(?u64, 3_380_379_648), billWired(3_380_379_648, false));
+    try testing.expectEqual(@as(?u64, 3_380_379_648), billWired(3_380_379_648, true));
 }
 
 // The KV positions the bill charges follow the Module's own bound (`Module.maxPositions`): the served path's prompt plus
