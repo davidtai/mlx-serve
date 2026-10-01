@@ -225,7 +225,7 @@ pub const PrefillBill = struct {
     ///   attention side (`waveBytes` without the chunk-major kept positions, which the kept state
     ///   above replaces) or a routed group (moeRowCap rows: the routed outputs, the joined input (under
     ///   JOINLESS the minimal copy's bound, `joinedBytes`), the combine and the HC post to the next stream,
-    ///   with the group's new stream held beside the old).
+    ///   with the group's new stream held beside the old), or the group's final evaluation (SERVED19, below).
     pub fn layerMajorWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
         const d = b.hidden;
         const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
@@ -239,7 +239,15 @@ pub const PrefillBill = struct {
         // The group's routed outputs, their joined input (`joinedBytes`), the combine and the HC post.
         const routed = g_rows * b.top_k * d * 4;
         const group = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.groupStreams() * b.hc * d * 4);
-        return kept_stream + halves + selection + @max(attn, group);
+        // The group's final evaluation (`evalAll(hs[i..j])`: the merge, every chunk's combine and HC post, the new
+        // streams at once; pass3ba: 9.182 GB with the early release on), at its worst over the evaluation order: the
+        // routed outputs and the merge's copies (`joinedBytes`), the shared outputs and the combines (2 d f32 a row),
+        // each post's materialized mix (an hc-width f32 row: the einsum the compiled post cannot fuse), the group's
+        // concatenated input (d f32 a row) and the routing arrays (top_k x 20 B a row). The new streams, h1, moe_in,
+        // the taps and the selection are the kept terms above. It binds where the group's streams no longer do (the
+        // tight bill with the early release).
+        const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * 4 + b.top_k * 20);
+        return kept_stream + halves + selection + @max(attn, @max(group, final_eval));
     }
 
     /// The K16 wide lane's own transient beside the layer-major wave: one more copy of the routed
@@ -393,10 +401,17 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expectEqual(@as(u64, 1_474_834_337), j.joinedBytes(16384));
     try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_474_834_337), j.layerMajorWaveBytes(16384, .served));
     // The main taps in their chunk fences (ee80e40, the tight variant). One hc-width stream (the holder released): 9.53 ->
-    // 5.50 GB, under the attention side (5.58 GB), which then binds: the wave falls 3,950,230,945 B.
-    // Two streams (the fence with SERVED16's holder): 9.53 -> 6.84 GB, the wave -2,684,354,560 B (SERVED16 measured -2.787).
+    // 5.50 GB, under the attention side (5.58 GB) and the group's final evaluation (5.84 GB, SERVED19), which binds: the wave
+    // falls 3,689,021,440 B (3,950,230,945 B to the attention side before SERVED19: 261,209,505 B under the final
+    // evaluation's worst case). Two streams (the fence with SERVED16's holder): 9.53 -> 6.84 GB, still the group's: the wave
+    // -2,684,354,560 B (SERVED16 measured -2.787).
     try std.testing.expectEqual(@as(u64, 2_684_354_560), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(2).layerMajorWaveBytes(16384, .served));
-    try std.testing.expectEqual(@as(u64, 3_950_230_945), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(1).layerMajorWaveBytes(16384, .served));
+    try std.testing.expectEqual(@as(u64, 3_689_021_440), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(1).layerMajorWaveBytes(16384, .served));
+    // The one-stream wave is the kept terms plus the final evaluation's: the routed outputs, the merge's bound, then
+    // 143,480 B a row (the conservative wave is the kept terms plus its group's 368,640 B a row).
+    const group4: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 4 * 5120 * 4);
+    const final_eval: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 5120 * 4 + 5120 * 4 + 6 * 20);
+    try std.testing.expectEqual(final_eval, j.withGroupStreams(1).layerMajorWaveBytes(16384, .served) - (j.layerMajorWaveBytes(16384, .served) - group4));
     // Longer prompts make more row-closed waves: at a 65,104-row group (the chunk target's cap) the bound is 167.
     try std.testing.expectEqual(@as(u64, 48 + 108 + 9 + 2), j.joinlessOutputsMax(shape, 65_104 * 6));
 }

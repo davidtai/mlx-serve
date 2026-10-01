@@ -3871,6 +3871,44 @@ test "dsv41 experts: JOINLESS's merge at L1's counts: the 28 smallest of 51 outp
     };
 }
 
+test "dsv41 experts: JOINLESS's merge copies at most (n - 23) / n of the routed rows at every n from 25 to 86, whatever the rows" {
+    // The bill's merge term (`PrefillBill.joinedBytes`) charges (n_max - 23) / n_max of the routed rows at the most outputs a
+    // call can make (86 at 16K); (n - 23) / n grows with n, so this bound at every n below it is what the bill relies on.
+    var rng = std.Random.DefaultPrng.init(0xb0b_5e19);
+    const r = rng.random();
+    var rows: [86]u32 = undefined;
+    var order: [86]u32 = undefined;
+    var src: [86]u8 = undefined;
+    var off: [86]u32 = undefined;
+    var n: usize = joinless_sources + 1;
+    while (n <= 86) : (n += 1) {
+        for (0..5) |shape| {
+            for (rows[0..n], 0..) |*x, i| x.* = switch (shape) {
+                0 => 1, // all equal
+                1 => @intCast(i + 1), // ascending
+                2 => @intCast(n - i), // descending
+                3 => if (i < n - joinless_sources + 1) 1 else 100_000, // many tiny, a few huge
+                else => r.intRangeAtMost(u32, 1, 4096),
+            };
+            const n_src = planJoinless(rows[0..n], order[0..n], src[0..n], off[0..n]);
+            try testing.expectEqual(@as(usize, joinless_sources), n_src);
+            var total: u64 = 0;
+            var copied: u64 = 0;
+            var merged: usize = 0;
+            for (rows[0..n], src[0..n]) |x, s_| {
+                total += x;
+                if (s_ == joinless_sources - 1) {
+                    copied += x;
+                    merged += 1;
+                }
+            }
+            try testing.expectEqual(n - (joinless_sources - 1), merged);
+            // copied / total <= (n - 23) / n, in integers.
+            try testing.expect(copied * n <= total * (n - (joinless_sources - 1)));
+        }
+    }
+}
+
 test "dsv41 experts: JOINLESS's merge at 24 outputs or fewer: every output its own source, read in place, nothing copied" {
     const a = testing.allocator;
     var g = TraceOps.init(a);

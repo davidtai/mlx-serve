@@ -890,15 +890,15 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .two = .{ .prefill = 140, .decode = 164 }, .one = .{ .prefill = 142, .decode = 164 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 164 }, .one = .{ .prefill = 142, .decode = 164 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 164 }, .one = .{ .prefill = 141, .decode = 164 } },
         .{ .base = 9_550_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         const on = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .input_stream_early_release = true });
-        // The tight wave drops by the third stream's bound (the attention side binds below two streams); the
-        // conservative wave, the KV and decode do not move.
-        try testing.expectEqual(@as(u64, 3_950_230_945 - 2_684_354_560), off.prefill_wave_tight - on.prefill_wave_tight);
+        // The tight wave drops by the third stream's bound down to the group's final evaluation (SERVED19: it binds
+        // below two streams, over the attention side); the conservative wave, the KV and decode do not move.
+        try testing.expectEqual(@as(u64, 3_689_021_440 - 2_684_354_560), off.prefill_wave_tight - on.prefill_wave_tight);
         try testing.expectEqual(off.prefill_wave, on.prefill_wave);
         try testing.expectEqual(off.decodeTotal(), on.decodeTotal());
         var rows: [2]arm_mod.NativeRows = undefined;
