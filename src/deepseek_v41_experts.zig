@@ -912,6 +912,10 @@ pub fn JoinlessScratch(comptime T: type) type {
     };
 }
 
+/// (profile builds) A wide call's JOINLESS merge for the prefill profile's group line: its outputs, the combine's sources and
+/// the rows the one concatenate copied (0: no merge, every output read in place).
+pub const MergeStats = struct { outputs: u32 = 0, sources: u32 = 0, copied_rows: u64 = 0 };
+
 /// JOINLESS's merge: `outs` (the KEPT outputs, join order; `pos`: each join-ordered row's assignment) becomes
 /// the combine's sources under `planJoinless` (the in-place outputs, then the merged one, KEPT; its inputs
 /// released) and `loc` each assignment's (source, row). Returns the rows copied.
@@ -1055,6 +1059,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         transient_released: bool = false,
         /// A1's recall check (profile builds): the next call's predicted ids, handed over before its layer's attention.
         recall_pred: if (recall.enabled) ?T else void = if (recall.enabled) null else {},
+        /// (profile builds: `prof.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
+        last_merge: if (prof.enabled) MergeStats else void = if (prof.enabled) .{} else {},
         /// A0 (a): per layer, the last wide call's last `warm_tail_rows` rows' experts (`Wide.warm_tail`; empty
         /// without it), and the wide call's record, prebound at construction.
         warm_tail: []std.StaticBitSet(warm_max_experts) = &.{},
@@ -1263,6 +1269,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             pub fn releaseParts(h: Hook, g: *G) void {
                 h.ex.releaseParts(g);
+            }
+
+            /// (profile builds) The last wide call's JOINLESS merge; zeros elsewhere.
+            pub fn lastMerge(h: Hook) MergeStats {
+                return if (comptime prof.enabled) h.ex.last_merge else .{};
             }
 
             /// P1 (`Wide.read_ahead`, fixed at construction): the model runs its predictor pass for this layer.
@@ -1589,7 +1600,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try self.runWideCore(g, layer, xf, indices, n, k, comptime @hasDecl(M, "has_parts") and M.has_parts);
             const w = &self.wide;
             try w.loc.resize(self.a, 2 * n * k);
-            _ = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
+            if (comptime prof.enabled) {
+                const n_out = w.kept.items.len;
+                const copied = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
+                self.last_merge = .{ .outputs = @intCast(n_out), .sources = @intCast(w.kept.items.len), .copied_rows = copied };
+            } else _ = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
             const loc = try g.hostArray(std.mem.sliceAsBytes(w.loc.items), &.{ @intCast(n), @intCast(k), 2 }, .int32);
             return .{ .outs = w.kept.items, .loc = loc };
         }
@@ -3935,6 +3950,12 @@ test "dsv41 experts: past 24 outputs the combine still reads each assignment's o
     for (g.nodes.items[first..]) |nd| n_cat += @intFromBool(nd.op == .concat);
     try testing.expectEqual(@as(usize, 1), n_cat);
     try testing.expectEqual(merged_rows, g.shapeOf(parts.outs[Ex.max_parts - 1]).dim(0));
+    // (profile builds) The merge's record for the prefill profile's group line: the outputs, the sources and the rows the
+    // one concatenate copied; zeros elsewhere (compiled out).
+    const ms = ex.at(0).lastMerge();
+    if (comptime prof.enabled) {
+        try testing.expectEqual(MergeStats{ .outputs = @intCast(n_out), .sources = Ex.max_parts, .copied_rows = @intCast(merged_rows) }, ms);
+    } else try testing.expectEqual(MergeStats{}, ms);
     const call = for (&src.calls) |*cl| {
         if (cl.plan.n_ids > 0 and cl.plan.n_ids == ex.wide.distinct.items.len) break cl;
     } else return error.NoCall;

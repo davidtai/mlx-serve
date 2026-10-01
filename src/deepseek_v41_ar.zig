@@ -2633,6 +2633,14 @@ const PrefillProbe = struct {
         /// MLX's active bytes right before the final evaluation, and that evaluation's high-water mark.
         active_before: u64 = 0,
         eval_peak: u64 = 0,
+        /// The group's concatenated MoE input (the routed call's, held by the group's wave through the evaluation).
+        cat_xf: u64 = 0,
+        /// The JOINLESS merge (the hook's record, profile builds): outputs, sources, the rows copied and their bytes
+        /// (the merged source is the last one).
+        merge_outputs: u64 = 0,
+        merge_sources: u64 = 0,
+        merge_copied_rows: u64 = 0,
+        merge_copied: u64 = 0,
     };
 
     fn bytesOf(x: ops.MlxOps.T) u64 {
@@ -2652,12 +2660,25 @@ const PrefillProbe = struct {
         }
     }
 
+    /// The group's JOINLESS merge (the hook's `MergeStats`, profile builds), after `groupHalves`.
+    pub fn groupMerge(self: *PrefillProbe, m: anytype) void {
+        self.group.merge_outputs = m.outputs;
+        self.group.merge_sources = m.sources;
+        self.group.merge_copied_rows = m.copied_rows;
+    }
+
     /// Right before the group's final evaluation: MLX's active mark and the geometry it reads and writes. The combine is
     /// one kernel over the sources in place (it gathers nothing): its f32 output and the cast are rows x hidden each.
-    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T) void {
+    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T, cat_xf: ops.MlxOps.T) void {
         var a: usize = 0;
         _ = mlx.mlx_get_active_memory(&a);
         self.group.active_before = a;
+        self.group.cat_xf = bytesOf(cat_xf);
+        if (self.group.merge_copied_rows > 0 and outs.len > 0) {
+            const last = outs[outs.len - 1];
+            const rows: u64 = @intCast(self.g.shapeOf(last).dim(0));
+            self.group.merge_copied = self.group.merge_copied_rows * (bytesOf(last) / @max(rows, 1));
+        }
         for (outs) |x| self.group.parts += bytesOf(x);
         if (loc) |x| self.group.loc = bytesOf(x);
         for (shared) |s| {
@@ -2881,11 +2902,12 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     // chunk's halves are held by the group's HC posts).
     {
         const hidden: u64 = md.model.c.hidden_size;
-        for (probe.groups[0..probe.n_groups]) |gr| std.debug.print("PREFILL_PROFILE_GROUP {{\"layer\": {d}, \"chunks\": {d}, \"rows\": {d}, \"grouped\": {}, \"active_before_gb\": {d:.3}, \"eval_peak_gb\": {d:.3}, \"parts_gb\": {d:.3}, \"loc_gb\": {d:.4}, \"shared_gb\": {d:.3}, \"next_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"combine_out_gb\": {d:.3}, \"combine_cast_gb\": {d:.3}, \"halves_held_at_eval_start\": {d}}}\n", .{
-            gr.layer,                                gr.chunks,                        gr.rows,       probe.grouped,
-            gb(gr.active_before -| start_active),    gb(gr.eval_peak -| start_active), gb(gr.parts),  gb(gr.loc),
-            gb(gr.shared),                           gb(gr.next),                      gb(gr.halves), gb(gr.rows * hidden * 4),
-            gb(gr.rows * hidden * gr.cast_itemsize), gr.chunks,
+        for (probe.groups[0..probe.n_groups]) |gr| std.debug.print("PREFILL_PROFILE_GROUP {{\"layer\": {d}, \"chunks\": {d}, \"rows\": {d}, \"grouped\": {}, \"active_before_gb\": {d:.3}, \"eval_peak_gb\": {d:.3}, \"parts_gb\": {d:.3}, \"loc_gb\": {d:.4}, \"shared_gb\": {d:.3}, \"next_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"combine_out_gb\": {d:.3}, \"combine_cast_gb\": {d:.3}, \"halves_held_at_eval_start\": {d}, \"cat_xf_gb\": {d:.3}, \"merge_outputs\": {d}, \"merge_sources\": {d}, \"merge_copied_rows\": {d}, \"merge_copied_gb\": {d:.3}}}\n", .{
+            gr.layer,                                gr.chunks,                        gr.rows,             probe.grouped,
+            gb(gr.active_before -| start_active),    gb(gr.eval_peak -| start_active), gb(gr.parts),        gb(gr.loc),
+            gb(gr.shared),                           gb(gr.next),                      gb(gr.halves),       gb(gr.rows * hidden * 4),
+            gb(gr.rows * hidden * gr.cast_itemsize), gr.chunks,                        gb(gr.cat_xf),       gr.merge_outputs,
+            gr.merge_sources,                        gr.merge_copied_rows,             gb(gr.merge_copied),
         });
     }
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));

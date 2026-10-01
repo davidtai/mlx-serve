@@ -863,6 +863,7 @@ pub fn Model(comptime G: type) type {
                     // The profile's grouped mode: the group's halves at its start (their handles go at the HC post builds
                     // below, h1 / post / comb with each post's evaluation).
                     probeGroupHalves(probe, halves[i..j], i);
+                    if (parts != null) probeGroupMerge(probe, hook);
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         probeChunk(probe, k);
@@ -890,7 +891,7 @@ pub fn Model(comptime G: type) type {
                     }
                     // The profile's mark before the group's final evaluation (the merge, the combines, the HC posts and the new
                     // streams at once, as the timed pass runs it), then that evaluation's own stage.
-                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j]);
+                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], cat_xf);
                     try g.evalAll(hs[i..j]);
                     probeChunk(probe, i);
                     try probe.put("group.eval", hs[i]);
@@ -967,9 +968,15 @@ pub fn Model(comptime G: type) type {
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupHalves")) probe.groupHalves(halves, first_chunk);
         }
 
-        fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T) void {
+        fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T, cat_xf: T) void {
             const P = @TypeOf(probe);
-            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupEval")) probe.groupEval(outs, loc, shared, next);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupEval")) probe.groupEval(outs, loc, shared, next, cat_xf);
+        }
+
+        /// The group's JOINLESS merge (the hook's record, profile builds) for a probe that reads it.
+        fn probeGroupMerge(probe: anytype, hook: anytype) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupMerge") and @hasDecl(@TypeOf(hook), "lastMerge")) probe.groupMerge(hook.lastMerge());
         }
 
         fn keepHalf(g: *G, hf: *Tr.Half) void {
@@ -1371,7 +1378,7 @@ const StageProbe = struct {
         self.chunks.append(testing.allocator, self.cur) catch unreachable;
         self.group_halves.append(testing.allocator, halves.len) catch unreachable;
     }
-    pub fn groupEval(self: *StageProbe, _: anytype, _: anytype, _: anytype, next: anytype) void {
+    pub fn groupEval(self: *StageProbe, _: anytype, _: anytype, _: anytype, next: anytype, _: anytype) void {
         self.names.append(testing.allocator, "group.mark") catch unreachable;
         self.chunks.append(testing.allocator, self.cur) catch unreachable;
         self.group_next.append(testing.allocator, next.len) catch unreachable;
