@@ -2873,11 +2873,10 @@ test "dsv41 stream: the construction's forget: the warm-up's seeded residents cl
 /// posix_spawn'd vm_stat, the settles, the report lines.
 const ProbeBox = struct {
     const ar = @import("deepseek_v41_ar.zig");
-    const status = @import("status.zig");
 
     pages: ar.VmStatPages,
     fp: u64,
-    pm: status.ProcessMemory,
+    pm: sdk.memory.ProcessMemory,
 
     const Self = @This();
     const Settled = struct { b: Self, ms: ?u64 };
@@ -2887,10 +2886,10 @@ const ProbeBox = struct {
         var n: u32 = 0;
         while (n < ar.box_mark_attempts) : (n += 1) {
             if (n > 0) std.Io.sleep(testing.io, .fromMilliseconds(ar.box_mark_retry_ms), .awake) catch {};
-            const f0 = status.footprint().now;
+            const f0 = sdk.memory.footprint().now;
             const pages = try ar.vmStatPages(try ar.readVmStat(buf));
-            const f1 = status.footprint().now;
-            if (@max(f0, f1) - @min(f0, f1) <= ar.box_mark_stable_bytes) return .{ .pages = pages, .fp = @max(f0, f1), .pm = status.processMemory() };
+            const f1 = sdk.memory.footprint().now;
+            if (@max(f0, f1) - @min(f0, f1) <= ar.box_mark_stable_bytes) return .{ .pages = pages, .fp = @max(f0, f1), .pm = sdk.memory.processMemory() };
         }
         return error.BoxMarkUnstable;
     }

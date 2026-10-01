@@ -26,7 +26,6 @@ const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
 const kernel_set = sdk.kernels.KernelSet(xk);
 const xq = @import("exl3_quant.zig");
-const status = @import("status.zig");
 const module = @import("deepseek_v41_module.zig");
 const gpu_ceiling = @import("gpu_ceiling.zig");
 const cell = @import("deepseek_v41_cell.zig");
@@ -47,7 +46,7 @@ const host_heap = @import("dsv41_host_heap.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
-/// (`status.footprint`, the one reader). The gap between the footprint and MLX is the host side.
+/// (`sdk.memory.footprint`, the one reader). The gap between the footprint and MLX is the host side.
 fn memProbe(harness: []const u8, phase: []const u8) void {
     _ = memProbePeak(harness, phase);
 }
@@ -58,14 +57,14 @@ fn memProbePeak(harness: []const u8, phase: []const u8) usize {
     var peak: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_peak_memory(&peak);
-    const fp = status.footprint().now;
+    const fp = sdk.memory.footprint().now;
     std.debug.print("\n{s}: memory {s}: MLX active {d:.2} GB, MLX peak since the last probe {d:.2} GB, footprint {d:.2} GB\n", .{
         harness, phase, @as(f64, @floatFromInt(active)) / 1e9, @as(f64, @floatFromInt(peak)) / 1e9, @as(f64, @floatFromInt(fp)) / 1e9,
     });
     // The box's pages as the guard reads them: what is outside this footprint shows here.
-    const v = status.vmBytes();
+    const v = sdk.memory.vmBytes();
     std.debug.print("NATIVE vm {s}: physical used {d} B (wired {d}, active {d}, inactive {d}, compressor {d}; purgeable {d}, speculative {d}, file-backed {d}), footprint {d} B\n", .{
-        phase, status.physicalUsedBytes(v), v.wired, v.active, v.inactive, v.compressor, v.purgeable, v.speculative, v.external, fp,
+        phase, sdk.memory.physicalUsedBytes(v), v.wired, v.active, v.inactive, v.compressor, v.purgeable, v.speculative, v.external, fp,
     });
     _ = mlx.mlx_reset_peak_memory();
     return peak;
@@ -428,9 +427,9 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     memProbe("dsv41 ar served", "start");
-    status.startFootprintInterval();
+    sdk.memory.startFootprintInterval();
     // The step's vm start (before any load): the page cache the step creates is measured from here.
-    const vm_start = status.vmBytes();
+    const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
     const m = try module.Module.init(gpa, io, &config, &weights, s);
@@ -1188,9 +1187,9 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     memProbe("dsv41 served cell", "start");
-    status.startFootprintInterval();
+    sdk.memory.startFootprintInterval();
     // The step's vm start (before any load): the page cache the step creates is measured from here.
-    const vm_start = status.vmBytes();
+    const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
     const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
@@ -1491,7 +1490,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const ids = try a.alloc(u32, out.items.len + 1);
     ids[0] = primary;
     @memcpy(ids[1..], out.items);
-    const fp = status.footprint();
+    const fp = sdk.memory.footprint();
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
@@ -1902,7 +1901,7 @@ pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
 /// One fresh reading of the box's physical pages beside this process's footprint, for the harnesses' box proofs.
 /// Read through a vm_stat child: XNU rate-limits host_statistics64 for non-platform binaries (2-10 fresh calls
 /// per second box-wide, then the last reading: pass3an2's phase change read one value five times while the
-/// footprint grew 13.66 GB); vm_stat, a platform binary, is exempt. `status.vmBytes` stays for coarse
+/// footprint grew 13.66 GB); vm_stat, a platform binary, is exempt. `sdk.memory.vmBytes` stays for coarse
 /// once-per-phase marks.
 pub const BoxMark = struct {
     /// vm_stat's wired + active + inactive + compressor-occupied pages (the guard's physical used), bytes.
@@ -1945,7 +1944,7 @@ const LiveBox = struct {
     io: std.Io,
 
     fn footprint(_: LiveBox) u64 {
-        return status.footprint().now;
+        return sdk.memory.footprint().now;
     }
 
     /// Through posix_spawn (`readVmStat`), as the sentinel reads: a mark never forks this process (no copy-on-write
@@ -2357,9 +2356,9 @@ pub const Sentinel = struct {
     }
 
     fn read(self: *Sentinel) !SentinelReading {
-        const f0 = status.footprint().now;
+        const f0 = sdk.memory.footprint().now;
         const pages = try vmStatPages(try readVmStat(&self.buf));
-        return .{ .pages = pages, .f0 = f0, .f1 = status.footprint().now };
+        return .{ .pages = pages, .f0 = f0, .f1 = sdk.memory.footprint().now };
     }
 
     fn run(self: *Sentinel) void {
@@ -2408,7 +2407,7 @@ pub const Sentinel = struct {
             .rise = rise,
             .pages = p,
             .delta = .{ .wired = d(p.wired, b.wired), .active = d(p.active, b.active), .inactive = d(p.inactive, b.inactive), .file_backed = d(p.file_backed, b.file_backed), .anonymous = d(p.anonymous, b.anonymous), .purgeable = d(p.purgeable, b.purgeable), .compressor = d(p.compressor, b.compressor), .speculative = d(p.speculative, b.speculative), .free = d(p.free, b.free) },
-            .task = status.processMemory(),
+            .task = sdk.memory.processMemory(),
         };
         var jb: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&jb);
@@ -2626,7 +2625,7 @@ test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and s
     const t0 = std.Io.Timestamp.now(testing.io, .boot);
     for (0..4) |_| {
         const live = try vmStatPages(try readVmStat(&buf));
-        try testing.expect(live.physical() > 0 and live.physical() <= status.getTotalMemBytes());
+        try testing.expect(live.physical() > 0 and live.physical() <= sdk.memory.totalMemBytes());
     }
     std.debug.print("\nsentinel reading (posix_spawn vm_stat): {d:.2} ms each\n", .{secondsSince(testing.io, t0) * 1000 / 4});
     // The thread over two periods, quiet on the host: it read, judged and stopped.
@@ -2812,7 +2811,7 @@ test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
     try testing.expectError(error.VmStatFormat, vmStatPhysical("Pages active: 1.\n"));
     // The live child (host only: vm_stat reads the box, no MLX): within the box's RAM.
     const m = try boxMark(testing.allocator, testing.io);
-    try testing.expect(m.physical > 0 and m.physical <= status.getTotalMemBytes());
+    try testing.expect(m.physical > 0 and m.physical <= sdk.memory.totalMemBytes());
 }
 
 // DSV41_BANK=<bank> (host): the harness's rows reach the Module's admission at the window's inputs (pass3an3's:

@@ -23,8 +23,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const status = @import("status.zig");
 const mlx = @import("mlx");
+const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
@@ -161,7 +161,7 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     for (bank.layers) |l| record = @max(record, l.logical_bytes);
     const inputs: expert_admission.Inputs = .{
         .baseline_bytes = baseline,
-        .wired_bytes = opt.wired_bytes orelse status.vmBytes().wired,
+        .wired_bytes = opt.wired_bytes orelse sdk.memory.vmBytes().wired,
         .record_bytes = record,
         .fixed_rows = opt.fixed_rows,
         .allocation = opt.allocation,

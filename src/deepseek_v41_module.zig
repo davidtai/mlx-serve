@@ -28,7 +28,6 @@ const xq = @import("exl3_quant.zig");
 const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
-const status = @import("status.zig");
 const gpu_ceiling = @import("gpu_ceiling.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -595,7 +594,7 @@ pub const Module = struct {
         if (admitted.expert_prefill_rows == null) {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, target, ov);
+            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, target, ov);
             if (admitted.expert_rows) |forced| {
                 admitted.expert_prefill_rows = @min(nr.prefill, forced);
             } else {
@@ -620,7 +619,7 @@ pub const Module = struct {
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            var b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, ov) catch |e| {
+            var b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -945,7 +944,7 @@ pub const Module = struct {
         // the 1.32 GB table (+1.33 GB over v7's construction, 0.75 GB over the bill).
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
-        const measured = status.footprint().now;
+        const measured = sdk.memory.footprint().now;
         const mb = try bill_mod.memoryBill(arena.allocator(), b);
         const billed = mb.constructionBytes(b.prefill_rows);
         var mlx_active: usize = 0;
@@ -1726,8 +1725,8 @@ const VmMark = struct {
     external: u64,
 
     fn now() VmMark {
-        const v = status.vmBytes();
-        return .{ .physical = status.physicalUsedBytes(v), .footprint = status.footprint().now, .purgeable = v.purgeable, .external = v.external };
+        const v = sdk.memory.vmBytes();
+        return .{ .physical = sdk.memory.physicalUsedBytes(v), .footprint = sdk.memory.footprint().now, .purgeable = v.purgeable, .external = v.external };
     }
 };
 
@@ -1880,7 +1879,7 @@ pub const BoundaryMemory = struct {
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
-        return .{ .active = active, .cache = cache, .footprint = status.footprint().now };
+        return .{ .active = active, .cache = cache, .footprint = sdk.memory.footprint().now };
     }
 };
 

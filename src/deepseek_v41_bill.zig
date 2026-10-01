@@ -15,7 +15,6 @@ const xp = @import("deepseek_v41_experts.zig");
 const expert_stream = @import("expert_stream.zig");
 const exl3 = @import("exl3_quant.zig");
 const engram = @import("deepseek_v41_engram.zig");
-const status = @import("status.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
@@ -248,7 +247,7 @@ pub const PhaseMemory = struct {
     phase: []const u8,
     billed: PhaseTerms,
     billed_process_bytes: u64,
-    process: status.ProcessMemory,
+    process: sdk.memory.ProcessMemory,
     mlx_active_bytes: u64,
     mlx_cache_bytes: u64,
     mlx_peak_bytes: u64,
@@ -281,11 +280,11 @@ pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_cache_memory(&cache);
     _ = mlx.mlx_get_peak_memory(&peak);
-    const pm = status.processMemory();
-    const v = status.vmBytes();
+    const pm = sdk.memory.processMemory();
+    const v = sdk.memory.vmBytes();
     _ = mlx.mlx_reset_peak_memory();
-    status.startFootprintInterval();
-    var r = recordOf(phase, billed, pm, active, cache, peak, status.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
+    sdk.memory.startFootprintInterval();
+    var r = recordOf(phase, billed, pm, active, cache, peak, sdk.memory.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
     r.box_wired_bytes = v.wired;
     return r;
 }
@@ -293,7 +292,7 @@ pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64
 /// `phaseMemory`'s arithmetic (host-testable): the MLX-device share of the bill is every term but the
 /// host ones (lookahead staging, host reserve, the wide window's host records, the overhead, the
 /// Engram row caches) and the allocator cache.
-pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: status.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
+pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: sdk.memory.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
     const process = billed.sum();
     const measured = @max(pm.footprint_interval_peak, pm.footprint);
     const device = billed.slot_banks + billed.residents + (billed.engram -| engram_host_bytes) + billed.waves + billed.kv;
@@ -1030,7 +1029,7 @@ test "dsv41 memory: ENGRAM=prefetch's posted gathers are one slot's ids and reco
 test "dsv41 memory: the phase record's residuals: billed less the interval peak, billed device terms less MLX's peak" {
     const b = cell4Bill();
     // cell4's prompt boundary: footprint 83.03 GB now; MLX active 76.56, peak 91.35 GB.
-    const pm: status.ProcessMemory = .{ .footprint = 83_030_000_000, .footprint_interval_peak = 97_000_000_000, .footprint_lifetime_peak = 97_000_000_000 };
+    const pm: sdk.memory.ProcessMemory = .{ .footprint = 83_030_000_000, .footprint_interval_peak = 97_000_000_000, .footprint_lifetime_peak = 97_000_000_000 };
     const r = recordOf("prompt pass", b.prefillTerms(), pm, 76_560_000_000, 5_000_000_000, 91_350_000_000, 110_000_000_000, 3_000_000_000, 850_000_000, 4_870_000_000, engram.row_cache_host_bytes);
     // The page cache the step created (file-backed now less at its vm start) and the speculative pages, recorded.
     try testing.expectEqual(@as(i64, 3_000_000_000 - 4_870_000_000), r.file_cache_created_bytes);
@@ -1040,7 +1039,7 @@ test "dsv41 memory: the phase record's residuals: billed less the interval peak,
     const device = b.slot_prefill + b.residents + (b.engram - engram.row_cache_host_bytes) + b.prefill_wave + b.kv;
     try testing.expectEqual(@as(i64, @intCast(device)) - 91_350_000_000, r.mlx_residual_bytes);
     // A footprint above its (stale) interval peak counts as the measurement; a peak below active reads active.
-    const late: status.ProcessMemory = .{ .footprint = 99_000_000_000, .footprint_interval_peak = 0 };
+    const late: sdk.memory.ProcessMemory = .{ .footprint = 99_000_000_000, .footprint_interval_peak = 0 };
     const r2 = recordOf("decode", b.decodeTerms(), late, 97_000_000_000, 0, 0, 0, 19_950_000_000, 15_940_000_000, 4_870_000_000, engram.row_cache_host_bytes);
     // v6c2's construction: 15.08 GB of page cache created, 15.94 GB of it speculative.
     try testing.expectEqual(@as(i64, 15_080_000_000), r2.file_cache_created_bytes);
