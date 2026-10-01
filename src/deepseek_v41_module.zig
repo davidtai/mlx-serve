@@ -43,6 +43,7 @@ const log = std.log.scoped(.dsv41);
 
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
+const expert_bank = @import("expert_bank.zig");
 const expert_event = @import("expert_event.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -140,9 +141,10 @@ pub const RouteOverrides = struct {
 ///   cache clear, the transient release), within `phase_change_tolerance_bytes`. Relative: the prompt's earlier
 ///   releases still trailing in the ledger count toward it (pass3bj: 1.414 GB of them between the boundary's
 ///   first reading and its frees, so one 5 ms poll satisfied it with 0.76 GB of the clear still landing).
-/// - `until_freed`: that, and the footprint at most the decode phase's billed process bytes less the grow's bytes
-///   (`untilFreedBound`): absolute, from the admission, so the grow can never land the process over its bill
-///   whatever trails; the time it takes is the reclaim's own lag.
+/// - `until_freed`: that, and the footprint at most the grow's bound, the decode phase's billed process bytes less the
+///   grow's bytes (`untilFreedBound`): absolute, from the admission, so the grow lands within the decode bill whatever
+///   trails; the time it takes is the reclaim's own lag. It bounds the grow, not decode: the decode bill's verify /
+///   draft wave and decode cache arrive after the grow, and the decode phase's residual stays their check.
 pub const PhaseChangeSettle = enum { interval, until_freed };
 
 /// The settle condition the Module installs: the setting over the default (`interval`).
@@ -150,14 +152,20 @@ pub fn phaseChangeSettle(ov: RouteOverrides) PhaseChangeSettle {
     return ov.phase_change_settle orelse .interval;
 }
 
-/// `until_freed`'s footprint bound before the grow: the decode phase's billed process bytes (`Bill.decodeTerms`, the
-/// admission) less the bytes the grow allocates, the decode slot banks over the prompt's (`slot_decode` -
-/// `slot_prefill`) plus the transient scratch the release freed (the grow reallocates decode's window 0 of it).
-/// pass3bd / pass3bj: the grow's measured MLX active rise is this + 1.6-3.4 MB.
-pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decode: u64, transient_freed: u64) struct { bound: u64, grow: u64 } {
-    const grow = (slot_decode + transient_freed) -| slot_prefill;
+/// `until_freed`'s grow bound (the footprint before the grow): the decode phase's billed process bytes (`Bill.decodeTerms`,
+/// the admission) less the bytes the grow allocates: the decode slot banks over the prompt's (`slot_decode` -
+/// `slot_prefill`), the transient scratch the release freed (the grow reallocates decode's window 0 of it), and each
+/// allocation's rounding (`grow_alloc_round_bytes`, one per array: `expert_bank.n_components` per grown layer and for
+/// window 0). pass3bd / pass3bj: the measured MLX active rise is the first two + 1.6-3.4 MB, under the rounding term's
+/// 5.9-6.0 MB.
+pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decode: u64, transient_freed: u64, n_layers: u32) struct { bound: u64, grow: u64 } {
+    const allocs: u64 = (@as(u64, n_layers) + @intFromBool(transient_freed > 0)) * expert_bank.n_components;
+    const grow = ((slot_decode + transient_freed) -| slot_prefill) + allocs * grow_alloc_round_bytes;
     return .{ .bound = billed_decode_process -| grow, .grow = grow };
 }
+
+/// One grow allocation's rounding bound: MLX's Metal allocator rounds a buffer up to the 16 KiB page.
+pub const grow_alloc_round_bytes: u64 = 16_384;
 
 /// The release route the Module installs and the bill charges (one resolver: the stream's capability and the setting
 /// over the default, off).
@@ -453,7 +461,7 @@ pub const Module = struct {
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
-            .until_freed => "until the footprint is down by the freed bytes and at most the decode bill less the grow",
+            .until_freed => "until the footprint is down by the freed bytes and at most the grow's bound, the decode bill less the grow",
         } });
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
@@ -973,14 +981,14 @@ pub const Module = struct {
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
-        const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
+        const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
             .interval => null,
-            .until_freed => untilFreedBound(self.bill.decodeTotal() - self.bill.baseline, self.bill.slot_prefill, self.bill.slot_decode, transient_freed),
+            .until_freed => untilFreedBound(self.bill.decodeTotal() - self.bill.baseline, self.bill.slot_prefill, self.bill.slot_decode, transient_freed, @intCast(self.model.c.n_layers)),
         };
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
         switch (self.arm) {
@@ -1215,9 +1223,9 @@ pub const PhaseChangeRecord = struct {
     settle_ms: u32,
     /// The settle condition the phase change waited for (a shrink: `interval`).
     settle: PhaseChangeSettle = .interval,
-    /// `until_freed` only: the footprint bound (the decode bill less the grow), the grow's bytes, and the bound less
+    /// `until_freed` only: the grow's bound on the footprint (the decode bill less the grow), the grow's bytes, and the bound less
     /// the footprint at the last reading (`after.footprint`; negative: refused).
-    bound_bytes: ?u64 = null,
+    grow_bound_bytes: ?u64 = null,
     grow_bytes: ?u64 = null,
     margin_bytes: ?i64 = null,
     /// The refusal's name, when the phase change refused the grow.
@@ -2090,20 +2098,28 @@ test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a re
     try std.testing.expectEqual(PhaseChangeSettle.interval, phaseChangeSettle(.{}));
     try std.testing.expectEqual(PhaseChangeSettle.interval, (Installed{}).phase_change_settle);
     try std.testing.expectEqual(PhaseChangeSettle.until_freed, phaseChangeSettle(.{ .phase_change_settle = .until_freed }));
-    // The bound from the bill (pass3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
-    // 74,567,270,400 -> 90,545,971,200 B; the grow 15,978,700,800 B (measured MLX active rise 15,980,298,240).
+    // The grow's bound from the bill (pass3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
+    // 74,567,270,400 -> 90,545,971,200 B, + 40 layers x 9 arrays x 16 KiB rounding: the grow 15,984,599,040 B (measured
+    // MLX active rise 15,980,298,240).
     const billed: u64 = 108_963_257_928;
-    const uf = untilFreedBound(billed, 74_567_270_400, 90_545_971_200, 0);
-    try std.testing.expectEqual(@as(u64, 15_978_700_800), uf.grow);
-    try std.testing.expectEqual(@as(u64, 92_984_557_128), uf.bound);
+    const uf = untilFreedBound(billed, 74_567_270_400, 90_545_971_200, 0, 40);
+    try std.testing.expectEqual(@as(u64, 15_978_700_800 + 360 * 16_384), uf.grow);
+    try std.testing.expectEqual(@as(u64, 92_978_658_888), uf.bound);
     // The release route (pass3bd release: 135 / 169 rows): the grow reallocates the freed scratch's window 0 too:
-    // 15,552,602,112 + 3,195,740,160 = 18,748,342,272 (measured 18,750,701,568).
-    const ur = untilFreedBound(109_069_782_600, 75_099_893_760, 90_652_495_872, 3_195_740_160);
-    try std.testing.expectEqual(@as(u64, 18_748_342_272), ur.grow);
-    try std.testing.expectEqual(@as(u64, 109_069_782_600 - 18_748_342_272), ur.bound);
+    // 15,552,602,112 + 3,195,740,160 + 41 x 9 x 16 KiB = 18,754,387,968 (measured 18,750,701,568).
+    const ur = untilFreedBound(109_069_782_600, 75_099_893_760, 90_652_495_872, 3_195_740_160, 40);
+    try std.testing.expectEqual(@as(u64, 18_754_387_968), ur.grow);
+    try std.testing.expectEqual(@as(u64, 109_069_782_600 - 18_754_387_968), ur.bound);
+    // Never under-stated: the bill's grow covers every measured rise (pass3bd control1 / release, pass3bj control1 / tight).
+    for ([_][4]u64{
+        .{ 75_099_893_760, 90_545_971_200, 0, 15_449_456_640 },
+        .{ 75_099_893_760, 90_652_495_872, 3_195_740_160, 18_750_701_568 },
+        .{ 74_567_270_400, 90_545_971_200, 0, 15_980_298_240 },
+        .{ 78_295_633_920, 90_545_971_200, 0, 12_252_610_560 },
+    }) |x| try std.testing.expect(untilFreedBound(billed, x[0], x[1], x[2], 40).grow >= x[3]);
     // poll5 (pass3bj): the drop test alone passes its first reading (2.788 GB down: 1.414 GB of the prompt's trailing
-    // releases + 1.374 of the 2.131 GB clear), above the bound by 1.579 GB; control1's settled reading 92,437,427,712
-    // (+ the grow 15.980 <= 108.963) is under it by 0.547 GB.
+    // releases + 1.374 of the 2.131 GB clear), above the bound by 1.585 GB; control1's settled reading 92,437,427,712
+    // (+ the grow 15.985 <= 108.963) is under it by 0.541 GB.
     const before: BoundaryMemory = .{ .active = 91_390_748_592, .cache = 2_130_798_984, .footprint = 97_351_005_792 };
     const early: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = 94_563_251_808 };
     const landed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = 92_437_427_712 };
@@ -2125,7 +2141,7 @@ test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a re
         try std.testing.expectEqual(@as(u32, 10), st.waited_ms);
         try std.testing.expectEqual(landed, st.after);
         try checkSettled(before, st.after, 0, uf.bound);
-        try std.testing.expectEqual(@as(i64, 547_129_416), @as(i64, @intCast(uf.bound)) - @as(i64, @intCast(st.after.footprint)));
+        try std.testing.expectEqual(@as(i64, 541_231_176), @as(i64, @intCast(uf.bound)) - @as(i64, @intCast(st.after.footprint)));
     }
     {
         // The settled arms' first reading passes at once (control1 112957, its own before).
