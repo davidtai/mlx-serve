@@ -39,7 +39,8 @@ const log = std.log.scoped(.dsv41);
 pub const Bill = struct {
     baseline: u64,
     /// The slot banks' geometry: routed layers, the transient rows (the prompt's: max_route_ids x wide depth; decode's:
-    /// `transientDecodeRows`), the layer's experts (the rows' cap).
+    /// `transientDecodeRows` at the release route the Module installs, `module.transientRelease`), the layer's experts
+    /// (the rows' cap).
     layers: u32 = 0,
     transient_rows: u64 = 0,
     transient_decode_rows: u64 = 0,
@@ -281,15 +282,6 @@ pub fn tightGroupStreams(fenced: bool, one_stream: bool) u64 {
     return if (one_stream) 1 else 2;
 }
 
-/// Whether the stream releases its transient windows past the first at the phase change (SERVED16: the integration
-/// lane's release at the PhaseGate, per-window MLX allocations freed before the grow). The declaration
-/// (`expert_stream.phase_change_releases_wide_windows`) lands with the release; a tree without it keeps every window
-/// through decode, and the bill with it.
-pub const stream_releases_wide_windows: bool = blk: {
-    if (!@hasDecl(expert_stream, "phase_change_releases_wide_windows")) break :blk false;
-    break :blk expert_stream.phase_change_releases_wide_windows;
-};
-
 /// Decode's own staging rows beside window 0 after the release (`expert_stream.decode_staging_rows`, declared with the
 /// release; 0 without the declaration).
 pub const stream_decode_staging_rows: u64 = blk: {
@@ -299,7 +291,9 @@ pub const stream_decode_staging_rows: u64 = blk: {
 
 /// Decode's transient rows: once the phase change releases the prompt's windows (the whole scratch freed, then window 0
 /// reallocated: decode's calls take at most max_route_ids ids), window 0 plus decode's staging rows; else every window
-/// the prompt's wide reads allocated.
+/// the prompt's wide reads allocated. `releases` is the route the Module installs (`module.transientRelease`: the
+/// stream's capability and the request's setting over the default, off since SERVED17), which `billAt` resolves from
+/// the same overrides the Module builds with, so one binary bills both arms.
 pub fn transientDecodeRows(wide_depth: u8, releases: bool, staging_rows: u64) u64 {
     return if (releases) xp.max_route_ids + staging_rows else @as(u64, wide_depth) * xp.max_route_ids;
 }
@@ -332,7 +326,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     // term into the host side; 9b's construction hid it behind ~0.64 GB of draft-head residents that load at the
     // first draft block, and SERVED10b's draft-block warm-up showed it (MLX active +642,935,748 B).
     const transient: u64 = @as(u64, opts.wide_depth) * xp.max_route_ids;
-    const transient_decode = transientDecodeRows(opts.wide_depth, stream_releases_wide_windows, stream_decode_staging_rows);
+    // Decode's: the release route the Module installs from these overrides (`Module.init` sets the stream's
+    // `transient_release` from the same resolver after `armOptions`).
+    const transient_decode = transientDecodeRows(opts.wide_depth, module.transientRelease(ov), stream_decode_staging_rows);
     var ck = try v41.Checkpoint.openIndexed(a, io, dir, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
@@ -680,24 +676,30 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
         .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 164 }, .on = .{ .prefill = 134, .decode = 164 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
     };
-    // With the stream's release declared (SERVED16), decode bills window 0 only: +5 decode rows at each baseline.
+    // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
+    // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 135, .decode = 169 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 134, .decode = 169 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
     };
-    for (if (stream_releases_wide_windows) window_0 else every_window) |w| {
-        config.memory_baseline_bytes = w.base;
-        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
-        // This tree's own route decision: off without the route's declarations, the served tier's with them.
-        try testing.expectEqual(if (engramPostedRoute(&config, .{}, &c)) posted else 0, b0.engram_posted);
-        b0.engram_posted = 0;
-        const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
-        b0.engram_posted = posted;
-        const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
-        std.debug.print("\nrows at baseline {d:.2} GB (target {d:.3} GB): posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, @as(f64, @floatFromInt(target)) / 1e9, off.prefill, off.decode, on.prefill, on.decode });
-        try testing.expectEqual(w.off, off);
-        try testing.expectEqual(w.on, on);
+    // The release route as the Module resolves it: the default (off), then each override.
+    for ([_]?bool{ null, false, true }) |route| {
+        const ov: module.RouteOverrides = .{ .transient_release = route };
+        for (if (module.transientRelease(ov)) window_0 else every_window) |w| {
+            config.memory_baseline_bytes = w.base;
+            var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, ov);
+            // This tree's own route decision: off without the route's declarations, the served tier's with them.
+            try testing.expectEqual(if (engramPostedRoute(&config, ov, &c)) posted else 0, b0.engram_posted);
+            b0.engram_posted = 0;
+            const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
+            b0.engram_posted = posted;
+            const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
+            const name = if (route) |r| (if (r) "on" else "off") else "default";
+            std.debug.print("\nrows at baseline {d:.2} GB (target {d:.3} GB, transient release {s}, {d} decode transient rows): posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, @as(f64, @floatFromInt(target)) / 1e9, name, b0.transient_decode_rows, off.prefill, off.decode, on.prefill, on.decode });
+            try testing.expectEqual(w.off, off);
+            try testing.expectEqual(w.on, on);
+        }
     }
     std.debug.print("\n", .{});
 }
@@ -767,8 +769,19 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
     // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
-    // Decode's transient rows: every window until the stream declares the phase change's release, window 0 after.
-    try testing.expectEqual(transientDecodeRows(opts.wide_depth, stream_releases_wide_windows, stream_decode_staging_rows), b.transient_decode_rows);
+    // Decode's transient rows follow the route the Module installs (`module.transientRelease`): the default (off)
+    // keeps every window; through billAt, the override off bills 240 rows and on bills window 0 (48, no staging rows),
+    // 2,556,592,128 B apart; the prompt's transient rows are the same on both routes.
+    try testing.expectEqual(transientDecodeRows(opts.wide_depth, module.transientRelease(.{}), stream_decode_staging_rows), b.transient_decode_rows);
+    try testing.expect(!module.transientRelease(.{}));
+    const route_off = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = false });
+    const route_on = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = true });
+    try testing.expectEqual(@as(u64, 240), route_off.transient_decode_rows);
+    try testing.expectEqual(@as(u64, 48), route_on.transient_decode_rows);
+    try testing.expectEqual(@as(u64, 2_556_592_128), route_off.slot_decode - route_on.slot_decode);
+    try testing.expectEqual(route_off.transient_rows, route_on.transient_rows);
+    try testing.expectEqual(route_off.slot_prefill, route_on.slot_prefill);
+    try testing.expectEqual(route_off.prefillTotal(), route_on.prefillTotal());
     try testing.expectEqual(@as(u64, 240), transientDecodeRows(5, false, 0));
     try testing.expectEqual(@as(u64, 48), transientDecodeRows(5, true, 0));
     // Decode's staging rows ride window 0 once declared (the release's commit declares 0).
@@ -802,10 +815,11 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
-        // The window release in both (this tree declares it); the fence at two streams (-2.68 GB) adds 5 prompt rows.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 135, .decode = 169 }, .tight = .{ .prefill = 140, .decode = 169 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 169 }, .tight = .{ .prefill = 139, .decode = 169 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        // The default route (the transient release off: every window through decode, SERVED17's arm 1 and -tight); the
+        // fence at two streams (-2.68 GB) adds 5 prompt rows.
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 135, .decode = 164 }, .tight = .{ .prefill = 140, .decode = 164 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 164 }, .tight = .{ .prefill = 139, .decode = 164 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 134, .decode = 163 }, .tight = .{ .prefill = 139, .decode = 163 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -822,7 +836,8 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
 
 // DSV41_BANK=<bank> (host): HEAD_MODE mxfp8 (cell arm 5) bills the head it runs: the dense bf16 head the Module drops
 // after construction (1,323,827,200 B) out of the residents, its codes and scales (682,598,400 B) in, net -641,228,800 B.
-// Arm 5's own fill therefore sits about a row a phase above the bf16 arm's.
+// Arm 5's own fill therefore sits about a row a phase above the bf16 arm's. Both at the default route (the transient
+// release off: every window through decode), as SERVED17's -mxfp8head arm runs.
 test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -843,9 +858,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 135, .decode = 169 }, .mxfp8 = .{ .prefill = 136, .decode = 170 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 169 }, .mxfp8 = .{ .prefill = 136, .decode = 170 } },
-        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 135, .decode = 164 }, .mxfp8 = .{ .prefill = 136, .decode = 165 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 164 }, .mxfp8 = .{ .prefill = 136, .decode = 165 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 134, .decode = 163 }, .mxfp8 = .{ .prefill = 135, .decode = 164 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -863,8 +878,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
 }
 
 // DSV41_BANK=<bank> (host): SERVED17's four arms, the bill's variant (the prompt's wave: four group streams or the
-// fence's two) against the transient release (decode's transient rows: every window, 240, or window 0, 48), forced
-// both ways whatever this tree declares. The variant moves only prompt rows, the release only decode rows.
+// fence's two) against the transient release (decode's transient rows: every window, 240, or window 0, 48), the
+// release through the route's override both ways (the cell's DSV41_CELL_TRANSIENT_RELEASE). The variant moves only
+// prompt rows, the release only decode rows.
 test "dsv41 memory: the four arms, variant by release, at the windows' baselines (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -886,16 +902,17 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
-        const b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
-        const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows);
-        const depth: u8 = @intCast(b0.transient_rows / xp.max_route_ids);
+        const by_route = [2]Bill{
+            try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = false }),
+            try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = true }),
+        };
+        try testing.expectEqual(@as(u64, 240), by_route[0].transient_decode_rows);
+        try testing.expectEqual(@as(u64, 48), by_route[1].transient_decode_rows);
         var got: [4]Rows = undefined;
-        for ([_]u64{ 4, 2 }, 0..) |streams, vi| for ([_]bool{ false, true }, 0..) |release, ri| {
-            var b = b0;
+        for ([_]u64{ 4, 2 }, 0..) |streams, vi| for (by_route, 0..) |br, ri| {
+            var b = br;
             b.engram_posted = posted;
             b.prefill_wave = pb.withGroupStreams(streams).layerMajorWaveBytes(fill_prompt_tokens, .served);
-            b.transient_decode_rows = transientDecodeRows(depth, release, 0);
-            b.slot_decode = (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec;
             got[vi * 2 + ri] = try fillRows(fillBillOf(b), target, b.n_experts);
         };
         std.debug.print("\nfour arms at baseline {d:.2} GB (posted gathers on): conservative release off {d} / {d}, on {d} / {d}; tight off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, got[0].prefill, got[0].decode, got[1].prefill, got[1].decode, got[2].prefill, got[2].decode, got[3].prefill, got[3].decode });
@@ -909,7 +926,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
 
 // DSV41_BANK=<bank> (host): the decode rows the phase change's window release returns (SERVED16). Decode keeps window 0
 // of the transient bank (48 rows) and gives windows 1..4 back (192 records, 2,556,592,128 B at depth 5); the prompt
-// phase is unchanged. The rows are the split's, whether or not this tree declares the release yet.
+// phase is unchanged. The rows are the release route's (`.transient_release = true`; the default is off).
 test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -929,11 +946,8 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
-        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
-        const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows);
-        const depth: u8 = @intCast(b0.transient_rows / xp.max_route_ids);
-        b0.transient_decode_rows = transientDecodeRows(depth, true, 0);
-        b0.slot_decode = (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows) * rec;
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = true });
+        try testing.expectEqual(@as(u64, 48), b0.transient_decode_rows);
         b0.engram_posted = 0;
         const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
         b0.engram_posted = posted;
