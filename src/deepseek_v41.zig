@@ -60,11 +60,11 @@ pub const PrefillBill = struct {
     joinless: ?JoinlessShape = null,
     /// The routed experts a layer has (`joinlessOutputsMax`).
     n_experts: u64 = 0,
-    /// The model's main taps evaluated in their chunk fences (`deepseek_v41_model.main_taps_in_chunk_fence`, ee80e40) and
-    /// the bill's tight variant: the routed group holds one hc-width f32 stream (mixed; next is kept_stream's old-or-new
-    /// stream), not four (without the fence the DSpark target layers' lazy taps pin their input streams: at layer 39
-    /// old37 + old38 + old39 beside next).
-    taps_fenced: bool = false,
+    /// The K16 routed group's hc-width f32 streams live at its peak (`groupStreams`): four without the main taps' chunk
+    /// fence (the DSpark target layers' lazy taps pin their input streams: at layer 39 old37 + old38 + old39 beside next),
+    /// two with it (ee80e40; SERVED16 measured the fence's drop at 2.787 GB: two streams freed, 2.684 GB, so one more than
+    /// the mixed stream stays live), one once the model declares that holder released.
+    group_streams: u64 = 4,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
@@ -93,15 +93,15 @@ pub const PrefillBill = struct {
         return x;
     }
 
-    pub fn withTapsFenced(b: PrefillBill, on: bool) PrefillBill {
+    pub fn withGroupStreams(b: PrefillBill, n: u64) PrefillBill {
         var x = b;
-        x.taps_fenced = on;
+        x.group_streams = n;
         return x;
     }
 
-    /// The routed group's hc-width f32 streams live at its peak (`taps_fenced`).
+    /// The routed group's hc-width f32 streams live at its peak (`group_streams`).
     pub fn groupStreams(b: PrefillBill) u64 {
-        return if (b.taps_fenced) 1 else 4;
+        return b.group_streams;
     }
 
     pub fn withJoinless(b: PrefillBill, shape: ?JoinlessShape) PrefillBill {
@@ -392,9 +392,11 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expectEqual(@as(u64, 2_013_265_920), b.joinedBytes(16384));
     try std.testing.expectEqual(@as(u64, 1_474_834_337), j.joinedBytes(16384));
     try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_474_834_337), j.layerMajorWaveBytes(16384, .served));
-    // The main taps in their chunk fences (ee80e40, the tight variant): one hc-width stream in the group, 9.53 -> 5.50 GB,
-    // under the attention side (5.58 GB), which then binds: the wave falls 3,950,230,945 B.
-    try std.testing.expectEqual(@as(u64, 3_950_230_945), j.layerMajorWaveBytes(16384, .served) - j.withTapsFenced(true).layerMajorWaveBytes(16384, .served));
+    // The main taps in their chunk fences (ee80e40, the tight variant). One hc-width stream (the holder released): 9.53 ->
+    // 5.50 GB, under the attention side (5.58 GB), which then binds: the wave falls 3,950,230,945 B.
+    // Two streams (the fence with SERVED16's holder): 9.53 -> 6.84 GB, the wave -2,684,354,560 B (SERVED16 measured -2.787).
+    try std.testing.expectEqual(@as(u64, 2_684_354_560), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(2).layerMajorWaveBytes(16384, .served));
+    try std.testing.expectEqual(@as(u64, 3_950_230_945), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(1).layerMajorWaveBytes(16384, .served));
     // Longer prompts make more row-closed waves: at a 65,104-row group (the chunk target's cap) the bound is 167.
     try std.testing.expectEqual(@as(u64, 48 + 108 + 9 + 2), j.joinlessOutputsMax(shape, 65_104 * 6));
 }
