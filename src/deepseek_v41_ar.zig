@@ -959,6 +959,8 @@ const CellReceipt = struct {
     phase_memory: ?[]const PhaseMemory = null,
     /// The phase change's readings before / after the frees and after the grow, the freed bytes, the reclaim time.
     phase_change: ?module.PhaseChangeRecord = null,
+    /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
+    phase_change_poll_ms: ?u32 = null,
     /// The verify-row routes the Module installed.
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -1301,6 +1303,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
         .phase_change = md.phase_change,
+        .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
@@ -1419,6 +1422,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
+    // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
+    if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
