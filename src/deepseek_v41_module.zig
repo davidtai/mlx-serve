@@ -111,6 +111,8 @@ pub const RouteOverrides = struct {
     decode_mxfp8_rows: ?bool = null,
     /// C22 moeshared: the shared expert's middle compiled at decode rows.
     decode_shared_mid: ?bool = null,
+    /// C22's memos at decode rows (rope tables, the window selection and shared compressed rows, b == 1 rows).
+    decode_memos: ?bool = null,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
@@ -319,6 +321,7 @@ pub const Module = struct {
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
+        if (ov.decode_memos) |v| tier.routes.decode_memos = v;
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
@@ -363,9 +366,10 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
+        self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.head_mode = self.model.tier.routes.head;
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
-        log.info("NATIVE decode dispatch fuse installed: shared middle {}", .{self.installed.decode_shared_mid});
+        log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
@@ -1005,6 +1009,8 @@ pub const Installed = struct {
     decode_mxfp8_rows: bool = false,
     /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
     decode_shared_mid: bool = false,
+    /// C22's memos, as installed.
+    decode_memos: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).
     head_mode: graph.Routes.Head = .f32,
 

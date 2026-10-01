@@ -107,7 +107,11 @@ pub const served: Tier = blk: {
     t.routes.rc_mxfp8_rows = true; // C29 MINVARIANT mxfp8 rows m1order (rows <= 8)
     t.routes.rc_index_topk = true; // C27 INDEX_TOPK=metal (rows <= 8)
     t.routes.rc_attn_softmax = true; // C23 ATTN_FUSE softmax (rows <= 8)
-    t.routes.shared_mid = true; // C22 DISPATCH_FUSE moeshared: the shared expert's middle compiled (rows <= 8)
+    // C22 at decode rows: moeshared (the shared expert's middle compiled) and the decode memos stay off by default. The
+    // best-known decode configuration is SERVED15's; SERVED16's decode regression is unattributed, so each is a
+    // one-factor arm (DSV41_CELL_DECODE_SHARED_MID=1, DSV41_CELL_DECODE_MEMOS=1) until a measured win flips it.
+    t.routes.shared_mid = false;
+    t.routes.decode_memos = false;
     break :blk t;
 };
 
