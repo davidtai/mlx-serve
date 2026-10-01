@@ -267,6 +267,20 @@ pub const model_taps_fenced: bool = blk: {
     break :blk mdl.main_taps_in_chunk_fence;
 };
 
+/// Whether this tree's model also releases the second stream SERVED16 measured live at the routed group's peak with the
+/// fence (the holder; the model lane declares it when released).
+pub const model_group_one_stream: bool = blk: {
+    if (!@hasDecl(mdl, "routed_group_one_stream")) break :blk false;
+    break :blk mdl.routed_group_one_stream;
+};
+
+/// The K16 routed group's live hc-width streams the tight variant bills: four without the fence, two with it (SERVED16's
+/// measured drop), one once the holder is declared released.
+pub fn tightGroupStreams(fenced: bool, one_stream: bool) u64 {
+    if (!fenced) return 4;
+    return if (one_stream) 1 else 2;
+}
+
 /// Whether the stream releases its transient windows past the first at the phase change (SERVED16: the integration
 /// lane's release at the PhaseGate, per-window MLX allocations freed before the grow). The declaration
 /// (`expert_stream.phase_change_releases_wide_windows`) lands with the release; a tree without it keeps every window
@@ -330,7 +344,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
     const variant = try billVariant();
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withTapsFenced(variant == .tight and model_taps_fenced);
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tightGroupStreams(model_taps_fenced, model_group_one_stream) else 4);
     const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
@@ -358,7 +372,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
         .prefill_wave = promptWave(bill, config.dsv41LayerMajor(), joinless, prompt_tokens),
         .variant = variant,
-        .prefill_wave_tight = promptWave(bill.withTapsFenced(model_taps_fenced), config.dsv41LayerMajor(), joinless, prompt_tokens),
+        .prefill_wave_tight = promptWave(bill.withGroupStreams(tightGroupStreams(model_taps_fenced, model_group_one_stream)), config.dsv41LayerMajor(), joinless, prompt_tokens),
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
         .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
         .prefill_cache = module.prefillCacheLimit(.served),
@@ -764,12 +778,16 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
 }
 
 // DSV41_BANK=<bank> (host): the bill's variants at the windows' baselines. Conservative (the default) bills the K16
-// routed group's four hc-width streams; tight bills one once the model declares its main taps fenced (ee80e40:
-// `main_taps_in_chunk_fence`). The tight rows are computed with the fence, whether or not this tree declares it.
+// routed group's four hc-width streams; tight bills two once the model declares its main taps fenced (ee80e40:
+// `main_taps_in_chunk_fence`; SERVED16 measured the second stream still live), one once it declares the holder released
+// (`routed_group_one_stream`). The tight rows are computed at two streams, whether or not this tree declares the fence.
 test "dsv41 memory: the bill's variants, conservative and tight, at the windows' baselines (bank)" {
     try testing.expectEqual(BillVariant.conservative, try parseBillVariant(null));
     try testing.expectEqual(BillVariant.tight, try parseBillVariant("tight"));
     try testing.expectError(error.BillVariantUnknown, parseBillVariant("loose"));
+    try testing.expectEqual(@as(u64, 4), tightGroupStreams(false, false));
+    try testing.expectEqual(@as(u64, 2), tightGroupStreams(true, false));
+    try testing.expectEqual(@as(u64, 1), tightGroupStreams(true, true));
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -781,13 +799,13 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withTapsFenced(true);
+    const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
-        // The window release in both (this tree declares it); the fenced taps' wave (-3.95 GB) adds 7-8 prompt rows.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 135, .decode = 169 }, .tight = .{ .prefill = 142, .decode = 169 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 169 }, .tight = .{ .prefill = 142, .decode = 169 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 141, .decode = 168 } },
+        // The window release in both (this tree declares it); the fence at two streams (-2.68 GB) adds 5 prompt rows.
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 135, .decode = 169 }, .tight = .{ .prefill = 140, .decode = 169 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 169 }, .tight = .{ .prefill = 139, .decode = 169 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -840,6 +858,51 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
         std.debug.print("\nhead modes at baseline {d:.2} GB (posted gathers on): bf16 {d} / {d}, mxfp8 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r5.prefill, r5.decode });
         try testing.expectEqual(w.bf16, r1);
         try testing.expectEqual(w.mxfp8, r5);
+    }
+    std.debug.print("\n", .{});
+}
+
+// DSV41_BANK=<bank> (host): SERVED17's four arms, the bill's variant (the prompt's wave: four group streams or the
+// fence's two) against the transient release (decode's transient rows: every window, 240, or window 0, 48), forced
+// both ways whatever this tree declares. The variant moves only prompt rows, the release only decode rows.
+test "dsv41 memory: the four arms, variant by release, at the windows' baselines (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
+    const pb = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape);
+    const Rows = arm_mod.NativeRows;
+    const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
+    for ([_]Want{
+        .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 135, .decode = 164 }, .cons_on = .{ .prefill = 135, .decode = 169 }, .tight_off = .{ .prefill = 140, .decode = 164 }, .tight_on = .{ .prefill = 140, .decode = 169 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 134, .decode = 164 }, .cons_on = .{ .prefill = 134, .decode = 169 }, .tight_off = .{ .prefill = 139, .decode = 164 }, .tight_on = .{ .prefill = 139, .decode = 169 } },
+        .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        const b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        const rec = b0.slot_decode / (@as(u64, b0.layers) * b0.decode_rows + b0.transient_decode_rows);
+        const depth: u8 = @intCast(b0.transient_rows / xp.max_route_ids);
+        var got: [4]Rows = undefined;
+        for ([_]u64{ 4, 2 }, 0..) |streams, vi| for ([_]bool{ false, true }, 0..) |release, ri| {
+            var b = b0;
+            b.engram_posted = posted;
+            b.prefill_wave = pb.withGroupStreams(streams).layerMajorWaveBytes(fill_prompt_tokens, .served);
+            b.transient_decode_rows = transientDecodeRows(depth, release, 0);
+            b.slot_decode = (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec;
+            got[vi * 2 + ri] = try fillRows(fillBillOf(b), target, b.n_experts);
+        };
+        std.debug.print("\nfour arms at baseline {d:.2} GB (posted gathers on): conservative release off {d} / {d}, on {d} / {d}; tight off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, got[0].prefill, got[0].decode, got[1].prefill, got[1].decode, got[2].prefill, got[2].decode, got[3].prefill, got[3].decode });
+        try testing.expectEqual(w.cons_off, got[0]);
+        try testing.expectEqual(w.cons_on, got[1]);
+        try testing.expectEqual(w.tight_off, got[2]);
+        try testing.expectEqual(w.tight_on, got[3]);
     }
     std.debug.print("\n", .{});
 }
