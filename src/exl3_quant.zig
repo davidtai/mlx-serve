@@ -2965,7 +2965,8 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
 }
 
 // DSV41_PHASE0B_MLX=1 and DSV41_BANK, lock-held (seconds, under 2 GB of device memory: 16 slot rows and one wave's
-// act / x / z). The table-codebook gate|up text against the 128-row text on real records.
+// act / x / z). The table-codebook gate|up text against the 128-row text on real records; the gate|up texts' tail tiles
+// priced (lever 3).
 test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 128-row text's on real records, bit for bit; microbench and sweep" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse {
@@ -3027,14 +3028,17 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
     const dig = DigX(G).init(&set.reg);
+    // the gate|up GEMM texts: the 64-row text, the 128-row text, the table-codebook text
+    const Text = enum { m64, m128, lut };
     const Wave = struct {
         rows: u32,
         x0: G.T,
         x1: G.T,
         gu: DigTable,
+        gu64: DigTable,
 
         /// A wave's rows grouped by expert in order (expert j at real record `refs_[j]`), its gate|up inputs from the
-        /// routed chain: x0 / x1 = take2(act); the 128-row table.
+        /// routed chain: x0 / x1 = take2(act); its tables at 128 and 64 rows.
         fn init(al: Allocator, gg: *G, per: []const u32, refs_: []const es.SlotRef, d: DigX(G), bank_: anytype, seed: u64) !@This() {
             var ex: [wave_max]WaveExpert = undefined;
             var n: u32 = 0;
@@ -3069,14 +3073,24 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
             const tbl = try gg.hostArray(std.mem.sliceAsBytes(&gu.table), &.{80}, .int32);
             const x = try d.take2(gg, act, ridx_a, rhs_a, tbl, bank_.gate.rin, bank_.up.rin);
             try gg.evalAll(&.{ x[0], x[1] });
-            return .{ .rows = n, .x0 = x[0], .x1 = x[1], .gu = gu };
+            return .{ .rows = n, .x0 = x[0], .x1 = x[1], .gu = gu, .gu64 = digTableBm(ex[0..per.len], d.digTiles(.gate_up), 64) };
         }
 
-        /// The gate|up GEMM through the 128-row text, or (`lut`) the table-codebook text.
-        fn gemm(w: *const @This(), gg: *G, d: DigX(G), bank_: anytype, lut: bool) ![2]G.T {
-            const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.gu.table), &.{80}, .int32);
-            if (lut) return d.gemmGateUpLut(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, w.gu.tgs);
-            return d.gemmGateUp(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, w.gu.tgs);
+        /// The gate|up GEMM through `text`, over its own table.
+        fn gemm(w: *const @This(), gg: *G, d: DigX(G), bank_: anytype, text: Text) ![2]G.T {
+            const t = if (text == .m64) &w.gu64 else &w.gu;
+            const tbl = try gg.hostArray(std.mem.sliceAsBytes(&t.table), &.{80}, .int32);
+            switch (text) {
+                .m64 => {
+                    var vars = rowsVars(w.rows);
+                    vars.set(.tgs, t.tgs);
+                    var out: [2]G.T = undefined;
+                    try launchRule(G, gg, d.gemm_gu, &vars, &.{ w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl }, &out);
+                    return out;
+                },
+                .m128 => return d.gemmGateUp(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, t.tgs),
+                .lut => return d.gemmGateUpLut(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, t.tgs),
+            }
         }
     };
     const k16 = [_]u32{ 256, 256, 256, 256, 256, 256, 256, 256 };
@@ -3085,8 +3099,8 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         const m = g.mark();
         defer g.resetTo(m);
         const w = try Wave.init(a, &g, per, rf, dig, ba, 0x7a17 + wi);
-        const z = try w.gemm(&g, dig, ba, false);
-        const zl = try w.gemm(&g, dig, ba, true);
+        const z = try w.gemm(&g, dig, ba, .m128);
+        const zl = try w.gemm(&g, dig, ba, .lut);
         try g.evalAll(&.{ z[0], z[1], zl[0], zl[1] });
         var words: usize = 0;
         var mismatch: usize = 0;
@@ -3111,7 +3125,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
     //    (DIGX_GEMM_SWEEP)
     const Time = struct {
         /// The best of 5 timed runs (after a warm one) of 8 launches of one text, per launch.
-        fn best(gg: *G, io_: std.Io, w: anytype, d: DigX(G), bank_: anytype, lut: bool) !struct { eval: u64, host: u64 } {
+        fn best(gg: *G, io_: std.Io, w: anytype, d: DigX(G), bank_: anytype, text: Text) !struct { eval: u64, host: u64 } {
             var best_eval: u64 = std.math.maxInt(u64);
             var best_host: u64 = std.math.maxInt(u64);
             for (0..6) |run| {
@@ -3120,7 +3134,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
                 var outs: [16]G.T = undefined;
                 const t0 = std.Io.Timestamp.now(io_, .boot);
                 for (0..8) |q| {
-                    const o = try w.gemm(gg, d, bank_, lut);
+                    const o = try w.gemm(gg, d, bank_, text);
                     outs[2 * q] = o[0];
                     outs[2 * q + 1] = o[1];
                 }
@@ -3140,9 +3154,9 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         const m = g.mark();
         defer g.resetTo(m);
         const w = try Wave.init(a, &g, per, rf, dig, ba, 0xbe7c);
-        for ([_]bool{ false, true }) |lut| {
-            const t = try Time.best(&g, io, &w, dig, ba, lut);
-            const kname = if (lut) @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut) else @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128);
+        for ([_]Text{ .m128, .lut }) |text| {
+            const t = try Time.best(&g, io, &w, dig, ba, text);
+            const kname = if (text == .lut) @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut) else @tagName(Kernel.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128);
             std.debug.print("DIGX_WAVE_MICROBENCH {{\"kernel\": \"{s}\", \"rows\": {d}, \"us\": {d:.1}, \"host_us\": {d:.1}}}\n", .{ kname, w.rows, @as(f64, @floatFromInt(t.eval)) / 1000.0, @as(f64, @floatFromInt(t.host)) / 1000.0 });
         }
     }
@@ -3151,9 +3165,26 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         defer g.resetTo(m);
         const per = [_]u32{ r, r, r, r, r, r, r, r };
         const w = try Wave.init(a, &g, &per, rf, dig, ba, 0x5eeb);
-        for ([_]bool{ false, true }) |lut| {
-            const t = try Time.best(&g, io, &w, dig, ba, lut);
-            std.debug.print("DIGX_GEMM_SWEEP {{\"gemm\": \"{s}\", \"experts\": 8, \"rows_per_expert\": {d}, \"us\": {d:.1}}}\n", .{ if (lut) "gate_up_lut" else "gate_up", r, @as(f64, @floatFromInt(t.eval)) / 1000.0 });
+        for ([_]Text{ .m128, .lut }) |text| {
+            const t = try Time.best(&g, io, &w, dig, ba, text);
+            std.debug.print("DIGX_GEMM_SWEEP {{\"gemm\": \"{s}\", \"experts\": 8, \"rows_per_expert\": {d}, \"us\": {d:.1}}}\n", .{ if (text == .lut) "gate_up_lut" else "gate_up", r, @as(f64, @floatFromInt(t.eval)) / 1000.0 });
+        }
+    }
+    // 4. tail tiles (lever 3's pricing): the 64-row, 128-row and table texts at 8 experts x 33 / 48 / 64 / 96 / 128 / 256
+    //    rows (DIGX_TAIL_SWEEP); a tail tile's cost = (the wave - the full tiles at the 8 x 256 wave's per-tile cost) / tails
+    for ([_]u32{ 33, 48, 64, 96, 128, 256 }) |r| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const per = [_]u32{ r, r, r, r, r, r, r, r };
+        const w = try Wave.init(a, &g, &per, rf, dig, ba, 0x7a11);
+        for ([_]Text{ .m64, .m128, .lut }) |text| {
+            const t = try Time.best(&g, io, &w, dig, ba, text);
+            const gname = switch (text) {
+                .m64 => "gate_up_m64",
+                .m128 => "gate_up",
+                .lut => "gate_up_lut",
+            };
+            std.debug.print("DIGX_TAIL_SWEEP {{\"gemm\": \"{s}\", \"experts\": 8, \"rows_per_expert\": {d}, \"us\": {d:.1}}}\n", .{ gname, r, @as(f64, @floatFromInt(t.eval)) / 1000.0 });
         }
     }
 }
