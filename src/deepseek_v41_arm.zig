@@ -34,6 +34,7 @@ const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
 const expert_policy = @import("sdk").expert.policy;
 const dspark_head = @import("deepseek_v41_dspark_head.zig");
+const prefill_timers = @import("dsv41_prefill_timers.zig");
 
 /// The receipt's `decode_binding`: which loop drove the cell.
 pub const DecodeBinding = enum { stand_in, dspark };
@@ -401,7 +402,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_release = opt.transient_release,
                 .grow_fill = opt.grow_fill,
                 .first_verify_warm = opt.first_verify_warm,
-                .decode_pool = opt.decode_pool,
+                .read_ahead_probe = if (comptime expert_stream.read_ahead_probed) .{ .barrier = prefill_timers.readAheadBarrier, .admission = prefill_timers.readAheadAdmission, .posted = prefill_timers.readAheadPosted } else {},
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);

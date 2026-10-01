@@ -8,7 +8,7 @@
 const std = @import("std");
 const sdk = @import("sdk");
 /// PROFILE builds only (`-Ddsv41-prefill-timers=true`): P1's read-ahead record; every call compiles to nothing otherwise.
-const prof = @import("dsv41_prefill_timers.zig");
+const bo = @import("build_options");
 const mlx = @import("mlx");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = sdk.expert.io;
@@ -305,73 +305,29 @@ pub const Options = struct {
     first_verify_warm: ?FirstVerifyWarm = null,
     /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
     grow_fill: GrowFill = .zeros,
-    /// Option (b): decode rows re-owned between layers once, from decode's own misses (`DecodePool`); null: off.
-    decode_pool: ?DecodePool = null,
-};
-
-/// Option (b) (#23, decode_first16): at the grow each layer keeps `per_layer` of its decode rows as POOL slots, rows of
-/// decode's window 0 (the shared transient bank every layer binds; window 0 is allocated `per_layer` x layers rows
-/// larger, each layer's ext as many smaller: the same bytes). At the end of cycle `at_cycle` (after its flush) the
-/// pool rows are re-owned by the bounded top-K over each layer's own misses in cycles `from_cycle`..`at_cycle`
-/// (row r of layer l worth m_l / r^3; rows in [U - per_layer, U + per_layer], total layers x U): owner changes only,
-/// no allocation, no record moved. The three numbers are static geometry, not tuned on any prompt.
-pub const DecodePool = struct { per_layer: u32 = 20, from_cycle: u32 = 2, at_cycle: u32 = 17 };
-
-/// One extra row of a layer as option (b) values it.
-pub const PoolCand = struct { m: u64, row: u32, layer: u32 };
-
-/// Option (b)'s rows: each layer keeps `floor[l]`; every further row r <= min(n_experts, uniform + per_layer) of
-/// layer l is worth m[l] / r^3; the top layers x uniform - sum floor win (value desc, then row asc, then layer asc).
-/// Equal misses everywhere give exactly `uniform` when the floors are equal.
-pub fn poolRows(cands: []PoolCand, m: []const u64, floor: []const u32, uniform: u32, per_layer: u32, n_experts: u32, out: []u32) void {
-    var k: u64 = @as(u64, out.len) * uniform;
-    var n: usize = 0;
-    for (out, m, floor, 0..) |*o, ml, lo, l| {
-        o.* = lo;
-        k -= lo;
-        var r = lo + 1;
-        while (r <= @min(n_experts, uniform + per_layer)) : (r += 1) {
-            cands[n] = .{ .m = ml, .row = r, .layer = @intCast(l) };
-            n += 1;
-        }
-    }
-    std.sort.pdq(PoolCand, cands[0..n], {}, struct {
-        fn lt(_: void, x: PoolCand, y: PoolCand) bool {
-            const rx: u128 = x.row;
-            const ry: u128 = y.row;
-            const vx = @as(u128, x.m) * ry * ry * ry;
-            const vy = @as(u128, y.m) * rx * rx * rx;
-            if (vx != vy) return vx > vy;
-            if (x.row != y.row) return x.row < y.row;
-            return x.layer < y.layer;
-        }
-    }.lt);
-    for (cands[0..@intCast(k)]) |c| out[c.layer] += 1;
-}
-
-/// Option (b)'s state in a Stream.
-const DPool = struct {
-    cfg: DecodePool,
-    /// [layers x 2 per_layer]: each layer's pool table (`LayerSlots.pool` is its slice).
-    table: []u32,
-    /// Window 0's first pool row (the scratch and staging rows come first).
-    row0: u32 = 0,
-    cycle: u32 = 0,
-    done: bool = false,
-    /// Misses at the end of cycle from_cycle - 1, then over from_cycle..at_cycle (the rule's input).
-    base: []u64,
-    first: []u64,
-    /// Each layer's rows after the re-plan.
-    rows: []u32,
-    floor: []u32,
-    cands: []PoolCand,
-    free: std.ArrayList(u32) = .empty,
+    /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
+    read_ahead_probe: ProbeSlot = no_probe,
 };
 
 /// The grow's new rows: `zeros` evaluates MLX zeros (a GPU fill of every row); `unfilled` takes MLX-owned buffers without
 /// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
 /// every record lands by its read into the row before that state is set.
 pub const GrowFill = enum { zeros, unfilled };
+
+/// G7: the prompt pass's read-ahead records, in the package's prefill-timers build only: the arch that builds the
+/// stream hands it these probes; every other build has no field, call or branch for them.
+pub const read_ahead_probed: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;
+pub const ReadAheadProbe = struct {
+    /// At a layer's barrier: the records read ahead that its call routed, and its seed (the demand records).
+    barrier: *const fn (layer: u32, hits: u32, seed: *const std.DynamicBitSetUnmanaged) void,
+    /// At the read-ahead's admission: the predicted seed's top (hottest first, as many as the unprotected rows), the
+    /// records admitted, and those neither resident nor admitted.
+    admission: *const fn (layer: u32, top: []const u16, admitted: u32, blocked: u32) void,
+    /// Records posted to the reader.
+    posted: *const fn (layer: u32, n: u32) void,
+};
+const ProbeSlot = if (read_ahead_probed) ?ReadAheadProbe else void;
+const no_probe: ProbeSlot = if (read_ahead_probed) null else {};
 
 /// A0 (a)'s budget: at most `max_records` warm records (layer-major: the earliest layers first) and the jobs the
 /// reader may run at once while demand is idle (`expert_io.Warm.busy_max`; below the worker count, so one stays free).
@@ -486,6 +442,8 @@ pub const Stream = struct {
     /// The prompt phase's scratch rows and windows (`Options`): `regrowTransient` re-creates them for a later prompt.
     prompt_transient_rows: u32 = 0,
     prompt_wide_depth: u8 = 1,
+    /// G7: the arch's read-ahead records (`Options.read_ahead_probe`).
+    probe: ProbeSlot = no_probe,
     memory: SlotMemory = .host,
     max_route_ids: u32,
     records_per_part: u32,
@@ -723,8 +681,7 @@ pub const Stream = struct {
             .grow_fill = opt.grow_fill,
             .prompt_transient_rows = opt.transient_rows,
             .prompt_wide_depth = opt.wide_depth,
-            .layer_misses = layer_misses,
-            .dpool = dpool,
+            .probe = opt.read_ahead_probe,
             .memory = opt.slot_memory,
             .max_route_ids = opt.max_route_ids,
             .records_per_part = opt.records_per_part,
@@ -898,22 +855,12 @@ pub const Stream = struct {
         ah.tallied = true;
         for (ah.loads[0..ah.n]) |l| self.counters.ahead_hits += @intFromBool(policy.call_counts[l.expert] > 0);
         self.counters.ahead_demand += policy.seed.count();
-        if (comptime prof.enabled) {
-            // The layer's barrier record: hits, and each demand record's predicted count against the cut.
+        if (comptime read_ahead_probed) if (self.probe) |pr| {
+            // The layer's barrier record: hits, and the seed's demand records.
             var hits: u32 = 0;
             for (ah.loads[0..ah.n]) |l| hits += @intFromBool(policy.call_counts[l.expert] > 0);
-            var near: u32 = 0;
-            var far: u32 = 0;
-            if (layer < prof.max_layers) {
-                const cut = prof.ra[layer].cut;
-                var it = policy.seed.iterator(.{});
-                while (it.next()) |e| {
-                    const pc = if (e < prof.max_experts) prof.ra_counts[layer][e] else 0;
-                    if (prof.nearCut(pc, cut)) near += 1 else far += 1;
-                }
-            }
-            prof.recordBarrier(layer, hits, @intCast(policy.seed.count()), near, far);
-        }
+            pr.barrier(layer, hits, &policy.seed);
+        };
     }
 
     /// Resolves `ids` (the router's top-k of one layer call, host values read
@@ -1191,7 +1138,7 @@ pub const Stream = struct {
         const ah = &self.ahead;
         const fit = @min(ah.loads.len, (self.pool.published.len - self.pool.auxTickets() - 2 * expert_io.max_items) / 2);
         const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
-        if (comptime prof.enabled) {
+        if (comptime read_ahead_probed) if (self.probe) |pr| {
             // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
             // those neither resident nor admitted (no empty row: every row held by a resident, the read-ahead never evicts).
             const pol = &self.layers[layer].policy;
@@ -1199,9 +1146,8 @@ pub const Stream = struct {
             const top = experts[0..@min(experts.len, room)];
             var blocked: u32 = 0;
             for (top) |e| blocked += @intFromBool(pol.slotOf(e) == null);
-            const cut: u32 = if (top.len > 0 and layer < prof.max_layers and top[top.len - 1] < prof.max_experts) prof.ra_counts[layer][top[top.len - 1]] else 0;
-            prof.recordAdmission(layer, @intCast(top.len), @intCast(admitted.len), blocked, cut);
-        }
+            pr.admission(layer, top, @intCast(admitted.len), blocked);
+        };
         const n: u32 = @intCast(admitted.len);
         ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts };
         if (n == 0) return;
@@ -1239,7 +1185,7 @@ pub const Stream = struct {
                 part.ticket = expert_bank.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                 part.n_reads = nr;
                 self.counters.ahead_posted += nr;
-                prof.addPosted(layer, nr);
+                if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, nr);
             } else part.settled = true;
             ah.parts[ah.n_parts] = part;
             ah.n_parts += 1;

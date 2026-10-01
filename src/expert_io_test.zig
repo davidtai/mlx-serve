@@ -813,9 +813,8 @@ test "dsv41 io: qos: a claimed speculative record's worker runs at the demand cl
     defer pool.stop();
     defer clearFaults();
     const base: u64 = 20 * page;
-<<<<<<< HEAD:src/expert_io.zig
     injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 800 * std.time.ns_per_ms, 800 * std.time.ns_per_ms });
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, rec));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, rec));
     const SpecQos = struct {
         fn of() ?c_uint {
             var list: [*]ThreadProbe.mach_port_t = undefined;
@@ -838,37 +837,12 @@ test "dsv41 io: qos: a claimed speculative record's worker runs at the demand cl
     try testing.expectEqual(@as(i64, 0), pool.counter(.claimed));
     var d = try Dests.init(1, &spec_lens);
     defer testing.allocator.free(d.buf);
-    const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
     if (pool.counter(.spec_chunks) >= 2) {
         // The claim landed after the second chunk ended (the test thread stalled > 800 ms): no boundary left to promote at.
         std.debug.print("QOSPROBE skipped: the claim came after the second chunk (box loaded)\n", .{});
         try pool.wait(first, 2, 10 * std.time.ns_per_s);
         return error.SkipZigTest;
-=======
-    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 200 * std.time.ns_per_ms, 200 * std.time.ns_per_ms });
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, rec));
-    std.Io.sleep(testing.io, .fromMilliseconds(60), .awake) catch {};
-    const unclaimed = ThreadProbe.scan("spec unclaimed");
-    try testing.expectEqual(@as(u32, 1), unclaimed.spec_utility);
-    var d = try Dests.init(1, &spec_lens);
-    defer testing.allocator.free(d.buf);
-    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
-    // Past the second chunk's end: the third chunk runs claimed.
-    std.Io.sleep(testing.io, .fromMilliseconds(250), .awake) catch {};
-    var list: [*]ThreadProbe.mach_port_t = undefined;
-    var n: u32 = 0;
-    try testing.expectEqual(@as(c_int, 0), ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n));
-    var found = false;
-    for (list[0..n]) |port| {
-        const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
-        var name: [64]u8 = @splat(0);
-        _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
-        if (!std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) continue;
-        const q = ThreadProbe.qosOf(t);
-        std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{q});
-        try testing.expectEqual(ThreadProbe.user_interactive, q);
-        found = true;
->>>>>>> 0e76e1c3 (sdk.expert: the reader and the event gate move into the SDK; one record topology per source, uncached fds only (S5)):src/expert_io_test.zig
     }
     // Claimed: the worker reaches USER_INTERACTIVE before its third (claimed) chunk ends.
     var seen: ?c_uint = null;

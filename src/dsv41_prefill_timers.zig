@@ -106,6 +106,33 @@ pub inline fn recordBarrier(layer: usize, hits: u32, demand: u32, near: u32, far
     r.far = far;
 }
 
+/// The stream's read-ahead probes (`expert_stream.ReadAheadProbe`, G7): the source hands over what it saw; the
+/// predictor's counts, the cut and the near / far bands are this file's.
+pub fn readAheadBarrier(layer: u32, hits: u32, seed: *const std.DynamicBitSetUnmanaged) void {
+    if (comptime !enabled) return;
+    var near: u32 = 0;
+    var far: u32 = 0;
+    if (layer < max_layers) {
+        const cut = ra[layer].cut;
+        var it = seed.iterator(.{});
+        while (it.next()) |e| {
+            const pc = if (e < max_experts) ra_counts[layer][e] else 0;
+            if (nearCut(pc, cut)) near += 1 else far += 1;
+        }
+    }
+    recordBarrier(layer, hits, @intCast(seed.count()), near, far);
+}
+
+pub fn readAheadAdmission(layer: u32, top: []const u16, admitted: u32, blocked: u32) void {
+    if (comptime !enabled) return;
+    const cut: u32 = if (top.len > 0 and layer < max_layers and top[top.len - 1] < max_experts) ra_counts[layer][top[top.len - 1]] else 0;
+    recordAdmission(layer, @intCast(top.len), admitted, blocked, cut);
+}
+
+pub fn readAheadPosted(layer: u32, n: u32) void {
+    addPosted(layer, n);
+}
+
 /// A demand record's band: its predicted count within x0.8-1.25 of the cut (near), else far.
 pub fn nearCut(predicted: u32, cut: u32) bool {
     return cut > 0 and @as(u64, predicted) * 5 >= @as(u64, cut) * 4 and @as(u64, predicted) * 4 <= @as(u64, cut) * 5;
