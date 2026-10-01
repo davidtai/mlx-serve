@@ -14610,8 +14610,8 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
-    /// The request's shape, set once by the Generator before its first forward: a registered arch's prompt pass
-    /// derives its reservation from it (and refuses by name without it).
+    /// The request's shape, set once by whoever starts a request (Generator.init, each warm-up pass) before its
+    /// first forward: a registered arch's prompt pass derives its reservation from it (and refuses by name without it).
     request: ?sdk.RequestShape = null,
     /// An additive attention term composed into the standard PREFILL path's
     /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
@@ -19398,6 +19398,19 @@ pub const Transformer = struct {
         };
     }
 
+    /// The warm-up's passes, in order: [1, 1] (the decode shape: faults the embedding, compiles the decode
+    /// kernels), then [1, 8] (compiles the short-prefill kernels).
+    pub const warmup_passes = [_]u32{ 1, 8 };
+
+    /// A warm-up pass is a request of its own: `prompt_tokens` ids on the shell's own cache, nothing generated. A
+    /// registered arch's prompt pass reserves from this shape (deepseek_v41 reserves nothing); every other forward
+    /// reads only the default context.
+    pub fn warmupCtx(self: *Transformer, prompt_tokens: u32) ForwardCtx {
+        var ctx = self.defaultCtx();
+        ctx.request = .{ .prompt_tokens = prompt_tokens, .max_tokens = 0, .host_context = self.config.max_position_embeddings };
+        return ctx;
+    }
+
     /// Archs whose per-request decode state lives on their OWN module — one
     /// instance per MODEL, not one per slot — instead of in this shell's
     /// KVCache/ssm_entries. Every member is by construction single-flight at
@@ -19628,53 +19641,34 @@ pub const Transformer = struct {
 
     /// Pre-fault weight pages and trigger first-touch kernel compiles before
     /// the first real request so cold prefill doesn't pay 800+ms of GPU page
-    /// faulting (measured on Gemma 4 E4B 4-bit). Runs three forward passes:
-    ///   1. [1, 1] decode-shape: faults embed matrix + compiles decode kernel
-    ///   2. [1, 8] prefill-shape: compiles short-prefill kernel
-    /// then resets the cache so the first real request starts from clean state.
+    /// faulting (measured on Gemma 4 E4B 4-bit). Runs `warmup_passes` in order,
+    /// each a request of its own (`warmupCtx`), and resets the cache after
+    /// each: the next pass exercises the cold-init path, not the partial-cache
+    /// path, and the first real request starts from clean state.
     /// Idempotent — calling twice is wasted work but not incorrect.
     pub fn warmup(self: *Transformer) !void {
-        const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
-        const decode_shape = [_]c_int{ 1, 1 };
-        const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(decode_input);
-        const decode_logits = try self.forward(decode_input);
-        _ = mlx.mlx_array_free(decode_logits);
-        // Materialize the cache update so subsequent forwards see initialized entries.
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (self.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+        const ids: [8]i32 = @splat(0); // BOS-ish placeholders; the actual ids don't matter for warmup
+        for (warmup_passes) |n| {
+            const shape = [_]c_int{ 1, @intCast(n) };
+            const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(input);
+            var ctx = self.warmupCtx(n);
+            const logits = try self.forwardWith(&ctx, input);
+            _ = mlx.mlx_array_free(logits);
+            // Materialize the cache update so subsequent forwards see initialized entries.
+            {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                for (self.cache.entries) |*entry| {
+                    if (!entry.initialized) continue;
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                }
+                _ = mlx.mlx_eval(eval_vec);
             }
-            _ = mlx.mlx_eval(eval_vec);
+            _ = mlx.mlx_clear_cache();
+            try self.resetCache();
         }
-        _ = mlx.mlx_clear_cache();
-
-        // Reset before the prefill-shape pass so we exercise the cold-init path,
-        // not the partial-cache path.
-        try self.resetCache();
-
-        const ids_8 = [_]i32{ 0, 0, 0, 0, 0, 0, 0, 0 };
-        const prefill_shape = [_]c_int{ 1, 8 };
-        const prefill_input = mlx.mlx_array_new_data(&ids_8, &prefill_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(prefill_input);
-        const prefill_logits = try self.forward(prefill_input);
-        _ = mlx.mlx_array_free(prefill_logits);
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (self.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
-            }
-            _ = mlx.mlx_eval(eval_vec);
-        }
-        _ = mlx.mlx_clear_cache();
-        try self.resetCache();
     }
 
     // A throw-away slot for the spec warm-up: its own KV, SSM entries and context, so nothing
@@ -42493,9 +42487,18 @@ fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     return t;
 }
 
-/// The prompt at `cache.step == 0` (a fresh request, its shape set by the Generator), later positions after it;
+/// What a registered arch's forward runs at this context: its prompt pass, with the request's shape, at a fresh request
+/// (`cache.step == 0`); its step after it (null). A prompt pass without the request's shape is refused by name: every
+/// caller that starts a request states it (Generator.init, each warm-up pass).
+fn archPass(ctx: *const ForwardCtx) error{RequestShapeMissing}!?sdk.RequestShape {
+    if (ctx.cache.step != 0) return null;
+    return ctx.request orelse error.RequestShapeMissing;
+}
+
+/// The prompt at `cache.step == 0` (a fresh request, its shape set by whoever started it), later positions after it;
 /// the last row's logits as rank-3 [1, 1, vocab] f32 (callers slice the last position).
 fn forwardArch(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, a: sdk.ArchInstance) !mlx.mlx_array {
+    const prompt = try archPass(ctx);
     const n = mlx.mlx_array_size(token_ids);
     var ids32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids32);
@@ -42505,10 +42508,7 @@ fn forwardArch(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, a
     const ids = try self.allocator.alloc(u32, n);
     defer self.allocator.free(ids);
     for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
-    const logits = if (ctx.cache.step == 0)
-        try a.vt.prefill(a.module, ids, ctx.request orelse return error.RequestShapeMissing)
-    else
-        try a.vt.step(a.module, ids);
+    const logits = if (prompt) |req| try a.vt.prefill(a.module, ids, req) else try a.vt.step(a.module, ids);
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;
     var f32_logits = mlx.mlx_array_new();
@@ -61923,6 +61923,32 @@ test "dsv41 handover: the decode handover reaches a registered arch that takes o
     try testing.expect(!xfm.decodeHandoverWanted());
     try xfm.decodeHandover(h);
     try testing.expectEqual(@as(u32, 1), Fake.calls.handover);
+}
+
+test "dsv41 warmup: each warm-up pass is a request of its own, so a registered arch's prompt pass gets its shape" {
+    // The warm-up once forwarded on the default context: a registered arch refused its first pass by name
+    // (RequestShapeMissing) and every load logged "Warmup failed". MLX arrays are off limits on the host, so this
+    // pins the passes and the contexts `warmup` runs them on, and the decision `forwardArch` makes from each.
+    var t: Transformer = undefined;
+    t.cache.step = 0;
+    t.moe_seq_offset = 0;
+    t.ssm_entries = null;
+    t.capture_hidden = null;
+    t.vision_embeddings = null;
+    t.config.max_position_embeddings = 163_840;
+    try testing.expectEqualSlices(u32, &.{ 1, 8 }, &Transformer.warmup_passes);
+    for (Transformer.warmup_passes) |n| {
+        const ctx = t.warmupCtx(n);
+        try testing.expect(ctx.cache == &t.cache and ctx.moe_seq_offset == &t.moe_seq_offset);
+        try testing.expectEqual(sdk.RequestShape{ .prompt_tokens = n, .max_tokens = 0, .host_context = 163_840 }, (try archPass(&ctx)).?);
+    }
+    // The default context states no request: a prompt pass refuses by name, a step needs none.
+    const plain = t.defaultCtx();
+    try testing.expectError(error.RequestShapeMissing, archPass(&plain));
+    t.cache.step = 1;
+    try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&plain));
+    const later = t.warmupCtx(8);
+    try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&later));
 }
 
 test "every generative forward arm splices vision embeddings" {
