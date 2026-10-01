@@ -17,6 +17,7 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const model_io = @import("model.zig");
+const sdk = @import("sdk");
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -629,7 +630,8 @@ pub const Module = struct {
             }
             self.fill_target = target;
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
-            admitPhases(b, self.fill_target) catch |e| {
+            const mb = try bill_mod.memoryBill(arena.allocator(), b);
+            sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
                 log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
                 return e;
             };
@@ -930,10 +932,10 @@ pub const Module = struct {
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
-        if (b.prefill_rows != rows.prefill or b.decode_rows != rows.decode) {
+        sdk.checkRows(.{ .prompt = b.prefill_rows, .decode = b.decode_rows }, .{ .prompt = rows.prefill, .decode = rows.decode }) catch |e| {
             log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
-            return error.BillRowsMismatch;
-        }
+            return e;
+        };
         self.bill = b;
         // The footprint the module keeps: every command retired (their completion handlers hand the buffers
         // they held to MLX's cache), then the cache cleared. SERVED9 (pass3an) read it with the fence's
@@ -942,15 +944,22 @@ pub const Module = struct {
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         const measured = status.footprint().now;
-        const billed = b.constructionTerms().sum();
+        const mb = try bill_mod.memoryBill(arena.allocator(), b);
+        const billed = mb.constructionBytes(b.prefill_rows);
         var mlx_active: usize = 0;
         var mlx_cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&mlx_active);
         _ = mlx.mlx_get_cache_memory(&mlx_cache);
         log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
         log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
-        checkConstructionBytes(billed, measured) catch |e| {
+        sdk.checkConstruction(billed, measured, construction_tolerance_bytes) catch |e| {
             log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
+            return e;
+        };
+        // The bill's measured bound (the host side) against its one measurement here.
+        const host_side = measured -| mlx_active -| mlx_cache;
+        for (mb.terms) |t| if (t.measured) sdk.checkMeasured(t, host_side) catch |e| {
+            log.err("construction check: the host side {d} B exceeds its billed bound {d} B", .{ host_side, t.bytes[0] });
             return e;
         };
     }

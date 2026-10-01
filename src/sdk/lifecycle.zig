@@ -9,9 +9,9 @@ pub const Step = enum {
     synchronize,
     /// harness only: the observer's mark before any free
     observe_start,
-    /// the arch's frees (the embedding fence)
+    /// the arch's frees (the embedding fence, when construction has not fenced it already)
     fence,
-    /// the transient release, when its route is installed
+    /// the transient release: present exactly when its route is installed
     release,
     cache_clear,
     /// decode's cache limit
@@ -26,12 +26,12 @@ pub const Step = enum {
     observe_grown,
 };
 
-/// The contract's order; the optional steps may be absent, never moved.
+/// The contract's order; the optional steps may be absent, never moved. The release follows its route.
 pub const order = [_]struct { step: Step, optional: bool = false }{
     .{ .step = .synchronize },
     .{ .step = .observe_start, .optional = true },
-    .{ .step = .fence },
-    .{ .step = .release, .optional = true },
+    .{ .step = .fence, .optional = true },
+    .{ .step = .release },
     .{ .step = .cache_clear },
     .{ .step = .cache_limit },
     .{ .step = .synchronize_freed },
@@ -43,10 +43,18 @@ pub const order = [_]struct { step: Step, optional: bool = false }{
 };
 
 /// A recorded phase change against the contract's order: every required step once, in order, optional steps only
-/// in their places. On a violation `at` names the step the contract expected.
-pub fn checkOrder(steps: []const Step, at: *?Step) error{PhaseOrderViolated}!void {
+/// in their places, the release exactly when `release_installed`. On a violation `at` names the step the contract
+/// expected (or the release that ran with its route off).
+pub fn checkOrder(steps: []const Step, release_installed: bool, at: *?Step) error{PhaseOrderViolated}!void {
     var i: usize = 0;
     for (order) |o| {
+        if (o.step == .release and !release_installed) {
+            if (i < steps.len and steps[i] == .release) {
+                at.* = .release;
+                return error.PhaseOrderViolated;
+            }
+            continue;
+        }
         if (i < steps.len and steps[i] == o.step) {
             i += 1;
         } else if (!o.optional) {
@@ -81,14 +89,21 @@ pub const PhaseObserver = struct {
 
 const testing = std.testing;
 
-test "sdk lifecycle: the phase change's order holds with or without the harness marks and the release route" {
+test "sdk lifecycle: the phase change's order holds with or without the harness marks, the fence and the release route" {
     var at: ?Step = null;
-    try checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, &at);
-    try checkOrder(&.{ .synchronize, .observe_start, .fence, .release, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .observe_released, .grow, .observe_grown }, &at);
+    try checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, false, &at);
+    try checkOrder(&.{ .synchronize, .observe_start, .fence, .release, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .observe_released, .grow, .observe_grown }, true, &at);
+    // The served tree fences the embedding at construction: a phase change records no fence.
+    try checkOrder(&.{ .synchronize, .observe_start, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .observe_released, .grow, .observe_grown }, false, &at);
     // A grow before the boundary check, a release after the clear and a second grow are refused, naming what was due.
-    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .grow, .settle, .check_freed }, &at));
+    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .grow, .settle, .check_freed }, false, &at));
     try testing.expectEqual(Step.settle, at.?);
-    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .release, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, &at));
-    try testing.expectEqual(Step.cache_limit, at.?);
-    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow, .grow }, &at));
+    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .release, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, true, &at));
+    try testing.expectEqual(Step.release, at.?);
+    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow, .grow }, false, &at));
+    // The release follows its route: required when installed, refused when not.
+    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, true, &at));
+    try testing.expectEqual(Step.release, at.?);
+    try testing.expectError(error.PhaseOrderViolated, checkOrder(&.{ .synchronize, .release, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, false, &at));
+    try testing.expectEqual(Step.release, at.?);
 }

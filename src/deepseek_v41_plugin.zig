@@ -66,11 +66,24 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *c
     return bill_mod.loadRequirementBytes(arena.allocator(), io, c.withFacts(facts), ceiling);
 }
 
+/// G4: the bill's terms at the request's shape, rows-free (taken at the fill's floor rows), through the routes the
+/// host passes (the served path's: none). The load preflight's inputs (`loadRequirementBytes`): no baseline in the
+/// terms, the bank's headers through `io`, no device.
+pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sdk.MemoryBill {
+    const ov: *const module.RouteOverrides = @ptrCast(@alignCast(req.routes));
+    var c = @as(*const Config, @ptrCast(@alignCast(req.cfg))).*;
+    c.memory_baseline_bytes = 0;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b = try bill_mod.billAtFloor(arena.allocator(), io, c, req.prompt_tokens, req.max_tokens, null, req.ceiling, ov.*);
+    return bill_mod.memoryBill(gpa, b);
+}
+
 /// The prompt admission's bytes: the tier's bill for the pass the module builds (K16 layer-major, or chunk-major).
 pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
-    const bill = c.dsv41_prefill.?;
+    const pb = c.dsv41_prefill.?;
     const tier: v41.PrefillBill.Tier = if ((c.numeric_tier orelse .served) == .stock) .stock else .served;
-    return if (c.dsv41LayerMajor()) bill.layerMajorBytes(seq, max_tokens, tier) else bill.bytes(seq, max_tokens, tier);
+    return if (c.dsv41LayerMajor()) pb.layerMajorBytes(seq, max_tokens, tier) else pb.bytes(seq, max_tokens, tier);
 }
 
 pub fn init(load: *const sdk.LoadCtx, c: *const Config) !*Module {
@@ -172,8 +185,26 @@ test "dsv41 plugin: the draft lane arms only clean greedy requests, and the serv
         try testing.expectEqual(@as(u64, 0), reservedTokens(req));
 }
 
-test "dsv41 plugin: the table the registry builds (owns its decode state, a handover, a draft lane, both bills)" {
+test "dsv41 plugin: the table the registry builds (owns its decode state, a handover, a draft lane, its bills)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode);
-    try testing.expect(vt.handover != null and vt.prompt_bytes != null and vt.spec == .draft_lane);
+    try testing.expect(vt.handover != null and vt.prompt_bytes != null and vt.bill != null and vt.spec == .draft_lane);
+}
+
+// DSV41_BANK=<bank> (host): the term-wise bill's process bound at the fill's floor rows is the load preflight's number.
+test "dsv41 plugin: the term-wise bill bounds the process exactly as the load preflight bills it (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const host = try model.parseConfig(testing.io, a, bank_dir);
+    const cfg: *const Config = @ptrCast(@alignCast(host.arch_cfg.?));
+    const ceiling: u64 = 120_259_084_288;
+    const ov: module.RouteOverrides = .{};
+    const p = try sdk.ConfigPeek.parse(a, bank_dir, "{}");
+    const req: sdk.BillRequest = .{ .peek = &p, .cfg = cfg, .routes = &ov, .prompt_tokens = bill_mod.fill_prompt_tokens, .max_tokens = bill_mod.fill_max_tokens, .ceiling = ceiling, .stop = module.ceiling_stop_bytes };
+    const mb = try bill(testing.allocator, testing.io, &req);
+    defer mb.free(testing.allocator);
+    const floor: sdk.Rows = .{ .prompt = bill_mod.min_fill_rows, .decode = bill_mod.min_fill_rows };
+    try testing.expectEqual(try loadBytes(testing.allocator, testing.io, cfg, &host.loadFacts(), ceiling), mb.processBound(floor));
 }

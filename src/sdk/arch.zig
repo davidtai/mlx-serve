@@ -90,7 +90,8 @@ pub const Arch = struct {
     handover: ?*const fn (m: *anyopaque, h: DecodeHandover) anyerror!void,
     spec: spec.Spec,
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
-    bill: ?*const fn (gpa: Allocator, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
+    /// Pure host: it may read the model's headers through `io`, never the device.
+    bill: ?*const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
 
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
@@ -117,7 +118,7 @@ pub const Arch = struct {
             check.fnDecl(w, T, "step", &.{ *T.Module, []const u32 }, mlx.mlx_array);
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
-            if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, *const bill.BillRequest }, bill.MemoryBill);
+            if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
         }
         const W = struct {
             fn cfgOf(cfg: *anyopaque) *T.Config {
@@ -165,8 +166,8 @@ pub const Arch = struct {
             fn handover(m: *anyopaque, h: DecodeHandover) anyerror!void {
                 return T.handover(mod(m), h);
             }
-            fn billOf(gpa: Allocator, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
-                return T.bill(gpa, req);
+            fn billOf(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
+                return T.bill(gpa, io, req);
             }
         };
         return .{

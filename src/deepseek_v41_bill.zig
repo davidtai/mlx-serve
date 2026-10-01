@@ -4,6 +4,7 @@
 //! harnesses pass their window's numbers explicitly).
 
 const std = @import("std");
+const sdk = @import("sdk");
 const mlx = @import("mlx");
 const model = @import("model.zig");
 const settings = @import("deepseek_v41_settings.zig");
@@ -651,7 +652,49 @@ fn engramPostedRoute(config: *const settings.Config, ov: module.RouteOverrides, 
 /// `wired_bytes` as `billAt`.
 pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
     const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
-    return fillRows(fillBillOf(b0), target, b0.n_experts);
+    const mb = try memoryBill(a, b0);
+    defer mb.free(a);
+    const r = try sdk.fill(mb, b0.baseline, target, b0.n_experts, min_fill_rows);
+    return .{ .prefill = r.prompt, .decode = r.decode };
+}
+
+/// The bill as the SDK's term-wise view (`sdk.MemoryBill`): each phase's terms in the printed order, the slot banks'
+/// persistent rows apart as `per_row` (one row on every routed layer, the record as `fillBillOf` derives it), the
+/// construction terms marked (`constructionTerms`) and the host side a measured bound. The baseline stays out: the
+/// fill and the admission take it.
+pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
+    const per_row = @as(u64, b.layers) * rec;
+    const p = b.prefillTerms();
+    const d = b.decodeTerms();
+    const c = b.constructionTerms();
+    const T = sdk.MemoryBill.Term;
+    const terms = try a.dupe(T, &[_]T{
+        .{ .name = "slot banks (transient rows)", .bytes = .{ p.slot_banks - b.prefill_rows * per_row, d.slot_banks - b.decode_rows * per_row }, .at_construction = true },
+        .{ .name = "lookahead staging", .bytes = .{ p.lookahead_staging, d.lookahead_staging }, .at_construction = true },
+        .{ .name = "residents", .bytes = .{ p.residents, d.residents }, .at_construction = true },
+        .{ .name = "Engram residents", .bytes = .{ p.engram, d.engram }, .at_construction = true },
+        .{ .name = "Engram posted gathers", .bytes = .{ p.engram_posted, d.engram_posted }, .at_construction = false },
+        .{ .name = "waves", .bytes = .{ p.waves, d.waves }, .at_construction = false },
+        .{ .name = "KV", .bytes = .{ p.kv, d.kv }, .at_construction = false },
+        .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
+        .{ .name = "host side", .bytes = .{ p.host_reserve, d.host_reserve }, .at_construction = true, .measured = true, .construction = c.host_reserve },
+        .{ .name = "wide read windows", .bytes = .{ p.wide_window, d.wide_window }, .at_construction = true },
+        .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = true },
+        .{ .name = "unbilled process overhead", .bytes = .{ p.unbilled_overhead, d.unbilled_overhead }, .at_construction = true },
+        .{ .name = "wire tables", .bytes = .{ p.wire_tables, d.wire_tables }, .at_construction = false, .with_rows = true },
+        .{ .name = "decode buffer allowance", .bytes = .{ p.decode_buffer_allowance, d.decode_buffer_allowance }, .at_construction = false },
+        .{ .name = "prompt buffer allowance", .bytes = .{ p.prompt_buffer_allowance, d.prompt_buffer_allowance }, .at_construction = false },
+    });
+    const w = fillBillOf(b).wiring.?;
+    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired, per_row, 0 }, .at = wiringAt } };
+}
+
+/// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`), exactly as `FillBill.total` re-evaluates them; `data` is
+/// each phase's wired bytes less its slot rows, and the per-row bytes.
+fn wiringAt(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32) u64 {
+    const fb: FillBill = .{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = data[2], .wiring = .{ .prefill_wired = data[0], .decode_wired = data[1] } };
+    return fb.total(phase == .decode, rows) - rows * data[2];
 }
 
 /// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
@@ -684,7 +727,7 @@ pub fn fillExtraRecords(b: Bill, target: u64) u32 {
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
-fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+pub fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
@@ -876,6 +919,61 @@ test "dsv41 memory: wire_tables bills the page tables and wiring records of a ph
     try testing.expectEqual(@as(u64, 0), b.constructionTerms().wire_tables);
 }
 
+/// The SDK's term-wise view of `b` (`memoryBill`) against the bill's own arithmetic: the record exact in both phases,
+/// the fill and its refusal, the admission at the bill's rows, the construction terms and the process bound.
+fn expectSdkView(b: Bill, target: u64) !void {
+    const mb = try memoryBill(testing.allocator, b);
+    defer mb.free(testing.allocator);
+    const rec = mb.per_row / b.layers;
+    try testing.expectEqual(b.slot_prefill, (@as(u64, b.layers) * b.prefill_rows + b.transient_rows) * rec);
+    try testing.expectEqual(b.slot_decode, (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec);
+    const got = sdk.fill(mb, b.baseline, target, b.n_experts, min_fill_rows);
+    if (fillRows(fillBillOf(b), target, b.n_experts)) |want| {
+        const g = try got;
+        try testing.expectEqual(want, arm_mod.NativeRows{ .prefill = g.prompt, .decode = g.decode });
+    } else |e| try testing.expectError(e, got);
+    const rows: sdk.Rows = .{ .prompt = b.prefill_rows, .decode = b.decode_rows };
+    if (admitPhases(b, target)) |_| try sdk.admit(mb, b.baseline, rows, target) else |e| try testing.expectError(e, sdk.admit(mb, b.baseline, rows, target));
+    try testing.expectEqual(b.constructionTerms().sum(), mb.constructionBytes(b.prefill_rows));
+    try testing.expectEqual(b.processBound(), mb.processBound(rows));
+}
+
+test "dsv41 memory: the SDK's term-wise view fills, admits and checks construction exactly as the bill does" {
+    const target = 120_259_084_288 - module.ceiling_stop_bytes;
+    var b = cell4Bill();
+    try expectSdkView(b, target);
+    // Every phase over the target: the same refusal by name.
+    b.baseline = target;
+    try expectSdkView(b, target);
+    // The construction check through the SDK: exactly at the tolerance passes, one byte over refuses, as before.
+    const c = cell4Bill();
+    const mb = try memoryBill(testing.allocator, c);
+    defer mb.free(testing.allocator);
+    const billed = mb.constructionBytes(c.prefill_rows);
+    try sdk.checkConstruction(billed, billed + module.construction_tolerance_bytes, module.construction_tolerance_bytes);
+    try module.checkConstructionBytes(billed, billed + module.construction_tolerance_bytes);
+    try testing.expectError(error.ConstructionOverBill, sdk.checkConstruction(billed, billed + module.construction_tolerance_bytes + 1, module.construction_tolerance_bytes));
+    try testing.expectError(error.ConstructionOverBill, module.checkConstructionBytes(billed, billed + module.construction_tolerance_bytes + 1));
+}
+
+test "dsv41 memory: the host side is the bill's measured bound: SERVED17's 0.3318 GB passes, past 0.90 GB refuses" {
+    var b = cell4Bill();
+    b.host_reserve = measured_host_side_bytes;
+    const mb = try memoryBill(testing.allocator, b);
+    defer mb.free(testing.allocator);
+    var measured: usize = 0;
+    for (mb.terms) |t| if (t.measured) {
+        measured += 1;
+        try testing.expectEqualStrings("host side", t.name);
+        try sdk.checkMeasured(t, 331_800_000);
+        try sdk.checkMeasured(t, 900_000_000);
+        try testing.expectError(error.ConstructionOverBill, sdk.checkMeasured(t, 900_000_001));
+    };
+    try testing.expectEqual(@as(usize, 1), measured);
+    // The phases bill 1.25 GB, construction holds its 0.90 GB: the view's construction bytes are the bill's.
+    try testing.expectEqual(b.constructionTerms().sum(), mb.constructionBytes(b.prefill_rows));
+}
+
 test "dsv41 memory: a phase's total is the baseline plus its terms; the construction terms drop the wave, the KV and the cache" {
     const b = cell4Bill();
     try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window + b.prefillTerms().wire_tables + b.prefillTerms().prompt_buffer_allowance, b.prefillTotal());
@@ -1047,8 +1145,10 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
             // This tree's own route decision: off without the route's declarations, the served tier's with them.
             try testing.expectEqual(if (engramPostedRoute(&config, ov, &c)) posted else 0, b0.engram_posted);
             b0.engram_posted = 0;
+            try expectSdkView(b0, target);
             const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
             b0.engram_posted = posted;
+            try expectSdkView(b0, target);
             const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
             const name = if (route) |r| (if (r) "on" else "off") else "default";
             std.debug.print("\nrows at baseline {d:.2} GB (target {d:.3} GB, transient release {s}, {d} decode transient rows): posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, @as(f64, @floatFromInt(target)) / 1e9, name, b0.transient_decode_rows, off.prefill, off.decode, on.prefill, on.decode });
@@ -1182,8 +1282,10 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         b0.engram_posted = posted;
+        try expectSdkView(b0, target);
         const cons = try fillRows(fillBillOf(b0), target, b0.n_experts);
         b0.prefill_wave = fenced.layerMajorWaveBytes(fill_prompt_tokens, .served);
+        try expectSdkView(b0, target);
         const tight = try fillRows(fillBillOf(b0), target, b0.n_experts);
         std.debug.print("\nbill variants at baseline {d:.2} GB (posted gathers on): conservative {d} / {d}, tight {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, cons.prefill, cons.decode, tight.prefill, tight.decode });
         try testing.expectEqual(w.conservative, cons);
@@ -1326,7 +1428,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
         try testing.expectEqual(@as(i64, -641_228_800), @as(i64, @intCast(b5.residents)) - @as(i64, @intCast(b1.residents)));
         b1.engram_posted = posted;
         b5.engram_posted = posted;
+        try expectSdkView(b1, target);
         const r1 = try fillRows(fillBillOf(b1), target, b1.n_experts);
+        try expectSdkView(b5, target);
         const r5 = try fillRows(fillBillOf(b5), target, b5.n_experts);
         std.debug.print("\nhead modes at baseline {d:.2} GB (posted gathers on): bf16 {d} / {d}, mxfp8 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r5.prefill, r5.decode });
         try testing.expectEqual(w.bf16, r1);
@@ -1371,6 +1475,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
             var b = br;
             b.engram_posted = posted;
             b.prefill_wave = pb.withGroupStreams(streams).layerMajorWaveBytes(fill_prompt_tokens, .served);
+            try expectSdkView(b, target);
             got[vi * 2 + ri] = try fillRows(fillBillOf(b), target, b.n_experts);
         };
         std.debug.print("\nfour arms at baseline {d:.2} GB (posted gathers on): conservative release off {d} / {d}, on {d} / {d}; tight off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, got[0].prefill, got[0].decode, got[1].prefill, got[1].decode, got[2].prefill, got[2].decode, got[3].prefill, got[3].decode });
@@ -1408,8 +1513,10 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = true });
         try testing.expectEqual(@as(u64, 48), b0.transient_decode_rows);
         b0.engram_posted = 0;
+        try expectSdkView(b0, target);
         const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
         b0.engram_posted = posted;
+        try expectSdkView(b0, target);
         const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
         std.debug.print("\nwindow release: rows at baseline {d:.2} GB: posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, off.prefill, off.decode, on.prefill, on.decode });
         try testing.expectEqual(w.off, off);

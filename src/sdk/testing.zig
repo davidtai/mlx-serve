@@ -3,6 +3,12 @@
 //! - `cpu`: `zig build conformance` with no device; the lane fails if a Metal device was created.
 //! - `gpu_small`: fixture shapes on an author's Mac, lock-held on our box.
 //! - `window`: ours only (the real bank at the box ceiling), never in the suite.
+//!
+//! Pending here (they live in the DeepSeek-V4.1 harness, deepseek_v41_ar.zig, until they move): the release proof
+//! with its settle (the pages outside the footprint rise <= 0.5 GB from the phase change's start to the release,
+//! retaken every 50 ms up to 2,000 ms; not applicable with the route off), the grow proof (physical growth <=
+//! footprint growth + 0.5 GB), the stable box mark (the footprint read on both sides of vm_stat within 64 MiB) and
+//! the sentinel (a 2 GB rise outside the footprint stops the process by name, exit 86).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -102,10 +108,10 @@ pub fn expectRouteFollowing(a: bill.MemoryBill, b: bill.MemoryBill, owned: []con
 
 // ── The phase change (cpu) ──
 
-/// A recorded phase change keeps the contract's order (lifecycle.order).
-pub fn expectPhaseOrder(steps: []const lifecycle.Step) !void {
+/// A recorded phase change keeps the contract's order (lifecycle.order), the release as its route says.
+pub fn expectPhaseOrder(steps: []const lifecycle.Step, release_installed: bool) !void {
     var at: ?lifecycle.Step = null;
-    lifecycle.checkOrder(steps, &at) catch |e| {
+    lifecycle.checkOrder(steps, release_installed, &at) catch |e| {
         std.debug.print("phase change out of order: {s} was due\n", .{@tagName(at.?)});
         return e;
     };
@@ -345,7 +351,7 @@ test "sdk testing: claims fixtures, admission triples and route-following run on
 }
 
 test "sdk testing: the phase change's order and a sticky refusal; a receipt's stamps" {
-    try expectPhaseOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow });
+    try expectPhaseOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, false);
     const Gate = struct {
         refused: ?anyerror = null,
         fn request(g: *const @This()) error{PhaseChangeRefused}!void {

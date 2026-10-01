@@ -10,14 +10,14 @@ const kernels = @import("kernels.zig");
 const check = @import("check.zig");
 
 const Allocator = std.mem.Allocator;
-const BillFn = *const fn (gpa: Allocator, req: *const bill.BillRequest) anyerror!bill.MemoryBill;
+const BillFn = *const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill;
 
 fn billOf(comptime T: type, comptime w: []const u8) ?BillFn {
     if (!check.has(T, "bill")) return null;
-    check.fnDecl(w, T, "bill", &.{ Allocator, *const bill.BillRequest }, bill.MemoryBill);
+    check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
     return struct {
-        fn f(gpa: Allocator, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
-            return T.bill(gpa, req);
+        fn f(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
+            return T.bill(gpa, io, req);
         }
     }.f;
 }
