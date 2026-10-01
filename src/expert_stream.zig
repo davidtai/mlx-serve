@@ -266,7 +266,14 @@ pub const Options = struct {
     /// The phase change's transient release installed (`releaseTransient`, then the grow's window 0); off: the whole
     /// scratch stays through decode.
     transient_release: bool = false,
+    /// A0 (a): the first verify's warm reads (`warmIssue` after the grow, settled at each layer's first decode route)
+    /// on the read pool's warm class; null: no warm tickets, no warm state.
+    first_verify_warm: ?FirstVerifyWarm = null,
 };
+
+/// A0 (a)'s budget: at most `max_records` warm records (layer-major: the earliest layers first) and the jobs the
+/// reader may run at once while demand is idle (`expert_io.Warm.busy_max`; below the worker count, so one stays free).
+pub const FirstVerifyWarm = struct { max_records: u32 = 320, busy_max: u32 = 3 };
 
 /// DSV41_LOOKAHEAD4=<k>:<tau>:<budget>:<chunks> at horizon 1.
 pub const Lookahead = struct {
@@ -333,6 +340,12 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// A0 (a)'s warm reads: records issued at the grow, landed / cancelled by their layer's first decode route, and
+    /// that route's hits on landed ones (once per layer; warm_landed + warm_cancelled == warm_issued).
+    warm_issued: u64 = 0,
+    warm_landed: u64 = 0,
+    warm_cancelled: u64 = 0,
+    warm_hits: u64 = 0,
 };
 
 pub const Error = error{
@@ -475,6 +488,22 @@ pub const Stream = struct {
     owner: std.Thread.Id,
     /// P1: the prompt pass's read-ahead in flight (one layer's predicted seed).
     ahead: Ahead,
+    /// A0 (a): the warm reads (`Options.first_verify_warm`); `warm_live` while a layer's are unsettled.
+    warm: ?Warm = null,
+    warm_live: bool = false,
+
+    /// A0 (a)'s records (layer-major, as issued) and each layer's span of them.
+    const Warm = struct {
+        loads: []WarmLoad,
+        admitted: []LayerPolicy.ReadAhead,
+        layers: []WarmLayer,
+        n: u32 = 0,
+        pending_layers: u32 = 0,
+    };
+    /// A warm record: its slot, its job's first ticket (`no_ticket`: the slot still held it, nothing read).
+    const WarmLoad = struct { expert: u16, slot: u32, ticket: u32, landed: bool = false };
+    const WarmLayer = struct { lo: u32 = 0, n: u32 = 0, issued: bool = false, pending: bool = false, wait_ns: u64 = 0 };
+    const no_ticket = std.math.maxInt(u32);
 
     /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
     /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
@@ -520,6 +549,12 @@ pub const Stream = struct {
         if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
         if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
         var pool_opt = opt.pool;
+        if (opt.first_verify_warm) |w| {
+            if (w.max_records == 0 or w.max_records > n_layers * bank.n_experts or w.busy_max == 0 or w.busy_max >= pool_opt.workers)
+                return error.InvalidOptions;
+            pool_opt.tickets += 2 * w.max_records;
+            pool_opt.warm = .{ .tickets = 2 * w.max_records, .busy_max = w.busy_max };
+        }
         if (opt.lookahead) |la| {
             if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
                 la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
@@ -579,6 +614,21 @@ pub const Stream = struct {
         errdefer a.free(ahead_reads);
         const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items) catch unreachable);
         errdefer a.free(ahead_parts);
+        var warm: ?Warm = null;
+        if (opt.first_verify_warm) |w| {
+            const loads = try a.alloc(WarmLoad, w.max_records);
+            errdefer a.free(loads);
+            const admitted = try a.alloc(LayerPolicy.ReadAhead, bank.n_experts);
+            errdefer a.free(admitted);
+            const wl = try a.alloc(WarmLayer, n_layers);
+            @memset(wl, .{});
+            warm = .{ .loads = loads, .admitted = admitted, .layers = wl };
+        }
+        errdefer if (warm) |w| {
+            a.free(w.loads);
+            a.free(w.admitted);
+            a.free(w.layers);
+        };
         const pool = try expert_io.Pool.start(a, pool_opt);
         errdefer pool.stop();
         if (opt.lookahead) |la| if (la.preread) try pool.armPreRead(&layers[widest].lens);
@@ -608,6 +658,7 @@ pub const Stream = struct {
             .gated = opt.event != null,
             .owner = std.Thread.getCurrentId(),
             .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts },
+            .warm = warm,
         };
         return self;
     }
@@ -632,6 +683,11 @@ pub const Stream = struct {
         a.free(self.ahead.loads);
         a.free(self.ahead.reads);
         a.free(self.ahead.parts);
+        if (self.warm) |w| {
+            a.free(w.loads);
+            a.free(w.admitted);
+            a.free(w.layers);
+        }
         a.destroy(self);
     }
 
@@ -774,6 +830,9 @@ pub const Stream = struct {
         std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
         // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
         if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
+        // A0 (a): a layer's warm reads settle at its first decode route (the cancelled ones become misses).
+        const settled_warm = self.warm_live and self.warm.?.layers[layer].pending;
+        if (settled_warm) try self.settleWarm(layer);
         const lookahead = self.route_lookahead;
         const tag = self.clock + 1;
         if (self.route_preread) try self.preRead(layer, ids, tag);
@@ -810,6 +869,7 @@ pub const Stream = struct {
             s.* = ls.policy.slotOf(e).?;
             self.locate(layer, s.*).meta.pins += 1;
         }
+        if (settled_warm) self.countWarmHits(layer, plan.hitsOf());
         var skipped: u64 = 0;
         for (plan.loadsOf(), 0..) |l, i| {
             const m = self.locate(layer, l.slot).meta;
@@ -1289,6 +1349,118 @@ pub const Stream = struct {
         self.route_preread = self.route_lookahead and self.preread;
     }
 
+    /// A0 (a): after the grow, `layer`'s warm set (its prompt tail's experts, ascending) read below demand: each
+    /// expert not resident takes an empty persistent slot (no eviction, the policy's read-ahead admission) and one
+    /// warm job reads it; a slot that still holds the record is ready at once. Layers in order, once each, up to the
+    /// budget's records. Returns the records issued.
+    pub fn warmIssue(self: *Stream, layer: u32, experts: []const u16) !u32 {
+        if (self.warm == null) return error.WarmNotInstalled;
+        const w = &self.warm.?;
+        if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
+        if (self.phase != .decode) return error.WarmBeforeGrow;
+        if (self.failed) return error.StreamFailed;
+        if (layer >= self.layers.len or w.layers[layer].issued) return error.InvalidWarm;
+        const wl = &w.layers[layer];
+        wl.* = .{ .lo = w.n, .issued = true };
+        const ls = &self.layers[layer];
+        const room = @min(w.loads.len - w.n, w.admitted.len);
+        const admitted = ls.policy.admitReadAhead(experts, w.admitted[0..room]);
+        for (admitted) |ad| {
+            const loc = self.locate(layer, ad.slot);
+            const m = loc.meta;
+            if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
+            var ticket: u32 = no_ticket;
+            if (m.state == .ready and m.layer == layer and m.expert == ad.expert) {
+                self.counters.loads_skipped += 1;
+            } else {
+                m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = ad.expert };
+                const sp = self.bank.spans(layer, ad.expert);
+                const rows = [1][n_components]u64{loc.rows.rowDest(loc.row)};
+                ticket = self.pool.submitWarm(self.bank.sidecar_fd, self.bank.sidecar_file_size, &.{sp.gu_offset}, &.{sp.down_offset}, &rows, &ls.lens) catch |e| return self.fail(e);
+            }
+            w.loads[w.n] = .{ .expert = ad.expert, .slot = ad.slot, .ticket = ticket };
+            w.n += 1;
+        }
+        wl.n = @intCast(admitted.len);
+        if (wl.n > 0) {
+            wl.pending = true;
+            w.pending_layers += 1;
+            self.warm_live = true;
+        }
+        self.counters.warm_issued += wl.n;
+        return wl.n;
+    }
+
+    /// A0 (a): `layer`'s warm reads at its first decode route, before its pre-read and plan. The queued jobs are
+    /// cancelled (their experts forgotten, their slots empty again), the started ones waited for (`warmWaitNs`), the
+    /// landed ones ready. A failed read fails the stream, as a demand read does.
+    fn settleWarm(self: *Stream, layer: u32) Error!void {
+        const w = &self.warm.?;
+        const wl = &w.layers[layer];
+        wl.pending = false;
+        w.pending_layers -= 1;
+        if (w.pending_layers == 0) self.warm_live = false;
+        const loads = w.loads[wl.lo..][0..wl.n];
+        // The layer's jobs hold consecutive tickets (one record each, issued in order; the warm ring holds the budget).
+        var first: u32 = no_ticket;
+        var end: u32 = 0;
+        for (loads) |l| if (l.ticket != no_ticket) {
+            if (first == no_ticket) first = l.ticket;
+            end = l.ticket + 2;
+        };
+        if (first != no_ticket) {
+            _ = self.pool.cancelWarm(first, end - first);
+            const t0 = expert_io.monotonicNs();
+            self.pool.wait(first, end - first, wait_timeout_ns) catch |e| return self.fail(e);
+            wl.wait_ns = @intCast(@max(expert_io.monotonicNs() - t0, 0));
+        }
+        const ls = &self.layers[layer];
+        for (loads) |*l| {
+            const m = self.locate(layer, l.slot).meta;
+            if (l.ticket == no_ticket) {
+                l.landed = true;
+                self.counters.warm_landed += 1;
+                continue;
+            }
+            const gu = self.pool.result(l.ticket).status;
+            const down = self.pool.result(l.ticket + 1).status;
+            if (gu == .ok and down == .ok) {
+                m.state = .ready;
+                l.landed = true;
+                self.counters.warm_landed += 1;
+                for ([2]u32{ l.ticket, l.ticket + 1 }) |t| {
+                    const res = self.pool.result(t);
+                    self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
+                    self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
+                    self.read_ns += @intCast(@max(res.t_end_ns - res.t_start_ns, 0));
+                }
+            } else if (gu == .skipped and down == .skipped) {
+                ls.policy.invalidate(l.expert);
+                m.* = .{};
+                self.counters.warm_cancelled += 1;
+            } else return self.fail(error.ReadFailed);
+        }
+    }
+
+    /// A0 (a): the settling route's hits on `layer`'s landed warm records (once per layer).
+    fn countWarmHits(self: *Stream, layer: u32, hits: []const u16) void {
+        const w = &self.warm.?;
+        const wl = w.layers[layer];
+        for (hits) |e| for (w.loads[wl.lo..][0..wl.n]) |l| {
+            if (l.landed and l.expert == e) {
+                self.counters.warm_hits += 1;
+                break;
+            }
+        };
+    }
+
+    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs; 0
+    /// without the route or with none in flight.
+    pub fn warmWaitNs(self: *const Stream, layer: u32) u64 {
+        const w = self.warm orelse return 0;
+        return if (layer < w.layers.len) w.layers[layer].wait_ns else 0;
+    }
+
     pub fn stats(self: *Stream) Stats {
         var s = self.counters;
         s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
@@ -1690,6 +1862,62 @@ test "dsv41 stream: growth is the one phase change" {
     try testing.expectEqual(@as(u32, 0), r.plan.n_evictions);
     try expectServed(s, &sb, r, &.{ 1, 2, 3, 4 });
     s.release(r);
+}
+
+test "dsv41 stream: A0 (a): the grow's warm reads fill empty rows below demand; a layer's first decode route lands the started, cancels the queued (served on demand) and counts its hits" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const page = std.heap.pageSize();
+    // Off its route the class is refused by name and counts nothing.
+    {
+        const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+        defer s.deinit();
+        try s.grow(&.{ 4, 4 });
+        try testing.expectError(error.WarmNotInstalled, s.warmIssue(0, &.{3}));
+        try testing.expectEqual(@as(u64, 0), s.stats().warm_issued);
+    }
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .first_verify_warm = .{ .max_records = 8, .busy_max = 1 } });
+    defer s.deinit();
+    defer expert_io.clearFaults();
+    var r = try serve(s, 0, &.{ 1, 2 });
+    s.release(r);
+    r = try serve(s, 1, &.{ 1, 2 });
+    s.release(r);
+    try testing.expectError(error.WarmBeforeGrow, s.warmIssue(0, &.{3}));
+    try s.grow(&.{ 6, 6 });
+    // Layer 0's first warm record (expert 3) holds the reader 80 ms, so the rest wait in the warm ring (busy limit 1).
+    const off3 = sb.bank.recordOffset(0, 3);
+    expert_io.injectFault(off3 - off3 % page, 5, 80 * std.time.ns_per_ms);
+    // Layer 0: 1 is resident (skipped), 3, 4 and 5 issued; layer 1: 7; a layer issues once.
+    try testing.expectEqual(@as(u32, 3), try s.warmIssue(0, &.{ 1, 3, 4, 5 }));
+    try testing.expectEqual(@as(u32, 1), try s.warmIssue(1, &.{7}));
+    try testing.expectError(error.InvalidWarm, s.warmIssue(0, &.{6}));
+    while (s.pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
+    // Layer 0's first decode route: 3 lands (waited for), 4 and 5 are cancelled; 3 is a hit, 4 and 6 are read on demand.
+    r = try serve(s, 0, &.{ 3, 4, 6 });
+    try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
+    try testing.expectEqualSlices(u16, &.{3}, r.plan.hitsOf());
+    try expectServed(s, &sb, r, &.{ 3, 4, 6 });
+    try testing.expect(s.warmWaitNs(0) > 0);
+    s.release(r);
+    // Layer 1's warm record lands below demand; its first route serves it as a hit.
+    const w = &s.warm.?;
+    const t7 = w.loads[w.layers[1].lo].ticket;
+    try s.pool.wait(t7, 2, 10 * std.time.ns_per_s);
+    r = try serve(s, 1, &.{ 7, 8 });
+    try testing.expectEqualSlices(u16, &.{7}, r.plan.hitsOf());
+    try expectServed(s, &sb, r, &.{ 7, 8 });
+    s.release(r);
+    // Settled once: a later route of layer 0 counts no warm hit.
+    r = try serve(s, 0, &.{3});
+    s.release(r);
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 4), st.warm_issued);
+    try testing.expectEqual(@as(u64, 2), st.warm_landed);
+    try testing.expectEqual(@as(u64, 2), st.warm_cancelled);
+    try testing.expectEqual(@as(u64, 2), st.warm_hits);
+    try testing.expectEqual(st.warm_issued, st.warm_landed + st.warm_cancelled);
+    try testing.expect(!s.warm_live);
 }
 
 test "dsv41 stream: slots held for a deferred call are never refilled until released" {

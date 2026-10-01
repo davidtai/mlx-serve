@@ -13,6 +13,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
+const first_cycle = @import("dsv41_decode_first.zig");
 const dt = @import("dsv41_decode_timers.zig");
 
 pub const Config = struct {
@@ -416,6 +417,41 @@ pub fn Loop(comptime G: type) type {
         /// draft. Neither is in the state.
         const Core = struct { drafts: [ds.max_block]u32, n_drafts: u32, kept: u32, next: u32, verify_hidden: T };
 
+        /// A0 (c)'s D1, profile builds only, in the decode's first cycle before its own draft block:
+        ///   1. the state that block's eval would otherwise realise (the main row and the stage windows: the prompt's
+        ///      seed), evaluated and timed apart;
+        ///   2. one draft block whose output is dropped: its build and wait timed, the bytes MLX took for it counted,
+        ///      and its arrays freed (`resetTo`) so the cycle's own block can reuse their buffers.
+        /// `draftBlock` reads the caches as `[]const Cache` and the head as const, so the cycle's block and every id after
+        /// it are unchanged. Returns MLX's (active, cache) bytes before the cycle's own block.
+        fn droppedDraft(self: *Self) ![2]u64 {
+            const g = self.g;
+            const dev = comptime G == ops.MlxOps;
+            var pend: [9]T = undefined;
+            var np: usize = 0;
+            pend[np] = self.main_h.?;
+            np += 1;
+            for (self.caches) |c| if (c.window) |w| {
+                if (np == pend.len) return error.TooManyStages;
+                pend[np] = w;
+                np += 1;
+            };
+            var t = dt.now();
+            try g.evalAll(pend[0..np]);
+            first_cycle.cycle1_pending_ns = dt.now() - t;
+            const m = g.mark();
+            const before = first_cycle.memNow(dev);
+            t = dt.now();
+            const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
+            const sig = try g.sigmoid(try g.astype(d.conf, .float32));
+            const built = dt.now();
+            try g.evalAll(&.{ d.ids, sig });
+            const waited = dt.now();
+            first_cycle.recordDraft(0, built - t, waited - built, before, first_cycle.memNow(dev));
+            g.resetTo(m);
+            return first_cycle.memNow(dev);
+        }
+
         fn core(self: *Self, ex: anytype, log: ?*CycleLog, stamp: anytype, accepted_cap: u32) !Core {
             const g = self.g;
             const st = &self.stats;
@@ -425,14 +461,29 @@ pub fn Loop(comptime G: type) type {
             var native: [ds.max_block]u32 = undefined;
             var tt = dt.now();
             if (self.k_cap > 0) {
+                // A0 (c)'s D1 (profile builds, the decode's first cycle): the pending state and a dropped draft block
+                // first, timed apart and charged to no bucket; this block is then the second (`droppedDraft`).
+                const doubled = first_cycle.enabled and first_cycle.firstDraft();
+                var mem0: [2]u64 = .{ 0, 0 };
+                if (comptime first_cycle.enabled) {
+                    if (doubled) {
+                        mem0 = try self.droppedDraft();
+                        tt = dt.now();
+                    }
+                }
+                const t_build = tt;
                 const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
                 // CYCLE_TRIM draftfold: the confidence sigmoid is realised by the draft's own eval (one
                 // sync), which also realises the main row and window update the previous commit left.
                 const sig = try g.sigmoid(try g.astype(d.conf, .float32));
                 tt = dt.charge(.draft_build, tt);
+                const t_wait = tt;
                 try g.evalAll(&.{ d.ids, sig });
                 tt = dt.charge(.draft_wait, tt);
+                if (comptime first_cycle.enabled) {
+                    if (doubled) first_cycle.recordDraft(1, t_wait - t_build, tt - t_wait, mem0, first_cycle.memNow(G == ops.MlxOps));
+                }
                 _ = try g.hostU32(d.ids, native[0..bs]);
                 var conf: [ds.max_block]f32 = undefined;
                 _ = try g.hostF32(sig, conf[0..bs]);
@@ -755,6 +806,51 @@ test "dsv41 dspark loop: the mini model's cycles draft, verify, accept, trim and
     try testing.expectEqual(script.f32s.len, script.nf);
     // Every verify forward routed through the source: 3 prompt forwards + 4 verifies per layer.
     try testing.expectEqual(@as(u64, 7 * c.n_layers), rig.src.stats().route_calls);
+}
+
+test "dsv41 dspark loop: A0 (c) D1 (profile builds): the first cycle evaluates its pending state, then a draft block dropped and freed, then its own; the tokens are unchanged" {
+    if (comptime !first_cycle.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var script: Script = .{
+        .n_experts = @intCast(rig.m.c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    const g = &rig.g;
+    first_cycle.startDecode();
+    defer first_cycle.phase = .build;
+    for (0..4) |i| {
+        const e0 = g.evals.items.len;
+        const f0 = g.freed.items.len;
+        _ = try lp.cycle(&rig.ex, &out, a, null);
+        first_cycle.endCycle();
+        const evals = g.evals.items[e0..];
+        if (i == 0) {
+            // the pending state, the dropped block, the cycle's own block, the verify
+            try testing.expectEqual(@as(usize, 4), evals.len);
+            // the dropped block's arrays, built between the first two syncs, are freed before the cycle's own block
+            var dropped_freed = false;
+            for (g.freed.items[f0..]) |r| dropped_freed = dropped_freed or (r.from == evals[0] and r.to == evals[1]);
+            try testing.expect(dropped_freed);
+        } else try testing.expectEqual(@as(usize, 2), evals.len);
+    }
+    try testing.expect(!first_cycle.firstDraft());
+    // the same tokens as the cycles without D1 (the first test's script, every host value read once)
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
+    try testing.expectEqual(script.u32s.len, script.nu);
+    try testing.expectEqual(script.f32s.len, script.nf);
 }
 
 test "dsv41 dspark loop: CYCLE_TRIM: one eval per draft with its sigmoid, the commit's window update dispatched and waited by the next draft" {

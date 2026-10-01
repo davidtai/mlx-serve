@@ -123,6 +123,9 @@ pub const RouteOverrides = struct {
     head_mode: ?graph.Routes.Head = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, off.
     transient_release: ?bool = null,
+    /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
+    /// the grow below demand). null: the default, off.
+    first_verify_warm: ?bool = null,
 };
 
 /// The release route the Module installs and the bill charges (one resolver: the stream's capability and the setting
@@ -135,6 +138,11 @@ pub fn transientRelease(ov: RouteOverrides) bool {
 /// served tier's route): the routed groups hold one hc-width stream when it is on.
 pub fn inputStreamEarlyRelease(ov: RouteOverrides) bool {
     return ov.input_stream_early_release orelse numericTier(.served).routes.input_stream_early_release;
+}
+
+/// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
+pub fn firstVerifyWarm(ov: RouteOverrides) bool {
+    return ov.first_verify_warm orelse false;
 }
 
 /// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
@@ -376,7 +384,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0 },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .first_verify_warm = t.arm.stream.warm != null },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -396,6 +404,7 @@ pub const Module = struct {
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
+        log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -509,7 +518,11 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wideRoute(config) }, diag) catch |e| return refused(e, diag);
+        const warm = firstVerifyWarm(self.overrides);
+        opts.first_verify_warm = if (warm) .{} else null;
+        var wide = wideRoute(config);
+        wide.warm_tail = warm;
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         // LOOKAHEAD4, once before any request: a gated call's waves against the same slots waited.
@@ -923,6 +936,13 @@ pub const Module = struct {
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
+        // A0 (a), after the grow's record and marks: the first verify's warm reads, below demand.
+        if (self.installed.first_verify_warm) {
+            const issued = switch (self.arm) {
+                inline else => |t| t.arm.warmIssue() catch |e| return self.refuseBoundary(e),
+            };
+            log.info("NATIVE first-verify warm: {d} records issued at the grow", .{issued});
+        }
     }
 
     /// The harness's observer at a proof point (none on the served path); its error refuses the boundary.
@@ -1020,6 +1040,8 @@ pub const Installed = struct {
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
     lookahead_budget: u32 = 0,
+    /// A0 (a): the first verify's warm reads (installed in the stream at construction).
+    first_verify_warm: bool = false,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -1485,6 +1507,16 @@ test "dsv41 module: the read-ahead's speculative budget: 2 unless set, the strea
     const f = bill_mod.fill_fixture;
     const slot = std.mem.alignForward(u64, f.record, 16384) + 2 * 16384;
     try std.testing.expectEqual(2 * slot, expert_admission.lookaheadCharge(f.record, 2 * lookahead.budget, 16384) - expert_admission.lookaheadCharge(f.record, 2 * la.budget, 16384));
+}
+
+test "dsv41 module: A0 (a): the first verify's warm reads are off unless the route is set, and the transient release's resolver is apart" {
+    try std.testing.expect(!firstVerifyWarm(.{}));
+    try std.testing.expect(firstVerifyWarm(.{ .first_verify_warm = true }));
+    try std.testing.expect(!firstVerifyWarm(.{ .first_verify_warm = false }));
+    try std.testing.expect(!firstVerifyWarm(.{ .transient_release = true }));
+    try std.testing.expectEqual(transientRelease(.{}), transientRelease(.{ .first_verify_warm = true }));
+    const off: Installed = .{};
+    try std.testing.expect(!off.first_verify_warm);
 }
 
 test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {
