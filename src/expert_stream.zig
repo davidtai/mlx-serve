@@ -3249,10 +3249,16 @@ fn waitWord(s: *const Stream, value: u64) !void {
     }
 }
 
-/// Routes a call and, as the GPU would, waits on its gates instead of the pool.
+/// Routes a call and, as the GPU would, waits on its gates instead of the pool. A gate also opens when its read fails
+/// or the watchdog forces it, so before anyone reads the slots: a forced gate is refused by name (GateForced), then
+/// every part is settled (no wait once its gate opened; a failed read raises ReadFailed by name).
 fn serveGated(s: *Stream, layer: u32, ids: []const u16, scores: []const f32) !*Route {
     const r = try s.route(layer, ids, scores);
-    if (try s.gate(r)) |g| try waitWord(s, g.down_first + g.n_parts - 1);
+    if (try s.gate(r)) |g| {
+        try waitWord(s, g.down_first + g.n_parts - 1);
+        if (s.pool.counter(.ev_wd_forced) != 0) return error.GateForced;
+        for (0..r.n_parts) |i| try s.waitDown(r, @intCast(i));
+    }
     return r;
 }
 
@@ -3911,7 +3917,7 @@ test "dsv41 stream: a two-layer recorded trace with lookahead and gates on the r
     var rows: [40]u32 = @splat(0);
     rows[L] = 3;
     rows[L + 1] = 3;
-    const s = try Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 6, .lookahead = .{}, .event = .{} });
+    const s = try Stream.init(a, &bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 6, .lookahead = .{}, .event = .{ .watchdog_ms = 10_000 } });
     defer s.deinit();
     const geom = &bank.layers[L];
     for ([_]u32{ L, L + 1 }) |l| {
