@@ -1977,6 +1977,7 @@ pub const StreamSource = struct {
                 .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
             };
         } else {
+            if (comptime !@hasDecl(G, "input")) @compileError("StreamSource binds MLX arrays or a trace backend's inputs; " ++ @typeName(G) ++ " has neither");
             const rows = self.bankRows(layer, kind);
             if (rows == 0) return null;
             return try traceBank(g, &self.stream.bank.layers[layer], rows);
