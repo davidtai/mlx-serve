@@ -270,6 +270,11 @@ pub const StreamSource = struct {
         return self.stream.layers[layer].policy.slotOf(expert) != null;
     }
 
+    /// The pool's demand read gauge now: wall ns with a demand (or pre-) read in flight (A0's per-layer split).
+    pub fn readWallNs(self: *StreamSource) u64 {
+        return @intCast(@max(self.stream.pool.readGauge()[4], 0));
+    }
+
     /// A live prefill call's persistent slots kept pinned and held past its release (`Wide.defer_base`).
     pub fn holdBase(self: *StreamSource, call: *Call) !void {
         return self.stream.holdBase(call.route.?);
@@ -1366,6 +1371,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
             tt = dt.charge(.barrier, tt);
             const t_barrier = tt;
+            // A0 (profile builds): the read gauge at the barrier's end; in the first cycle the tail set's reads (before
+            // the route plans); in the prompt the tail set itself (a decode-width prompt call).
+            const wall_b: u64 = if (comptime first_cycle.enabled and @hasDecl(S, "readWallNs")) self.source.readWallNs() else 0;
+            const tail_reads: u64 = if (comptime first_cycle.enabled and @hasDecl(S, "isResident")) first_cycle.tailReads(layer, ResidentAt{ .src = self.source, .layer = layer }, ResidentAt.of) else 0;
+            if (comptime first_cycle.enabled) {
+                first_cycle.tailRecord(layer, ids, n, k);
+                tt = dt.now();
+            }
             var pred_buf: [max_route_ids]u16 = undefined;
             var predicted: []const u16 = &.{};
             var wasted: u64 = 0;
@@ -1404,7 +1417,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             self.source.release(call);
             released = true;
-            if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, first_cycle.missedOf(ids, sv.waves));
+            if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
             return self.join(g, &acc, n, k);
         }
 
@@ -1591,6 +1604,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var tp = prof.now();
             _ = try g.hostIds(indices, w.ids.items);
             prof.charge(.barrier, tp);
+            // A0 (profile builds): the prompt's last rows' experts, the layer's tail set
+            if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
             w.distinct.clearRetainingCapacity();
