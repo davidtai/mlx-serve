@@ -4,14 +4,15 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const model_io = @import("model.zig");
+const settings = @import("deepseek_v41_settings.zig");
 
 /// The arch's load requirement (the preflight's hook): not built for this target.
-pub fn loadRequirementBytes(_: std.mem.Allocator, _: std.Io, _: *const model_io.ModelConfig) !u64 {
+pub fn loadRequirementBytes(_: std.mem.Allocator, _: std.Io, _: *const settings.Config) !u64 {
     return error.Dsv41NotBuiltForThisTarget;
 }
 
 pub const Module = struct {
-    pub fn init(_: std.mem.Allocator, _: std.Io, _: *const model_io.ModelConfig, _: *model_io.Weights, _: mlx.mlx_stream) !*Module {
+    pub fn init(_: std.mem.Allocator, _: std.Io, _: *const settings.Config, _: *model_io.Weights, _: mlx.mlx_stream) !*Module {
         return error.Dsv41NotBuiltForThisTarget;
     }
     pub fn deinit(_: *Module) void {}

@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const model = @import("model.zig");
+const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
@@ -421,7 +422,7 @@ pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
 /// bytes `planRows` reads (null: none for a native bill, `billWired`; the live read for the envelope planner). A bill
 /// taken after construction passes the wired bytes the arm was planned with (`arm.inputs.wired_bytes`), never a live
 /// read: the module's own banks are wired by then.
-pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
     errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
@@ -639,7 +640,7 @@ pub fn engramPostedBytes(e: v41.Engram, prompt_tokens: u64) u64 {
 
 /// Whether `config`'s prompt pass posts its Engram gathers: the K16 pass over a bank with Engram layers, the
 /// route set (the harness's override, else the served tier's).
-fn engramPostedRoute(config: *const model.ModelConfig, ov: module.RouteOverrides, c: *const v41.Config) bool {
+fn engramPostedRoute(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config) bool {
     if (!config.dsv41LayerMajor() or c.engram.n_layers == 0) return false;
     return ov.engram_posted orelse module.numericTier(.served).routes.engram_posted;
 }
@@ -648,7 +649,7 @@ fn engramPostedRoute(config: *const model.ModelConfig, ov: module.RouteOverrides
 /// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
 /// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
 /// `wired_bytes` as `billAt`.
-pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
+pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
     const b0 = try billAtFloor(a, io, config, prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
     return fillRows(fillBillOf(b0), target, b0.n_experts);
 }
@@ -683,7 +684,7 @@ pub fn fillExtraRecords(b: Bill, target: u64) u32 {
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
-fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
@@ -693,7 +694,7 @@ fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prom
 /// What the module needs free to load at all, for upstream's load preflight (`scheduler.loadRequirementBytes`
 /// is fed this in place of the shards' disk bytes): the process bound of the standard request's bill at the
 /// fill's floor rows. The fill then takes rows up to the box's target; below the floor it refuses by name.
-pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, ceiling_bytes: u64) !u64 {
+pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: settings.Config, ceiling_bytes: u64) !u64 {
     var c = config;
     c.memory_baseline_bytes = 0;
     // The server's load preflight: the served routes, no harness override.
@@ -960,7 +961,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 8_548_761_600;
     const ceiling_bytes: u64 = 119_259_000_000;
     const wired: u64 = 3_380_379_648;
@@ -1009,7 +1010,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1089,7 +1090,7 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310 + 3 * 2 * 2048 * 184;
     try testing.expectEqual(@as(u64, 184_758_272), at_change);
     // The bill carries them per phase.
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     // Option B: the ceiling is the bill's argument, not a config field.
     config.memory_baseline_bytes = 9_200_000_000;
     const b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, 120_259_084_288, .{});
@@ -1106,7 +1107,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     // Option B: the ceiling is the harness's argument, not a config field.
     const ceiling: u64 = 120_259_084_288;
     config.memory_baseline_bytes = 9_200_000_000;
@@ -1162,7 +1163,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1216,7 +1217,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1296,7 +1297,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1343,7 +1344,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1389,7 +1390,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1473,7 +1474,7 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const config = try model.parseConfig(testing.io, a, bank_dir);
+    const config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const need = try loadRequirementBytes(a, testing.io, config, ceiling_bytes);
     var floor = config;

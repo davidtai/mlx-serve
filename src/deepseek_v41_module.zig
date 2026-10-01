@@ -16,6 +16,7 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const model_io = @import("model.zig");
+const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
@@ -67,7 +68,7 @@ pub const Arm = union(enum) { host_waits: Tiered(A), event_gates: Tiered(AGated)
 
 /// The arm a config builds: event gates unless the setting says otherwise on the served tier (the
 /// Python typical tier of record's LOOKAHEAD4), host waits on the stock tier.
-pub fn eventGates(config: *const model_io.ModelConfig) bool {
+pub fn eventGates(config: *const settings.Config) bool {
     return config.expert_event_gates orelse ((config.numeric_tier orelse .served) == .served);
 }
 
@@ -541,12 +542,12 @@ pub const Module = struct {
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig, weights: *model_io.Weights, s: mlx.mlx_stream) !*Module {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream) !*Module {
         return initWith(gpa, io, config, weights, s, .{});
     }
 
     /// `init` with a harness's route overrides (the served path passes none).
-    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig, weights: *model_io.Weights, s: mlx.mlx_stream, ov: RouteOverrides) !*Module {
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, ov: RouteOverrides) !*Module {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -916,7 +917,7 @@ pub const Module = struct {
     /// check against it: the footprint after the install (warm-up released, cache cleared) must sit
     /// within `construction_tolerance_bytes` of the bill's construction terms, else the module is
     /// refused by name before any request.
-    fn checkConstruction(self: *Module, io: std.Io, admitted: *const model_io.ModelConfig, ceiling_bytes: u64) !void {
+    fn checkConstruction(self: *Module, io: std.Io, admitted: *const settings.Config, ceiling_bytes: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         // The bill plans through the arm's own inputs: the wired bytes the arm was planned with (a live
@@ -954,7 +955,7 @@ pub const Module = struct {
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
-    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const model_io.ModelConfig, weights: *const model_io.Weights, s: mlx.mlx_stream, ceiling: expert_admission.Ceiling, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
+    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const settings.Config, weights: *const model_io.Weights, s: mlx.mlx_stream, ceiling: expert_admission.Ceiling, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
@@ -1690,7 +1691,7 @@ pub const Module = struct {
 
 /// The load preflight's requirement (`transformer.archLoadRequirementBytes`): the native bill at the fill's
 /// floor rows (`deepseek_v41_bill.loadRequirementBytes`).
-pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const model_io.ModelConfig) !u64 {
+pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const settings.Config) !u64 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     // Upstream's load preflight (the server, the device in hand): its static GPU ceiling, read here at the call site.
@@ -1703,7 +1704,7 @@ pub const layer_major_billed = true;
 
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
-pub fn layerMajor(config: *const model_io.ModelConfig) error{ LayerMajorOnStockTier, LayerMajorNotBilled, ReadAheadNeedsLayerMajor }!bool {
+pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, LayerMajorNotBilled, ReadAheadNeedsLayerMajor }!bool {
     // P1's predictor pass is the layer-major prompt pass's (a chunk-major one has no layer top to read ahead from).
     if (config.dsv41WideReadAhead() and (!config.dsv41LayerMajor() or !config.dsv41WideSeed())) return error.ReadAheadNeedsLayerMajor;
     if (!config.dsv41LayerMajor()) return false;
@@ -1833,7 +1834,7 @@ pub const Installed = struct {
 
 /// The prefill indexer route as the Module builds it (the setting, else the tier's route); the bill
 /// reads the same answer. It needs K30's selected keys.
-pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides) !bool {
+pub fn prefillIndexRoute(config: *const settings.Config, ov: RouteOverrides) !bool {
     const t = numericTier(config.numeric_tier orelse .served);
     const on = ov.prefill_index orelse t.routes.prefill_index;
     if (on and !t.routes.selected_keys) return error.PrefillIndexNeedsSelectedKeys;
@@ -1841,13 +1842,13 @@ pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides
 }
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
-pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
+pub fn wideRoute(config: *const settings.Config) xp.Wide {
     return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned(), .resident_first = config.dsv41WideResidentFirst() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
 /// decode-width (8 rows: no rounding-class wide lane); `served` is the tier of record (its DIG-X prefill).
-pub fn numericTier(t: @import("model_settings.zig").NumericTier) routes.Tier {
+pub fn numericTier(t: settings.NumericTier) routes.Tier {
     return switch (t) {
         .stock => blk: {
             var s = routes.stock;
@@ -2065,7 +2066,7 @@ pub const ceiling_stop_bytes: u64 = 2_000_000_000;
 /// the peak `ceiling_stop_bytes` under it, every layer up to its expert count.
 /// The arm's construction options from the shell's config (the admission's inputs): the module builds
 /// with them, and a host bill plans the same rows with them (`slot_memory = .host`).
-pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission.Ceiling, slot_memory: expert_stream.SlotMemory) arm_mod.Options {
+pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceiling, slot_memory: expert_stream.SlotMemory) arm_mod.Options {
     return .{
         .model_dir = config.expert_bank_dir.?,
         .envelope = envelope,
@@ -2088,7 +2089,7 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
 }
 
 /// The read-ahead at the config's speculative budget (`expert_lookahead_budget`; the bill reads the same options).
-pub fn lookaheadFor(config: *const model_io.ModelConfig) expert_stream.Lookahead {
+pub fn lookaheadFor(config: *const settings.Config) expert_stream.Lookahead {
     var la = lookahead;
     la.budget = config.dsv41LookaheadBudget();
     return la;
@@ -2137,7 +2138,7 @@ fn setCacheLimit(limit: usize) void {
 
 /// The Engram residents' sidecar joins the loaded shards (the index names none of them), read as the residents
 /// are: past the page cache (the aligned uncached reader) under the model's `nocache_weights` setting.
-fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8, config: *const model_io.ModelConfig) !void {
+fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8, config: *const settings.Config) !void {
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/" ++ dsp.engram_residents_file, .{dir}, 0);
     defer gpa.free(path);
     const cpu = mlx.mlx_default_cpu_stream_new();
@@ -2214,7 +2215,7 @@ test "dsv41 module: a request's bounded lanes hold its reservation, else the pro
 }
 
 test "dsv41 module: the served tier's prefill routes are on by default, the stock tier's off; a setting overrides; layer-major refused on stock" {
-    var c: model_io.ModelConfig = undefined;
+    var c: settings.Config = undefined;
     c.layer_major_prefill = null;
     c.numeric_tier = null;
     c.expert_wide_feed = null;
@@ -2266,7 +2267,7 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
 }
 
 test "dsv41 module: the read-ahead's speculative budget: 2 unless set, the stream and the staging bill read the setting" {
-    var c: model_io.ModelConfig = undefined;
+    var c: settings.Config = undefined;
     c.expert_lookahead_budget = null;
     try std.testing.expectEqual(lookahead, lookaheadFor(&c));
     c.expert_lookahead_budget = 1;
@@ -2292,7 +2293,7 @@ test "dsv41 module: A0 (a): the first verify's warm reads are off unless the rou
 }
 
 test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {
-    var c: model_io.ModelConfig = undefined;
+    var c: settings.Config = undefined;
     c.numeric_tier = null;
     c.expert_event_gates = null;
     try std.testing.expect(eventGates(&c));

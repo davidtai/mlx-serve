@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = if (@import("build_options").macos_engines) @import("deepseek_v41_module.zig") else @import("deepseek_v41_module_stub.zig");
+const dsv41_settings = @import("deepseek_v41_settings.zig");
 /// The deepseek_v41 module as this build links it (the generator's draft-lane dispatch names it).
 pub const Dsv41Module = dsv41_mod.Module;
 const qwen4_mod = @import("qwen4_exp.zig");
@@ -42480,7 +42481,8 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
 /// preflight is the one load gate and its message and `--skip-mem-preflight` apply.
 pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig) ?u64 {
     if (std.mem.eql(u8, config.model_type, "deepseek_v41")) {
-        return dsv41_mod.loadRequirementBytes(allocator, io, config) catch |e| {
+        const c = dsv41_settings.Config.fromHost(config);
+        return dsv41_mod.loadRequirementBytes(allocator, io, &c) catch |e| {
             std.log.warn("[preflight] deepseek_v41 bill unavailable ({s}); billing the shards", .{@errorName(e)});
             return null;
         };
@@ -42491,7 +42493,8 @@ pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config
 /// deepseek_v41: the module over the loaded residents; the shell is dsv4's (a 0-layer KVCache,
 /// empty standard fields).
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
-    const mdl = try dsv41_mod.Module.init(allocator, io, &config, weights, s);
+    const c = dsv41_settings.Config.fromHost(&config);
+    const mdl = try dsv41_mod.Module.init(allocator, io, &c, weights, s);
     errdefer mdl.deinit();
     var t = try initDsv4Shell(allocator, config, s);
     t.dsv41 = mdl;

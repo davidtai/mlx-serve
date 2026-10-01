@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx");
 const model = @import("model.zig");
+const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const routes = @import("deepseek_v41_routes.zig");
@@ -401,7 +402,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const run = try parseServedRun(n, envStr("DSV41_AR_SPLIT"), envStr("DSV41_AR_PHASE"), envStr("DSV41_AR_TIER"));
     const calls = try promptCalls(a, n, run);
     const forwards = try forwardRows(a, calls, ref.new_tokens);
-    var config = try model.parseConfig(io, a, bank_dir);
+    var config = try settings.Config.load(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     // The box the module's admission fills: the guard's ceiling (unset: the GPU's working set), with its stop, for
     // the test's span (`WindowStop`).
@@ -800,7 +801,7 @@ test "dsv41 ar: the served schedule's host preconditions: the top-2 rule and, on
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // What Module.init reads from the shell's config: the bank dir and the Engram token map beside it.
-    const config = try model.parseConfig(testing.io, arena.allocator(), bank_dir);
+    const config = try settings.Config.load(testing.io, arena.allocator(), bank_dir);
     try testing.expect(config.expert_bank_dir != null and config.engram_token_map_path != null);
     if (std.c.getenv("DSV41_AR_REF")) |rp| {
         const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std.mem.span(rp), arena.allocator(), .limited(16 << 20));
@@ -1226,7 +1227,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
         const out_k = if (k == 0) out_path else try std.fmt.allocPrint(a, "{s}.req{d}.json", .{ out_path, k + 1 });
         // Either arm the configuration builds: host waits (the served default) or event gates (C6).
         switch (md.arm) {
-            inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_k, .request = @intCast(k + 1), .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
+            inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .eos = inputs.eos, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_k, .request = @intCast(k + 1), .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
         }
     }
 }
@@ -1279,7 +1280,8 @@ const CellCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     md: *module.Module,
-    config: *const model.ModelConfig,
+    /// The shell's EOS ids (the Generator's stops).
+    eos: []const u32,
     prompt: []const u32,
     delta: f64,
     max_tokens: u32,
@@ -1306,7 +1308,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const gpa = cx.gpa;
     const io = cx.io;
     const md = cx.md;
-    const config = cx.config;
     const prompt = cx.prompt;
     const delta = cx.delta;
     const max_tokens = cx.max_tokens;
@@ -1317,8 +1318,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // The served decode lane (the Module's DSpark strategy): the shell's calls, in the shell's order.
     if (md.draftBlockSize() == 0) return error.CellNeedsDspark;
     var stops: [8]u32 = undefined;
-    const n_stop = config.num_eos_tokens;
-    @memcpy(stops[0..n_stop], config.eos_token_ids[0..n_stop]);
+    const n_stop = cx.eos.len;
+    @memcpy(stops[0..n_stop], cx.eos);
     const isStop = struct {
         fn f(ss: []const u32, t: u32) bool {
             return std.mem.indexOfScalar(u32, ss, t) != null;
@@ -1658,7 +1659,7 @@ const CellArgs = struct {
 /// DSV41_CELL_ROWS (a forced decode row count; unset = the admission's fill), DSV41_CELL_PREFILL_ROWS,
 /// DSV41_CELL_FILL_LADDER, DSV41_CELL_WIRED_GB, and the routes (the shell's settings onto `config`, the
 /// Module's overrides into the returned args).
-fn cellConfig(config: *model.ModelConfig) !CellArgs {
+fn cellConfig(config: *settings.Config) !CellArgs {
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
@@ -1777,7 +1778,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
 /// ladder's widest admission (the widest windows, `max_wide_depth`, and the larger of the chunk-major and layer-major prompt
 /// waves; feed and cold rows bill nothing), so every ladder line admits the same rows at one baseline.
-fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !void {
+fn cellFill(a: std.mem.Allocator, io: std.Io, config: *settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !void {
     const target = args.ceiling -| args.stop;
     if (args.prefill_rows) |pr| {
         const decode = config.expert_rows.?;
@@ -1830,7 +1831,7 @@ fn gbOf(x: u64) f64 {
 /// The harness's bill (`bill_mod.billAt` at the window's wired bytes).
 /// The record granule (`DSV41_CELL_DECODE_FILL_GRANULE=record`): the single decode records the Module derives at the same
 /// target (`bill_mod.fillExtraRecords`), billed.
-fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
+fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
     const b = try bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, args.ov);
     if (module.decodeFillGranule(args.ov) == .row) return b;
     var ov = args.ov;
@@ -1840,7 +1841,7 @@ fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, 
 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less the window's stop
 /// (the window's own numbers, passed explicitly), refused by name on stdout.
-fn fillAt(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
+fn fillAt(a: std.mem.Allocator, io: std.Io, config: settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     const target = args.ceiling -| args.stop;
     return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, target, args.ov) catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
@@ -2821,7 +2822,7 @@ test "dsv41 memory: the harness's filled rows pass the Module's admission under 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 9_730_000_000;
     const ceiling: u64 = 120_259_084_288;
     const nr = try bill_mod.fill(a, testing.io, config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null, ceiling, ceiling - module.ceiling_stop_bytes, .{});
@@ -2866,7 +2867,7 @@ test "dsv41 memory: cell fill == server fill at 9.20, 9.73, 12.90 (bank)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const ceiling: u64 = 120_259_084_288;
     // The runner's stop: the harness's default when DSV41_CELL_STOP_BYTES is unset, and --wired-margin's parse of it.
     const stop = try windowStopBytes("DSV41_CELL_STOP_BYTES");
@@ -2903,7 +2904,7 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try settings.Config.load(testing.io, a, bank_dir);
     const args = try cellConfig(&config);
     const stop = WindowStop.set(args.stop, args.ceiling);
     defer stop.restore();
@@ -3355,12 +3356,13 @@ fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
 
 /// The cell's host inputs: the standard prompt (16,384 tokens, seed 20260829, digest checked) and
 /// the shell's config of the bank (its bank / token-map paths, the EOS ids the Generator stops on).
-fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: model.ModelConfig } {
+fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: settings.Config, eos: []const u32 } {
     const prompt = try cellPrompt(a, io, prompt_path, case_id);
-    const config = try model.parseConfig(io, a, bank_dir);
+    const host = try model.parseConfig(io, a, bank_dir);
+    const config = settings.Config.fromHost(&host);
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
-    if (config.num_eos_tokens == 0) return error.NoEosIds;
-    return .{ .prompt = prompt, .config = config };
+    if (host.num_eos_tokens == 0) return error.NoEosIds;
+    return .{ .prompt = prompt, .config = config, .eos = try a.dupe(u32, host.eos_token_ids[0..host.num_eos_tokens]) };
 }
 
 // DSV41_EMBED_GATHER_BENCH=1 with DSV41_BANK and DSV41_CELL_PROMPT_IDS (host I/O only; never inside a window): the
