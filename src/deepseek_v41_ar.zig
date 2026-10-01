@@ -927,7 +927,7 @@ const CellReceipt = struct {
     wide_depth: ?u8 = null,
     /// Decode's transient rows after the phase change (window 0 + `decode_staging_rows`; the bill's name).
     transient_decode_rows: ?u32 = null,
-    /// The phase change's transient release as installed (the route; off by default since SERVED17).
+    /// The phase change's transient release as installed (the route; on by default since SERVED19E).
     transient_release: ?bool = null,
     wide_cold_rows: ?u8 = null,
     /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
@@ -964,7 +964,7 @@ const CellReceipt = struct {
     phase_change: ?module.PhaseChangeRecord = null,
     /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default interval).
+    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
     /// until_freed's bound, grow and margin ride in `phase_change`.
     phase_change_settle: ?module.PhaseChangeSettle = null,
     /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
@@ -2128,9 +2128,11 @@ fn printBill(b: CellBill) void {
         .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
         .{ .name = "page cache created by the step (assumed 0; enforced)", .p = 0, .d = 0 },
         .{ .name = "unbilled process overhead (prompt phase; decode's is prompt_state)", .p = b.unbilled_overhead, .d = 0 },
+        .{ .name = "wire_tables (page tables + wiring records for the wired bytes)", .p = b.prefillTerms().wire_tables, .d = b.decodeTerms().wire_tables },
+        .{ .name = "decode buffer allowance (provisional; deleted at the first served19e decode-mark reading)", .p = 0, .d = b.decodeTerms().decode_buffer_allowance },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
-    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv) });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, bill_mod.wire_buffer_bytes });
 }
 
 test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {

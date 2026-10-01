@@ -19,6 +19,7 @@ const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
+const expert_bank = @import("expert_bank.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -92,6 +93,11 @@ pub const Bill = struct {
     /// ENGRAM=prefetch's posted gathers (`engramPostedBytes`: one Engram slot's ids and records, host), prompt
     /// phase only; 0 when the route is off.
     engram_posted: u64 = 0,
+    /// The MLX buffers each phase holds, printed beside `wire_tables` (not billed: a per-buffer table cost is unmeasured):
+    /// the checkpoint's tensors, what the model builds and the state, the slot banks' arrays, and twice the phase's
+    /// widest wave (one live, one in the cache).
+    wire_arrays_prompt: u64 = 0,
+    wire_arrays_decode: u64 = 0,
 
     pub fn prefillTotal(b: Bill) u64 {
         return b.baseline + b.prefillTerms().sum();
@@ -103,13 +109,15 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        return .{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted };
+        return withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted });
     }
 
     /// The decode phase's process terms (the embedding off at the fence; the larger of the verify and draft waves:
     /// a round drafts, then verifies, so the two never hold their transients at once).
     pub fn decodeTerms(b: Bill) PhaseTerms {
-        return .{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state };
+        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state });
+        t.decode_buffer_allowance = decodeBufferAllowance(b.wire_arrays_decode, t.wire_tables);
+        return t;
     }
 
     /// What the constructed module holds before any request (after the install warm-up released its
@@ -121,6 +129,9 @@ pub const Bill = struct {
         t.kv = 0;
         t.mlx_cache = 0;
         t.engram_posted = 0;
+        // Outside the footprint the construction check compares.
+        t.wire_tables = 0;
+        t.decode_buffer_allowance = 0;
         return t;
     }
 
@@ -146,6 +157,10 @@ pub const PhaseTerms = struct {
     prompt_state: u64 = 0,
     /// ENGRAM=prefetch's posted gathers (prompt phase).
     engram_posted: u64 = 0,
+    /// Kernel and GPU page tables and wiring records for the wired bytes, geometric (`wireTables`).
+    wire_tables: u64 = 0,
+    /// Decode only, provisional (`decodeBufferAllowance`; deleted at the first served19e decode-mark reading).
+    decode_buffer_allowance: u64 = 0,
 
     pub fn sum(t: PhaseTerms) u64 {
         var n: u64 = 0;
@@ -153,6 +168,52 @@ pub const PhaseTerms = struct {
         return n;
     }
 };
+
+/// A phase's terms with `wire_tables` over its wired bytes: every other process term but the host ones (the host side,
+/// the lookahead staging, the wide window's records, the overhead, the posted gathers): under the wired policy MLX's
+/// allocations are wired, the host heap is not.
+fn withWireTables(t: PhaseTerms) PhaseTerms {
+    var w = t;
+    w.wire_tables = wireTables(wiredOf(t));
+    return w;
+}
+
+/// A phase's wired bytes: its terms less the host ones and the wiring terms themselves.
+pub fn wiredOf(t: PhaseTerms) u64 {
+    return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.host_reserve - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
+}
+
+/// The page granule of the kernel and of the GPU (ARM64 16 KiB).
+pub const wire_page_bytes: u64 = 16_384;
+
+/// The memory the wiring of `wired` bytes costs outside the process footprint (the memory lane, ledger sec. 73:
+/// +0.091-0.126 GB in every SERVED19 cell): per 16 KiB page a CPU and a GPU leaf entry and the kernel's wiring record
+/// (8 B each), one CPU + GPU L2 entry per 32 MiB and L1 entry per 64 GiB. No per-buffer term: ~4,000 live buffers at
+/// construction left no room for one under the measured figure. Monotone and subadditive, so a fill's per-row step can
+/// carry `wireTables(per_row)`.
+pub fn wireTables(wired: u64) u64 {
+    return (std.math.divCeil(u64, wired, wire_page_bytes) catch unreachable) * 24 +
+        (std.math.divCeil(u64, wired, 1 << 25) catch unreachable) * 16 +
+        (std.math.divCeil(u64, wired, 1 << 36) catch unreachable) * 16;
+}
+
+/// The wiring overhead per live buffer if all of it were per buffer (the memory lane, ledger sec. 78a): the largest
+/// construction reading, 125,852,608 B (pass3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
+pub const wire_buffer_bytes: u64 = 28_672;
+
+/// Decode's provisional buffer allowance: what a per-buffer cost over the phase's buffers would bill beyond the
+/// per-page term (never both: the larger of the two is billed). Deleted at the first served19e decode-mark reading.
+pub fn decodeBufferAllowance(buffers: u64, wire_tables: u64) u64 {
+    return (wire_buffer_bytes * buffers) -| wire_tables;
+}
+
+/// The printed buffer counts the geometry does not give (`Bill.wire_arrays_*`), pinned by the served tier's bank trace (deepseek_v41_module
+/// "the prefill bill covers the served prompt forwards' waves", DSV41_WIRE_ARRAYS, which asserts each stays under):
+/// what the model builds beyond the checkpoint's tensors plus the request state's arrays, and the most buffers one
+/// forward holds at once at decode rows (<= 8) and at prompt rows.
+pub const wire_arrays_state: u64 = 512;
+pub const wire_arrays_decode_wave: u64 = 704;
+pub const wire_arrays_prompt_wave: u64 = 4400;
 
 /// One phase boundary's memory record (NATIVE; probes at the four boundaries only: module constructed,
 /// end of the prompt pass, after the phase change, end of decode): the phase's billed terms, the
@@ -179,6 +240,9 @@ pub const PhaseMemory = struct {
     mlx_residual_bytes: i64,
     /// The phase change's boundary only: how long the driver took to reclaim the frees before the grow.
     settle_ms: ?u32 = null,
+    /// The box's wired pages (vm_stat), for wire_tables' proof: box wired less this process's graphics footprint
+    /// less the idle census's wired.
+    box_wired_bytes: u64 = 0,
 };
 
 /// The boundary's record from what the kernel and MLX already track (no new counter): reads the
@@ -196,7 +260,9 @@ pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64
     const v = status.vmBytes();
     _ = mlx.mlx_reset_peak_memory();
     status.startFootprintInterval();
-    return recordOf(phase, billed, pm, active, cache, peak, status.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
+    var r = recordOf(phase, billed, pm, active, cache, peak, status.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
+    r.box_wired_bytes = v.wired;
+    return r;
 }
 
 /// `phaseMemory`'s arithmetic (host-testable): the MLX-device share of the bill is every term but the
@@ -371,6 +437,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
     const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
+    // The phases' buffers (printed): the checkpoint's tensors as the Module keeps them, what it builds, the state, the slot banks.
+    const persistent_arrays = m.totalTensors() - droppedResidentArrays(headRoute(ov)) + builtResidentArrays(&c, headRoute(ov)) + em.totalTensors() + wire_arrays_state + (@as(u64, c.n_layers) + 1) * expert_bank.n_components;
     return .{
         // Unset (a shell without a box baseline): the process terms alone.
         .baseline = config.memory_baseline_bytes orelse 0,
@@ -407,6 +475,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .embedding_host_rows = config.embedding_host_rows orelse true,
         .prompt_state = dsl.seedRetainedBytes(&c, prompt_tokens),
         .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
+        .wire_arrays_prompt = persistent_arrays + 2 * wire_arrays_prompt_wave,
+        .wire_arrays_decode = persistent_arrays + 2 * wire_arrays_decode_wave,
     };
 }
 
@@ -430,6 +500,19 @@ pub fn builtResidentBytes(c: *const v41.Config, head: graph.Routes.Head) u64 {
     if (module.numericTier(.served).routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
     if (head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
     return n;
+}
+
+/// `builtResidentBytes`' arrays: HEAD_MODE mxfp8's codes and scales, W97's dense wo_a per layer.
+pub fn builtResidentArrays(c: *const v41.Config, head: graph.Routes.Head) u64 {
+    var n: u64 = 0;
+    if (module.numericTier(.served).routes.wo_a_f32) n += c.n_layers;
+    if (head == .mxfp8) n += 2;
+    return n;
+}
+
+/// `droppedResidentBytes`' arrays: the dense head's one tensor under HEAD_MODE mxfp8.
+pub fn droppedResidentArrays(head: graph.Routes.Head) u64 {
+    return @intFromBool(head == .mxfp8);
 }
 
 /// Checkpoint residents the Module drops once the model is built (`Model.droppedBytes`): the dense bf16 head under
@@ -464,14 +547,18 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_
     return fillRows(fillBillOf(b0), target, b0.n_experts);
 }
 
-/// A bill in the fill's shape: its phases' totals less their slot rows, and one row on every routed layer.
+/// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
+/// layer, and each phase's wired bytes less its slot rows (the wiring terms, re-evaluated at every row count).
 pub fn fillBillOf(b: Bill) FillBill {
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
     const per_row = @as(u64, b.layers) * rec;
+    const p = b.prefillTerms();
+    const d = b.decodeTerms();
     return .{
-        .prefill_fixed = b.prefillTotal() - b.prefill_rows * per_row,
-        .decode_fixed = b.decodeTotal() - b.decode_rows * per_row,
+        .prefill_fixed = b.prefillTotal() - p.wire_tables - b.prefill_rows * per_row,
+        .decode_fixed = b.decodeTotal() - d.wire_tables - d.decode_buffer_allowance - b.decode_rows * per_row,
         .per_row = per_row,
+        .wiring = .{ .prefill_wired = wiredOf(p) - b.prefill_rows * per_row, .decode_wired = wiredOf(d) - b.decode_rows * per_row, .decode_buffers = b.wire_arrays_decode },
     };
 }
 
@@ -496,8 +583,30 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: model.Mode
 
 /// A native bill in the fill's shape: each phase's billed bytes (the box baseline included) without its
 /// persistent slot rows, and one row on every routed layer (layers x the record); a phase's total at
-/// r rows is `fixed + r * per_row`.
-pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u64 };
+/// r rows is `fixed + r * per_row` plus, with `wiring`, its wiring terms at r rows (`FillBill.Wiring.at`).
+pub const FillBill = struct {
+    prefill_fixed: u64,
+    decode_fixed: u64,
+    per_row: u64,
+    wiring: ?Wiring = null,
+
+    /// Each phase's wired bytes without its slot rows, and decode's buffers (`decodeBufferAllowance`).
+    pub const Wiring = struct {
+        prefill_wired: u64,
+        decode_wired: u64,
+        decode_buffers: u64,
+    };
+
+    /// A phase's total at `rows`: exactly the bill's at those rows.
+    pub fn total(b: FillBill, decode: bool, rows: u64) u64 {
+        const fixed = if (decode) b.decode_fixed else b.prefill_fixed;
+        const w = b.wiring orelse return fixed + rows * b.per_row;
+        const slots = rows * b.per_row;
+        if (!decode) return fixed + slots + wireTables(w.prefill_wired + slots);
+        const tables = wireTables(w.decode_wired + slots);
+        return fixed + slots + tables + decodeBufferAllowance(w.decode_buffers, tables);
+    }
+};
 
 /// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
 /// layer's experts) whose phase totals each stay under `target` (the caller's box: the ceiling less its margin). The slot banks
@@ -506,12 +615,16 @@ pub const FillBill = struct { prefill_fixed: u64, decode_fixed: u64, per_row: u6
 /// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
 pub fn fillRows(b: FillBill, target: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
     const most = struct {
-        fn f(fixed: u64, t: u64, per_row: u64) u64 {
-            return if (fixed >= t) 0 else (t - fixed) / per_row;
+        // The linear rows (the wiring terms left out) bound it from above; step down while the exact total is over.
+        fn f(fb: FillBill, decode: bool, t: u64) u64 {
+            const fixed = if (decode) fb.decode_fixed else fb.prefill_fixed;
+            var r = if (fixed >= t) 0 else (t - fixed) / fb.per_row;
+            while (r > 0 and fb.total(decode, r) > t) r -= 1;
+            return r;
         }
     }.f;
-    const decode = @min(most(b.decode_fixed, target, b.per_row), n_experts);
-    const prefill = @min(most(b.prefill_fixed, target, b.per_row), decode);
+    const decode = @min(most(b, true, target), n_experts);
+    const prefill = @min(most(b, false, target), decode);
     if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
     return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
 }
@@ -545,7 +658,7 @@ test "dsv41 memory: the host side bills 1.25 GB in the prompt and decode phases,
     try testing.expectEqual(@as(u64, 1_250_000_000), b.decodeTerms().host_reserve);
     // The construction check keeps its own term (the constructed host side measures 0.385-0.446 GB).
     try testing.expectEqual(@as(u64, 900_000_000), b.constructionTerms().host_reserve);
-    try testing.expectEqual(b.prefillTerms().sum() - 350_000_000 - b.prefill_wave - b.kv - b.prefill_cache - b.engram_posted, b.constructionTerms().sum());
+    try testing.expectEqual(b.prefillTerms().sum() - 350_000_000 - b.prefill_wave - b.kv - b.prefill_cache - b.engram_posted - b.prefillTerms().wire_tables, b.constructionTerms().sum());
     // A bill billing less than the construction term keeps its own (cell4's 408,944,640 B).
     try testing.expectEqual(@as(u64, 408_944_640), cell4Bill().constructionTerms().host_reserve);
 }
@@ -580,24 +693,50 @@ pub fn cell4Bill() Bill {
     };
 }
 
+test "dsv41 memory: wire_tables bills the page tables and wiring records of a phase's wired bytes, per 16 KiB page" {
+    // 24 B a page, 16 B per 32 MiB, 16 B per 64 GiB; no per-buffer term.
+    try testing.expectEqual(@as(u64, 24 + 16 + 16), wireTables(1));
+    try testing.expectEqual(@as(u64, 2048 * 24 + 16 + 16), wireTables(1 << 25));
+    // Construction at the measured maximum (graphics footprint 91.398 GB): it covers the 0.126 GB measured outside.
+    try testing.expectEqual(@as(u64, 133_927_424), wireTables(91_398_000_000));
+    try testing.expect(wireTables(91_398_000_000) >= 126_000_000);
+    // Subadditive (the fill's per-row step): a bill's total at r rows never exceeds fixed + r x per_row.
+    try testing.expect(wireTables(91_398_000_000 + 532_623_360) <= wireTables(91_398_000_000) + wireTables(532_623_360));
+    // The phases carry it over their wired terms (the host terms out); the construction check does not.
+    const b = cell4Bill();
+    const p = b.prefillTerms();
+    try testing.expectEqual(wireTables(p.sum() - p.wire_tables - p.host_reserve - p.lookahead_staging - p.wide_window - p.unbilled_overhead - p.engram_posted), p.wire_tables);
+    const d = b.decodeTerms();
+    try testing.expectEqual(wireTables(d.sum() - d.wire_tables - d.decode_buffer_allowance - d.host_reserve - d.lookahead_staging - d.wide_window), d.wire_tables);
+    try testing.expect(p.wire_tables > 0 and d.wire_tables > 0);
+    // Decode's provisional buffer allowance: the per-buffer reading's excess over the per-page term, decode only.
+    try testing.expectEqual(@as(u64, 169_193_472 - 157_720_000), decodeBufferAllowance(4_493 + 1_408, 157_720_000));
+    try testing.expectEqual(@as(u64, 0), decodeBufferAllowance(4_493, 157_720_000));
+    try testing.expectEqual(decodeBufferAllowance(b.wire_arrays_decode, d.wire_tables), d.decode_buffer_allowance);
+    try testing.expectEqual(@as(u64, 0), p.decode_buffer_allowance);
+    try testing.expectEqual(@as(u64, 0), b.constructionTerms().wire_tables);
+}
+
 test "dsv41 memory: a phase's total is the baseline plus its terms; the construction terms drop the wave, the KV and the cache" {
     const b = cell4Bill();
-    try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window, b.prefillTotal());
+    try testing.expectEqual(b.baseline + b.slot_prefill + b.lookahead_staging + b.residents + b.engram + b.prefill_wave + b.kv + b.prefill_cache + b.host_reserve + b.unbilled_overhead + b.wide_window + b.prefillTerms().wire_tables, b.prefillTotal());
     // The decode phase carries no unbilled overhead (what it covered there is the retained prompt state).
-    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv_decode + @max(b.decode_wave, b.draft_wave) + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state, b.decodeTotal());
+    try testing.expectEqual(b.baseline + b.slot_decode + b.lookahead_staging + b.residents - b.embedding + b.engram + b.kv_decode + @max(b.decode_wave, b.draft_wave) + b.decode_cache + b.host_reserve + b.wide_window + b.prompt_state + b.decodeTerms().wire_tables + b.decodeTerms().decode_buffer_allowance, b.decodeTotal());
     try testing.expectEqual(@as(u64, 0), b.decodeTerms().unbilled_overhead);
     const c = b.constructionTerms();
-    try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache, c.sum());
+    try testing.expectEqual(b.prefillTerms().sum() - b.prefill_wave - b.kv - b.prefill_cache - b.prefillTerms().wire_tables, c.sum());
     // cell4's constructed footprint (76.41 GB) sits under its construction terms (77.00 GB).
     try testing.expect(c.sum() > 76_410_000_000 and c.sum() < 77_100_000_000);
 }
 
-test "dsv41 memory: with the embedding on its host rows no phase bills the device table, and the one-count fill gains 2 rows" {
+test "dsv41 memory: with the embedding on its host rows no phase bills the device table, and the one-count fill gains 2-3 rows" {
     var dev = cell4Bill();
     dev.embedding_host_rows = false;
     var host = dev;
     host.embedding_host_rows = true;
-    try testing.expectEqual(dev.prefillTotal() - dev.embedding, host.prefillTotal());
+    try testing.expectEqual(dev.prefillTotal() - dev.prefillTerms().wire_tables - dev.embedding, host.prefillTotal() - host.prefillTerms().wire_tables);
+    const dp = dev.prefillTerms();
+    try testing.expectEqual(wireTables(dp.sum() - dp.wire_tables - dp.host_reserve - dp.lookahead_staging - dp.wide_window - dp.unbilled_overhead - dp.engram_posted - dev.embedding), host.prefillTerms().wire_tables);
     try testing.expectEqual(dev.decodeTotal(), host.decodeTotal());
     try testing.expectEqual(dev.constructionTerms().sum() - dev.embedding, host.constructionTerms().sum());
     const per_row = @as(u64, dev.layers) * 13_315_584;
@@ -608,7 +747,8 @@ test "dsv41 memory: with the embedding on its host rows no phase bills the devic
     }.f;
     const r_dev = try fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
     const r_host = try fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
-    try testing.expectEqual(r_dev.prefill + 2, r_host.prefill);
+    // The embedding is 2.48 rows: the fill gains its floor or its ceiling by where the remainder falls.
+    try testing.expect(r_host.prefill == r_dev.prefill + 2 or r_host.prefill == r_dev.prefill + 3);
 }
 
 test "dsv41 memory: ENGRAM=prefetch's posted gathers are one slot's ids and records, billed in the prompt phase only" {
@@ -721,19 +861,20 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // before it 8.99 GB 135 / 164 off, 134 / 164 on; 9.20 GB 134 / 163 both; 9.55 GB 134 / 163 off, 133 / 163 on).
     // SERVED19: the host side billed at 1.25 GB in both phases (was 0.90; the decode host side on libc malloc measured
     // 1.115-1.120 GB): before it 8.99 GB 135 / 164, 9.20 GB 135 / 164 off and 134 / 164 on, 9.55 GB 134 / 163.
+    // SERVED19E: wire_tables (~0.16 GB a phase) and decode's buffer allowance: 9.20 GB posted on 134 -> 133 prompt rows.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 162 }, .on = .{ .prefill = 133, .decode = 162 } },
     };
     // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 133, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     };
-    // The release route as the Module resolves it: the default (off), then each override.
+    // The release route as the Module resolves it: the default (on), then each override.
     for ([_]?bool{ null, false, true }) |route| {
         const ov: module.RouteOverrides = .{ .transient_release = route };
         for (if (module.transientRelease(ov)) window_0 else every_window) |w| {
@@ -821,11 +962,11 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     // The windows past the first: 4 x 48 records, 2,556,592,128 B (the second, 639,148,032 B, was the 10b
     // construction's unbilled MLX active less ~3.8 MB; each later one is as large).
     try testing.expectEqual(@as(u64, 2_556_592_128), arm_mod.wideWindowBytes(opts.wide_depth, rec));
-    // Decode's transient rows follow the route the Module installs (`module.transientRelease`): the default (off)
-    // keeps every window; through billAt, the override off bills 240 rows and on bills window 0 (48, no staging rows),
+    // Decode's transient rows follow the route the Module installs (`module.transientRelease`): the default (on)
+    // bills window 0; through billAt, the override off bills 240 rows and on bills window 0 (48, no staging rows),
     // 2,556,592,128 B apart; the prompt's transient rows are the same on both routes.
     try testing.expectEqual(transientDecodeRows(opts.wide_depth, module.transientRelease(.{}), stream_decode_staging_rows), b.transient_decode_rows);
-    try testing.expect(!module.transientRelease(.{}));
+    try testing.expect(module.transientRelease(.{}));
     const route_off = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = false });
     const route_on = try billAt(a, testing.io, &config, fill_prompt_tokens, fill_max_tokens, null, ceiling, .{ .transient_release = true });
     try testing.expectEqual(@as(u64, 240), route_off.transient_decode_rows);
@@ -868,11 +1009,11 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
-        // The default route (the transient release off: every window through decode, SERVED17's arm 1 and -tight); the
-        // fence at two streams (-2.68 GB) adds 5 prompt rows.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 163 }, .tight = .{ .prefill = 139, .decode = 163 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 134, .decode = 163 }, .tight = .{ .prefill = 139, .decode = 163 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 162 }, .tight = .{ .prefill = 138, .decode = 162 } },
+        // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
+        // 5 prompt rows.
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 133, .decode = 168 }, .tight = .{ .prefill = 138, .decode = 168 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -920,9 +1061,9 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
-        .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 162 }, .one = .{ .prefill = 140, .decode = 162 } },
+        .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 168 }, .one = .{ .prefill = 141, .decode = 168 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 138, .decode = 168 }, .one = .{ .prefill = 140, .decode = 168 } },
+        .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 140, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -949,7 +1090,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
 // DSV41_BANK=<bank> (host): HEAD_MODE mxfp8 (cell arm 5) bills the head it runs: the dense bf16 head the Module drops
 // after construction (1,323,827,200 B) out of the residents, its codes and scales (682,598,400 B) in, net -641,228,800 B.
 // Arm 5's own fill therefore sits about a row a phase above the bf16 arm's. Both at the default route (the transient
-// release off: every window through decode), as SERVED17's -mxfp8head arm runs.
+// release on: decode bills window 0).
 test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -970,9 +1111,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 163 }, .mxfp8 = .{ .prefill = 135, .decode = 165 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 134, .decode = 163 }, .mxfp8 = .{ .prefill = 135, .decode = 164 } },
-        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 162 }, .mxfp8 = .{ .prefill = 134, .decode = 164 } },
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 133, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1010,7 +1151,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 168 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 168 } },
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 133, .decode = 162 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 162 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1055,7 +1196,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 133, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;

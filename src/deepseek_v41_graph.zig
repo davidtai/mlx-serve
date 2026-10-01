@@ -3905,6 +3905,18 @@ pub fn heldBytes(g: *const TraceOps, from: usize, to: usize) struct { sum: u64, 
     return .{ .sum = sum, .max = mx, .max_op = mop };
 }
 
+/// The buffers a traced node range allocates: every node but the views (host arrays and scalars are buffers of their
+/// own here, unlike in `heldBytes`); `inputs` also counts the input leaves (each resident or state tensor).
+pub fn heldArrays(g: *const TraceOps, from: usize, to: usize, inputs: bool) u64 {
+    var n: u64 = 0;
+    for (g.nodes.items[from..to]) |x| switch (x.op) {
+        .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => {},
+        .input => n += @intFromBool(inputs),
+        else => n += 1,
+    };
+    return n;
+}
+
 /// Handles with MLX's lifetimes (the trace backend frees nothing): `keep` makes
 /// an untracked handle, `resetTo` kills every handle tracked since the mark.
 const Handles = struct {

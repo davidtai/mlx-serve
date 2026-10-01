@@ -122,16 +122,16 @@ pub const RouteOverrides = struct {
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
     head_mode: ?graph.Routes.Head = null,
-    /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, off.
+    /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
     /// the grow below demand). null: the default, off.
     first_verify_warm: ?bool = null,
     /// The phase change's settle poll: milliseconds between this process's footprint reads (1..`phase_change_settle_ms`).
-    /// null: the default, `phase_change_poll_ms`. Exact: it moves only when the settle sees the frees, not what it reads
-    /// or the one check that judges the last reading.
+    /// null: the settle's own default (`phaseChangePollMs`). Exact: it moves only when the settle sees the frees, not
+    /// what it reads or the one check that judges the last reading.
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `interval`.
+    /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `until_freed`.
     phase_change_settle: ?PhaseChangeSettle = null,
     /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
     /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
@@ -182,9 +182,10 @@ pub const DecodeHost = struct {
 ///   draft wave and decode cache arrive after the grow, and the decode phase's residual stays their check.
 pub const PhaseChangeSettle = enum { interval, until_freed };
 
-/// The settle condition the Module installs: the setting over the default (`interval`).
+/// The settle condition the Module installs: the setting over the default (`until_freed`: its bound is absolute, so
+/// a fast poll cannot return on a reading the trailing releases satisfied).
 pub fn phaseChangeSettle(ov: RouteOverrides) PhaseChangeSettle {
-    return ov.phase_change_settle orelse .interval;
+    return ov.phase_change_settle orelse .until_freed;
 }
 
 /// `until_freed`'s grow bound (the footprint before the grow): the decode phase's billed process bytes (`Bill.decodeTerms`,
@@ -203,7 +204,7 @@ pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decod
 pub const grow_alloc_round_bytes: u64 = 16_384;
 
 /// The release route the Module installs and the bill charges (one resolver: the stream's capability and the setting
-/// over the default, off).
+/// over the default, on).
 pub fn transientRelease(ov: RouteOverrides) bool {
     return expert_stream.phase_change_releases_wide_windows and (ov.transient_release orelse expert_stream.transient_release_default);
 }
@@ -219,10 +220,14 @@ pub fn firstVerifyWarm(ov: RouteOverrides) bool {
     return ov.first_verify_warm orelse false;
 }
 
-/// The phase change's settle poll the Module installs: the setting over the default (`phase_change_poll_ms`); a value
-/// outside 1..`phase_change_settle_ms` refuses at construction.
+/// The phase change's settle poll the Module installs: the setting over its condition's default (`until_freed`:
+/// `phase_change_until_freed_poll_ms`; `interval`: `phase_change_poll_ms`, whose relative test a fast poll satisfies
+/// early); a value outside 1..`phase_change_settle_ms` refuses at construction.
 pub fn phaseChangePollMs(ov: RouteOverrides) error{PhaseChangePollMs}!u32 {
-    const ms = ov.phase_change_poll_ms orelse return phase_change_poll_ms;
+    const ms = ov.phase_change_poll_ms orelse return switch (phaseChangeSettle(ov)) {
+        .interval => phase_change_poll_ms,
+        .until_freed => phase_change_until_freed_poll_ms,
+    };
     if (ms == 0 or ms > phase_change_settle_ms) return error.PhaseChangePollMs;
     return ms;
 }
@@ -1167,7 +1172,7 @@ pub const Installed = struct {
     /// The phase change's settle poll (ms), as installed (`phaseChangePollMs`).
     phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The phase change's settle condition, as installed (`phaseChangeSettle`).
-    phase_change_settle: PhaseChangeSettle = .interval,
+    phase_change_settle: PhaseChangeSettle = .until_freed,
     /// The phase change's host relief, as installed (`hostRelief`).
     host_relief: bool = false,
     /// The prefill attention core (installed and past its construction self-check).
@@ -1390,6 +1395,8 @@ const LiveReader = struct {
 pub const phase_change_tolerance_bytes: u64 = 250_000_000;
 /// The reclaim wait: read every `phase_change_poll_ms`, refuse after `phase_change_settle_ms`.
 pub const phase_change_poll_ms: u32 = 250;
+/// The phase change's poll under `until_freed` (its bound, not the poll, sets the wait).
+pub const phase_change_until_freed_poll_ms: u32 = 5;
 pub const phase_change_settle_ms: u32 = 10_000;
 
 fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
@@ -1740,11 +1747,16 @@ const WaveBound = struct {
     reset: u64,
     outside: u64,
     widest: u64,
+    /// The same bound in buffers (`graph.heldArrays`): the nodes outside every wave plus the widest wave's kept ones
+    /// and its widest sub-wave's two.
+    arrays: u64,
 
     fn of(g: *const ops.TraceOps, from: usize, to: usize, freed: []const ops.TraceOps.Freed) WaveBound {
         const total = graph.heldBytes(g, from, to).sum;
         var in_waves: u64 = 0;
         var widest: u64 = 0;
+        var in_waves_n: u64 = 0;
+        var widest_n: u64 = 0;
         for (freed, 0..) |w, i| {
             if (w.to <= w.from) continue;
             const inner = for (freed, 0..) |v, j| {
@@ -1753,10 +1765,16 @@ const WaveBound = struct {
             if (inner) continue;
             const all = graph.heldBytes(g, w.from, w.to).sum;
             in_waves += all;
+            const all_n = graph.heldArrays(g, w.from, w.to, false);
+            in_waves_n += all_n;
+            var kept_n = all_n;
+            var live_n: u64 = 0;
             var kept = all;
             var live: u64 = 0;
             for (freed) |r| {
                 if (r.from >= w.from and r.to <= w.to and (r.from != w.from or r.to != w.to) and r.to > r.from) {
+                    kept_n = (kept_n -| graph.heldArrays(g, r.from, r.to, false)) + 1;
+                    live_n = 2;
                     var a: u64 = 0;
                     var b: u64 = 0;
                     var out: u64 = 0;
@@ -1774,8 +1792,9 @@ const WaveBound = struct {
                 }
             }
             widest = @max(widest, kept + live);
+            widest_n = @max(widest_n, kept_n + live_n);
         }
-        return .{ .reset = total, .outside = total -| in_waves, .widest = widest };
+        return .{ .reset = total, .outside = total -| in_waves, .widest = widest, .arrays = (graph.heldArrays(g, from, to, false) -| in_waves_n) + widest_n };
     }
 };
 
@@ -1835,16 +1854,25 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     g.host_values = rid.values();
     const prompt = try aa.alloc(u32, 16384);
     for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    // wire_tables' buffer counts (`bill.wire_arrays_*`), the served tier's: what the model builds beyond the checkpoint's
+    // tensors (the bill counts those from the headers) plus the state's KV, and the most buffers one forward holds at
+    // once at decode rows (<= 8) and at prompt rows.
+    var state_n: u64 = 0;
+    var wave_n: [2]u64 = .{ 0, 0 };
     for ([_]struct { name: []const u8, tier: routes.Tier, attn: v41.PrefillBill.Tier }{
         .{ .name = "stock", .tier = routes.stock, .attn = .stock },
         .{ .name = "served", .tier = routes.served, .attn = .served },
     }) |t| {
+        const m0 = g.nodes.items.len;
         const model_ = try TM.initWith(a, &g, c, t.tier, &lookup, &src, .{ .registry = &reg });
         defer model_.deinit(&g);
+        const model_n = graph.heldArrays(&g, m0, g.nodes.items.len, false);
         // (positions already in the state, rows): the decode lane, the gate's prompt, wide chunks, the 16K prompt.
         for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 953 }, .{ 1024, 953 }, .{ 0, 16384 } }) |pn| {
+            const s0 = g.nodes.items.len;
             var st = try model_.newState();
             defer st.deinit(&g, a);
+            if (t.attn == .served) state_n = @max(state_n, model_n + graph.heldArrays(&g, s0, g.nodes.items.len, true));
             if (pn[0] > 0) {
                 const r0 = try model_.forward(&g, &st, prompt[0..pn[0]], .{ .logits = .none }, &ex, graph.NoProbe{});
                 try TM.fence(&g, &st, &.{r0.hidden});
@@ -1862,10 +1890,15 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
             // The widest wave is a whole chunk's: the model's chunk, reading the whole prompt at its end.
             const chunk = @min(n, bill.chunkRows(pn[0] + n));
             const billed = bill.waveBytes(chunk, pn[0] + n, t.attn);
-            std.debug.print("\nDSV41_HELD {{\"tier\": \"{s}\", \"positions\": {d}, \"rows\": {d}, \"outside\": {d}, \"widest\": {d}, \"billed\": {d}}}", .{ t.name, pn[0], n, h.outside, h.widest, billed });
+            std.debug.print("\nDSV41_HELD {{\"tier\": \"{s}\", \"positions\": {d}, \"rows\": {d}, \"outside\": {d}, \"widest\": {d}, \"billed\": {d}, \"arrays\": {d}}}", .{ t.name, pn[0], n, h.outside, h.widest, billed, h.arrays });
             try std.testing.expect(h.outside + h.widest <= billed);
+            if (t.attn == .served) wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)] = @max(wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)], h.arrays);
         }
     }
+    std.debug.print("\nDSV41_WIRE_ARRAYS {{\"built_and_state\": {d}, \"decode_wave\": {d}, \"prompt_wave\": {d}}}", .{ state_n, wave_n[0], wave_n[1] });
+    try std.testing.expect(state_n <= bill_mod.wire_arrays_state);
+    try std.testing.expect(wave_n[0] <= bill_mod.wire_arrays_decode_wave);
+    try std.testing.expect(wave_n[1] <= bill_mod.wire_arrays_prompt_wave);
     // The bill's chunk is the model's.
     for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
         try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));
@@ -2123,8 +2156,11 @@ test "dsv41 memory: the settle waits for the footprint to show the frees, then t
 }
 
 test "dsv41 memory: the phase change's settle poll as a route (poll5): the same reads and check, its own wait steps" {
-    // The resolver: the default; an override in 1..phase_change_settle_ms; else refused at construction.
-    try std.testing.expectEqual(phase_change_poll_ms, try phaseChangePollMs(.{}));
+    // The resolver: the settle's default (5 under until_freed, 250 under interval); an override in
+    // 1..phase_change_settle_ms; else refused at construction.
+    try std.testing.expectEqual(@as(u32, 5), try phaseChangePollMs(.{}));
+    try std.testing.expectEqual(@as(u32, 250), try phaseChangePollMs(.{ .phase_change_settle = .interval }));
+    try std.testing.expectEqual(@as(u32, 250), try phaseChangePollMs(.{ .phase_change_settle = .until_freed, .phase_change_poll_ms = 250 }));
     try std.testing.expectEqual(@as(u32, 5), try phaseChangePollMs(.{ .phase_change_poll_ms = 5 }));
     try std.testing.expectEqual(phase_change_settle_ms, try phaseChangePollMs(.{ .phase_change_poll_ms = phase_change_settle_ms }));
     try std.testing.expectError(error.PhaseChangePollMs, phaseChangePollMs(.{ .phase_change_poll_ms = 0 }));
@@ -2156,10 +2192,10 @@ test "dsv41 memory: the phase change's settle poll as a route (poll5): the same 
 }
 
 test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a reading above it keeps polling, the settled arms pass at once" {
-    // The resolver: interval by default (the served default unchanged), until_freed on the setting.
-    try std.testing.expectEqual(PhaseChangeSettle.interval, phaseChangeSettle(.{}));
-    try std.testing.expectEqual(PhaseChangeSettle.interval, (Installed{}).phase_change_settle);
-    try std.testing.expectEqual(PhaseChangeSettle.until_freed, phaseChangeSettle(.{ .phase_change_settle = .until_freed }));
+    // The resolver: until_freed by default (served and cell), interval on the setting (the control arm).
+    try std.testing.expectEqual(PhaseChangeSettle.until_freed, phaseChangeSettle(.{}));
+    try std.testing.expectEqual(PhaseChangeSettle.until_freed, (Installed{}).phase_change_settle);
+    try std.testing.expectEqual(PhaseChangeSettle.interval, phaseChangeSettle(.{ .phase_change_settle = .interval }));
     // The grow's bound from the bill (pass3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
     // 74,567,270,400 -> 90,545,971,200 B, + 40 layers x 9 arrays x 16 KiB rounding: the grow 15,984,599,040 B (measured
     // MLX active rise 15,980,298,240).
