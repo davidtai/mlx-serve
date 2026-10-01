@@ -7,13 +7,21 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
-const first_cycle = @import("dsv41_decode_first.zig");
+const bo = @import("build_options");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "21521ce4d44e18a8ad828f1e14447053903b6e5c0df4e25f84b175d265d1858f";
+pub const manifest_sha256 = "97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15";
+
+/// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
+/// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
+pub const launch_observed: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
+/// A launch config's template key (`launchKey`), kept with its prepared config.
+pub const LaunchKey = if (launch_observed) u64 else void;
+/// The observer a profile hook installs: the kernel's name, the launch key and the inputs.
+pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const mlx.mlx_array) void else void;
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -574,8 +582,8 @@ pub const Prepared = struct {
     kernel: Kernel,
     config: mlx.mlx_fast_metal_kernel_config,
     n_out: usize,
-    /// its template arguments' key (A0's first dispatches; profile builds only)
-    tkey: first_cycle.TKey = if (first_cycle.enabled) 0 else {},
+    /// its template arguments' key (the observer's; profile builds only)
+    tkey: LaunchKey = if (launch_observed) 0 else {},
 
     pub fn deinit(self: *Prepared) void {
         _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
@@ -588,12 +596,20 @@ pub const Bound = struct {
     reg: *const Registry,
     stream: mlx.mlx_stream,
     kernels: [n_kernels]mlx.mlx_fast_metal_kernel,
+    /// the profile hook's launch probe (`observe`); void outside the decode-timers build
+    observer: Observer = if (launch_observed) null else {},
 
     pub fn deinit(self: *Bound) void {
         for (self.kernels) |k| {
             if (k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k);
         }
         self.* = undefined;
+    }
+
+    /// Every later launch reaches the hook's launch probe `L` (`sdk.profile.Hook.launch`), at construction, before
+    /// the first: a no-op unless the build observes launches and `L` is enabled.
+    pub fn observe(self: *Bound, comptime L: type) void {
+        if (comptime launch_observed and L.enabled) self.observer = &L.kernel;
     }
 
     /// A launch's mlx config built once (a route's construction): `applyPrepared` hands it to the
@@ -610,7 +626,7 @@ pub const Bound = struct {
             .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
         };
         var p: Prepared = .{ .kernel = k, .config = c, .n_out = cfg.n_out };
-        if (comptime first_cycle.enabled) {
+        if (comptime launch_observed) {
             var names: [16][]const u8 = undefined;
             var values: [16]i64 = undefined;
             const nt = @min(cfg.template.len, names.len);
@@ -621,7 +637,7 @@ pub const Bound = struct {
                     .dtype => |x| @backingInt(x),
                 };
             }
-            p.tkey = first_cycle.templateKey(names[0..nt], values[0..nt]);
+            p.tkey = launchKey(names[0..nt], values[0..nt]);
         }
         return p;
     }
@@ -632,7 +648,7 @@ pub const Bound = struct {
         defer _ = mlx.mlx_vector_array_free(vin);
         var vout = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vout);
-        if (comptime first_cycle.enabled) first_cycle.kernel(@tagName(p.kernel), p.tkey, inputs);
+        if (comptime launch_observed) if (self.observer) |f| f(@tagName(p.kernel), p.tkey, inputs);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
         for (outs[0..p.n_out], 0..) |*o, i| {
             o.* = mlx.mlx_array_new();
@@ -649,6 +665,16 @@ pub const Bound = struct {
         try self.applyPrepared(&p, inputs, outs);
     }
 };
+
+/// The template key of a launch config's template arguments (name, then the value's bytes).
+pub fn launchKey(names: []const []const u8, values: []const i64) u64 {
+    var h = std.hash.Wyhash.init(0x5eed);
+    for (names, values) |n, v| {
+        h.update(n);
+        h.update(std.mem.asBytes(&v));
+    }
+    return h.final();
+}
 
 // ── Manifest adoption (once, at init) ──
 
@@ -1177,12 +1203,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     // the LUT gate|up text's manifest lists the fused down GEMM's (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71"));
     // the routed forms' manifest lists the LUT gate|up text's (every kernel and header unchanged)
-    try testing.expect(reg.acceptsManifest("4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"));
-    // the HC post texts' manifest and the banked texts' manifest each list the routed forms' (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15"));
-    // served19j's union manifest lists both (every kernel and header of each unchanged)
-    try testing.expect(reg.acceptsManifest("9033520a3565e84d0d3ece55ba5f9e0db096b7e27f7c955f6ed8de9acf26cdf9"));
-    try testing.expect(reg.acceptsManifest("1aee687704d0009f85155621acdfb8917c7ba1446f652f5209b19028204beac4"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each

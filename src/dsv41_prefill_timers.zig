@@ -5,13 +5,13 @@
 
 const std = @import("std");
 const bo = @import("build_options");
+const sdk = @import("sdk");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;
 
-/// Where the routed call's host time goes: the routing barrier (the ids to the host), the stream's route
-/// (reads issued), the read waits, the waves' encode (graphs, host tables, submission), the drains (the
-/// host blocked on GPU compute), the join (the outputs' concatenate / take).
-pub const Bucket = enum { barrier, route, read_wait, encode, drain, join };
+/// Where the routed call's host time goes (the SDK's probe shape, G7): the routing barrier, the stream's route,
+/// the read waits, the waves' encode, the drains, the join.
+pub const Bucket = sdk.profile.PrefillBucket;
 const n_buckets = @typeInfo(Bucket).@"enum".field_names.len;
 
 pub var ns: [n_buckets]u64 = @splat(0);

@@ -16,7 +16,7 @@ const selfcheck = @import("exl3_selfcheck.zig");
 const kr = @import("kernel_routes.zig");
 const ks = @import("kernel_set.zig");
 const quant = @import("quant.zig");
-const prof = @import("dsv41_prefill_timers.zig");
+const sdk = @import("sdk");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -964,6 +964,8 @@ pub fn DigXPrefill(comptime G: type) type {
         @compileError("exl3 kernel ops: DigXPrefill needs a backend with mark / resetTo (the wave lifecycle)");
     return struct {
         const Self = @This();
+        /// G7: the backend's prompt-pass split (the arch injects it; off on every other backend and build).
+        const prof = sdk.profile.of(G).prefill;
         const hidden = 5120;
         /// The wave's down stage, installed at construction (`installDown`): the 128-row down text then rot_widen1
         /// (stock), or the fused down GEMM (the same words in one launch). Each builds its own table.

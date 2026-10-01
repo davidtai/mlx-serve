@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
+const sdk = @import("sdk");
 const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 
@@ -89,13 +90,15 @@ pub const Set = struct {
 
     /// Points the backend's launcher at the bound kernels (its `launcher: ?*const xk.Bound`
     /// field, or its base backend's under a wrapper), before any consumer builds a route: a
-    /// backend that prepares launches prepares them through it. A backend without a route
-    /// method does not compile (the method is named).
-    pub fn install(self: *const Set, comptime G: type, g: *G) void {
+    /// backend that prepares launches prepares them through it. The backend's profile hook
+    /// (G7, `sdk.profile.of`) observes the set's launches from here on. A backend without a
+    /// route method does not compile (the method is named).
+    pub fn install(self: *Set, comptime G: type, g: *G) void {
         comptime {
             if (missingBackendMethod(G)) |m| @compileError("kernel set: the backend " ++ @typeName(G) ++ " lacks " ++ m);
         }
         if (launcherSlot(G, g)) |s| s.* = &self.bound;
+        self.bound.observe(sdk.profile.of(G).launch);
     }
 
     /// Clears the backend's launcher (after the last consumer's `deinit`).

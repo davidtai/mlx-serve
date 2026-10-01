@@ -84,6 +84,8 @@ pub const expert = struct {
 };
 
 pub const kernels = @import("sdk/kernels.zig");
+/// G7: a plugin's profile probes, injected by its arch's backend type (`of(Backend)`); off everywhere else.
+pub const profile = @import("sdk/profile.zig");
 pub const BuildOption = @import("sdk/build_option.zig").BuildOption;
 pub const QuantMode = @import("sdk/quant_mode.zig").QuantMode;
 
@@ -99,5 +101,6 @@ test {
     _ = memory_bill;
     _ = lifecycle;
     _ = kinds;
+    _ = profile;
     _ = testing;
 }

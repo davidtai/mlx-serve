@@ -65,7 +65,7 @@ pub var cycle1_new: [96]Named = undefined;
 pub var n_cycle1_new: usize = 0;
 var seen: [16384]u64 = @splat(0);
 
-/// A launch config's template key (`exl3_kernels.Bound.prepare`): its template arguments' names and values.
+/// A launch config's template key (`exl3_kernels.launchKey`, kept by `Bound.prepare`).
 pub const TKey = if (enabled) u64 else void;
 
 /// The prompt pass begins (construction's dispatches are behind it).
@@ -191,17 +191,8 @@ pub fn missedOf(ids: []const u16, waves: []const u8) u64 {
     return m.count();
 }
 
-/// The template key of a launch config's template arguments (name, then the value's bytes).
-pub fn templateKey(names: []const []const u8, values: []const i64) u64 {
-    var h = std.hash.Wyhash.init(0x5eed);
-    for (names, values) |n, v| {
-        h.update(n);
-        h.update(std.mem.asBytes(&v));
-    }
-    return h.final();
-}
-
-/// A registry kernel dispatched (`Bound.applyPrepared`): its variant counted in the phase that first dispatches it.
+/// A registry kernel dispatched (`Bound.applyPrepared`, through the observer the kernel set installs from the
+/// backend's profile hook): its variant counted in the phase that first dispatches it.
 pub fn kernel(name: []const u8, tkey: TKey, inputs: []const mlx.mlx_array) void {
     if (comptime !enabled) return;
     var h = std.hash.Wyhash.init(tkey);
