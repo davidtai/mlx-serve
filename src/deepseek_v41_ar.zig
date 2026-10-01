@@ -2301,6 +2301,15 @@ const PrefillProbe = struct {
     read_bytes: u64 = 0,
     misses: u64 = 0,
     before: expert_stream.Stats = .{},
+    /// MLX's high-water mark within each stage's segment (`peakOf`: read after the stage's eval, then reset), the
+    /// largest per stage name, and the layer and chunk where the pass's largest one fell: which stage sets the prompt's
+    /// transient (G7's second stream holder).
+    peak: [n_max]u64 = @splat(0),
+    peak_max: u64 = 0,
+    peak_stage: usize = 0,
+    /// `layers_done` (out.h puts: one per layer and chunk) and the chunk when the largest one fell.
+    peak_done: u64 = 0,
+    peak_chunk: usize = 0,
 
     pub fn atChunk(self: *PrefillProbe, i: usize) void {
         self.cur_chunk = i;
@@ -2330,9 +2339,25 @@ const PrefillProbe = struct {
     fn charge(self: *PrefillProbe, name: []const u8) !void {
         const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
-        self.ns[try self.slot(name)] += d;
+        const k = try self.slot(name);
+        self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
+        self.peakOf(k, chunk);
+    }
+
+    /// The segment's MLX high-water mark (since the previous stage's reset), charged to stage `k`.
+    fn peakOf(self: *PrefillProbe, k: usize, chunk: usize) void {
+        var pk: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&pk);
+        _ = mlx.mlx_reset_peak_memory();
+        self.peak[k] = @max(self.peak[k], pk);
+        if (pk > self.peak_max) {
+            self.peak_max = pk;
+            self.peak_stage = k;
+            self.peak_done = self.layers_done;
+            self.peak_chunk = chunk;
+        }
     }
 
     fn slot(self: *PrefillProbe, name: []const u8) !usize {
@@ -2350,9 +2375,11 @@ const PrefillProbe = struct {
         try self.g.evalAll(&.{x});
         const d: u64 = @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
-        self.ns[try self.slot(name)] += d;
+        const k = try self.slot(name);
+        self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
+        self.peakOf(k, chunk);
         if (is_routed) {
             const after = self.stats_of(self.stats_ctx);
             self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
@@ -2438,6 +2465,9 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
     const s0 = stats_of(@ptrCast(&arm.hook));
     dsv41_prof.reset(); // the construction's warm-up routed calls do not count
+    var start_active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&start_active);
+    _ = mlx.mlx_reset_peak_memory();
     const t0 = std.Io.Timestamp.now(io, .boot);
     probe.last = t0;
     const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
@@ -2455,6 +2485,17 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
         inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, s1.expert_bytes_read - s0.expert_bytes_read, secs(s1.read_wall_ns - s0.read_wall_ns), s1.expert_cache_misses - s0.expert_cache_misses, secs(probe.read_wall_ns),
     });
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    // Per stage, MLX's high-water mark above the pass's start (the constructed residents): which stage sets the transient.
+    const gb = struct {
+        fn f(b: u64) f64 {
+            return @as(f64, @floatFromInt(b)) / 1e9;
+        }
+    }.f;
+    for (probe.names[0..probe.n], probe.peak[0..probe.n]) |name, pk| std.debug.print("PREFILL_PROFILE_PEAK {{\"stage\": \"{s}\", \"above_start_gb\": {d:.3}}}\n", .{ name, gb(pk -| start_active) });
+    {
+        const chunks = @max(@as(u64, 1), probe.layers_done / @max(@as(u64, 1), probe.n_layers));
+        std.debug.print("PREFILL_PROFILE_PEAK_MAX {{\"stage\": \"{s}\", \"above_start_gb\": {d:.3}, \"start_active_gb\": {d:.3}, \"layer\": {d}, \"chunk\": {d}}}\n", .{ if (probe.n > 0) probe.names[probe.peak_stage] else "none", gb(probe.peak_max -| start_active), gb(start_active), probe.peak_done / chunks, probe.peak_chunk });
+    }
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });
     // The wide calls' merges (K16 JOINLESS): the bytes they allocated fresh against those MLX's cache gave back.
