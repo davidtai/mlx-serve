@@ -831,10 +831,9 @@ fn msSince(t: std.Io.Timestamp) f64 {
 
 /// The Engram files' page-cache residency (mincore).
 fn engramResident(src: *const RowSource, bank_dir: []const u8) !u64 {
-    const nocache = @import("nocache_reader.zig");
     var sum: u64 = 0;
     var buf: [1024]u8 = undefined;
-    for (0..src.hashing.n_layers) |i| sum += try nocache.residentBytes(try std.fmt.bufPrintSentinel(&buf, "{s}/engram/{s}", .{ bank_dir, src.bank.files[i] }, 0));
+    for (0..src.hashing.n_layers) |i| sum += try io_util.residentBytes(try std.fmt.bufPrintSentinel(&buf, "{s}/engram/{s}", .{ bank_dir, src.bank.files[i] }, 0));
     return sum;
 }
 
