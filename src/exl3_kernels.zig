@@ -13,7 +13,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71";
+pub const manifest_sha256 = "4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -118,6 +118,9 @@ pub const Kernel = enum {
     // The 128-row down GEMM at BN 128 with rot_widen1 as its epilogue (09-30, mlx-serve native): z stays in the
     // threadgroup (fused check: the words of the 128-row down text, then q3_prefill_dig_rot_widen1_5120)
     dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1,
+    // The 128-row gate|up GEMM with the mul1h codebook through a threadgroup table (09-30, mlx-serve native; header
+    // dig_mul1h_k3_lut): the same halves from a 1,024-entry table (twin check: the 128-row text's words)
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -133,7 +136,7 @@ pub fn baseOf(k: Kernel) ?Kernel {
 }
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
-pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless };
+pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
@@ -1135,8 +1138,8 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 78), n_kernels);
-    try testing.expectEqual(@as(usize, 15), n_headers);
+    try testing.expectEqual(@as(usize, 79), n_kernels);
+    try testing.expectEqual(@as(usize, 16), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1150,7 +1153,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 7), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 8), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
@@ -1158,6 +1161,8 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     try testing.expect(reg.acceptsManifest("230f778d9db6d66789316f10d45f9d445ba95dab4e888e7ec7539986708f0912"));
     // the fused down GEMM's manifest lists the 128-row GEMMs' (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("efe9bb1adf9d9cfd0ec6b79bd22b20fac12077b04b57758b3c544e578eb1839d"));
+    // the LUT gate|up text's manifest lists the fused down GEMM's (every kernel and header unchanged)
+    try testing.expect(reg.acceptsManifest("833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each

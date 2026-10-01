@@ -71,7 +71,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 22), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 23), eq.kernels.len);
     try testing.expectEqual(@as(usize, 56), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
@@ -81,7 +81,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         var fam = false;
         for (exl3_families) |f| fam = fam or std.mem.eql(u8, e.family, f);
         try testing.expectEqual(fam, ex.contains(e.kernel));
-        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3);
+        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3 or h == .dig_mul1h_k3_lut);
     }
     // the EXL3-only check kinds stay on the EXL3 side
     for (&reg.entries) |*e| {
@@ -127,11 +127,14 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try acc.routeFusedDown(set, &diag);
     try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
     for (acc.waves) |*w| try testing.expectEqual(@as(u32, 4), w.wave_launches);
-    // the trunk: the rest of the plan, none of the EXL3 kernels
+    // the trunk: the rest of the plan less the table-codebook text's 3 (the EXL3 subset's, registered, not checked at
+    // accept), none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
-    try testing.expectEqual(plan - 60 - fused_checks, rep.results.items.len);
+    const lut_checks = set.reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut).checks.count();
+    try testing.expectEqual(@as(usize, 3), lut_checks);
+    try testing.expectEqual(plan - 60 - fused_checks - lut_checks, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
@@ -537,7 +540,14 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
             _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)));
             try expectLaunch(t.back(1), e, s, &.{ x, c0, tbl });
         }
-        // the down GEMM the prefill waves launch: the fused text (its own samples: grid 512 x tgs, BN 128 tables)
+        // the table-codebook gate|up text (its own samples: the 128-row text's geometry)
+        for (r.gemm_gu128lut.samples) |*s| {
+            const e, const v = .{ r.gemm_gu128lut, &s.vars };
+            const x0, const x1, const c0, const c1, const tbl = .{ try t.arg(e, "x0", v), try t.arg(e, "x1", v), try t.arg(e, "code0", v), try t.arg(e, "code1", v), try t.arg(e, "tbl", v) };
+            _ = try r.gemmGateUpLut(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)));
+            try expectLaunch(t.back(1), e, s, &.{ x0, x1, c0, c1, tbl });
+        }
+        // the fused arm's down GEMM (its own samples: grid 512 x tgs, BN 128 tables)
         for (r.gemm_dn_w1.samples) |*s| {
             const e, const v = .{ r.gemm_dn_w1, &s.vars };
             const x, const c0, const rout, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "rout", v), try t.arg(e, "tbl", v) };

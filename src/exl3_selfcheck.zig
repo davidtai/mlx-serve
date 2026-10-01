@@ -120,11 +120,13 @@ fn fusedOf(k: Kernel) ?Kernel {
     return if (k == .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1) .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 else null;
 }
 
-/// A 128-row DIG-X GEMM's 64-row text (its `twin` check's reference); null for every other kernel.
+/// A DIG-X GEMM's `twin` check reference: a 128-row text's 64-row text, the table-codebook text's 128-row text; null
+/// for every other kernel.
 fn twinOf(k: Kernel) ?Kernel {
     return switch (k) {
         .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 => .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
         .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 => .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
+        .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut => .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
         else => null,
     };
 }
@@ -1580,7 +1582,7 @@ fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
 const dig_rows = [_]u32{ 70, 37, 20, 17 };
 
 fn isGateUp(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut;
 }
 
 /// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand); `rout` for the fused
@@ -1711,7 +1713,7 @@ fn checkComposition(h: *H, k: Kernel) !void {
 /// The 128-row texts' twin experts: full and partial 128-row tiles, a 64-row expert, a single row.
 const twin_rows = [_]u32{ 270, 129, 64, 1 };
 
-/// A 128-row DIG-X GEMM against its 64-row text on the same x, codes and wave: every z word.
+/// A DIG-X GEMM against its twin (`twinOf`) on the same x, codes and wave: every z word.
 fn checkTwin(h: *H, k: Kernel) !void {
     var sc: Scope = .{ .a = h.a };
     defer sc.deinit();
