@@ -6,6 +6,7 @@
 //! the host dry path is the model test "the AR dry path ...".
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -878,6 +879,12 @@ const CellReceipt = struct {
     bill_variant: []const u8 = "conservative",
     /// The window's arm tag (DSV41_CELL_ARM: tight, fusedw, maxops40, mxfp8head), null for arm 1.
     cell_arm: ?[]const u8 = null,
+    /// The server's wired-residency policy as this process applied it after construction (`applyServerWiredPolicy`:
+    /// MLX_SERVE_WIRED, default max): the mode, and the wired limit it set (null: declined).
+    wired_policy: ?[]const u8 = null,
+    wired_limit_bytes: ?u64 = null,
+    /// The host allocator this process ran on (`cellHostAllocator`: the server's init.gpa for the build mode).
+    host_allocator: ?[]const u8 = null,
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -955,6 +962,8 @@ const CellReceipt = struct {
     phase_memory: ?[]const PhaseMemory = null,
     /// The phase change's readings before / after the frees and after the grow, the freed bytes, the reclaim time.
     phase_change: ?module.PhaseChangeRecord = null,
+    /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
+    phase_change_poll_ms: ?u32 = null,
     /// The verify-row routes the Module installed.
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -989,7 +998,9 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // The Module's construction / phase-change evidence lines (log.info: the routes installed, the
     // construction check, the phase change's boundary marks) reach the window log; none is per token.
     testing.log_level = .info;
-    const gpa = testing.allocator;
+    const host = cellHostAllocator();
+    std.debug.print("NATIVE host allocator: {s} (the server's init.gpa in this build mode)\n", .{host.name});
+    const gpa = host.a;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1029,6 +1040,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     defer weights.deinit();
     const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
+    const wired = applyServerWiredPolicy();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
     // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
     try checkPageCache(constructed.file_cache_created_bytes);
@@ -1043,8 +1055,51 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
     switch (md.arm) {
-        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks }),
+        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
     }
+}
+
+/// The server's host allocator: main.zig takes the runtime's `init.gpa`, which start.zig's `callMain` makes libc's malloc
+/// in a ReleaseFast (or small) binary that links libc (the served and window builds), else the smp allocator; a debug or
+/// safe build keeps the testing allocator (its leak checks; the server would run its safe allocator there).
+const HostAllocator = struct { a: std.mem.Allocator, name: []const u8 };
+
+fn cellHostAllocator() HostAllocator {
+    return switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => if (builtin.link_libc)
+            .{ .a = std.heap.c_allocator, .name = "c_allocator" }
+        else if (!builtin.single_threaded)
+            .{ .a = std.heap.smp_allocator, .name = "smp_allocator" }
+        else
+            .{ .a = testing.allocator, .name = "testing" },
+        .Debug, .ReleaseSafe => .{ .a = testing.allocator, .name = "testing" },
+    };
+}
+
+test "dsv41 served cell: the host allocator is the server's init.gpa for the build mode (libc's malloc in the window builds)" {
+    const h = cellHostAllocator();
+    switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => if (builtin.link_libc) {
+            try testing.expectEqualStrings("c_allocator", h.name);
+            try testing.expect(h.a.vtable == std.heap.c_allocator.vtable);
+        },
+        .Debug, .ReleaseSafe => {
+            try testing.expectEqualStrings("testing", h.name);
+            try testing.expect(h.a.ptr == testing.allocator.ptr and h.a.vtable == testing.allocator.vtable);
+        },
+    }
+}
+
+/// The server's wired-residency policy at the server's point: the scheduler applies `mlx.applyWiredPolicy()` once the
+/// model is constructed, before its first forward ("[wired] mode=max limit=114688 MB" on this box). The cell (timed,
+/// decode profile and prefill profile alike) applies it right after `Module.initWith`, before the "module constructed"
+/// record, so the window runs the Metal residency setup the server runs. Once per process, outside the timed spans.
+fn applyServerWiredPolicy() mlx.WiredPolicyResult {
+    const r = mlx.applyWiredPolicy();
+    if (r.target) |t| {
+        std.debug.print("NATIVE wired policy: mode={s} limit={d} MB (the server's, after construction)\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+    } else std.debug.print("NATIVE wired policy: mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+    return r;
 }
 
 const CellCtx = struct {
@@ -1065,6 +1120,10 @@ const CellCtx = struct {
     file_backed_start: u64,
     /// The phase change's proof marks (the Module's observer).
     marks: *PhaseMarks,
+    /// The server's wired-residency policy, applied after construction (the receipt stamps it).
+    wired: mlx.WiredPolicyResult,
+    /// The host allocator the cell ran on (`cellHostAllocator`; the receipt stamps it).
+    host_allocator: []const u8,
 };
 
 /// The timed cell over the Module's arm (`arm` the host-waits or the event-gated one).
@@ -1217,6 +1276,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .mlx_max_ops_per_buffer = envStr("MLX_MAX_OPS_PER_BUFFER"),
         .bill_variant = envStr("DSV41_BILL_VARIANT") orelse "conservative",
         .cell_arm = envStr("DSV41_CELL_ARM"),
+        .wired_policy = @tagName(cx.wired.mode),
+        .wired_limit_bytes = if (cx.wired.target) |t| @as(u64, t) else null,
+        .host_allocator = cx.host_allocator,
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
@@ -1280,6 +1342,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .bill_baseline_bytes = cx.bill.baseline,
         .phase_memory = &phases,
         .phase_change = md.phase_change,
+        .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
@@ -1398,6 +1461,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
+    // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
+    if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
@@ -2539,6 +2604,88 @@ const PrefillProbe = struct {
     /// `layers_done` (out.h puts: one per layer and chunk) and the chunk when the largest one fell.
     peak_done: u64 = 0,
     peak_chunk: usize = 0,
+    /// (SERVED19) The grouped mode (DSV41_CELL_GROUP_PROFILE=1): the routed group's final evaluation measured whole, as
+    /// the timed pass runs it. The per-chunk moe.y / out.h points and the merge's own stage are not evaluated (out.h keeps
+    /// its row bookkeeping; the layer count moves at group.eval), so "group.eval" is the merge, the combines, the HC
+    /// posts and the new streams at once.
+    grouped: bool = false,
+    /// The routed group being measured (`groupHalves`, `groupEval`, then its peak at group.eval) and those recorded.
+    group: Group = .{},
+    groups: [max_groups]Group = undefined,
+    n_groups: usize = 0,
+    /// Layers begun (a group at chunk 0 starts one), for the groups' layer index.
+    group_layers: u64 = 0,
+    const max_groups = 64;
+    const Group = struct {
+        layer: u64 = 0,
+        chunks: u64 = 0,
+        rows: u64 = 0,
+        /// The halves' bytes at the group's start (moe_in, h1, post, comb, ffn_pre) and the MoE input's item size (the
+        /// combine's output is cast to it).
+        halves: u64 = 0,
+        cast_itemsize: u64 = 0,
+        /// What the final evaluation reads and writes: the wide call's sources and loc, the shared experts' outputs, the
+        /// new streams (unevaluated there: shape x item size).
+        parts: u64 = 0,
+        loc: u64 = 0,
+        shared: u64 = 0,
+        next: u64 = 0,
+        /// MLX's active bytes right before the final evaluation, and that evaluation's high-water mark.
+        active_before: u64 = 0,
+        eval_peak: u64 = 0,
+        /// The group's concatenated MoE input (the routed call's, held by the group's wave through the evaluation).
+        cat_xf: u64 = 0,
+        /// The JOINLESS merge (the hook's record, profile builds): outputs, sources, the rows copied and their bytes
+        /// (the merged source is the last one).
+        merge_outputs: u64 = 0,
+        merge_sources: u64 = 0,
+        merge_copied_rows: u64 = 0,
+        merge_copied: u64 = 0,
+    };
+
+    fn bytesOf(x: ops.MlxOps.T) u64 {
+        return @as(u64, mlx.mlx_array_size(x)) * @as(u64, mlx.mlx_array_itemsize(x));
+    }
+
+    /// The group's halves at its start: every chunk's are held by the group's HC posts until each post evaluates (h1 /
+    /// post / comb), ffn_pre as the next layer's pre_mix, moe_in to the layer's end.
+    pub fn groupHalves(self: *PrefillProbe, halves: anytype, first_chunk: usize) void {
+        if (first_chunk == 0) self.group_layers += 1;
+        self.group = .{ .layer = self.group_layers -| 1, .chunks = halves.len };
+        for (halves) |h| {
+            inline for (@typeInfo(@TypeOf(h)).@"struct".field_names) |name| self.group.halves += bytesOf(@field(h, name));
+            const sh = self.g.shapeOf(h.moe_in);
+            self.group.rows += @intCast(sh.dim(0) * sh.dim(1));
+            self.group.cast_itemsize = @as(u64, mlx.mlx_array_itemsize(h.moe_in));
+        }
+    }
+
+    /// The group's JOINLESS merge (the hook's `MergeStats`, profile builds), after `groupHalves`.
+    pub fn groupMerge(self: *PrefillProbe, m: anytype) void {
+        self.group.merge_outputs = m.outputs;
+        self.group.merge_sources = m.sources;
+        self.group.merge_copied_rows = m.copied_rows;
+    }
+
+    /// Right before the group's final evaluation: MLX's active mark and the geometry it reads and writes. The combine is
+    /// one kernel over the sources in place (it gathers nothing): its f32 output and the cast are rows x hidden each.
+    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T, cat_xf: ops.MlxOps.T) void {
+        var a: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a);
+        self.group.active_before = a;
+        self.group.cat_xf = bytesOf(cat_xf);
+        if (self.group.merge_copied_rows > 0 and outs.len > 0) {
+            const last = outs[outs.len - 1];
+            const rows: u64 = @intCast(self.g.shapeOf(last).dim(0));
+            self.group.merge_copied = self.group.merge_copied_rows * (bytesOf(last) / @max(rows, 1));
+        }
+        for (outs) |x| self.group.parts += bytesOf(x);
+        if (loc) |x| self.group.loc = bytesOf(x);
+        for (shared) |s| {
+            if (s) |x| self.group.shared += bytesOf(x);
+        }
+        for (next) |x| self.group.next += bytesOf(x);
+    }
 
     pub fn atChunk(self: *PrefillProbe, i: usize) void {
         self.cur_chunk = i;
@@ -2547,6 +2694,8 @@ const PrefillProbe = struct {
     /// The wide call's merged sources evaluated on their own stage ("moe.merge"), MLX's active and cache read around
     /// them: active growth the cache did not give back is fresh allocation.
     pub fn merge(self: *PrefillProbe, outs: []const ops.MlxOps.T) !void {
+        // The grouped mode: the merge lands in group.eval, as in the timed pass.
+        if (self.grouped) return;
         var a0: usize = 0;
         var c0: usize = 0;
         _ = mlx.mlx_get_active_memory(&a0);
@@ -2572,11 +2721,11 @@ const PrefillProbe = struct {
         self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
-        self.peakOf(k, chunk);
+        _ = self.peakOf(k, chunk);
     }
 
     /// The segment's MLX high-water mark (since the previous stage's reset), charged to stage `k`.
-    fn peakOf(self: *PrefillProbe, k: usize, chunk: usize) void {
+    fn peakOf(self: *PrefillProbe, k: usize, chunk: usize) u64 {
         var pk: usize = 0;
         _ = mlx.mlx_get_peak_memory(&pk);
         _ = mlx.mlx_reset_peak_memory();
@@ -2587,6 +2736,7 @@ const PrefillProbe = struct {
             self.peak_done = self.layers_done;
             self.peak_chunk = chunk;
         }
+        return pk;
     }
 
     fn slot(self: *PrefillProbe, name: []const u8) !usize {
@@ -2599,6 +2749,16 @@ const PrefillProbe = struct {
 
     pub fn put(self: *PrefillProbe, name: []const u8, x: anytype) !void {
         if (@TypeOf(x) != ops.MlxOps.T) return;
+        // The grouped mode leaves the per-chunk combine and HC post points to the group's one evaluation (group.eval);
+        // out.h keeps only its row bookkeeping.
+        if (self.grouped and (std.mem.eql(u8, name, "moe.y") or std.mem.eql(u8, name, "out.h"))) {
+            if (std.mem.eql(u8, name, "out.h")) {
+                const c: usize = @min(self.cur_chunk orelse 0, self.chunk_rows.len - 1);
+                const sh = self.g.shapeOf(x);
+                if (self.chunk_rows[c] == 0) self.chunk_rows[c] = @intCast(sh.dim(0) * sh.dim(1));
+            }
+            return;
+        }
         const is_routed = std.mem.eql(u8, name, "moe.routed");
         if (std.mem.eql(u8, name, "gate.weights")) self.before = self.stats_of(self.stats_ctx);
         try self.g.evalAll(&.{x});
@@ -2608,7 +2768,16 @@ const PrefillProbe = struct {
         self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
-        self.peakOf(k, chunk);
+        const pk = self.peakOf(k, chunk);
+        if (std.mem.eql(u8, name, "group.eval")) {
+            self.group.eval_peak = pk;
+            if (self.n_groups < max_groups) {
+                self.groups[self.n_groups] = self.group;
+                self.n_groups += 1;
+            }
+            // The grouped mode's layer count (out.h's moves it otherwise): one per chunk of the group, after its peak.
+            if (self.grouped) self.layers_done += self.group.chunks;
+        }
         if (is_routed) {
             const after = self.stats_of(self.stats_ctx);
             self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
@@ -2634,7 +2803,9 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     if (std.c.getenv("DSV41_CELL_PROFILE") == null) return error.SkipZigTest;
     const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    const gpa = testing.allocator;
+    const host = cellHostAllocator();
+    std.debug.print("NATIVE host allocator: {s} (the server's init.gpa in this build mode)\n", .{host.name});
+    const gpa = host.a;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2663,6 +2834,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer weights.deinit();
     const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
+    _ = applyServerWiredPolicy();
     const arm = switch (md.arm) {
         .host_waits => |t| t.arm,
         else => return error.CellArmVariant,
@@ -2691,7 +2863,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
         });
         return;
     }
-    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
+    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined, .grouped = std.c.getenv("DSV41_CELL_GROUP_PROFILE") != null };
     const s0 = stats_of(@ptrCast(&arm.hook));
     dsv41_prof.reset(); // the construction's warm-up routed calls do not count
     var start_active: usize = 0;
@@ -2724,6 +2896,19 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     {
         const chunks = @max(@as(u64, 1), probe.layers_done / @max(@as(u64, 1), probe.n_layers));
         std.debug.print("PREFILL_PROFILE_PEAK_MAX {{\"stage\": \"{s}\", \"above_start_gb\": {d:.3}, \"start_active_gb\": {d:.3}, \"layer\": {d}, \"chunk\": {d}}}\n", .{ if (probe.n > 0) probe.names[probe.peak_stage] else "none", gb(probe.peak_max -| start_active), gb(start_active), probe.peak_done / chunks, probe.peak_chunk });
+    }
+    // (SERVED19) Per routed group: MLX's active mark right before its final evaluation and that evaluation's peak (above the
+    // pass's start), with the geometry it reads and writes (the combine gathers nothing; at the evaluation's start every
+    // chunk's halves are held by the group's HC posts).
+    {
+        const hidden: u64 = md.model.c.hidden_size;
+        for (probe.groups[0..probe.n_groups]) |gr| std.debug.print("PREFILL_PROFILE_GROUP {{\"layer\": {d}, \"chunks\": {d}, \"rows\": {d}, \"grouped\": {}, \"active_before_gb\": {d:.3}, \"eval_peak_gb\": {d:.3}, \"parts_gb\": {d:.3}, \"loc_gb\": {d:.4}, \"shared_gb\": {d:.3}, \"next_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"combine_out_gb\": {d:.3}, \"combine_cast_gb\": {d:.3}, \"halves_held_at_eval_start\": {d}, \"cat_xf_gb\": {d:.3}, \"merge_outputs\": {d}, \"merge_sources\": {d}, \"merge_copied_rows\": {d}, \"merge_copied_gb\": {d:.3}}}\n", .{
+            gr.layer,                                gr.chunks,                        gr.rows,             probe.grouped,
+            gb(gr.active_before -| start_active),    gb(gr.eval_peak -| start_active), gb(gr.parts),        gb(gr.loc),
+            gb(gr.shared),                           gb(gr.next),                      gb(gr.halves),       gb(gr.rows * hidden * 4),
+            gb(gr.rows * hidden * gr.cast_itemsize), gr.chunks,                        gb(gr.cat_xf),       gr.merge_outputs,
+            gr.merge_sources,                        gr.merge_copied_rows,             gb(gr.merge_copied),
+        });
     }
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });

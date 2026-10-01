@@ -126,6 +126,10 @@ pub const RouteOverrides = struct {
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
     /// the grow below demand). null: the default, off.
     first_verify_warm: ?bool = null,
+    /// The phase change's settle poll: milliseconds between this process's footprint reads (1..`phase_change_settle_ms`).
+    /// null: the default, `phase_change_poll_ms`. Exact: it moves only when the settle sees the frees, not what it reads
+    /// or the one check that judges the last reading.
+    phase_change_poll_ms: ?u32 = null,
 };
 
 /// The release route the Module installs and the bill charges (one resolver: the stream's capability and the setting
@@ -143,6 +147,14 @@ pub fn inputStreamEarlyRelease(ov: RouteOverrides) bool {
 /// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 pub fn firstVerifyWarm(ov: RouteOverrides) bool {
     return ov.first_verify_warm orelse false;
+}
+
+/// The phase change's settle poll the Module installs: the setting over the default (`phase_change_poll_ms`); a value
+/// outside 1..`phase_change_settle_ms` refuses at construction.
+pub fn phaseChangePollMs(ov: RouteOverrides) error{PhaseChangePollMs}!u32 {
+    const ms = ov.phase_change_poll_ms orelse return phase_change_poll_ms;
+    if (ms == 0 or ms > phase_change_settle_ms) return error.PhaseChangePollMs;
+    return ms;
 }
 
 /// A request's DSpark strategy: the loop over the Module's state and the head's per-request caches.
@@ -245,6 +257,10 @@ pub const Module = struct {
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
             log.err("prefill routes refused: {s}", .{@errorName(e)});
+            return e;
+        };
+        const poll_ms = phaseChangePollMs(ov) catch |e| {
+            log.err("phase change poll refused: {d} ms (1..{d})", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
             return e;
         };
         const self = try gpa.create(Module);
@@ -405,6 +421,8 @@ pub const Module = struct {
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
         log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
+        self.installed.phase_change_poll_ms = poll_ms;
+        log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -442,7 +460,7 @@ pub const Module = struct {
             // 05:36 / 06:28 cells' constructions: out of MLX's active and cache, 1.32 GB still in the
             // footprint). The phase change's settle waits for the footprint to show the release (bounded)
             // before the construction check reads it.
-            const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes());
+            const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes(), phase_change_poll_ms);
             log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
             self.fenced = true;
             self.installed.embedding_rows = true;
@@ -862,7 +880,7 @@ pub const Module = struct {
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         _ = mlx.mlx_synchronize(self.g.s);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes, phase_change_poll_ms);
         self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .settle_ms = st.waited_ms };
         checkFreed(before, st.after, freed_bytes) catch |e| return self.refuseBoundary(e);
         self.logPhaseChange();
@@ -922,7 +940,7 @@ pub const Module = struct {
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_device);
+        const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms);
         marks[3] = VmMark.now();
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms };
         checkFreed(before, st.after, freed_device) catch |e| return self.refuseBoundary(e);
@@ -1042,6 +1060,8 @@ pub const Installed = struct {
     lookahead_budget: u32 = 0,
     /// A0 (a): the first verify's warm reads (installed in the stream at construction).
     first_verify_warm: bool = false,
+    /// The phase change's settle poll (ms), as installed (`phaseChangePollMs`).
+    phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -1259,15 +1279,15 @@ fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
 }
 
-/// After the frees: `reader` read every `phase_change_poll_ms` until this process's footprint shows them
-/// (its ledger can trail a release while the driver retires it), at most `phase_change_settle_ms`; the one
-/// check then judges the last reading.
-pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64) struct { after: BoundaryMemory, waited_ms: u32 } {
+/// After the frees: `reader` read every `poll_ms` (the phase change's installed poll; `phase_change_poll_ms` elsewhere)
+/// until this process's footprint shows them (its ledger can trail a release while the driver retires it), at most
+/// `phase_change_settle_ms`; the one check then judges the last reading.
+pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64, poll_ms: u32) struct { after: BoundaryMemory, waited_ms: u32 } {
     var m = reader.now();
     var waited: u32 = 0;
     while (!footprintFreed(before, m, freed_device) and waited < phase_change_settle_ms) {
-        reader.sleep(phase_change_poll_ms);
-        waited += phase_change_poll_ms;
+        reader.sleep(poll_ms);
+        waited += poll_ms;
         m = reader.now();
     }
     return .{ .after = m, .waited_ms = waited };
@@ -1947,7 +1967,7 @@ test "dsv41 memory: the settle waits for the footprint to show the frees, then t
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, 0);
+        const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, 0, phase_change_poll_ms);
         try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
         try std.testing.expectEqual(phase_change_settle_ms, slept);
         try std.testing.expectEqual(@as(usize, phase_change_settle_ms / phase_change_poll_ms + 1), i);
@@ -1957,7 +1977,7 @@ test "dsv41 memory: the settle waits for the footprint to show the frees, then t
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{ lagging, lagging, freed }, .i = &i, .slept_ms = &slept }, before, 0);
+        const st = settle(FakeReader{ .readings = &.{ lagging, lagging, freed }, .i = &i, .slept_ms = &slept }, before, 0, phase_change_poll_ms);
         try std.testing.expectEqual(@as(u32, 2 * phase_change_poll_ms), st.waited_ms);
         try checkFreed(before, st.after, 0);
     }
@@ -1965,9 +1985,42 @@ test "dsv41 memory: the settle waits for the footprint to show the frees, then t
     {
         var i: usize = 0;
         var slept: u32 = 0;
-        const st = settle(FakeReader{ .readings = &.{freed}, .i = &i, .slept_ms = &slept }, before, 0);
+        const st = settle(FakeReader{ .readings = &.{freed}, .i = &i, .slept_ms = &slept }, before, 0, phase_change_poll_ms);
         try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
         try checkFreed(before, st.after, 0);
+    }
+}
+
+test "dsv41 memory: the phase change's settle poll as a route (poll5): the same reads and check, its own wait steps" {
+    // The resolver: the default; an override in 1..phase_change_settle_ms; else refused at construction.
+    try std.testing.expectEqual(phase_change_poll_ms, try phaseChangePollMs(.{}));
+    try std.testing.expectEqual(@as(u32, 5), try phaseChangePollMs(.{ .phase_change_poll_ms = 5 }));
+    try std.testing.expectEqual(phase_change_settle_ms, try phaseChangePollMs(.{ .phase_change_poll_ms = phase_change_settle_ms }));
+    try std.testing.expectError(error.PhaseChangePollMs, phaseChangePollMs(.{ .phase_change_poll_ms = 0 }));
+    try std.testing.expectError(error.PhaseChangePollMs, phaseChangePollMs(.{ .phase_change_poll_ms = phase_change_settle_ms + 1 }));
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
+    const lagging: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint };
+    const freed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = before.footprint - before.cache };
+    // The frees show on the third reading: three reads and the same last reading at either poll; the wait is two of
+    // the route's polls (10 ms at 5, 500 ms at 250) and the one check judges the same reading.
+    for ([_]u32{ 5, phase_change_poll_ms }) |poll| {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{ lagging, lagging, freed }, .i = &i, .slept_ms = &slept }, before, 0, poll);
+        try std.testing.expectEqual(@as(usize, 3), i);
+        try std.testing.expectEqual(2 * poll, st.waited_ms);
+        try std.testing.expectEqual(2 * poll, slept);
+        try std.testing.expectEqual(freed, st.after);
+        try checkFreed(before, st.after, 0);
+    }
+    // Never freed: the cap holds at 5 ms too (10,000 ms over 2,001 reads), then refused by name.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, 0, 5);
+        try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
+        try std.testing.expectEqual(@as(usize, phase_change_settle_ms / 5 + 1), i);
+        try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, 0));
     }
 }
 
@@ -2068,7 +2121,7 @@ test "dsv41 memory: the return to the prompt rows (shrink) is judged like the ph
     lagging.footprint = before.footprint;
     var i: usize = 0;
     var slept: u32 = 0;
-    const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, grown_rows);
+    const st = settle(FakeReader{ .readings = &.{lagging}, .i = &i, .slept_ms = &slept }, before, grown_rows, phase_change_poll_ms);
     try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
     try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, grown_rows));
 }
