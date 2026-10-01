@@ -174,6 +174,11 @@ pub const Routes = struct {
     /// SwiGLU clamps, silu, the product, the cast back) as one compiled region (`SharedMid`), on the RC and the
     /// M-invariant shared experts; checked bit for bit against the op chain at construction.
     shared_mid: bool = false,
+    /// C22 DISPATCH_FUSE's memos at decode rows (<= rc_max_rows): the RoPE tables per family, the K30 decode path's
+    /// window selection and shared selected compressed rows, and `gatherRows`' flat rows at b == 1. Exact either way;
+    /// off by default (SERVED16's decode regression is unattributed: one-factor arm, DSV41_CELL_DECODE_MEMOS=1). The
+    /// RoPE tables' memo at prompt widths is C22's prompt member and stays on.
+    decode_memos: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,
@@ -1228,14 +1233,14 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// `_gather_rows`: `source[b, idx]` as `[b, s, k, d]` (pads read row 0).
-        fn gatherRows(g: *G, source: T, idx: T, valid: T) !T {
+        fn gatherRows(g: *G, source: T, idx: T, valid: T, b1_rows: bool) !T {
             const ss = g.shapeOf(source);
             const is = g.shapeOf(idx);
             const b = ss.d[0];
             const n = ss.d[1];
             const idx_c = try g.where(valid, idx, try g.scalar(0, .int32));
             // C22 kvidx: at b == 1 the flat offset `arange(b) * n` is zero, so the indices are the rows.
-            const flat = if (b == 1) try g.reshape(idx_c, &.{-1}) else blk: {
+            const flat = if (b == 1 and b1_rows) try g.reshape(idx_c, &.{-1}) else blk: {
                 const offs = try g.reshape(try g.mul(try g.arange(0, @floatFromInt(b), 1, .int32), try g.scalar(@floatFromInt(n), .int32)), &.{ b, 1, 1 });
                 break :blk try g.reshape(try g.add(idx_c, offs), &.{-1});
             };
@@ -1253,7 +1258,7 @@ pub fn Trunk(comptime G: type) type {
             // C22 kvidx: below the score-wave width the window rows' selection is built by the forward's first layer
             // and reused (K24's key). Wider calls run inside a score wave, whose close would free a memo.
             const t_len = g.shapeOf(window).dim(1);
-            const sel_idx, const sel_valid = if (b * s <= score_wave_min_rows) blk: {
+            const sel_idx, const sel_valid = if (b * s <= score_wave_min_rows and rt.decode_memos) blk: {
                 const x = try windowSelection(g, c, shared, positions, t_len, drop);
                 break :blk .{ x.idx, x.valid };
             } else blk: {
@@ -1262,15 +1267,15 @@ pub fn Trunk(comptime G: type) type {
             };
             const win_idx = try g.broadcastTo(try g.expandDims(sel_idx, 0), &.{ b, s, W_ });
             const win_valid = try g.broadcastTo(try g.expandDims(sel_valid, 0), &.{ b, s, W_ });
-            var kvg = try gatherRows(g, window, win_idx, win_valid);
+            var kvg = try gatherRows(g, window, win_idx, win_valid, rt.decode_memos);
             var valid = win_valid;
             if (comp_kv != null and comp_idx != null) {
                 // C22 kvidx: at decode rows the selected compressed rows are gathered once per source and selection
                 // and shared by the layers that read both (a prompt's rows are gathered per layer: their size).
-                const share_rows = b * s <= rc_max_rows;
+                const share_rows = b * s <= rc_max_rows and rt.decode_memos;
                 const rows_, const cv = if (share_rows and shared.comp_rows != null) .{ shared.comp_rows.?, shared.comp_valid.? } else blk: {
                     const v = try g.greaterEqual(comp_idx.?, try g.scalar(0, .int32));
-                    const r = try gatherRows(g, comp_kv.?, comp_idx.?, v);
+                    const r = try gatherRows(g, comp_kv.?, comp_idx.?, v, rt.decode_memos);
                     if (share_rows) {
                         shared.comp_rows = r;
                         shared.comp_valid = v;
@@ -1776,7 +1781,7 @@ pub fn Trunk(comptime G: type) type {
             const pa: ?*const kr.PrefillAttn(G) = if (rc == null and !compiled and b * s > attn_compile_max_rows and rt.selected_keys) lk.prefill_attn else null;
             // The prefill indexer at the same widths (one prompt row block).
             const pi: ?PrefillIndex = if (b == 1 and s > attn_compile_max_rows and lk.idx_score != null) .{ .score = lk.idx_score.?, .topk = lk.index_topk.? } else null;
-            const cs = try ropeTables(g, shared, li, inv_freq, positions);
+            const cs = if (rt.decode_memos or b * s > rc_max_rows) try ropeTables(g, shared, li, inv_freq, positions) else try cosSin(g, inv_freq, positions);
             var q: T = undefined;
             var qr: T = undefined;
             var kv_new: T = undefined;
@@ -3511,7 +3516,7 @@ test "dsv41 graph: C22 DISPATCH_FUSE: RoPE tables once per family; the decode wi
     try testing.expectEqual(@as(usize, 2), std.mem.count(ops.Op, rope_ops, &.{.cos}));
     // K30 at a decode row: the first layer builds the window selection and gathers the selected compressed rows;
     // a later layer reading the same source and selection builds neither (no arange, one take: its own window).
-    const rt: Routes = .{ .selected_keys = true };
+    const rt: Routes = .{ .selected_keys = true, .decode_memos = true };
     const w = try traceLayerW(&g, &c, c.layers[1]);
     const H = ci(c.n_heads);
     const D = ci(c.head_dim);
@@ -3543,6 +3548,19 @@ test "dsv41 graph: C22 DISPATCH_FUSE: RoPE tables once per family; the decode wi
     // Third, after a publish: the compressed rows gathered again, the window selection still shared.
     try testing.expectEqual(@as(usize, 2), std.mem.count(ops.Op, calls[2], &.{.take}));
     try testing.expectEqual(@as(usize, 0), std.mem.count(ops.Op, calls[2], &.{.arange}));
+    // With the memos off (the A/B route) every call rebuilds them all: the window selection's arange, both gathers and
+    // both gathers' offsets (two more aranges at b == 1), and the RoPE tables each call.
+    const rt_off: Routes = .{ .selected_keys = true };
+    var so: Tr.Share = .{};
+    for (0..2) |_| {
+        const m = g.nodes.items.len;
+        _ = try Tr.sparseAttendSelected(&g, &c, &rt_off, &w, null, q, window, 0, ckv, cidx, pos, &so);
+        const seq = try g.opsSince(testing.allocator, m);
+        defer testing.allocator.free(seq);
+        try testing.expectEqual(@as(usize, 3), std.mem.count(ops.Op, seq, &.{.arange}));
+        try testing.expectEqual(@as(usize, 2), std.mem.count(ops.Op, seq, &.{.take}));
+    }
+    try testing.expect(so.comp_rows == null and so.win_idx == null);
 }
 
 test "dsv41 graph: C22 moeshared: the shared expert's middle runs as one compiled region over the op chain's ops" {

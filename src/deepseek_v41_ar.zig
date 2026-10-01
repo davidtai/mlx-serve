@@ -948,6 +948,8 @@ const CellReceipt = struct {
     decode_mxfp8_rows: ?bool = null,
     /// C22 moeshared (installed): the shared expert's middle compiled at decode rows.
     decode_shared_mid: ?bool = null,
+    /// C22's memos (installed): the rope tables, the decode window selection and shared compressed rows, b == 1 rows.
+    decode_memos: ?bool = null,
     /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
     head_mode: ?[]const u8 = null,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
@@ -1263,6 +1265,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
         .decode_shared_mid = md.installed.decode_shared_mid,
+        .decode_memos = md.installed.decode_memos,
         .head_mode = @tagName(md.installed.head_mode),
         .file_backed_start_bytes = cx.file_backed_start,
     };
@@ -1362,6 +1365,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
+    if (envStr("DSV41_CELL_DECODE_MEMOS")) |v| ov.decode_memos = try cellBool("DSV41_CELL_DECODE_MEMOS", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
@@ -2237,6 +2241,37 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
 }
 
+/// The prompt pass's K16 chunk timeline with no syncs of its own (D14 CHUNKPIPE's price): per chunk and layer, the host's
+/// build of the chunk's graph, while the GPU idles (the previous fence drained it), and the fence, the host waiting on the
+/// GPU. Stage probes are no-ops, so the pass runs as the timed cell's does. The build is what CHUNKPIPE's `ahead` (commit
+/// chunk c + 1 before waiting on chunk c) could overlap.
+const FenceProbe = struct {
+    io: std.Io,
+    t: std.Io.Timestamp = undefined,
+    build_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    fences: u64 = 0,
+    max_build_ns: u64 = 0,
+
+    pub fn put(_: *FenceProbe, _: []const u8, _: anytype) !void {}
+
+    pub fn fenceMark(self: *FenceProbe, at: mdl.FenceAt) void {
+        const d: u64 = @intCast(self.t.untilNow(self.io, .boot).nanoseconds);
+        switch (at) {
+            .build => {},
+            .wait => {
+                self.build_ns += d;
+                self.max_build_ns = @max(self.max_build_ns, d);
+            },
+            .done => {
+                self.wait_ns += d;
+                self.fences += 1;
+            },
+        }
+        self.t = std.Io.Timestamp.now(self.io, .boot);
+    }
+};
+
 /// The prompt pass's stage profile: the model's probe points (`p.put` in the graph: attn.x ... out.h),
 /// each one evaluated where the model publishes it, the host clock charged to the stage that ends
 /// there (so a segment is everything the graph built and ran since the previous point), per stage
@@ -2389,6 +2424,20 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const g = &md.g;
     var st = try md.model.newStateWith(md.model.boundedKv(module.Module.maxPositions(inputs.prompt.len, inputs.prompt.len + 1024)));
     defer st.deinit(g, gpa);
+    // DSV41_CELL_FENCE_PROFILE=1: the chunk timeline alone (no stage syncs), one PREFILL_FENCE_PROFILE line.
+    if (std.c.getenv("DSV41_CELL_FENCE_PROFILE") != null) {
+        var fp: FenceProbe = .{ .io = io };
+        dsv41_prof.reset();
+        const tf = std.Io.Timestamp.now(io, .boot);
+        fp.t = tf;
+        const rf = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &fp);
+        try g.evalAll(&.{rf.logits.?});
+        const wall = secondsSince(io, tf);
+        std.debug.print("\nPREFILL_FENCE_PROFILE {{\"prompt_tokens\": {d}, \"wall_s\": {d:.3}, \"fences\": {d}, \"build_s\": {d:.3}, \"wait_s\": {d:.3}, \"build_ms_per_fence\": {d:.3}, \"max_build_ms\": {d:.3}}}\n", .{
+            inputs.prompt.len, wall, fp.fences, @as(f64, @floatFromInt(fp.build_ns)) / 1e9, @as(f64, @floatFromInt(fp.wait_ns)) / 1e9, @as(f64, @floatFromInt(fp.build_ns)) / 1e6 / @as(f64, @floatFromInt(@max(fp.fences, 1))), @as(f64, @floatFromInt(fp.max_build_ns)) / 1e6,
+        });
+        return;
+    }
     var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
     const s0 = stats_of(@ptrCast(&arm.hook));
     dsv41_prof.reset(); // the construction's warm-up routed calls do not count
