@@ -2565,6 +2565,67 @@ const PrefillProbe = struct {
     /// `layers_done` (out.h puts: one per layer and chunk) and the chunk when the largest one fell.
     peak_done: u64 = 0,
     peak_chunk: usize = 0,
+    /// (SERVED19) The grouped mode (DSV41_CELL_GROUP_PROFILE=1): the routed group's final evaluation measured whole, as
+    /// the timed pass runs it. The per-chunk moe.y / out.h points and the merge's own stage are not evaluated (out.h keeps
+    /// its row bookkeeping; the layer count moves at group.eval), so "group.eval" is the merge, the combines, the HC
+    /// posts and the new streams at once.
+    grouped: bool = false,
+    /// The routed group being measured (`groupHalves`, `groupEval`, then its peak at group.eval) and those recorded.
+    group: Group = .{},
+    groups: [max_groups]Group = undefined,
+    n_groups: usize = 0,
+    /// Layers begun (a group at chunk 0 starts one), for the groups' layer index.
+    group_layers: u64 = 0,
+    const max_groups = 64;
+    const Group = struct {
+        layer: u64 = 0,
+        chunks: u64 = 0,
+        rows: u64 = 0,
+        /// The halves' bytes at the group's start (moe_in, h1, post, comb, ffn_pre) and the MoE input's item size (the
+        /// combine's output is cast to it).
+        halves: u64 = 0,
+        cast_itemsize: u64 = 0,
+        /// What the final evaluation reads and writes: the wide call's sources and loc, the shared experts' outputs, the
+        /// new streams (unevaluated there: shape x item size).
+        parts: u64 = 0,
+        loc: u64 = 0,
+        shared: u64 = 0,
+        next: u64 = 0,
+        /// MLX's active bytes right before the final evaluation, and that evaluation's high-water mark.
+        active_before: u64 = 0,
+        eval_peak: u64 = 0,
+    };
+
+    fn bytesOf(x: ops.MlxOps.T) u64 {
+        return @as(u64, mlx.mlx_array_size(x)) * @as(u64, mlx.mlx_array_itemsize(x));
+    }
+
+    /// The group's halves at its start: every chunk's are held by the group's HC posts until each post evaluates (h1 /
+    /// post / comb), ffn_pre as the next layer's pre_mix, moe_in to the layer's end.
+    pub fn groupHalves(self: *PrefillProbe, halves: anytype, first_chunk: usize) void {
+        if (first_chunk == 0) self.group_layers += 1;
+        self.group = .{ .layer = self.group_layers -| 1, .chunks = halves.len };
+        for (halves) |h| {
+            inline for (@typeInfo(@TypeOf(h)).@"struct".field_names) |name| self.group.halves += bytesOf(@field(h, name));
+            const sh = self.g.shapeOf(h.moe_in);
+            self.group.rows += @intCast(sh.dim(0) * sh.dim(1));
+            self.group.cast_itemsize = @as(u64, mlx.mlx_array_itemsize(h.moe_in));
+        }
+    }
+
+    /// Right before the group's final evaluation: MLX's active mark and the geometry it reads and writes. The combine is
+    /// one kernel over the sources in place (it gathers nothing): its f32 output and the cast are rows x hidden each.
+    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T) void {
+        var a: usize = 0;
+        _ = mlx.mlx_get_active_memory(&a);
+        self.group.active_before = a;
+        for (outs) |x| self.group.parts += bytesOf(x);
+        if (loc) |x| self.group.loc = bytesOf(x);
+        for (shared) |s| {
+            if (s) |x| self.group.shared += bytesOf(x);
+        }
+        for (next) |x| self.group.next += bytesOf(x);
+    }
 
     pub fn atChunk(self: *PrefillProbe, i: usize) void {
         self.cur_chunk = i;
@@ -2573,6 +2634,8 @@ const PrefillProbe = struct {
     /// The wide call's merged sources evaluated on their own stage ("moe.merge"), MLX's active and cache read around
     /// them: active growth the cache did not give back is fresh allocation.
     pub fn merge(self: *PrefillProbe, outs: []const ops.MlxOps.T) !void {
+        // The grouped mode: the merge lands in group.eval, as in the timed pass.
+        if (self.grouped) return;
         var a0: usize = 0;
         var c0: usize = 0;
         _ = mlx.mlx_get_active_memory(&a0);
@@ -2598,11 +2661,11 @@ const PrefillProbe = struct {
         self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
-        self.peakOf(k, chunk);
+        _ = self.peakOf(k, chunk);
     }
 
     /// The segment's MLX high-water mark (since the previous stage's reset), charged to stage `k`.
-    fn peakOf(self: *PrefillProbe, k: usize, chunk: usize) void {
+    fn peakOf(self: *PrefillProbe, k: usize, chunk: usize) u64 {
         var pk: usize = 0;
         _ = mlx.mlx_get_peak_memory(&pk);
         _ = mlx.mlx_reset_peak_memory();
@@ -2613,6 +2676,7 @@ const PrefillProbe = struct {
             self.peak_done = self.layers_done;
             self.peak_chunk = chunk;
         }
+        return pk;
     }
 
     fn slot(self: *PrefillProbe, name: []const u8) !usize {
@@ -2625,6 +2689,16 @@ const PrefillProbe = struct {
 
     pub fn put(self: *PrefillProbe, name: []const u8, x: anytype) !void {
         if (@TypeOf(x) != ops.MlxOps.T) return;
+        // The grouped mode leaves the per-chunk combine and HC post points to the group's one evaluation (group.eval);
+        // out.h keeps only its row bookkeeping.
+        if (self.grouped and (std.mem.eql(u8, name, "moe.y") or std.mem.eql(u8, name, "out.h"))) {
+            if (std.mem.eql(u8, name, "out.h")) {
+                const c: usize = @min(self.cur_chunk orelse 0, self.chunk_rows.len - 1);
+                const sh = self.g.shapeOf(x);
+                if (self.chunk_rows[c] == 0) self.chunk_rows[c] = @intCast(sh.dim(0) * sh.dim(1));
+            }
+            return;
+        }
         const is_routed = std.mem.eql(u8, name, "moe.routed");
         if (std.mem.eql(u8, name, "gate.weights")) self.before = self.stats_of(self.stats_ctx);
         try self.g.evalAll(&.{x});
@@ -2634,7 +2708,16 @@ const PrefillProbe = struct {
         self.ns[k] += d;
         const chunk: usize = @min(self.cur_chunk orelse self.layers_done / self.n_layers, self.chunk_ns.len - 1);
         self.chunk_ns[chunk] += d;
-        self.peakOf(k, chunk);
+        const pk = self.peakOf(k, chunk);
+        if (std.mem.eql(u8, name, "group.eval")) {
+            self.group.eval_peak = pk;
+            if (self.n_groups < max_groups) {
+                self.groups[self.n_groups] = self.group;
+                self.n_groups += 1;
+            }
+            // The grouped mode's layer count (out.h's moves it otherwise): one per chunk of the group, after its peak.
+            if (self.grouped) self.layers_done += self.group.chunks;
+        }
         if (is_routed) {
             const after = self.stats_of(self.stats_ctx);
             self.read_wall_ns += after.read_wall_ns -| self.before.read_wall_ns;
@@ -2718,7 +2801,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
         });
         return;
     }
-    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined };
+    var probe: PrefillProbe = .{ .g = g, .io = io, .stats_of = stats_of, .stats_ctx = @ptrCast(&arm.hook), .n_layers = md.model.c.n_layers, .last = undefined, .grouped = std.c.getenv("DSV41_CELL_GROUP_PROFILE") != null };
     const s0 = stats_of(@ptrCast(&arm.hook));
     dsv41_prof.reset(); // the construction's warm-up routed calls do not count
     var start_active: usize = 0;
@@ -2751,6 +2834,18 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     {
         const chunks = @max(@as(u64, 1), probe.layers_done / @max(@as(u64, 1), probe.n_layers));
         std.debug.print("PREFILL_PROFILE_PEAK_MAX {{\"stage\": \"{s}\", \"above_start_gb\": {d:.3}, \"start_active_gb\": {d:.3}, \"layer\": {d}, \"chunk\": {d}}}\n", .{ if (probe.n > 0) probe.names[probe.peak_stage] else "none", gb(probe.peak_max -| start_active), gb(start_active), probe.peak_done / chunks, probe.peak_chunk });
+    }
+    // (SERVED19) Per routed group: MLX's active mark right before its final evaluation and that evaluation's peak (above the
+    // pass's start), with the geometry it reads and writes (the combine gathers nothing; at the evaluation's start every
+    // chunk's halves are held by the group's HC posts).
+    {
+        const hidden: u64 = md.model.c.hidden_size;
+        for (probe.groups[0..probe.n_groups]) |gr| std.debug.print("PREFILL_PROFILE_GROUP {{\"layer\": {d}, \"chunks\": {d}, \"rows\": {d}, \"grouped\": {}, \"active_before_gb\": {d:.3}, \"eval_peak_gb\": {d:.3}, \"parts_gb\": {d:.3}, \"loc_gb\": {d:.4}, \"shared_gb\": {d:.3}, \"next_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"combine_out_gb\": {d:.3}, \"combine_cast_gb\": {d:.3}, \"halves_held_at_eval_start\": {d}}}\n", .{
+            gr.layer,                                gr.chunks,                        gr.rows,       probe.grouped,
+            gb(gr.active_before -| start_active),    gb(gr.eval_peak -| start_active), gb(gr.parts),  gb(gr.loc),
+            gb(gr.shared),                           gb(gr.next),                      gb(gr.halves), gb(gr.rows * hidden * 4),
+            gb(gr.rows * hidden * gr.cast_itemsize), gr.chunks,
+        });
     }
     const n_chunks: usize = @intCast(@min((probe.layers_done + probe.n_layers - 1) / probe.n_layers, probe.chunk_ns.len));
     for (0..n_chunks) |i| std.debug.print("PREFILL_PROFILE_CHUNK {{\"chunk\": {d}, \"rows\": {d}, \"s\": {d:.3}}}\n", .{ i, probe.chunk_rows[i], secs(probe.chunk_ns[i]) });

@@ -860,6 +860,9 @@ pub fn Model(comptime G: type) type {
                         // The profile's own stage for the group's routed compute (else it lands in moe.shared).
                         try probe.put("moe.routed", ro);
                     }
+                    // The profile's grouped mode: the group's halves at its start (their handles go at the HC post builds
+                    // below, h1 / post / comb with each post's evaluation).
+                    probeGroupHalves(probe, halves[i..j], i);
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         probeChunk(probe, k);
@@ -885,7 +888,13 @@ pub fn Model(comptime G: type) type {
                         pms[k] = g.keep(halves[k].ffn_pre);
                         releaseHalf(g, &halves[k]);
                     }
+                    // The profile's mark before the group's final evaluation (the merge, the combines, the HC posts and the new
+                    // streams at once, as the timed pass runs it), then that evaluation's own stage.
+                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j]);
                     try g.evalAll(hs[i..j]);
+                    probeChunk(probe, i);
+                    try probe.put("group.eval", hs[i]);
+                    probeChunk(probe, j - 1);
                     if (comptime has_parts) {
                         if (parts != null) hook.releaseParts(g);
                     }
@@ -948,6 +957,19 @@ pub fn Model(comptime G: type) type {
         fn probeMerge(probe: anytype, outs: []const T) !void {
             const P = @TypeOf(probe);
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "merge")) try probe.merge(outs);
+        }
+
+        /// A probe that measures the routed group's final evaluation whole (the profile's grouped mode) reads the group's
+        /// halves at its start and, right before `evalAll(hs[i..j])`, MLX's active mark and the geometry the evaluation
+        /// reads and writes; compiled out for every other probe (NoProbe in timed builds).
+        fn probeGroupHalves(probe: anytype, halves: []const Tr.Half, first_chunk: usize) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupHalves")) probe.groupHalves(halves, first_chunk);
+        }
+
+        fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T) void {
+            const P = @TypeOf(probe);
+            if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupEval")) probe.groupEval(outs, loc, shared, next);
         }
 
         fn keepHalf(g: *G, hf: *Tr.Half) void {
@@ -1328,9 +1350,13 @@ const StageProbe = struct {
     names: std.ArrayList([]const u8) = .empty,
     chunks: std.ArrayList(usize) = .empty,
     cur: usize = 0,
+    group_halves: std.ArrayList(usize) = .empty,
+    group_next: std.ArrayList(usize) = .empty,
     fn deinit(self: *StageProbe) void {
         self.names.deinit(testing.allocator);
         self.chunks.deinit(testing.allocator);
+        self.group_halves.deinit(testing.allocator);
+        self.group_next.deinit(testing.allocator);
     }
     pub fn atChunk(self: *StageProbe, i: usize) void {
         self.cur = i;
@@ -1338,6 +1364,17 @@ const StageProbe = struct {
     pub fn put(self: *StageProbe, name: []const u8, _: anytype) !void {
         try self.names.append(testing.allocator, name);
         try self.chunks.append(testing.allocator, self.cur);
+    }
+    /// The grouped profile's hooks (no evaluation): recorded in the stage order with the group's sizes.
+    pub fn groupHalves(self: *StageProbe, halves: anytype, _: usize) void {
+        self.names.append(testing.allocator, "group.halves") catch unreachable;
+        self.chunks.append(testing.allocator, self.cur) catch unreachable;
+        self.group_halves.append(testing.allocator, halves.len) catch unreachable;
+    }
+    pub fn groupEval(self: *StageProbe, _: anytype, _: anytype, _: anytype, next: anytype) void {
+        self.names.append(testing.allocator, "group.mark") catch unreachable;
+        self.chunks.append(testing.allocator, self.cur) catch unreachable;
+        self.group_next.append(testing.allocator, next.len) catch unreachable;
     }
     fn count(self: *const StageProbe, name: []const u8) usize {
         var n: usize = 0;
@@ -1387,6 +1424,31 @@ test "dsv41 model: the K16 profile charges a chunk's carry-over to its own stage
             try testing.expectEqual(ch, p.chunks.items[k - 1]);
         }
     }
+    // (SERVED19) the grouped profile's points: per routed group, the halves read after its routed call (before the first
+    // combine), the mark after the last HC post's build, then group.eval (the group's one evaluation, charged to its first
+    // chunk) right before group.frees (charged to its last chunk, as before); the halves and the new streams are the
+    // group's chunks.
+    const ng = p.count("group.frees");
+    for ([_][]const u8{ "group.halves", "group.mark", "group.eval" }) |x| try testing.expectEqual(ng, p.count(x));
+    try testing.expectEqualSlices(usize, p.group_halves.items, p.group_next.items);
+    var first: usize = 0;
+    for (p.names.items, p.chunks.items, 0..) |x, ch, k| {
+        if (std.mem.eql(u8, x, "group.halves")) {
+            try testing.expectEqualStrings("moe.routed", p.names.items[k - 1]);
+            // The group's first combine follows (its shared expert's own point first on the combine path without parts).
+            var y = k + 1;
+            while (!std.mem.eql(u8, p.names.items[y], "moe.y")) : (y += 1) try testing.expectEqualStrings("moe.shared", p.names.items[y]);
+            first = p.chunks.items[y];
+        }
+        if (std.mem.eql(u8, x, "group.mark")) try testing.expectEqualStrings("out.h", p.names.items[k - 1]);
+        if (std.mem.eql(u8, x, "group.eval")) {
+            try testing.expectEqualStrings("group.mark", p.names.items[k - 1]);
+            try testing.expectEqualStrings("group.frees", p.names.items[k + 1]);
+            try testing.expectEqual(first, ch);
+            try testing.expectEqual(p.chunks.items[k - 1], p.chunks.items[k + 1]);
+        }
+    }
+    for (p.group_halves.items) |n| try testing.expect(n > 0);
 }
 
 test "dsv41 model: the AR dry path routes every layer call of every forward through the expert source" {
