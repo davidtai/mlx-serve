@@ -7,6 +7,7 @@ const std = @import("std");
 const peek = @import("peek.zig");
 const bill = @import("memory_bill.zig");
 const kernels = @import("kernels.zig");
+const quant = @import("quant.zig");
 const check = @import("check.zig");
 
 const Allocator = std.mem.Allocator;
@@ -53,11 +54,12 @@ pub const Engine = struct {
 };
 
 /// Weight load and the MoE matmul for one weight format. The load path asks every quant once per weight group;
-/// the arch binds the one that claimed its group at comptime (quant.zig's contract: Arrays, Accepted, accept).
+/// the arch binds the one that claimed its group at comptime (`sdk.quant`'s contract, C2: Arrays, claims,
+/// Accepted, accept).
 pub const Quant = struct {
     name: []const u8,
     claims: *const fn (p: *const peek.GroupPeek, why: ?*peek.Diag) ?peek.Priority,
-    /// G5: the quant's kernel set pin; null = it brings no kernels.
+    /// G5: the quant's kernel set pin (`kernel_pin`); null = it brings no kernels.
     kernels: ?kernels.Pin,
     /// G4: resident bytes, including what its codec drops and builds; null = none.
     bill: ?BillFn,
@@ -67,12 +69,13 @@ pub const Quant = struct {
             const w = "quant " ++ @typeName(T);
             check.nameDecl(w, T);
             check.fnDecl(w, T, "claims", &.{ *const peek.GroupPeek, ?*peek.Diag }, ?peek.Priority);
-            if (check.has(T, "kernels")) check.valueDecl(w, T, "kernels", kernels.Pin);
+            quant.check(T);
+            if (check.has(T, "kernel_pin")) check.valueDecl(w, T, "kernel_pin", kernels.Pin);
         }
         return .{
             .name = T.name,
             .claims = T.claims,
-            .kernels = if (check.has(T, "kernels")) T.kernels else null,
+            .kernels = if (check.has(T, "kernel_pin")) T.kernel_pin else null,
             .bill = comptime billOf(T, "quant " ++ @typeName(T)),
         };
     }

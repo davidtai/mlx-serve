@@ -50,6 +50,7 @@ const expert_bank = @import("expert_bank.zig");
 const expert_event = @import("expert_event.zig");
 const expert_io = @import("expert_io.zig");
 const xsc = @import("expert_slot_cache.zig");
+const expert_bank = @import("expert_bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
 comptime {
@@ -577,6 +578,7 @@ pub const Module = struct {
             log.err("config refused: {s}", .{vd0.message()});
             return e;
         };
+        claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
         try self.acceptKernels(gpa, &c0, s, &diag);
         // The box the admission fits: upstream's static GPU ceiling (Metal's working set, or its static override:
         // `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling through the same
@@ -2149,6 +2151,17 @@ fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: 
     try model_io.loadSafetensorsFile(gpa, weights, path.ptr, cpu, opts);
 }
 
+/// The quant kind at load, before its accept: the EXL3 quant this arch binds claims the bank's description
+/// (`expert_bank.peek`, streamed past the page cache like the bank's own manifests), or the load refuses by name
+/// with the quant's decline.
+fn claimBank(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, diag: *arm_mod.Diag) !void {
+    var bd: expert_bank.Diag = .{};
+    var p = expert_bank.peek(gpa, io, dir, &bd) catch |e| return refuse(diag, e, "bank: {s}", .{bd.message()});
+    defer p.deinit();
+    var why: xk.Diag = .{};
+    if (xq.claims(&p.view, &why) == null) return refuse(diag, error.QuantNotClaimed, "quant {s}: {s}", .{ xq.name, why.message() });
+}
+
 fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
     log.err("refused: {s} {s}", .{ @errorName(err), diag.message() });
     return err;
@@ -2199,6 +2212,23 @@ fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const mode
         gt.* = .{ .w = w.?, .bias = b.? };
     }
     return gates;
+}
+
+test "dsv41 module: the load refuses a bank its quant does not claim, by name, before the quant is accepted" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = try expert_bank.tmpRoot(&tmp, &rbuf);
+    const fixture = @embedFile("fixtures/dsv41_bank_peek.json");
+    var diag: arm_mod.Diag = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = fixture });
+    try claimBank(a, std.testing.io, root, &diag);
+    const walsh = try std.mem.replaceOwned(u8, a, fixture, "\"order\":\"sylvester-natural\"", "\"order\":\"walsh\"");
+    defer a.free(walsh);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = walsh });
+    try std.testing.expectError(error.QuantNotClaimed, claimBank(a, std.testing.io, root, &diag));
+    try std.testing.expect(std.mem.startsWith(u8, diag.message(), "quant exl3-mul1-k3: exl3 quant: quantization.hadamard"));
 }
 
 test "dsv41 module: each tier's prefill allocator cache is inside what the admission charges the prefill" {

@@ -1,5 +1,6 @@
-//! mlx-stream: the native streaming stack as one plugin. The DeepSeek-V4.1 arch today; its EXL3 quant and its
-//! expert source join as their kinds land. Built only where the macOS-only sources are.
+//! mlx-stream: the native streaming stack as one plugin: the DeepSeek-V4.1 arch and the EXL3 quant it binds (the
+//! routed experts' kernels over the package's pinned registry); its expert source joins when its kind lands. Built
+//! only where the macOS-only sources are.
 
 const sdk = @import("sdk");
 
@@ -8,5 +9,8 @@ pub const plugin = sdk.Plugin{
     .api = .{ .major = 1, .minor = 0 },
     .mlx = "v0.32.2",
     .macos_only = true,
-    .provides = .{ .arch = @import("deepseek_v41_plugin.zig") },
+    .provides = .{
+        .arch = @import("deepseek_v41_plugin.zig"),
+        .quant = @import("exl3_quant.zig"),
+    },
 };

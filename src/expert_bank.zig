@@ -615,8 +615,8 @@ const quant = @import("sdk").quant;
 
 /// The bank's description (`quant.BankPeek`) from its v2 manifest, for the load path's quant
 /// `claims`: the `quantization` object whole (each quant reads its own fields), the dims, and
-/// every layer's K and segment table. Parsed on its own, before `Bank.open` checks the bank
-/// against what the claimed quant implements; the records are skipped.
+/// every layer's K and segment table. Read on its own, before the quant the bank's arch binds is
+/// accepted and before `Bank.open`; the records are skipped.
 pub const Peek = struct {
     arena: std.heap.ArenaAllocator,
     view: quant.BankPeek,
@@ -624,49 +624,70 @@ pub const Peek = struct {
     pub fn deinit(self: *Peek) void {
         self.arena.deinit();
     }
+
+    fn adopt(p: *Peek, j: PeekJson, diag: ?*Diag) !void {
+        const aa = p.arena.allocator();
+        if (!std.mem.eql(u8, j.format, format_v2)) return refuse(diag, error.ManifestFormat, "v2 peek: format \"{s}\" is not {s}", .{ j.format, format_v2 });
+        if (j.layers.len > max_layers) return refuse(diag, error.LayerGeometry, "v2 peek: {d} layers", .{j.layers.len});
+        const layers = try aa.alloc(quant.LayerPeek, j.layers.len);
+        for (j.layers, layers, 0..) |l, *o, li| {
+            if (l.layer != li) return refuse(diag, error.LayerGeometry, "v2 peek: layer entry {d} names layer {d}", .{ li, l.layer });
+            if (l.K > std.math.maxInt(u32)) return refuse(diag, error.KNotImplemented, "v2 peek: layer {d} K={d}", .{ li, l.K });
+            const segs = try aa.alloc(quant.Segment, l.segments.len);
+            for (l.segments, segs) |s, *d| d.* = .{ .name = s.component, .dtype = s.dtype, .shape = s.shape };
+            o.* = .{ .bits = @intCast(l.K), .segments = segs };
+        }
+        p.view = .{ .quantization = j.quantization, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers, .layers = layers };
+    }
+};
+
+const PeekJson = struct {
+    format: []const u8,
+    quantization: std.json.Value,
+    dims: struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 },
+    layers: []const struct { layer: u64, K: u64, segments: []const SegJson },
 };
 
 /// `Peek` of a v2 manifest's text.
 pub fn peekText(a: std.mem.Allocator, text: []const u8, diag: ?*Diag) !Peek {
     var p: Peek = .{ .arena = .init(a), .view = undefined };
     errdefer p.arena.deinit();
-    const aa = p.arena.allocator();
-    const J = struct {
-        format: []const u8,
-        quantization: std.json.Value,
-        dims: struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 },
-        layers: []const struct { layer: u64, K: u64, segments: []const SegJson },
-    };
-    const j = std.json.parseFromSliceLeaky(J, aa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |e| switch (e) {
+    const j = std.json.parseFromSliceLeaky(PeekJson, p.arena.allocator(), text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |e| switch (e) {
         error.OutOfMemory => |x| return x,
         else => return refuse(diag, error.ManifestSyntax, "v2 peek: {s}", .{@errorName(e)}),
     };
-    if (!std.mem.eql(u8, j.format, format_v2)) return refuse(diag, error.ManifestFormat, "v2 peek: format \"{s}\" is not {s}", .{ j.format, format_v2 });
-    if (j.layers.len > max_layers) return refuse(diag, error.LayerGeometry, "v2 peek: {d} layers", .{j.layers.len});
-    const layers = try aa.alloc(quant.LayerPeek, j.layers.len);
-    for (j.layers, layers, 0..) |l, *o, li| {
-        if (l.layer != li) return refuse(diag, error.LayerGeometry, "v2 peek: layer entry {d} names layer {d}", .{ li, l.layer });
-        if (l.K > std.math.maxInt(u32)) return refuse(diag, error.KNotImplemented, "v2 peek: layer {d} K={d}", .{ li, l.K });
-        const segs = try aa.alloc(quant.Segment, l.segments.len);
-        for (l.segments, segs) |s, *d| d.* = .{ .name = s.component, .dtype = s.dtype, .shape = s.shape };
-        o.* = .{ .bits = @intCast(l.K), .segments = segs };
-    }
-    p.view = .{ .quantization = j.quantization, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers, .layers = layers };
+    try p.adopt(j, diag);
     return p;
 }
 
-/// `Peek` of the bank at `dir` (its expert-manifest-v2.json, read whole: the bank of record's
-/// is 5.9 MB).
+/// `Peek` of the bank at `dir`: its expert-manifest-v2.json streamed past the page cache, as `Bank.open` reads it,
+/// the records skipped.
 pub fn peek(a: std.mem.Allocator, io: std.Io, dir: []const u8, diag: ?*Diag) !Peek {
     if (!std.fs.path.isAbsolute(dir)) return refuse(diag, error.BankDirNotAbsolute, "bank dir \"{s}\" is not an absolute path", .{dir});
-    const path = try std.fmt.allocPrint(a, "{s}/expert-manifest-v2.json", .{dir});
-    defer a.free(path);
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20)) catch |e| switch (e) {
-        error.FileNotFound => return refuse(diag, error.ManifestMissing, "expert-manifest-v2.json: not found", .{}),
-        else => |x| return x,
-    };
-    defer a.free(text);
-    return peekText(a, text, diag);
+    var src = try ManifestSource.open(a, io, dir, "expert-manifest-v2.json", diag);
+    defer src.deinit();
+    var p: Peek = .{ .arena = .init(a), .view = undefined };
+    errdefer p.arena.deinit();
+    const aa = p.arena.allocator();
+    const Key = enum { format, quantization, dims, layers, unknown };
+    var format: ?[]const u8 = null;
+    var quantization: ?std.json.Value = null;
+    var dims: ?@FieldType(PeekJson, "dims") = null;
+    var layers: ?@FieldType(PeekJson, "layers") = null;
+    try src.expect(.object_begin);
+    while (try src.key(Key)) |k| {
+        switch (k) {
+            .format => format = try src.parse([]const u8, aa),
+            .quantization => quantization = try src.parse(std.json.Value, aa),
+            .dims => dims = try src.parse(@FieldType(PeekJson, "dims"), aa),
+            .layers => layers = try src.parse(@FieldType(PeekJson, "layers"), aa),
+            .unknown => try src.skip(),
+        }
+    }
+    if (format == null or quantization == null or dims == null or layers == null)
+        return refuse(diag, error.ManifestSyntax, "v2 peek: no format / quantization / dims / layers", .{});
+    try p.adopt(.{ .format = format.?, .quantization = quantization.?, .dims = dims.?, .layers = layers.? }, diag);
+    return p;
 }
 
 // ── Tests ──

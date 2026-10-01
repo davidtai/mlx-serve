@@ -40,6 +40,9 @@ const no_vars = kr.no_vars;
 
 pub const name = "exl3-mul1-k3";
 
+/// G5: the kernel set this quant self-checks at accept is pinned by the registry's manifest.
+pub const kernel_pin: sdk.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sha256 };
+
 /// This consumer's subset of the kernel set: the EXL3 families (the decode GEMV, the rin stage,
 /// the rebuild, DIG-X and its golden-tile check texts).
 pub const kernels = [_]Kernel{
@@ -1334,6 +1337,41 @@ test "dsv41 kernels c2: the real 3.0 bank's own manifest is claimed (DSV41_BANK)
     defer p.deinit();
     var why: Diag = .{};
     try testing.expectEqual(@as(?quant.Priority, .native), claims(&p.view, &why));
+}
+
+test "dsv41 kernels c2: the load's peek streams the bank's description past the page cache, as the text peek reads it" {
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = bank_peek_fixture });
+    var rbuf: [512]u8 = undefined;
+    const root = try expert_bank.tmpRoot(&tmp, &rbuf);
+    var bd: expert_bank.Diag = .{};
+    var s = try expert_bank.peek(a, std.testing.io, root, &bd);
+    defer s.deinit();
+    var t = try expert_bank.peekText(a, bank_peek_fixture, null);
+    defer t.deinit();
+    const qs = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(s.view.quantization, .{})});
+    defer a.free(qs);
+    const qt = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(t.view.quantization, .{})});
+    defer a.free(qt);
+    try testing.expectEqualStrings(qt, qs);
+    try testing.expectEqual(t.view.hidden, s.view.hidden);
+    try testing.expectEqual(t.view.inter, s.view.inter);
+    try testing.expectEqual(t.view.n_experts, s.view.n_experts);
+    try testing.expectEqual(t.view.n_layers, s.view.n_layers);
+    try testing.expectEqual(t.view.layers.len, s.view.layers.len);
+    for (t.view.layers, s.view.layers) |lt, ls| {
+        try testing.expectEqual(lt.bits, ls.bits);
+        try testing.expectEqual(lt.segments.len, ls.segments.len);
+        for (lt.segments, ls.segments) |gt, gs| {
+            try testing.expectEqualStrings(gt.name, gs.name);
+            try testing.expectEqualStrings(gt.dtype, gs.dtype);
+            try testing.expectEqualSlices(u64, gt.shape, gs.shape);
+        }
+    }
+    var why: Diag = .{};
+    try testing.expectEqual(@as(?quant.Priority, .native), claims(&s.view, &why));
 }
 
 // ── 6. The Spec contract ──

@@ -46,6 +46,24 @@ pub fn expectNoDevice() error{DeviceCreatedInCpuLane}!void {
 /// A fixture config and the claim it must get: the plugin's own config at its priority, near misses declined.
 pub const ClaimCase = struct { config: []const u8, want: ?peek.Priority };
 
+/// A weight group as a quant claims it at load: its `quantization` description (JSON) and dims, and the claim it must
+/// get.
+pub const GroupClaimCase = struct { quantization: []const u8, hidden: u64, inter: u64, want: ?peek.Priority };
+
+pub fn expectGroupClaims(claims: *const fn (*const peek.GroupPeek, ?*peek.Diag) ?peek.Priority, cases: []const GroupClaimCase) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (cases) |c| {
+        const q = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), c.quantization, .{});
+        const g: peek.GroupPeek = .{ .quantization = q, .hidden = c.hidden, .inter = c.inter, .n_experts = 0, .n_layers = 0, .layers = &.{} };
+        var why: peek.Diag = .{};
+        std.testing.expectEqual(c.want, claims(&g, &why)) catch |e| {
+            std.debug.print("claims: {s} ({s})\n", .{ c.quantization, why.message() });
+            return e;
+        };
+    }
+}
+
 pub fn expectClaims(claims: *const fn (*const peek.ConfigPeek) ?peek.Priority, cases: []const ClaimCase) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

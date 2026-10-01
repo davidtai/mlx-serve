@@ -196,6 +196,19 @@ test "plugins conformance: every registered plugin's kinds decline what is not t
     };
     inline for (registry.archs) |e| try sdk.testing.expectClaims(e.kind.claims, &near_misses);
     inline for (registry.expert_sources) |e| try sdk.testing.expectClaims(e.kind.claims, &near_misses);
+    // a weight group no quant's format describes
+    const group_near_misses = [_]sdk.testing.GroupClaimCase{
+        .{ .quantization = "{}", .hidden = 5120, .inter = 2304, .want = null },
+        .{ .quantization = "{\"mode\":\"__no_such_format__\",\"bits\":4,\"group_size\":32}", .hidden = 5120, .inter = 2304, .want = null },
+    };
+    inline for (registry.quants) |e| try sdk.testing.expectGroupClaims(e.kind.claims, &group_near_misses);
+}
+
+test "plugins conformance: mlx-stream registers its EXL3 quant, pinned by the kernel registry's manifest" {
+    const R = Registry(&.{@import("mlx_stream.zig").plugin}, .{ .macos = true });
+    try testing.expectEqual(@as(usize, 1), R.quants.len);
+    try testing.expectEqualStrings("exl3-mul1-k3", R.quants[0].kind.name);
+    try testing.expectEqualStrings(@import("exl3_kernels.zig").manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
