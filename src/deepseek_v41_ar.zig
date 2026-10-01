@@ -6,6 +6,7 @@
 //! the host dry path is the model test "the AR dry path ...".
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -882,6 +883,8 @@ const CellReceipt = struct {
     /// MLX_SERVE_WIRED, default max): the mode, and the wired limit it set (null: declined).
     wired_policy: ?[]const u8 = null,
     wired_limit_bytes: ?u64 = null,
+    /// The host allocator this process ran on (`cellHostAllocator`: the server's init.gpa for the build mode).
+    host_allocator: ?[]const u8 = null,
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -995,7 +998,9 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // The Module's construction / phase-change evidence lines (log.info: the routes installed, the
     // construction check, the phase change's boundary marks) reach the window log; none is per token.
     testing.log_level = .info;
-    const gpa = testing.allocator;
+    const host = cellHostAllocator();
+    std.debug.print("NATIVE host allocator: {s} (the server's init.gpa in this build mode)\n", .{host.name});
+    const gpa = host.a;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1050,7 +1055,38 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
     switch (md.arm) {
-        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired }),
+        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
+    }
+}
+
+/// The server's host allocator: main.zig takes the runtime's `init.gpa`, which start.zig's `callMain` makes libc's malloc
+/// in a ReleaseFast (or small) binary that links libc (the served and window builds), else the smp allocator; a debug or
+/// safe build keeps the testing allocator (its leak checks; the server would run its safe allocator there).
+const HostAllocator = struct { a: std.mem.Allocator, name: []const u8 };
+
+fn cellHostAllocator() HostAllocator {
+    return switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => if (builtin.link_libc)
+            .{ .a = std.heap.c_allocator, .name = "c_allocator" }
+        else if (!builtin.single_threaded)
+            .{ .a = std.heap.smp_allocator, .name = "smp_allocator" }
+        else
+            .{ .a = testing.allocator, .name = "testing" },
+        .Debug, .ReleaseSafe => .{ .a = testing.allocator, .name = "testing" },
+    };
+}
+
+test "dsv41 served cell: the host allocator is the server's init.gpa for the build mode (libc's malloc in the window builds)" {
+    const h = cellHostAllocator();
+    switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => if (builtin.link_libc) {
+            try testing.expectEqualStrings("c_allocator", h.name);
+            try testing.expect(h.a.vtable == std.heap.c_allocator.vtable);
+        },
+        .Debug, .ReleaseSafe => {
+            try testing.expectEqualStrings("testing", h.name);
+            try testing.expect(h.a.ptr == testing.allocator.ptr and h.a.vtable == testing.allocator.vtable);
+        },
     }
 }
 
@@ -1086,6 +1122,8 @@ const CellCtx = struct {
     marks: *PhaseMarks,
     /// The server's wired-residency policy, applied after construction (the receipt stamps it).
     wired: mlx.WiredPolicyResult,
+    /// The host allocator the cell ran on (`cellHostAllocator`; the receipt stamps it).
+    host_allocator: []const u8,
 };
 
 /// The timed cell over the Module's arm (`arm` the host-waits or the event-gated one).
@@ -1240,6 +1278,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .cell_arm = envStr("DSV41_CELL_ARM"),
         .wired_policy = @tagName(cx.wired.mode),
         .wired_limit_bytes = if (cx.wired.target) |t| @as(u64, t) else null,
+        .host_allocator = cx.host_allocator,
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
@@ -2743,7 +2782,9 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     if (std.c.getenv("DSV41_CELL_PROFILE") == null) return error.SkipZigTest;
     const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    const gpa = testing.allocator;
+    const host = cellHostAllocator();
+    std.debug.print("NATIVE host allocator: {s} (the server's init.gpa in this build mode)\n", .{host.name});
+    const gpa = host.a;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
