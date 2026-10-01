@@ -4,8 +4,8 @@
 //! ids on the GPU, so a forward built on lazy ids needs no host read before it runs.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const qwen4 = @import("qwen4_exp.zig");
 
 /// Why the loader picked its arm. Everything but `.gpu` serves the host gather.

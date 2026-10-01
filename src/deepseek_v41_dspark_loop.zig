@@ -2228,7 +2228,7 @@ test "dsv41 dspark loop: the fixture's mini config builds the model and head, an
 // DSV41_PHASE0B_MLX=1 only (a GPU-lock-held run: any MLX array creates the Metal device).
 test "dsv41 smoke 0b: the seed's row copy owns its rows and equals the view (MLX)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx.zig");
+    const mlx = @import("mlx");
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);

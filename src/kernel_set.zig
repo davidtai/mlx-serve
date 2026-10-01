@@ -10,7 +10,7 @@
 //! (every text verified) and only that consumer's subset is self-checked.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 

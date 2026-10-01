@@ -4,7 +4,7 @@
 //! like the composed chain) plus the shared expert's output. One dispatch
 //! replaces up to six. Same structure as TensorFold's `add_norm` (MIT).
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 // Mirrors MLX's single-row `rms_norm` kernel so the normed output is
 // bit-equal to `add -> fast::rms_norm`: TN = ceil(D/4) threads per row, each

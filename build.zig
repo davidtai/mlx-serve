@@ -128,6 +128,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "macos_engines", true);
     // The DSV4.1 prompt pass routed-call timers (src/dsv41_prefill_timers.zig): profile builds only.
     build_options.addOption(bool, "dsv41_prefill_timers", b.option(bool, "dsv41-prefill-timers", "Compile the DSV4.1 prompt pass routed-call timers in (profile builds only)") orelse false);
+    const shared = addShared(b, target, optimize);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
@@ -163,6 +164,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
+    shared.importInto(mod);
 
     // Jinja2 template engine (from llama.cpp's common/jinja + nlohmann/json).
     // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
@@ -254,6 +256,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    shared.importInto(test_mod);
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
@@ -305,6 +308,24 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Only the test root's module runs its `test` decls, so each shared module gets its own artifact.
+    // mlx.zig's tests create arrays (the device): the full suite runs them, the hermetic lanes never do.
+    // mlx-test gets its own module instance: linking MLX into the shared one would link it everywhere.
+    const mlx_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mlx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "log", .module = shared.log }},
+    });
+    addMlxLib(b, mlx_test_mod);
+    const shared_tests = [_]*std.Build.Step.Compile{
+        b.addTest(.{ .name = "log-test", .root_module = shared.log }),
+        b.addTest(.{ .name = "io_util-test", .root_module = shared.io_util }),
+        b.addTest(.{ .name = "mlx-test", .root_module = mlx_test_mod }),
+    };
+    for (shared_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -410,6 +431,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
         },
     });
+    addShared(b, target, optimize).importInto(mod);
 
     // Jinja2 template engine — same vendored sources as the macOS graph, built
     // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
@@ -582,6 +604,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
             .{ .name = "build_options", .module = ios_options.createModule() },
         },
     });
+    addShared(b, ios_target, .ReleaseFast).importInto(mod);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -752,6 +775,33 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
     module.addIncludePath(b.path("lib/ane"));
+}
+
+/// The modules every graph shares by name (docs/plugins.md, PR 1): the MLX FFI, logging and the I/O helpers.
+/// One instance per graph, so every module that imports them sees one set of types.
+const Shared = struct {
+    mlx: *std.Build.Module,
+    log: *std.Build.Module,
+    io_util: *std.Build.Module,
+
+    fn importInto(s: Shared, m: *std.Build.Module) void {
+        m.addImport("mlx", s.mlx);
+        m.addImport("log", s.log);
+        m.addImport("io_util", s.io_util);
+    }
+};
+
+fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Shared {
+    const log = b.createModule(.{ .root_source_file = b.path("src/log.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const io_util = b.createModule(.{ .root_source_file = b.path("src/io_util.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const mlx = b.createModule(.{
+        .root_source_file = b.path("src/mlx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "log", .module = log }},
+    });
+    return .{ .mlx = mlx, .log = log, .io_util = io_util };
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

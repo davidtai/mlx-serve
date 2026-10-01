@@ -2,7 +2,7 @@
 //! `build_options.macos_engines` false), as `arch/ds4_stub.zig`: the arch refuses to load, by name.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_io = @import("model.zig");
 
 /// The arch's load requirement (the preflight's hook): not built for this target.

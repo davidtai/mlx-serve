@@ -3,7 +3,7 @@
 //! g from a splitmix64 hash: a function of the row's own logits and its position only, so a verify row
 //! draws the token the serial step draws, and a draft over the head's logits shares that noise.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 /// Most candidates a row sorts; tokens within NEAR (in logits / T) of the max are gathered directly.
 const CANDIDATES = 1024;

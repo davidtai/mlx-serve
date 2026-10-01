@@ -8,7 +8,7 @@
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const qwen4 = @import("qwen4_exp.zig");
-const io_util = @import("io_util.zig");
+const io_util = @import("io_util");
 
 pub const max_ngram = 8;
 pub const max_heads = 16;

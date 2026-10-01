@@ -5,7 +5,7 @@
 //! holds the evaluating thread. Inference thread only, like every MLX call.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const expert_io = @import("expert_io.zig");
 const expert_bank = @import("expert_bank.zig");
 

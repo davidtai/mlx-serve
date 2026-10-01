@@ -13,7 +13,7 @@ const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const qwen4 = @import("qwen4_exp.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
 

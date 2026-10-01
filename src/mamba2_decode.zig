@@ -6,7 +6,7 @@
 //! chain's: f32 math, bf16 where the chain stores bf16. The SSM state stays
 //! f32; `y` comes back in x's dtype.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 /// Rows of B/C the step kernel stages per threadgroup pass; a wider window
 /// loops over passes. Also the decode/verify width `add_norm` keys on.

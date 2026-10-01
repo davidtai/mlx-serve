@@ -6,7 +6,7 @@
 //! rides in the window changes nothing a row computes, so serial decoding
 //! through this kernel is the reference a verify window reproduces.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 const CK = 128;
 const SPLIT = 4;

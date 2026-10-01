@@ -16,7 +16,7 @@
 //! nodes of `cfg`'s output shapes and dtypes).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 
 const Kernel = xk.Kernel;

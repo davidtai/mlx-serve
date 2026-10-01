@@ -5,8 +5,8 @@
 //! simdgroup MMAs, `scalar` (one row) with scalar FMAs; where a chip's MMA is
 //! not that chain, `prepare` sends one-row calls of the shape through `mma`.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 
 pub const MAX_ROWS = 16;
 const RT_MAX = 2;

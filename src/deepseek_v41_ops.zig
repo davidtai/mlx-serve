@@ -11,7 +11,7 @@
 //! the dtype explicitly through `scalar`, never an f32 default.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model = @import("model.zig");
 const xk = @import("exl3_kernels.zig");
 const first_cycle = @import("dsv41_decode_first.zig");

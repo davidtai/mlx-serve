@@ -8,7 +8,7 @@
 const std = @import("std");
 /// PROFILE builds only (`-Ddsv41-prefill-timers=true`): P1's read-ahead record; every call compiles to nothing otherwise.
 const prof = @import("dsv41_prefill_timers.zig");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_policy = @import("expert_policy.zig");

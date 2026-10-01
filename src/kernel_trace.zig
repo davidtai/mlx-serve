@@ -2,7 +2,7 @@
 //! launch, eval, join and graph op recorded with its inputs, no MLX. Test code only.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const kr = @import("kernel_routes.zig");
 

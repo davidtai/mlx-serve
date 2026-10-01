@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const status = @import("status.zig");
-const mlx = @import("mlx.zig");
-const io_util = @import("io_util.zig");
+const mlx = @import("mlx");
+const io_util = @import("io_util");
 
 /// One read's staging buffer: page-aligned (the page allocator), a multiple of every page size.
 const stage_bytes: usize = 8 << 20;

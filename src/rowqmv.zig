@@ -2,7 +2,7 @@
 //! Every input row is its own simdgroup running one row's loop, so a row's bits never
 //! depend on how many rows share the call: serial decode and a verify window agree.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 pub const MAX_ROWS = 16;
 /// Output rows a simdgroup.

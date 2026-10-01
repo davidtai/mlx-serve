@@ -5,7 +5,7 @@
 //! so its test runs only inside a guarded window (`_GPU_WINDOW_LOCKED=1`).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model = @import("model.zig");
 /// Bank shards open past the page cache (F_NOCACHE): a test's reads leave no credited cache behind
 /// for the next window (SERVED3 found 4.2 GB).

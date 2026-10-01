@@ -6,7 +6,7 @@
 //! verbatim from exl3_kernel_ops.zig.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const kr = @import("kernel_routes.zig");

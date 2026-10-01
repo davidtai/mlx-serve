@@ -21,9 +21,9 @@
 //!    attention in transformers 5.17 Qwen3-VL).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
-const log = @import("log.zig");
+const log = @import("log");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
 const mrope = @import("mrope.zig");

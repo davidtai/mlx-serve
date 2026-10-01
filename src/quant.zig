@@ -33,7 +33,7 @@
 //!   deinit(*, *G) void
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const kernel_set = @import("kernel_set.zig");
 const QuantMode = @import("model.zig").QuantMode;

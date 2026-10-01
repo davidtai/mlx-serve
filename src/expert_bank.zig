@@ -5,7 +5,7 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
-const io_util = @import("io_util.zig");
+const io_util = @import("io_util");
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
 /// down span the last three.

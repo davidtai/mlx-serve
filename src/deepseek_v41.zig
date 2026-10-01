@@ -7,7 +7,7 @@
 //! bank (`expert_bank.zig`), never from these shards.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model = @import("model.zig");
 const expert_admission = @import("expert_admission.zig");
 const kvc = @import("deepseek_v41_cache.zig");

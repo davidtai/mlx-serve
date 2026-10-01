@@ -2,7 +2,6 @@
 // Run with: zig build test
 
 test {
-    _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
@@ -148,5 +147,4 @@ test {
     _ = @import("launch.zig");
     _ = @import("lan.zig");
     _ = @import("providers.zig");
-    _ = @import("mlx.zig");
 }

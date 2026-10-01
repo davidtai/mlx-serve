@@ -7,8 +7,8 @@
 //! picks its geometry per GPU generation. Decoding once for every row follows
 //! @sudoingX's CUDA small-batch PTQ1_0 kernels (PrismML-Eng/llama.cpp#218).
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 
 /// Codes (j, j+8) of `u` as exact half2 integers, minus `o`.
 const DECODE =

@@ -6,7 +6,7 @@
 //! with the geometry fixed here: nothing is selected or re-validated per call.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const first_cycle = @import("dsv41_decode_first.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;

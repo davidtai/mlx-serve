@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const status = @import("status.zig");
 
 extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;

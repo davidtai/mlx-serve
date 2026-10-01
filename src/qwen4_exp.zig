@@ -12,8 +12,8 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
-const log = @import("log.zig");
-const io_util = @import("io_util.zig");
+const log = @import("log");
+const io_util = @import("io_util");
 const nocache_reader = @import("nocache_reader.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
