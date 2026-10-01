@@ -77,7 +77,7 @@ test {
     _ = @import("dsv41_host_heap.zig");
     _ = @import("dsv41_hcpost_emul_bench.zig");
     _ = @import("nocache_reader.zig");
-    _ = @import("expert_policy.zig");
+    _ = @import("expert_policy_test.zig");
     _ = @import("expert_stream.zig");
     _ = @import("exl3_kernels.zig");
     _ = @import("exl3_selfcheck.zig");

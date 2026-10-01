@@ -32,7 +32,7 @@ const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
-const expert_policy = @import("expert_policy.zig");
+const expert_policy = @import("sdk").expert.policy;
 const dspark_head = @import("deepseek_v41_dspark_head.zig");
 
 /// The receipt's `decode_binding`: which loop drove the cell.

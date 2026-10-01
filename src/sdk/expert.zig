@@ -6,6 +6,9 @@
 const std = @import("std");
 const mlx = @import("mlx");
 
+/// The residency policy every source plans with (one admission and replacement policy for every source).
+pub const policy = @import("expert/policy.zig");
+
 /// The reader's per-range component limit (lib/expert_io/q3_lookahead4_exl3.c MAX_COMP): a record's gate/up range and
 /// its down range each hold 1..6 components.
 pub const max_range_components = 6;

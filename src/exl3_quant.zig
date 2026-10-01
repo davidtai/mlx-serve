@@ -1973,7 +1973,7 @@ test "dsv41 smoke 0b: L1: DIG-X prefill waves at 8 experts per wave equal Record
         try st.waitGu(r, @intCast(p));
         try st.waitDown(r, @intCast(p));
     }
-    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(r, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     for (rf) |x| try testing.expectEqual(es.BankKind.base, x.bank);
@@ -2634,7 +2634,7 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -2859,7 +2859,7 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -3088,7 +3088,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -3283,7 +3283,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("expert_policy.zig").max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;

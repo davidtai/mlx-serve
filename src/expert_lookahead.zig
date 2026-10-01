@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
-const expert_policy = @import("expert_policy.zig");
+const expert_policy = @import("sdk").expert.policy;
 
 const LayerPolicy = expert_policy.LayerPolicy;
 

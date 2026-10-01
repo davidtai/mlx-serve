@@ -12,7 +12,7 @@ const prof = @import("dsv41_prefill_timers.zig");
 const mlx = @import("mlx");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
-const expert_policy = @import("expert_policy.zig");
+const expert_policy = @import("sdk").expert.policy;
 const expert_lookahead = @import("expert_lookahead.zig");
 
 const n_components = expert_bank.n_components;
@@ -2441,7 +2441,8 @@ fn realBankTrace(memory: SlotMemory) !void {
     defer bank.deinit();
     const text = try std.Io.Dir.cwd().readFileAlloc(io, fixture, a, .limited(64 << 20));
     defer a.free(text);
-    const parsed = try std.json.parseFromSlice(struct { bank_trace: expert_policy.BankTrace }, a, text, .{ .ignore_unknown_fields = true });
+    const policy_fixtures = @import("expert_policy_test.zig");
+    const parsed = try std.json.parseFromSlice(struct { bank_trace: policy_fixtures.BankTrace }, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const bt = parsed.value.bank_trace;
     const L = bt.layer;
@@ -2452,14 +2453,14 @@ fn realBankTrace(memory: SlotMemory) !void {
     const geom = &bank.layers[L];
     var served: u64 = 0;
     try s.seedPrefill(L, bt.seed);
-    for ([_][]const expert_policy.FixPlan{ bt.prefill, bt.routes }, 0..) |plans, phase| {
+    for ([_][]const policy_fixtures.FixPlan{ bt.prefill, bt.routes }, 0..) |plans, phase| {
         if (phase == 1) {
             rows[L] = bt.decode_rows;
             try s.grow(&rows);
         }
         for (plans) |want| {
             const r = try serve(s, L, want.ids);
-            try expert_policy.expectPlan(&r.plan, want);
+            try policy_fixtures.expectPlan(&r.plan, want);
             // Every served expert's slot holds its record: sha256 == the runtime manifest's.
             for (r.plan.hitsOf(), r.hit_slots[0..r.plan.n_hits]) |e, slot| {
                 const d = slotDigest(s, L, slot, geom);

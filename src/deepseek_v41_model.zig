@@ -18,7 +18,7 @@ const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
 const routes = @import("deepseek_v41_routes.zig");
-const expert_policy = @import("expert_policy.zig");
+const expert_policy = @import("sdk").expert.policy;
 /// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
 const prof = @import("dsv41_prefill_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");

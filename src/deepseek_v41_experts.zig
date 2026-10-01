@@ -28,7 +28,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_io = @import("expert_io.zig");
-const expert_policy = @import("expert_policy.zig");
+const expert_policy = @import("sdk").expert.policy;
 const expert_stream = @import("expert_stream.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
@@ -2769,7 +2769,7 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
 test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hook as the Python bank serves them" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE1_ROUTE_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const FixPlan = expert_policy.FixPlan;
+    const FixPlan = @import("expert_policy_test.zig").FixPlan;
     const Fixture = struct {
         layers: u32,
         experts: u32,
@@ -2793,7 +2793,7 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
         try src.seedPrefill(@intCast(l), f.resident0[l]);
         for (f.seed_plans[l]) |want| {
             const call = try src.route(@intCast(l), want.ids, &.{});
-            try expert_policy.expectPlan(&call.plan, want);
+            try @import("expert_policy_test.zig").expectPlan(&call.plan, want);
             src.release(call);
         }
     }
@@ -2835,7 +2835,7 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
         const call = for (&src.calls) |*cl| {
             if (cl.state == .released) break cl;
         } else unreachable;
-        expert_policy.expectPlan(&call.plan, want) catch |e| {
+        @import("expert_policy_test.zig").expectPlan(&call.plan, want) catch |e| {
             std.debug.print("route {d} (cycle {d}, layer {d}) differs\n", .{ i, i / f.layers, l });
             return e;
         };
