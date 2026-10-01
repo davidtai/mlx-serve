@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const io_util = @import("io_util");
+const expert_io = @import("sdk").expert.io;
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
 /// down span the last three.
@@ -161,6 +162,27 @@ pub const Spans = struct {
     down_offset: u64,
 };
 
+/// EXL3's record topology on the reader: nine components, six in the gate/up range.
+pub const Records = expert_io.Records(n_components, gu_components);
+
+pub const RecordRef = struct { layer: u32, expert: u32 };
+
+/// `records` of `bank` (one segment geometry) as one job into `rows`.
+pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const RecordRef, rows: []const [n_components]u64) !u32 {
+    if (records.len != rows.len or records.len == 0 or records.len > expert_io.max_items) return error.InvalidJob;
+    var lens: [n_components]u64 = undefined;
+    for (&lens, bank.layers[records[0].layer].segments) |*l, sg| l.* = sg.length;
+    var gu: [expert_io.max_items]u64 = undefined;
+    var down: [expert_io.max_items]u64 = undefined;
+    for (records, 0..) |r, i| {
+        for (lens, bank.layers[r.layer].segments) |l, sg| if (l != sg.length) return error.MixedGeometry;
+        const sp = bank.spans(r.layer, r.expert);
+        gu[i] = sp.gu_offset;
+        down[i] = sp.down_offset;
+    }
+    return Records.submit(pool, bank.sidecar, gu[0..records.len], down[0..records.len], rows, &lens);
+}
+
 pub const Bank = struct {
     allocator: std.mem.Allocator,
     hidden: u64 = 0,
@@ -170,10 +192,10 @@ pub const Bank = struct {
     /// [layer * n_experts + expert]
     digests: []Digests = &.{},
     sidecar_path: [:0]const u8 = "",
-    /// experts.bin, opened once: read-only, O_NOFOLLOW, F_NOCACHE, no read-ahead.
-    sidecar_fd: std.c.fd_t = -1,
-    sidecar_file_size: u64 = 0,
-    /// Bytes the records occupy (v2 `sidecar.size`, <= `sidecar_file_size`).
+    /// experts.bin, opened once for the reader (`openUncached`: read-only, O_NOFOLLOW, F_NOCACHE, no read-ahead);
+    /// `sidecar.size` is the file's.
+    sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
+    /// Bytes the records occupy (v2 `sidecar.size`, <= the file's).
     sidecar_size: u64 = 0,
 
     /// sha256 of the padded record (v2) and of its logical bytes (v1).
@@ -196,7 +218,7 @@ pub const Bank = struct {
     }
 
     pub fn deinit(self: *Bank) void {
-        if (self.sidecar_fd >= 0) _ = std.c.close(self.sidecar_fd);
+        if (self.sidecar.fd >= 0) self.sidecar.close();
         self.allocator.free(self.layers);
         self.allocator.free(self.digests);
         if (self.sidecar_path.len > 0) self.allocator.free(self.sidecar_path);
@@ -280,20 +302,16 @@ pub const Bank = struct {
     /// The pool's descriptor: no symlink, a regular file holding every record,
     /// the page cache bypassed and read-ahead off (reads are whole spans).
     fn openSidecar(self: *Bank, diag: ?*Diag) !void {
-        const fd = std.c.open(self.sidecar_path.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) {
-            const e = std.c._errno().*;
-            if (e == @intFromEnum(std.posix.E.NOENT)) return refuse(diag, error.SidecarMissing, "{s}: not found", .{self.sidecar_path});
-            return refuse(diag, error.SidecarOpen, "{s}: open(O_RDONLY | O_NOFOLLOW) failed, errno {d}", .{ self.sidecar_path, e });
-        }
-        self.sidecar_fd = fd;
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return refuse(diag, error.SidecarOpen, "{s}: fstat failed", .{self.sidecar_path});
-        if (st.mode & std.c.S.IFMT != std.c.S.IFREG) return refuse(diag, error.SidecarGeometry, "{s} is not a regular file", .{self.sidecar_path});
-        const size: u64 = @intCast(st.size);
-        if (size < self.sidecar_size) return refuse(diag, error.SidecarGeometry, "{s} is {d} B < {d}", .{ self.sidecar_path, size, self.sidecar_size });
-        io_util.noCache(fd, .{}) catch return refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path});
-        self.sidecar_file_size = size;
+        var errno: c_int = 0;
+        const f = expert_io.openUncached(self.sidecar_path.ptr, &errno) catch |e| return switch (e) {
+            error.NotFound => refuse(diag, error.SidecarMissing, "{s}: not found", .{self.sidecar_path}),
+            error.OpenFailed => refuse(diag, error.SidecarOpen, "{s}: open(O_RDONLY | O_NOFOLLOW) failed, errno {d}", .{ self.sidecar_path, errno }),
+            error.StatFailed => refuse(diag, error.SidecarOpen, "{s}: fstat failed", .{self.sidecar_path}),
+            error.NotRegularFile => refuse(diag, error.SidecarGeometry, "{s} is not a regular file", .{self.sidecar_path}),
+            error.NoCacheRefused => refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path}),
+        };
+        self.sidecar = f;
+        if (f.size < self.sidecar_size) return refuse(diag, error.SidecarGeometry, "{s} is {d} B < {d}", .{ self.sidecar_path, f.size, self.sidecar_size });
     }
 
     /// The runtime (v1) manifest must describe exactly the v2 records:
@@ -963,8 +981,8 @@ test "dsv41 bank: a clean synthetic bank opens with offsets, spans and digests f
     try testing.expectEqual(@as(u64, 6 * 4096), bank.recordOffset(1, 2));
     try testing.expectEqual(Spans{ .gu_offset = 6 * 4096, .down_offset = 6 * 4096 + 1920 }, bank.spans(1, 2));
     try testing.expectEqual(@as(u64, bin.len), bank.sidecar_size);
-    try testing.expectEqual(@as(u64, bin.len), bank.sidecar_file_size);
-    try testing.expect(bank.sidecar_fd >= 0);
+    try testing.expectEqual(@as(u64, bin.len), bank.sidecar.size);
+    try testing.expect(bank.sidecar.fd >= 0);
     // Both digests of every record are the manifests' (checked against the image here).
     for (0..2) |l| for (0..4) |e| {
         const off = bank.recordOffset(@intCast(l), @intCast(e));
@@ -1067,7 +1085,7 @@ test "dsv41 bank: the real 3.0 bank opens" {
     };
     defer bank.deinit();
     try testing.expectEqual(@as(usize, 40 * 384), bank.digests.len);
-    try testing.expectEqual(bank.sidecar_size, bank.sidecar_file_size);
+    try testing.expectEqual(bank.sidecar_size, bank.sidecar.size);
     try testing.expectEqual(@as(u64, 204_535_234_560), bank.sidecar_size);
     for (bank.layers) |l| try testing.expectEqual(@as(u32, 3), l.k);
     const s = bank.spans(13, 17);

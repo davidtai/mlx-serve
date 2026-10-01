@@ -1,544 +1,32 @@
-//! Lookahead read pool (lib/expert_io/q3_lookahead4_exl3.c). Its demand path is
-//! the native-issue pool's: worker threads read each record's gate/up span,
-//! then its down span (page-aligned F_NOCACHE preadv into a staging buffer, then
-//! a scatter copy into slot rows) and publish every range's status words, then
-//! its ticket in an ordered log. Three classes ride on it, each chosen at
-//! construction: speculative whole-record reads (a demand submit claims the
-//! record holding its range and copies it out), pre-read ranges (queued before
-//! a plan, bound by the submit that needs them) and event gates (the satisfied
-//! prefix goes to an MTLSharedEvent or a host word; a watchdog forces a gate
-//! whose bytes never land). Workers never call MLX. The C state is static: one
-//! pool per process, stopped before the next.
+//! The reader's tests (`sdk.expert.io`), kept in the package's test root under their names: the C pool and its
+//! fault injection compile into the test binary, never into the SDK's own tests.
 
 const std = @import("std");
 const expert_bank = @import("expert_bank.zig");
-
+const io = @import("sdk").expert.io;
+const c = io.abi;
+const Pool = io.Pool;
+const Status = io.Status;
+const Spec = io.Spec;
+const Warm = io.Warm;
+const Sched = io.Sched;
+const max_items = io.max_items;
+const max_spec = io.max_spec;
+const max_pre = io.max_pre;
+const max_gate_tickets = io.max_gate_tickets;
+const res_w = io.res_w;
+const spec_state_w = io.spec_state_w;
+const pre_state_w = io.pre_state_w;
+const abi_version = io.abi_version;
+const slotBytes = io.slotBytes;
+const chunkBytes = io.chunkBytes;
+const injectFault = io.injectFault;
+const injectFaults = io.injectFaults;
+const clearFaults = io.clearFaults;
 const n_components = expert_bank.n_components;
 const gu_components = expert_bank.gu_components;
-
-// 1:1 mirror of lib/expert_io/q3_lookahead4.h (refusing stand-ins where the sources are not built).
-const c = if (@import("build_options").macos_engines) struct {
-    extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
-    extern fn q3ld_spec_streams(idle_busy: i32) c_int;
-    extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
-    extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
-    extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
-    extern fn q3ld_spec_state(out: *[spec_state_w * max_spec]i64) i32;
-    extern fn q3ld_seq() i64;
-    extern fn q3ld_wait(seen: i64, timeout_ns: i64) i64;
-    extern fn q3ld_gauge(out: *[6]i64) void;
-    extern fn q3ld_quiesce(timeout_ns: i64) c_int;
-    extern fn q3ld_stop() c_int;
-    extern fn q3ld_pre_config(ngu: i32, ndown: i32, lens: ?[*]const i64) c_int;
-    extern fn q3ld_pre_read_lens(fd: i32, file_size: i64, tag: i64, n: i32, bases: [*]const i64, lens: [*]const i64) i32;
-    extern fn q3ld_pre_state(out: *[pre_state_w * max_pre]i64) i32;
-    extern fn q3ld_ev_config(kind: i32, obj: u64, timeout_ns: i64, start: u64) c_int;
-    extern fn q3ld_ev_gates(n: i32, values: [*]const u64, counts: [*]const i32, tickets: [*]const i64) i32;
-    extern fn q3ld_ev_release(value: u64) i32;
-    extern fn q3ld_ev_state(out: *[10]i64) i32;
-    extern fn q3ld_warm_config(busy_max: i32) c_int;
-    extern fn q3ld_submit_warm(fd: i32, file_size: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
-    extern fn q3ld_warm_cancel(first: i64, count: i64) i64;
-    extern fn q3ld_monotonic_ns() i64;
-    extern fn q3ld_abi() i32;
-    extern fn q3ld_sched_config(mode: i32) c_int;
-    extern fn q3ld_counters_n() i32;
-    extern fn q3ld_max_spec() i32;
-    extern fn q3ld_max_pre() i32;
-    extern fn q3ld_max_gates() i32;
-    extern fn q3ld_max_gate_tickets() i32;
-    /// Q3LD_INJECT builds (the test module) only.
-    extern fn q3ld_test_rules(n: i32, off: [*]const i64, code: [*]const i64, arg: [*]const i64) void;
-    extern fn q3ld_test_delay(seed: u64, max_ns: i64) void;
-    extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
-} else @import("expert_io_stub.zig").q3ld;
-
-pub const abi_version = 2026100201;
-pub const max_workers = 8;
-/// Records per job (one fill unit).
-pub const max_items = 8;
-pub const max_spec = 16;
-pub const max_spec_threads = 3;
-pub const max_pre = 32;
-pub const max_gates = 256;
-pub const max_gate_tickets = 256;
-const res_w = 8;
-pub const spec_state_w = 11;
-pub const pre_state_w = 5;
-/// `q3ld_submit` reads -1 as no deadline; 0 would expire every range at once.
-const no_deadline: i64 = -1;
-
-pub const Status = enum(i64) { ok = 0, short = 1, os_error = 2, deadline = 3, skipped = 4, pending = -1, _ };
-
-/// One range's status words, as the worker published them.
-pub const Result = struct {
-    status: Status,
-    preadv_calls: i64,
-    bytes_returned: i64,
-    payload: i64,
-    errno: i64,
-    t_start_ns: i64,
-    t_end_ns: i64,
-    worker: i64,
-};
-
-/// The pool's counter words (q3_lookahead4_exl3.c `SC_*`), written under its
-/// mutex; the h_* entries are the first of four horizon classes.
-pub const Counter = enum(u8) {
-    submitted = 0,
-    refreshed = 1,
-    noslot = 2,
-    started = 3,
-    landed = 4,
-    failed = 5,
-    expired = 6,
-    cancelled_by_demand = 7,
-    claimed = 8,
-    claimed_inflight = 9,
-    abandoned = 10,
-    abandoned_bytes = 11,
-    discarded = 12,
-    adopt_ranges = 13,
-    adopt_bytes = 14,
-    adopt_waits = 15,
-    adopt_wait_ns = 16,
-    spec_bytes = 17,
-    spec_chunks = 18,
-    pauses = 19,
-    max_busy_at_start = 20,
-    max_qlen_at_start = 21,
-    parks = 22,
-    max_nearer_at_start = 23,
-    h_submitted = 24,
-    h_kept = 28,
-    h_dropped = 32,
-    h_claimed = 36,
-    h_adopt_ranges = 40,
-    idle_chunks = 44,
-    max_busy_at_start_idle = 45,
-    pre_calls = 46,
-    pre_issued = 47,
-    pre_noslot = 48,
-    pre_claims = 49,
-    pre_started = 50,
-    pre_bound = 51,
-    pre_cancelled = 52,
-    pre_expired = 53,
-    pre_served = 54,
-    pre_waits = 55,
-    pre_wait_ns = 56,
-    pre_bind_wait_ns = 57,
-    pre_skip_cancels = 58,
-    pre_max_inflight = 59,
-    ev_calls = 60,
-    ev_gates = 61,
-    ev_tickets = 62,
-    ev_immediate = 63,
-    ev_signals = 64,
-    ev_signal_ns = 65,
-    ev_lag_ns = 66,
-    ev_max_live = 67,
-    ev_wd_forced = 68,
-    ev_wd_last_value = 69,
-    ev_host_released = 70,
-    ev_stop_released = 71,
-    warm_submitted = 72,
-    warm_started = 73,
-    warm_cancelled = 74,
-    warm_max_busy_at_start = 75,
-};
-pub const counters_n = 76;
-
-/// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
-/// read by `threads` threads in `chunk_bytes` preadv steps.
-pub const Spec = struct {
-    threads: u32,
-    slots: u32,
-    /// The largest record's payload; a speculative read covers one record.
-    record_bytes: u64,
-    chunk_bytes: u64,
-    /// Queue rule of speculative threads >= 1: an unclaimed chunk starts only
-    /// while at most this many demand jobs execute (0 = demand idle).
-    idle_busy: u32 = 0,
-};
-
-/// The warm class (A0 (a)): stock jobs a worker starts only while no demand job or pre-range is queued and fewer than
-/// `busy_max` jobs run, on `tickets` tickets of their own at the top of the ring (demand wraps below them).
-pub const Warm = struct { tickets: u32, busy_max: u32 };
-
-/// The pool's scheduling, fixed at start (`reader_sched.zig`).
-pub const Sched = @import("reader_sched.zig").Sched;
-
-pub const Options = struct {
-    workers: u32 = 4,
-    sched: Sched = .{},
-    /// One page-aligned staging buffer per worker; 9 MiB holds a whole
-    /// 8,877,056-byte gate/up span plus its page alignment.
-    staging_bytes: u64 = 9 << 20,
-    tickets: u32 = 256,
-    spec: ?Spec = null,
-    warm: ?Warm = null,
-    /// Tickets of their own for a second demand client (the draft-expert cache), between demand's ring and the warm
-    /// class's: its submits (`submitAux`) never reuse a ticket the stream's demand ring holds. 0: none.
-    aux_tickets: u32 = 0,
-};
-
-/// A speculative staging slot: the page-rounded record plus two pages.
-pub fn slotBytes(record_bytes: u64, page: u64) u64 {
-    return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
-}
-
-/// Page-aligned chunk so `chunks` chunks cover a staging slot.
-pub fn chunkBytes(chunks: u32, record_bytes: u64, page: u64) u64 {
-    return (std.math.divCeil(u64, slotBytes(record_bytes, page), chunks * page) catch unreachable) * page;
-}
-
-pub const EventKind = enum(i32) { metal = 1, host = 2 };
-
-pub const Pool = struct {
-    allocator: std.mem.Allocator,
-    staging: []align(std.heap.page_size_min) u8,
-    spec_staging: ?[]align(std.heap.page_size_min) u8 = null,
-    /// [ticket * res_w + k], written by the workers; zeroed before start.
-    res: []i64,
-    /// Completion order: log[seq % tickets] = ticket.
-    log: []i64,
-    gauge: [6]i64 = @splat(0),
-    /// Written by the pool under its mutex until `stop`.
-    counters: [counters_n]i64 = @splat(0),
-    /// Tickets seen in the log since their last submit.
-    published: []bool,
-    /// Log entries consumed so far.
-    seen: i64 = 0,
-    next_ticket: u32 = 0,
-    /// Demand's tickets end here; the warm class's (`Options.warm`) run from here to the end of the ring.
-    demand_tickets: u32 = 0,
-    next_warm: u32 = 0,
-    /// The aux ring [aux_first, aux_end) (`Options.aux_tickets`) and its next ticket.
-    aux_first: u32 = 0,
-    aux_end: u32 = 0,
-    next_aux: u32 = 0,
-    record_bytes: u64 = 0,
-
-    /// Starts the process's pool (the speculative class, when given, is
-    /// configured first). Staging, status words, counters and the log live
-    /// here and stay put until `stop`.
-    pub fn start(allocator: std.mem.Allocator, opt: Options) !*Pool {
-        const page = std.heap.pageSize();
-        if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items)
-            return error.InvalidOptions;
-        if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
-            s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
-        if (opt.warm) |w| if (w.tickets == 0 or w.tickets % 2 != 0 or w.tickets > opt.tickets -| 2 * max_items or w.busy_max == 0 or
-            w.busy_max > opt.workers) return error.InvalidOptions;
-        const warm_n: u32 = if (opt.warm) |w| w.tickets else 0;
-        if (opt.aux_tickets % 2 != 0 or (opt.aux_tickets > 0 and opt.aux_tickets < 2 * max_items) or opt.aux_tickets + warm_n > opt.tickets -| 2 * max_items) return error.InvalidOptions;
-        if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
-            c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
-        const self = try allocator.create(Pool);
-        errdefer allocator.destroy(self);
-        const staging = try std.posix.mmap(null, @intCast(opt.workers * opt.staging_bytes), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-        errdefer std.posix.munmap(staging);
-        const res = try allocator.alloc(i64, @as(usize, opt.tickets) * res_w);
-        errdefer allocator.free(res);
-        const log_arr = try allocator.alloc(i64, opt.tickets);
-        errdefer allocator.free(log_arr);
-        const published = try allocator.alloc(bool, opt.tickets);
-        errdefer allocator.free(published);
-        @memset(res, 0);
-        @memset(log_arr, 0);
-        @memset(published, false);
-        const demand: u32 = opt.tickets - warm_n - opt.aux_tickets;
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .next_warm = demand + opt.aux_tickets, .aux_first = demand, .aux_end = demand + opt.aux_tickets, .next_aux = demand };
-        var bufs: [max_spec]u64 = undefined;
-        var threads: i32 = 0;
-        var slot_bytes: u64 = 0;
-        if (opt.spec) |s| {
-            slot_bytes = slotBytes(s.record_bytes, page);
-            const spec = try std.posix.mmap(null, @intCast(s.slots * slot_bytes), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-            self.spec_staging = spec;
-            for (0..s.slots) |i| bufs[i] = @intFromPtr(spec.ptr) + i * slot_bytes;
-            threads = @intCast(s.threads);
-            self.record_bytes = s.record_bytes;
-        }
-        errdefer if (self.spec_staging) |s| std.posix.munmap(s);
-        // Arguments are valid here, so a refusal means a pool is running.
-        const nslots: i32 = if (opt.spec) |s| @intCast(s.slots) else 0;
-        const rec_len: i64 = @intCast(self.record_bytes);
-        if (c.q3ld_spec_config(threads, &bufs, nslots, @intCast(slot_bytes), rec_len, @intCast(if (opt.spec) |s| s.chunk_bytes else 0), &self.counters) != 0)
-            return error.PoolUnavailable;
-        if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
-        var ptrs: [max_workers]u64 = undefined;
-        for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
-        if (c.q3ld_sched_config(testSched(opt.sched).bits()) != 0) return error.PoolUnavailable;
-        const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
-        if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
-        if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
-        if (opt.warm) |w| if (c.q3ld_warm_config(@intCast(w.busy_max)) != 0) {
-            _ = c.q3ld_stop();
-            return error.WarmRefused;
-        };
-        return self;
-    }
-
-    /// Drains the queue, joins the workers (releasing every live gate), then
-    /// frees what they wrote into.
-    pub fn stop(self: *Pool) void {
-        _ = c.q3ld_quiesce(10 * std.time.ns_per_s);
-        _ = c.q3ld_stop();
-        const a = self.allocator;
-        std.posix.munmap(self.staging);
-        if (self.spec_staging) |s| std.posix.munmap(s);
-        a.free(self.res);
-        a.free(self.log);
-        a.free(self.published);
-        a.destroy(self);
-    }
-
-    /// Arms the pre-read class with one layer geometry's component lengths
-    /// (needs the speculative class).
-    pub fn armPreRead(self: *Pool, lens: *const [n_components]u64) !void {
-        _ = self;
-        var l: [n_components]i64 = undefined;
-        for (lens, &l) |x, *y| y.* = @intCast(x);
-        if (c.q3ld_pre_config(gu_components, n_components - gu_components, &l) != 0) return error.PreReadRefused;
-    }
-
-    /// Arms the event-gate class: the satisfied prefix goes to `object` (an
-    /// id<MTLSharedEvent>, or an 8-aligned int64 host word) from the
-    /// publishing worker; a gate unsatisfied after `timeout_ns` is forced.
-    pub fn armEvent(self: *Pool, kind: EventKind, object: u64, timeout_ns: i64, start_value: u64) !void {
-        _ = self;
-        if (c.q3ld_ev_config(@intFromEnum(kind), object, timeout_ns, start_value) != 0) return error.EventRefused;
-    }
-
-    /// One job: `rows.len` records read by one worker, every gate/up span
-    /// (`gu_offsets`, six parts) then every down span (three parts), each part
-    /// `lens[c]` bytes into `rows[i][c]`. Returns the first of its 2n tickets:
-    /// gate/up of record i = first + i, down = first + n + i.
-    pub fn submit(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) !u32 {
-        return self.submitSplit(fd, file_size, gu_offsets, down_offsets, rows, lens, gu_components, n_components - gu_components);
-    }
-
-    /// `submit` for records of another part geometry: each gate/up span `ngu` parts, each down span `ndown`
-    /// (`lens[0..ngu]`, then `lens[ngu..][0..ndown]`; the rest of `rows[i]` and `lens` unused).
-    pub fn submitSplit(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
-        return self.submitOn(0, self.demand_tickets, &self.next_ticket, fd, file_size, gu_offsets, down_offsets, rows, lens, ngu, ndown);
-    }
-
-    /// `submitSplit` on the aux ring (`Options.aux_tickets`): a second client's jobs, on tickets the demand ring never uses.
-    pub fn submitAux(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
-        if (self.aux_end == self.aux_first) return error.InvalidJob;
-        return self.submitOn(self.aux_first, self.aux_end, &self.next_aux, fd, file_size, gu_offsets, down_offsets, rows, lens, ngu, ndown);
-    }
-
-    /// Tickets of the aux ring (0: none).
-    pub fn auxTickets(self: *const Pool) u32 {
-        return self.aux_end - self.aux_first;
-    }
-
-    fn submitOn(self: *Pool, lo: u32, hi: u32, next: *u32, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
-        const n = rows.len;
-        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or ngu == 0 or ndown == 0 or ngu + ndown > n_components) return error.InvalidJob;
-        const count: u32 = @intCast(2 * n);
-        self.drain();
-        if (next.* + count > hi) next.* = lo;
-        const first = next.*;
-        var offsets: [2 * max_items]i64 = undefined;
-        var row_ptrs: [max_items][*]const u64 = undefined;
-        for (0..n) |i| {
-            offsets[i] = @intCast(gu_offsets[i]);
-            offsets[n + i] = @intCast(down_offsets[i]);
-            row_ptrs[i] = &rows[i];
-        }
-        var lens_i: [n_components]i64 = undefined;
-        for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
-        switch (c.q3ld_submit(fd, @intCast(file_size), no_deadline, @intCast(n), @intCast(ngu), @intCast(ndown), &offsets, &row_ptrs, &lens_i, first)) {
-            0 => {},
-            -2 => return error.TicketsBusy,
-            -3 => return error.QueueFull,
-            else => return error.SubmitRefused,
-        }
-        @memset(self.published[first..][0..count], false);
-        next.* = first + count;
-        return first;
-    }
-
-    /// The warm class (`Options.warm`): one job queued below demand on the warm tickets, laid out as `submit`'s
-    /// (gate/up of record i = first + i, down = first + n + i). Returns its first ticket.
-    pub fn submitWarm(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) !u32 {
-        const n = rows.len;
-        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or self.aux_end == self.published.len) return error.InvalidJob;
-        const count: u32 = @intCast(2 * n);
-        self.drain();
-        if (self.next_warm + count > self.published.len) self.next_warm = self.aux_end;
-        const first = self.next_warm;
-        var offsets: [2 * max_items]i64 = undefined;
-        var row_ptrs: [max_items][*]const u64 = undefined;
-        for (0..n) |i| {
-            offsets[i] = @intCast(gu_offsets[i]);
-            offsets[n + i] = @intCast(down_offsets[i]);
-            row_ptrs[i] = &rows[i];
-        }
-        var lens_i: [n_components]i64 = undefined;
-        for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
-        switch (c.q3ld_submit_warm(fd, @intCast(file_size), @intCast(n), gu_components, n_components - gu_components, &offsets, &row_ptrs, &lens_i, first)) {
-            0 => {},
-            -2 => return error.TicketsBusy,
-            -3 => return error.QueueFull,
-            else => return error.SubmitRefused,
-        }
-        @memset(self.published[first..][0..count], false);
-        self.next_warm = first + count;
-        return first;
-    }
-
-    /// The queued warm jobs overlapping tickets [first, first + count), published skipped now (a started job
-    /// finishes). Returns the tickets cancelled.
-    pub fn cancelWarm(_: *Pool, first: u32, count: u32) u32 {
-        const n = c.q3ld_warm_cancel(first, count);
-        return if (n < 0) 0 else @intCast(n);
-    }
-
-    /// A layer call's speculative step: settles every unclaimed record tagged
-    /// <= `cur`, then queues `bases` (whole records of `len` bytes) tagged
-    /// `cur + 1`. Returns how many were newly queued.
-    pub fn specStep(self: *Pool, fd: std.c.fd_t, file_size: u64, cur: i64, bases: []const i64, len: u64) !u32 {
-        const len_i: i64 = @intCast(if (len == 0) self.record_bytes else len);
-        const rc = c.q3ld_spec_step_len(fd, @intCast(file_size), cur, @intCast(bases.len), bases.ptr, len_i);
-        if (rc < 0) return error.SpecRefused;
-        return @intCast(rc);
-    }
-
-    /// A layer call's certain misses (record bases, route order) before its
-    /// plan, as gate/up and down ranges of `lens`; `tag` = the call's settle
-    /// value. Returns how many ranges were queued.
-    pub fn preRead(self: *Pool, fd: std.c.fd_t, file_size: u64, tag: i64, bases: []const i64, lens: *const [n_components]u64) !u32 {
-        _ = self;
-        var l: [n_components]i64 = undefined;
-        for (lens, &l) |x, *y| y.* = @intCast(x);
-        const rc = c.q3ld_pre_read_lens(fd, @intCast(file_size), tag, @intCast(bases.len), bases.ptr, &l);
-        if (rc < 0) return error.PreReadRefused;
-        return @intCast(rc);
-    }
-
-    /// Registers gates in the GPU's encode order: gate i waits for `counts[i]`
-    /// of `tickets` (in order); values strictly increase above every earlier one.
-    pub fn registerGates(self: *Pool, values: []const u64, counts: []const i32, tickets: []const i64) !void {
-        _ = self;
-        std.debug.assert(values.len == counts.len and values.len > 0);
-        switch (c.q3ld_ev_gates(@intCast(values.len), values.ptr, counts.ptr, tickets.ptr)) {
-            -2 => return error.GateInvalid,
-            -3 => return error.GatesFull,
-            else => |rc| if (rc != @as(i32, @intCast(values.len))) return error.GateRefused,
-        }
-    }
-
-    /// Forces every live gate <= `value` (error paths: nothing may wait for it).
-    pub fn releaseGates(self: *Pool, value: u64) void {
-        _ = self;
-        _ = c.q3ld_ev_release(value);
-    }
-
-    pub fn counter(self: *const Pool, which: Counter) i64 {
-        return @atomicLoad(i64, &self.counters[@intFromEnum(which)], .monotonic);
-    }
-
-    /// Blocks until every ticket in [first, first + count) is in the log;
-    /// `timeout_ns` bounds each wait for the next completion.
-    pub fn wait(self: *Pool, first: u32, count: u32, timeout_ns: i64) !void {
-        while (true) {
-            self.drain();
-            if (std.mem.allEqual(bool, self.published[first..][0..count], true)) return;
-            if (c.q3ld_wait(self.seen, timeout_ns) == self.seen) return error.Timeout;
-        }
-    }
-
-    /// A copy of the read gauge (taken under the pool mutex): 0 in flight, 1 max in flight, 2 depth sum,
-    /// 3 samples, 4 wall ns with a read in flight, 5 busy-since ns.
-    pub fn readGauge(self: *Pool) [6]i64 {
-        _ = self;
-        var out: [6]i64 = undefined;
-        c.q3ld_gauge(&out);
-        return out;
-    }
-
-    pub fn result(self: *const Pool, ticket: u32) Result {
-        const w = self.res[@as(usize, ticket) * res_w ..][0..res_w];
-        return .{ .status = @enumFromInt(w[0]), .preadv_calls = w[1], .bytes_returned = w[2], .payload = w[3], .errno = w[4], .t_start_ns = w[5], .t_end_ns = w[6], .worker = w[7] };
-    }
-
-    /// Tickets in publication order for log positions [from, to).
-    pub fn logOrder(self: *const Pool, from: i64, to: i64, out: []u32) []u32 {
-        var n: usize = 0;
-        var s = from;
-        while (s < to and n < out.len) : (s += 1) {
-            out[n] = @intCast(self.log[@intCast(@mod(s, @as(i64, @intCast(self.log.len))))]);
-            n += 1;
-        }
-        return out[0..n];
-    }
-
-    /// Marks what the log published since the last call (ACQUIRE on the
-    /// sequence, so the status words and slot bytes of those tickets are visible).
-    fn drain(self: *Pool) void {
-        const s = c.q3ld_seq();
-        while (self.seen < s) : (self.seen += 1) {
-            const t = self.log[@intCast(@mod(self.seen, @as(i64, @intCast(self.log.len))))];
-            self.published[@intCast(t)] = true;
-        }
-    }
-};
-
-/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts with the default
-/// (stock) scheduling at that value, so the stream's bank tests prove each value reads the same bytes into the same
-/// rows; a test that asks for a scheduling itself keeps it.
-fn testSched(s: Sched) Sched {
-    if (comptime !@import("builtin").is_test) return s;
-    if (s.qos or s.spin or s.demand_first) return s;
-    const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
-    return Sched.parse(std.mem.span(v)) orelse s;
-}
-
-/// The reader's monotonic clock (ns), the one its result words use.
-pub fn monotonicNs() i64 {
-    return c.q3ld_monotonic_ns();
-}
-
-/// Test builds (-DQ3LD_INJECT): one scripted preadv fault at an aligned file
-/// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes, 5
-/// sleep `arg` ns first).
-pub fn injectFault(aligned_offset: u64, code: i64, arg: i64) void {
-    c.q3ld_test_rules(1, &[_]i64{@intCast(aligned_offset)}, &[_]i64{code}, &[_]i64{arg});
-}
-
-pub fn injectFaults(aligned_offsets: []const i64, codes: []const i64, args: []const i64) void {
-    c.q3ld_test_rules(@intCast(aligned_offsets.len), aligned_offsets.ptr, codes.ptr, args.ptr);
-}
-
-pub fn clearFaults() void {
-    c.q3ld_test_rules(0, &[_]i64{0}, &[_]i64{0}, &[_]i64{0});
-}
-
-pub const RecordRef = struct { layer: u32, expert: u32 };
-
-/// `records` of `bank` (one segment geometry) as one job into `rows`.
-pub fn submitRecords(pool: *Pool, bank: *const expert_bank.Bank, records: []const RecordRef, rows: []const [n_components]u64) !u32 {
-    if (records.len != rows.len or records.len == 0 or records.len > max_items) return error.InvalidJob;
-    var lens: [n_components]u64 = undefined;
-    for (&lens, bank.layers[records[0].layer].segments) |*l, s| l.* = s.length;
-    var gu: [max_items]u64 = undefined;
-    var down: [max_items]u64 = undefined;
-    for (records, 0..) |r, i| {
-        for (lens, bank.layers[r.layer].segments) |l, s| if (l != s.length) return error.MixedGeometry;
-        const sp = bank.spans(r.layer, r.expert);
-        gu[i] = sp.gu_offset;
-        down[i] = sp.down_offset;
-    }
-    return pool.submit(bank.sidecar_fd, bank.sidecar_file_size, gu[0..records.len], down[0..records.len], rows, &lens);
-}
-
-// ── Tests ──
+/// EXL3's record topology (the bank of record's).
+const R96 = io.Records(n_components, gu_components);
 
 const testing = std.testing;
 
@@ -546,7 +34,7 @@ const testing = std.testing;
 const PatternFile = struct {
     tmp: std.testing.TmpDir,
     image: []u8,
-    fd: std.c.fd_t,
+    ufd: io.UncachedFd,
 
     fn init(len: usize) !PatternFile {
         var tmp = std.testing.tmpDir(.{});
@@ -558,13 +46,12 @@ const PatternFile = struct {
         var root: [512]u8 = undefined;
         var pbuf: [600]u8 = undefined;
         const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/pattern.bin", .{root[0..try tmp.dir.realPath(std.testing.io, &root)]}, 0);
-        const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.OpenFailed;
-        return .{ .tmp = tmp, .image = image, .fd = fd };
+        const ufd = try io.openUncached(path.ptr, null);
+        return .{ .tmp = tmp, .image = image, .ufd = ufd };
     }
 
     fn deinit(self: *PatternFile) void {
-        _ = std.c.close(self.fd);
+        self.ufd.close();
         testing.allocator.free(self.image);
         self.tmp.cleanup();
     }
@@ -627,7 +114,7 @@ test "dsv41 io: pool scatters a synthetic file" {
             down[i] = 40 * page + 3 + i * (2 * page + 7);
         }
         const seq0 = c.q3ld_seq();
-        const first = try pool.submit(f.fd, f.image.len, gu[0..n], down[0..n], d.rows[0..n], &lens);
+        const first = try R96.submit(pool, f.ufd, gu[0..n], down[0..n], d.rows[0..n], &lens);
         const count: u32 = @intCast(2 * n);
         try pool.wait(first, count, 10 * std.time.ns_per_s);
         for (0..n) |i| {
@@ -680,7 +167,7 @@ test "dsv41 io: injected faults map to status words" {
         injectFault(hit_off, cs.code, cs.arg);
         var d = try Dests.init(2, &lens);
         defer testing.allocator.free(d.buf);
-        const first = try pool.submit(f.fd, f.image.len, &gu, &down, d.rows[0..2], &lens);
+        const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..2], &lens);
         try pool.wait(first, 4, 10 * std.time.ns_per_s);
         for (cs.want, 0..) |w, k| {
             const r = pool.result(first + @as(u32, @intCast(k)));
@@ -723,10 +210,10 @@ test "dsv41 io: A0 (a): warm jobs start only with demand idle, after a demand jo
     var d = try Dests.init(4, &lens);
     defer testing.allocator.free(d.buf);
     const seq0 = c.q3ld_seq();
-    const j0 = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
-    const w0 = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
-    const w1 = try pool.submitWarm(f.fd, f.image.len, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
-    const j1 = try pool.submit(f.fd, f.image.len, &.{6 * page + 500}, &.{6 * page + 700}, d.rows[3..4], &lens);
+    const j0 = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
+    const w0 = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+    const w1 = try R96.submitWarm(pool, f.ufd, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
+    const j1 = try R96.submit(pool, f.ufd, &.{6 * page + 500}, &.{6 * page + 700}, d.rows[3..4], &lens);
     try testing.expect(w0 >= 16 and w1 == w0 + 2 and j1 == j0 + 2 and j1 < 16);
     try pool.wait(j0, 2, 10 * std.time.ns_per_s);
     try pool.wait(j1, 2, 10 * std.time.ns_per_s);
@@ -754,9 +241,9 @@ test "dsv41 io: A0 (a): a warm cancel publishes the queued jobs skipped at once 
     defer testing.allocator.free(d.buf);
     // The started one: its first range sleeps 80 ms, so the two after it stay queued (one worker).
     injectFault(0, 5, 80 * std.time.ns_per_ms);
-    const w0 = try pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
-    const w1 = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
-    const w2 = try pool.submitWarm(f.fd, f.image.len, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
+    const w0 = try R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
+    const w1 = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+    const w2 = try R96.submitWarm(pool, f.ufd, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
     while (pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
     try testing.expectEqual(@as(u32, 4), pool.cancelWarm(w0, w2 + 2 - w0));
     try pool.wait(w1, 4, std.time.ns_per_s);
@@ -783,11 +270,11 @@ test "dsv41 io: A0 (a): demand wraps below the warm tickets; a pool stopping wit
         defer pool.stop();
         // Demand's 16 tickets: eight 1-record jobs, then the ninth wraps to 0, never into the warm tickets.
         for (0..9) |k| {
-            const t = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
+            const t = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
             try testing.expectEqual(@as(u32, @intCast((2 * k) % 16)), t);
             try pool.wait(t, 2, 10 * std.time.ns_per_s);
         }
-        const w = try pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[1..2], &lens);
+        const w = try R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[1..2], &lens);
         try testing.expectEqual(@as(u32, 16), w);
         try pool.wait(w, 2, 10 * std.time.ns_per_s);
     }
@@ -795,8 +282,8 @@ test "dsv41 io: A0 (a): demand wraps below the warm tickets; a pool stopping wit
         var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
         defer clearFaults();
         injectFault(0, 5, 50 * std.time.ns_per_ms);
-        _ = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
-        _ = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+        _ = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
+        _ = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
         pool.stop();
     }
     // Refusals at construction: odd or oversized warm tickets, a busy limit of 0 or past the workers.
@@ -805,7 +292,7 @@ test "dsv41 io: A0 (a): demand wraps below the warm tickets; a pool stopping wit
     // Without the class, a warm submit is refused by name.
     var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32 });
     defer pool.stop();
-    try testing.expectError(error.InvalidJob, pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens));
+    try testing.expectError(error.InvalidJob, R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens));
 }
 
 test "dsv41 io: speculative slots and chunks follow the lane's sizes" {
@@ -866,13 +353,13 @@ test "dsv41 io: a landed speculative record serves the demand read with no pread
     var pool = try specPool(2, 2);
     defer pool.stop();
     const base: u64 = 3 * page + 100;
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, spec_rec_len));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, spec_rec_len));
     // A second issue of a live record only refreshes it.
-    try testing.expectEqual(@as(u32, 0), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, spec_rec_len));
+    try testing.expectEqual(@as(u32, 0), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, spec_rec_len));
     try waitFor(@as(i64, @intCast(base)), landedAt);
     var d = try Dests.init(1, &spec_lens);
     defer testing.allocator.free(d.buf);
-    const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
     try pool.wait(first, 2, 10 * std.time.ns_per_s);
     try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
     for (0..2) |k| {
@@ -899,18 +386,18 @@ test "dsv41 io: a queued speculative record is cancelled by the demand read; set
     injectFaults(&.{ @intCast(slow[0]), @intCast(slow[1]) }, &.{ 5, 5 }, &.{ 300 * std.time.ns_per_ms, 300 * std.time.ns_per_ms });
     var busy = try Dests.init(2, &spec_lens);
     defer testing.allocator.free(busy.buf);
-    const j0 = try pool.submit(f.fd, f.image.len, slow[0..1], &.{slow[0] + spec_gu_len}, busy.rows[0..1], &spec_lens);
-    const j1 = try pool.submit(f.fd, f.image.len, slow[1..2], &.{slow[1] + spec_gu_len}, busy.rows[1..2], &spec_lens);
+    const j0 = try R96.submit(pool, f.ufd, slow[0..1], &.{slow[0] + spec_gu_len}, busy.rows[0..1], &spec_lens);
+    const j1 = try R96.submit(pool, f.ufd, slow[1..2], &.{slow[1] + spec_gu_len}, busy.rows[1..2], &spec_lens);
     const a: u64 = 2 * page + 7;
     const b: u64 = 6 * page + 9;
-    try testing.expectEqual(@as(u32, 2), try pool.specStep(f.fd, f.image.len, 1, &.{ @intCast(a), @intCast(b) }, spec_rec_len));
+    try testing.expectEqual(@as(u32, 2), try pool.specStep(f.ufd, 1, &.{ @intCast(a), @intCast(b) }, spec_rec_len));
     // The demand read of `a` cancels its queued record and reads it itself.
     var d = try Dests.init(1, &spec_lens);
     defer testing.allocator.free(d.buf);
-    const first = try pool.submit(f.fd, f.image.len, &.{a}, &.{a + spec_gu_len}, d.rows[0..1], &spec_lens);
+    const first = try R96.submit(pool, f.ufd, &.{a}, &.{a + spec_gu_len}, d.rows[0..1], &spec_lens);
     try testing.expectEqual(@as(i64, 1), pool.counter(.cancelled_by_demand));
     // The next layer call's settle drops `b`, never claimed.
-    _ = try pool.specStep(f.fd, f.image.len, 2, &.{}, spec_rec_len);
+    _ = try pool.specStep(f.ufd, 2, &.{}, spec_rec_len);
     try testing.expectEqual(@as(i64, 1), pool.counter(.expired));
     var slots: [max_spec]SpecSlot = undefined;
     for (specSlots(&slots)) |s| try testing.expectEqual(@as(i64, 0), s.state);
@@ -945,26 +432,26 @@ test "dsv41 io: pre-read ranges bind to the demand submit; unbound ones expire a
     defer f.deinit();
     var pool = try specPool(4, 2);
     defer pool.stop();
-    try pool.armPreRead(&spec_lens);
+    try R96.armPreRead(pool, &spec_lens);
     // Bound: two records pre-read (4 ranges, each worker holds one at its first copy), then demanded.
     const recs = [2]u64{ 5 * page + 11, 9 * page + 13 };
-    try testing.expectEqual(@as(u32, 4), try pool.preRead(f.fd, f.image.len, 1, &.{ @intCast(recs[0]), @intCast(recs[1]) }, &spec_lens));
+    try testing.expectEqual(@as(u32, 4), try R96.preRead(pool, f.ufd, 1, &.{ @intCast(recs[0]), @intCast(recs[1]) }, &spec_lens));
     try waitFor(pool, preCount);
     var d = try Dests.init(2, &spec_lens);
     defer testing.allocator.free(d.buf);
-    const first = try pool.submit(f.fd, f.image.len, &recs, &.{ recs[0] + spec_gu_len, recs[1] + spec_gu_len }, d.rows[0..2], &spec_lens);
+    const first = try R96.submit(pool, f.ufd, &recs, &.{ recs[0] + spec_gu_len, recs[1] + spec_gu_len }, d.rows[0..2], &spec_lens);
     try pool.wait(first, 4, 10 * std.time.ns_per_s);
     for (0..2) |i| try d.expectRecord(i, f.image, recs[i], recs[i] + spec_gu_len, &spec_lens);
     for (0..4) |k| try testing.expect(pool.result(first + @as(u32, @intCast(k))).preadv_calls >= 1);
     try testing.expectEqual(@as(i64, 4), pool.counter(.pre_bound));
     try testing.expectEqual(@as(i64, 4), pool.counter(.pre_served));
     try testing.expectEqual(@as(i64, 0), pool.counter(.pre_cancelled));
-    _ = try pool.specStep(f.fd, f.image.len, 1, &.{}, spec_rec_len);
+    _ = try pool.specStep(f.ufd, 1, &.{}, spec_rec_len);
     // Unbound: pre-read, never demanded; the call's settle expires both ranges and frees their workers.
     const lone: u64 = 20 * page + 5;
-    try testing.expectEqual(@as(u32, 2), try pool.preRead(f.fd, f.image.len, 2, &.{@intCast(lone)}, &spec_lens));
+    try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, f.ufd, 2, &.{@intCast(lone)}, &spec_lens));
     try waitFor(pool, preCount6);
-    _ = try pool.specStep(f.fd, f.image.len, 2, &.{}, spec_rec_len);
+    _ = try pool.specStep(f.ufd, 2, &.{}, spec_rec_len);
     try waitFor(pool, preIdle);
     try testing.expectEqual(@as(i64, 2), pool.counter(.pre_expired));
     try testing.expectEqual(@as(i64, 4), pool.counter(.pre_served));
@@ -1022,7 +509,7 @@ const EvRig = struct {
             gu[i] = base(r);
             down[i] = base(r) + ev_gu_len;
         }
-        const first = try self.pool.submit(self.f.fd, self.f.image.len, gu[0..recs.len], down[0..recs.len], d.rows[0..recs.len], &ev_lens);
+        const first = try R96.submit(self.pool, self.f.ufd, gu[0..recs.len], down[0..recs.len], d.rows[0..recs.len], &ev_lens);
         try self.dests.append(testing.allocator, d);
         return first;
     }
@@ -1193,7 +680,7 @@ test "dsv41 io: the event class refuses a pool without it and bad arguments" {
     try testing.expectError(error.EventRefused, pool.armEvent(.host, @intFromPtr(&word), 999_999, 0));
     try testing.expectError(error.EventRefused, pool.armEvent(.host, 0, std.time.ns_per_s, 0));
     // The pre-read class needs the speculative class.
-    try testing.expectError(error.PreReadRefused, pool.armPreRead(&spec_lens));
+    try testing.expectError(error.PreReadRefused, R96.armPreRead(pool, &spec_lens));
 }
 
 /// The pool threads as the kernel sees them (tests): each thread's QoS class and name.
@@ -1300,10 +787,10 @@ test "dsv41 io: demand first: no unclaimed speculative chunk starts while a dema
     injectFault(base / page * page, 5, 80 * std.time.ns_per_ms);
     var d = try Dests.init(1, &spec_lens);
     defer testing.allocator.free(d.buf);
-    const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
     std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
     const spec_base: u64 = 30 * page + 7;
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(spec_base)}, spec_rec_len));
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(spec_base)}, spec_rec_len));
     std.Io.sleep(testing.io, .fromMilliseconds(30), .awake) catch {};
     // Still executing: nothing speculative started.
     try testing.expectEqual(@as(i64, 0), pool.counter(.spec_chunks));
@@ -1326,6 +813,7 @@ test "dsv41 io: qos: a claimed speculative record's worker runs at the demand cl
     defer pool.stop();
     defer clearFaults();
     const base: u64 = 20 * page;
+<<<<<<< HEAD:src/expert_io.zig
     injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 800 * std.time.ns_per_ms, 800 * std.time.ns_per_ms });
     try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, rec));
     const SpecQos = struct {
@@ -1356,6 +844,31 @@ test "dsv41 io: qos: a claimed speculative record's worker runs at the demand cl
         std.debug.print("QOSPROBE skipped: the claim came after the second chunk (box loaded)\n", .{});
         try pool.wait(first, 2, 10 * std.time.ns_per_s);
         return error.SkipZigTest;
+=======
+    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 200 * std.time.ns_per_ms, 200 * std.time.ns_per_ms });
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, rec));
+    std.Io.sleep(testing.io, .fromMilliseconds(60), .awake) catch {};
+    const unclaimed = ThreadProbe.scan("spec unclaimed");
+    try testing.expectEqual(@as(u32, 1), unclaimed.spec_utility);
+    var d = try Dests.init(1, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    // Past the second chunk's end: the third chunk runs claimed.
+    std.Io.sleep(testing.io, .fromMilliseconds(250), .awake) catch {};
+    var list: [*]ThreadProbe.mach_port_t = undefined;
+    var n: u32 = 0;
+    try testing.expectEqual(@as(c_int, 0), ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n));
+    var found = false;
+    for (list[0..n]) |port| {
+        const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
+        var name: [64]u8 = @splat(0);
+        _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
+        if (!std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) continue;
+        const q = ThreadProbe.qosOf(t);
+        std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{q});
+        try testing.expectEqual(ThreadProbe.user_interactive, q);
+        found = true;
+>>>>>>> 0e76e1c3 (sdk.expert: the reader and the event gate move into the SDK; one record topology per source, uncached fds only (S5)):src/expert_io_test.zig
     }
     // Claimed: the worker reaches USER_INTERACTIVE before its third (claimed) chunk ends.
     var seen: ?c_uint = null;

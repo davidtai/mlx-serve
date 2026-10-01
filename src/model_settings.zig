@@ -11,7 +11,7 @@ const sdk = @import("sdk");
 
 /// A streamed-expert model's read pool scheduling (`expert_reader_sched`): "off" or a comma list of qos, spin,
 /// demandfirst (`reader_sched.Sched.parse`).
-pub const ReaderSched = @import("reader_sched.zig").Sched;
+pub const ReaderSched = @import("sdk").expert.Sched;
 
 pub const Override = struct {
     ctx_size: ?u32 = null,

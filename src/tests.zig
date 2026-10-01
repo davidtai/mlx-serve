@@ -54,10 +54,10 @@ test {
     _ = @import("deepseek_v41_dspark_head.zig");
     _ = @import("deepseek_v41_dspark_loop.zig");
     _ = @import("expert_bank.zig");
-    _ = @import("expert_io.zig");
+    _ = @import("expert_io_test.zig");
     _ = @import("expert_slot_cache.zig");
     _ = @import("expert_lookahead.zig");
-    _ = @import("expert_event.zig");
+    _ = @import("expert_event_test.zig");
     _ = @import("expert_admission.zig");
     _ = @import("deepseek_v41_arm.zig");
     _ = @import("deepseek_v41_cell.zig");

@@ -1,88 +1,21 @@
-//! MLX side of the streamer's event gate (lib/expert_io/mlx_event_shim.cpp).
-//! A gated wave reads slot arrays through `wait` aliases: on a GPU stream the
-//! command buffer waits for the pool to hand the event the gate's value, so the
-//! waves are committed before their bytes land; on a CPU stream a host event
-//! holds the evaluating thread. Inference thread only, like every MLX call.
+//! The event gate's tests (`sdk.expert.event`), kept in the package's test root under their names (the 0b ones run
+//! inside a guarded window only: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device).
 
 const std = @import("std");
 const mlx = @import("mlx");
-const expert_io = @import("expert_io.zig");
 const expert_bank = @import("expert_bank.zig");
-
-const c = if (@import("build_options").macos_engines) struct {
-    extern fn dsv41ev_abi() i32;
-    extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
-    extern fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
-    extern fn dsv41ev_create_null() i32;
-    extern fn dsv41ev_wait(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, deps: ?[*]const mlx.mlx_array, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;
-    extern fn dsv41ev_signal(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;
-    extern fn dsv41ev_value(event: i32) u64;
-    extern fn dsv41ev_stats(out: *[8]i64) void;
-    extern fn dsv41ev_last_error() [*:0]const u8;
-} else @import("expert_io_stub.zig").ev;
-
-pub const abi_version = 2026092801;
-
-/// An event the pool signals: `id` names it to `wait`, `object` is what the
-/// pool's event class is armed with (the id<MTLSharedEvent>, or the word).
-pub const Event = struct { id: i32, object: u64 };
-
-/// An MTLSharedEvent on MLX's GPU device, at value 0. Creates the Metal device.
-pub fn createMetal() !Event {
-    var object: u64 = 0;
-    const id = c.dsv41ev_create_metal(0, &object);
-    if (id <= 0) return error.EventUnavailable;
-    return .{ .id = id, .object = object };
-}
-
-/// A host event over the stream's word (Stream.eventWord), for CPU streams.
-pub fn createHost(word: *i64, timeout_ns: i64) !Event {
-    const id = c.dsv41ev_create_host(word, timeout_ns);
-    if (id <= 0) return error.EventUnavailable;
-    return .{ .id = id, .object = @intFromPtr(word) };
-}
-
-/// `outs[i]` alias `xs[i]`; nothing reads them before the event reaches
-/// `value`. `deps` only order the wait (after them); `track_inputs` orders it
-/// after the producers of `xs` (only for GPU-produced inputs). `outs` are fresh
-/// handles (`mlx_array_new`): the shim assigns each alias into its handle.
-pub fn wait(xs: []const mlx.mlx_array, event: Event, value: u64, deps: []const mlx.mlx_array, track_inputs: bool, stream: mlx.mlx_stream, outs: []mlx.mlx_array) !void {
-    std.debug.assert(xs.len == outs.len and xs.len > 0);
-    if (std.debug.runtime_safety) std.debug.assert(allFresh(outs));
-    if (c.dsv41ev_wait(xs.ptr, xs.len, event.id, value, deps.ptr, deps.len, track_inputs, stream, outs.ptr) != 0) return error.EventWaitRefused;
-}
-
-/// `outs` alias `xs` (fresh handles, as `wait`'s); the GPU hands `value` to a
-/// metal event after every pass encoded before it (probes).
-pub fn signal(xs: []const mlx.mlx_array, event: Event, value: u64, stream: mlx.mlx_stream, outs: []mlx.mlx_array) !void {
-    if (std.debug.runtime_safety) std.debug.assert(allFresh(outs));
-    if (c.dsv41ev_signal(xs.ptr, xs.len, event.id, value, stream, outs.ptr) != 0) return error.EventSignalRefused;
-}
-
-/// Handles the shim may assign into: none holds an array (an `undefined` one is stack garbage, which the
-/// shim's move-assign would dereference).
-fn allFresh(outs: []const mlx.mlx_array) bool {
-    for (outs) |o| if (o.ctx != null) return false;
-    return true;
-}
-
-pub fn signaledValue(event: Event) u64 {
-    return c.dsv41ev_value(event.id);
-}
-
-pub const Stats = struct { gpu_waits: i64, gpu_signals: i64, host_ready: i64, host_blocked: i64, host_timeouts: i64, host_wait_ns: i64, cpu_passthrough: i64, events: i64 };
-
-pub fn stats() Stats {
-    var w: [8]i64 = undefined;
-    c.dsv41ev_stats(&w);
-    return .{ .gpu_waits = w[0], .gpu_signals = w[1], .host_ready = w[2], .host_blocked = w[3], .host_timeouts = w[4], .host_wait_ns = w[5], .cpu_passthrough = w[6], .events = w[7] };
-}
-
-pub fn lastError() []const u8 {
-    return std.mem.span(c.dsv41ev_last_error());
-}
-
-// ── Tests (GPU lock held: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device) ──
+const expert_io = @import("sdk").expert.io;
+const event = @import("sdk").expert.event;
+const c = event.abi;
+const abi_version = event.abi_version;
+const Event = event.Event;
+const createHost = event.createHost;
+const createMetal = event.createMetal;
+const signaledValue = event.signaledValue;
+const wait = event.wait;
+const signal = event.signal;
+const allFresh = event.allFresh;
+const stats = event.stats;
 
 const testing = std.testing;
 const n_components = expert_bank.n_components;
@@ -111,7 +44,7 @@ test "dsv41 event: a wait's and a signal's outputs must be fresh handles; stack 
 const Rig = struct {
     tmp: std.testing.TmpDir,
     image: []u8,
-    fd: std.c.fd_t,
+    ufd: expert_io.UncachedFd,
     arr: mlx.mlx_array,
     rows: [1][n_components]u64,
     const lens = [n_components]u64{ 8000, 100, 200, 8000, 100, 200, 3000, 200, 100 };
@@ -129,14 +62,14 @@ const Rig = struct {
         var root: [512]u8 = undefined;
         var pbuf: [600]u8 = undefined;
         const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/p.bin", .{root[0..try tmp.dir.realPath(std.testing.io, &root)]}, 0);
-        const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.OpenFailed;
+        const ufd = try expert_io.openUncached(path.ptr, null);
+        errdefer ufd.close();
         var arr = mlx.mlx_array_new();
         const shape = [_]c_int{total};
         try mlx.check(mlx.mlx_zeros(&arr, &shape, 1, .uint8, stream));
         try mlx.check(mlx.mlx_array_eval(arr));
         const p = @intFromPtr(mlx.mlx_array_data_uint8(arr) orelse return error.MlxNoData);
-        var rig: Rig = .{ .tmp = tmp, .image = image, .fd = fd, .arr = arr, .rows = undefined };
+        var rig: Rig = .{ .tmp = tmp, .image = image, .ufd = ufd, .arr = arr, .rows = undefined };
         var off: u64 = 0;
         for (lens, 0..) |l, k| {
             rig.rows[0][k] = p + off;
@@ -147,7 +80,7 @@ const Rig = struct {
 
     fn deinit(self: *Rig) void {
         _ = mlx.mlx_array_free(self.arr);
-        _ = std.c.close(self.fd);
+        self.ufd.close();
         testing.allocator.free(self.image);
         self.tmp.cleanup();
     }
@@ -155,7 +88,7 @@ const Rig = struct {
     /// The record's read (its gate/up read held `hold_ns`), gated by values 1 (gate/up) and 2 (down).
     fn submitGated(self: *Rig, pool: *expert_io.Pool, hold_ns: i64) !u32 {
         expert_io.injectFault(base / 16384 * 16384, 5, hold_ns);
-        const first = try pool.submit(self.fd, self.image.len, &.{base}, &.{base + gu_len}, &self.rows, &lens);
+        const first = try expert_io.Records(n_components, expert_bank.gu_components).submit(pool, self.ufd, &.{base}, &.{base + gu_len}, &self.rows, &lens);
         try pool.registerGates(&.{ 1, 2 }, &.{ 1, 1 }, &.{ first, first + 1 });
         return first;
     }

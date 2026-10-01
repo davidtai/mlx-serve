@@ -6,19 +6,25 @@
 const std = @import("std");
 const mlx = @import("mlx");
 
+/// The reader: one pool per process (lib/expert_io's C pool), read through one record topology per source
+/// (`Records(components, gate_up)`), from fds `openUncached` makes. On graphs without the C sources it refuses at start.
+pub const io = @import("expert/io.zig");
+pub const Pool = io.Pool;
+pub const Records = io.Records;
+pub const UncachedFd = io.UncachedFd;
+pub const openUncached = io.openUncached;
+/// The read pool threads' scheduling (`Options.sched`).
+pub const Sched = io.Sched;
+pub const max_range_components = io.max_range_components;
+pub const checkTopology = io.checkTopology;
+
+/// The event gate: the reader signals it, the arch's math waits on it (an MTLSharedEvent, or a host word on CPU
+/// streams).
+pub const event = @import("expert/event.zig");
+pub const Event = event.Event;
+
 /// The residency policy every source plans with (one admission and replacement policy for every source).
 pub const policy = @import("expert/policy.zig");
-
-/// The reader's per-range component limit (lib/expert_io/q3_lookahead4_exl3.c MAX_COMP): a record's gate/up range and
-/// its down range each hold 1..6 components.
-pub const max_range_components = 6;
-
-/// A record topology the reader serves, else a compile error: `gate_up` components in the gate/up range, the rest in
-/// the down range, each range 1..`max_range_components`.
-pub fn checkTopology(comptime components: usize, comptime gate_up: usize) void {
-    if (gate_up < 1 or gate_up > max_range_components or components <= gate_up or components - gate_up > max_range_components)
-        @compileError(std.fmt.comptimePrint("expert reader: {d} components with {d} gate/up (each range holds 1..{d})", .{ components, gate_up, max_range_components }));
-}
 
 /// The record layout a bank fills when it opens (EXL3: 9 components, 6 gate/up; MXFP4: 6, 4): each component's dtype,
 /// per-row shape, offset in the record and length; the record's bytes and its gate/up range's.

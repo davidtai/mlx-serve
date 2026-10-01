@@ -11,7 +11,7 @@ const sdk = @import("sdk");
 const prof = @import("dsv41_prefill_timers.zig");
 const mlx = @import("mlx");
 const expert_bank = @import("expert_bank.zig");
-const expert_io = @import("expert_io.zig");
+const expert_io = sdk.expert.io;
 const expert_policy = @import("sdk").expert.policy;
 const expert_lookahead = @import("expert_lookahead.zig");
 
@@ -703,7 +703,7 @@ pub const Stream = struct {
         errdefer if (dpool) |*d| dpoolFree(a, d);
         const pool = try expert_io.Pool.start(a, pool_opt);
         errdefer pool.stop();
-        if (opt.lookahead) |la| if (la.preread) try pool.armPreRead(&layers[widest].lens);
+        if (opt.lookahead) |la| if (la.preread) try expert_bank.Records.armPreRead(pool, &layers[widest].lens);
         if (opt.event) |ev| {
             const object: u64 = switch (ev.backend) {
                 .host => @intFromPtr(word.?),
@@ -1010,7 +1010,7 @@ pub const Stream = struct {
         if (misses.len == 0) return;
         var bases: [expert_lookahead.max_candidates]i64 = undefined;
         for (misses, bases[0..misses.len]) |e, *b| b.* = @intCast(self.bank.recordOffset(layer, e));
-        _ = self.pool.preRead(self.bank.sidecar_fd, self.bank.sidecar_file_size, tag, bases[0..misses.len], &self.layers[layer].lens) catch
+        _ = expert_bank.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..misses.len], &self.layers[layer].lens) catch
             return self.fail(error.PreReadRefused);
     }
 
@@ -1030,7 +1030,7 @@ pub const Stream = struct {
             }
             len = self.bank.layers[next].logical_bytes;
         }
-        _ = self.pool.specStep(self.bank.sidecar_fd, self.bank.sidecar_file_size, r.tag, bases[0..n], len) catch
+        _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
             return self.fail(error.SpecRefused);
     }
 
@@ -1131,7 +1131,7 @@ pub const Stream = struct {
                 nr += 1;
             }
             if (nr > 0) {
-                part.ticket = self.pool.submit(bank.sidecar_fd, bank.sidecar_file_size, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                part.ticket = expert_bank.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
                 part.n_reads = nr;
             } else part.settled = true;
             r.parts[r.n_parts] = part;
@@ -1236,7 +1236,7 @@ pub const Stream = struct {
                 nr += 1;
             };
             if (nr > 0) {
-                part.ticket = self.pool.submit(self.bank.sidecar_fd, self.bank.sidecar_file_size, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
+                part.ticket = expert_bank.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                 part.n_reads = nr;
                 self.counters.ahead_posted += nr;
                 prof.addPosted(layer, nr);
@@ -1692,7 +1692,7 @@ pub const Stream = struct {
                 m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = ad.expert };
                 const sp = self.bank.spans(layer, ad.expert);
                 const rows = [1][n_components]u64{loc.rows.rowDest(loc.row)};
-                ticket = self.pool.submitWarm(self.bank.sidecar_fd, self.bank.sidecar_file_size, &.{sp.gu_offset}, &.{sp.down_offset}, &rows, &ls.lens) catch |e| return self.fail(e);
+                ticket = expert_bank.Records.submitWarm(self.pool, self.bank.sidecar, &.{sp.gu_offset}, &.{sp.down_offset}, &rows, &ls.lens) catch |e| return self.fail(e);
             }
             w.loads[w.n] = .{ .expert = ad.expert, .slot = ad.slot, .ticket = ticket };
             w.n += 1;
@@ -1868,7 +1868,7 @@ fn hexEq(hex: []const u8, bytes: []const u8) bool {
 /// both manifest digests and the Python reader's per-component sha256.
 fn checkSet(name: []const u8, bank: *const expert_bank.Bank, set: []const FixRec, rows: anytype) !u64 {
     const n = set.len;
-    var refs: [expert_io.max_items]expert_io.RecordRef = undefined;
+    var refs: [expert_io.max_items]expert_bank.RecordRef = undefined;
     var dests: [expert_io.max_items][n_components]u64 = undefined;
     for (set, 0..) |r, i| {
         try testing.expectEqual(bank.recordOffset(r.layer, r.expert), r.sidecar_offset);
@@ -1878,7 +1878,7 @@ fn checkSet(name: []const u8, bank: *const expert_bank.Bank, set: []const FixRec
     // Stops (drains + joins) before the caller frees `rows`.
     var pool = try expert_io.Pool.start(testing.allocator, .{});
     defer pool.stop();
-    const first = try expert_io.submitRecords(pool, bank, refs[0..n], dests[0..n]);
+    const first = try expert_bank.submitRecords(pool, bank, refs[0..n], dests[0..n]);
     try pool.wait(first, @intCast(2 * n), 60 * std.time.ns_per_s);
     var calls: i64 = 0;
     var payload: i64 = 0;
@@ -1904,7 +1904,7 @@ fn checkSet(name: []const u8, bank: *const expert_bank.Bank, set: []const FixRec
         try testing.expectEqual(layer.record_bytes, r.record_bytes);
         var got: usize = 0;
         while (got < whole.len) {
-            const k = std.c.pread(bank.sidecar_fd, whole[got..].ptr, whole.len - got, @intCast(r.sidecar_offset + got));
+            const k = std.c.pread(bank.sidecar.fd, whole[got..].ptr, whole.len - got, @intCast(r.sidecar_offset + got));
             if (k <= 0) return error.ShortRead;
             got += @intCast(k);
         }
@@ -2973,7 +2973,7 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
 test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const expert_event = @import("expert_event.zig");
+    const expert_event = sdk.expert.event;
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var sb = try SynthBank.open(32);

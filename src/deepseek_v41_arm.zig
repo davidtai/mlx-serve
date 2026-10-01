@@ -29,7 +29,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const expert_bank = @import("expert_bank.zig");
-const expert_io = @import("expert_io.zig");
+const expert_io = @import("sdk").expert.io;
 const expert_stream = @import("expert_stream.zig");
 const expert_admission = @import("expert_admission.zig");
 const expert_policy = @import("sdk").expert.policy;
@@ -359,7 +359,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         /// The hook's construction inputs the arm's routes need beyond `Options`: every routed layer's gate
         /// (`.lookahead`: the predictor reads the next layer's) and the stream's event (`.gated`).
-        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null, wide: xp.Wide = .{}, banked: bool = false };
+        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("sdk").expert.Event = null, wide: xp.Wide = .{} };
 
         pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
             // The hook's predictor feeds the stream's read-ahead: the route needs the stream's class.
