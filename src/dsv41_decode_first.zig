@@ -9,6 +9,8 @@
 //!   - the prompt's last `tail_rows` rows' routed experts per layer, and in the first cycle how many of each layer's
 //!     misses they hold and how many reads they would cost (A0's first-verify reads at the grow);
 //!   - the decode timers' buckets at the first cycle's end;
+//!   - A0 (c)'s D1: the first cycle's draft block run twice (`Loop.droppedDraft`), the first dropped, each block's build,
+//!     wait and the bytes MLX took for it, after the state the draft's eval would realise (evaluated apart);
 //!   - the first dispatches of each phase (construction, the prompt pass, the first cycle, the warm cycles): a
 //!     registry kernel's variant (MLX builds one library per kernel, template and input binding: scalar, `constant`
 //!     under 8 elements, else `device`) and a compiled region's input signature (MLX traces one per shapes and dtypes).
@@ -44,6 +46,15 @@ var tail: [max_layers]std.StaticBitSet(max_experts) = @splat(.empty);
 /// call's misses it holds.
 pub var tails: [max_layers]Tail = @splat(.{});
 
+/// A0 (c)'s D1: one of the first cycle's draft blocks. Its graph's build and its eval's wait (ns), MLX's cache bytes
+/// before it, and the bytes MLX took from the system for it (`fresh_bytes`: active + cache after its eval, less before).
+pub const DraftBlock = struct { build_ns: u64 = 0, wait_ns: u64 = 0, cache_before: u64 = 0, fresh_bytes: u64 = 0 };
+/// [0] the dropped block, [1] the cycle's own.
+pub var cycle1_draft: [2]DraftBlock = @splat(.{});
+/// The main row and the stage windows the first draft's eval would realise (the prompt's seed), evaluated first.
+pub var cycle1_pending_ns: u64 = 0;
+var drafts_seen: u8 = 0;
+
 /// First dispatches counted per phase; the first cycle's named.
 pub var new_per_phase: [4]u32 = @splat(0);
 pub const Named = struct { what: []const u8, key: u64 };
@@ -69,7 +80,34 @@ pub fn startDecode() void {
     n_cycle1_new = 0;
     last_layer = null;
     tails = @splat(.{});
+    cycle1_draft = @splat(.{});
+    cycle1_pending_ns = 0;
+    drafts_seen = 0;
     phase = .cycle1;
+}
+
+/// The next draft block is the decode's first: D1 runs it twice (once dropped).
+pub fn firstDraft() bool {
+    if (comptime !enabled) return false;
+    return phase == .cycle1 and drafts_seen == 0;
+}
+
+/// MLX's active and cached bytes now on the device backend; zeros on the trace backend (no device, no MLX call).
+pub fn memNow(comptime on_device: bool) [2]u64 {
+    if (comptime !enabled or !on_device) return .{ 0, 0 };
+    var act: usize = 0;
+    var cached: usize = 0;
+    _ = mlx.mlx_get_active_memory(&act);
+    _ = mlx.mlx_get_cache_memory(&cached);
+    return .{ act, cached };
+}
+
+/// One of the first cycle's draft blocks (0: the dropped one, 1: the cycle's own): its build and wait, and MLX's
+/// (active, cache) bytes before it and after its eval.
+pub fn recordDraft(i: u1, build_ns: u64, wait_ns: u64, before: [2]u64, after: [2]u64) void {
+    if (comptime !enabled) return;
+    cycle1_draft[i] = .{ .build_ns = build_ns, .wait_ns = wait_ns, .cache_before = before[1], .fresh_bytes = (after[0] + after[1]) -| (before[0] + before[1]) };
+    drafts_seen = @max(drafts_seen, @as(u8, i) + 1);
 }
 
 /// A prompt call's routed ids (`n` rows x `k`, row order): its last `tail_rows` rows' experts become the layer's
@@ -257,6 +295,12 @@ fn write(w: *std.Io.Writer, n: u32, stream_misses: ?u64) !void {
         for (tails[0..n], 0..) |t, i| try w.print("{s}{d}", .{ if (i == 0) "" else ", ", @field(t, name) });
         try w.writeAll("]");
     }
+    // D1: the pending state, then the dropped block and the cycle's own (zeros when the first cycle drafted once)
+    try w.print(", \"cycle1_pending_ms\": {d:.3}", .{ms(cycle1_pending_ns, 1)});
+    inline for (.{ "first", "second" }, 0..) |label, i| {
+        const b = cycle1_draft[i];
+        try w.print(", \"cycle1_draft_{s}\": {{\"build_ms\": {d:.3}, \"wait_ms\": {d:.3}, \"cache_before\": {d}, \"fresh_bytes\": {d}}}", .{ label, ms(b.build_ns, 1), ms(b.wait_ns, 1), b.cache_before, b.fresh_bytes });
+    }
     try w.writeAll("}");
 }
 
@@ -302,6 +346,15 @@ test "dsv41 decode first: a variant or signature counts once, in the phase that 
     try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_stream_misses\": 300") != null);
     try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_tail_size\": 8, \"cycle1_tail_reads\": 5, \"cycle1_tail_hits\": 2, \"cycle1_tail_recall\": 1.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_tail_hits_by_layer\": [0, 0, 2, 0]") != null);
-    try std.testing.expect(std.mem.endsWith(u8, l, "]}"));
+    // D1: the first cycle's first draft is doubled once; the bytes MLX took are active + cache after less before
+    try std.testing.expect(firstDraft());
+    recordDraft(0, 3_000_000, 34_000_000, .{ 100, 0 }, .{ 100, 17 });
+    try std.testing.expect(!firstDraft());
+    recordDraft(1, 1_000_000, 7_000_000, .{ 100, 17 }, .{ 103, 14 });
+    cycle1_pending_ns = 2_000_000;
+    const l2 = line(&buf, 4, 300);
+    try std.testing.expect(std.mem.indexOf(u8, l2, "\"cycle1_pending_ms\": 2.000, \"cycle1_draft_first\": {\"build_ms\": 3.000, \"wait_ms\": 34.000, \"cache_before\": 0, \"fresh_bytes\": 17}, \"cycle1_draft_second\": {\"build_ms\": 1.000, \"wait_ms\": 7.000, \"cache_before\": 17, \"fresh_bytes\": 0}}") != null);
+    endCycle();
+    try std.testing.expect(!firstDraft());
     phase = .build;
 }
