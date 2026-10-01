@@ -1,0 +1,228 @@
+//! A0: the decode's first DSpark cycle against its warm cycles, in profile builds only (`dsv41_decode_timers.enabled`;
+//! in every other build each entry below compiles to nothing and the launch paths carry no call).
+//!
+//! What it counts:
+//!   - per routed layer call: the routing barrier's wait, the route, the MoE's build and commit (hit, hoist and miss
+//!     waves), and the distinct experts the call missed; the first cycle apart, the warm cycles summed;
+//!   - the decode timers' buckets at the first cycle's end;
+//!   - the first dispatches of each phase (construction, the prompt pass, the first cycle, the warm cycles): a
+//!     registry kernel's variant (MLX builds one library per kernel, template and input binding: scalar, `constant`
+//!     under 8 elements, else `device`) and a compiled region's input signature (MLX traces one per shapes and dtypes).
+//! Printed once after the decode (`DECODE_FIRST`).
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const dt = @import("dsv41_decode_timers.zig");
+
+pub const enabled = dt.enabled;
+
+/// The process's phase: construction (its self-checks and warm-up), the prompt pass (through the phase change), the
+/// decode's first cycle, its later cycles.
+pub const Phase = enum(u8) { build, prompt, cycle1, warm };
+pub var phase: Phase = .build;
+
+pub const max_layers = 64;
+pub const max_experts = 512;
+pub const Layer = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, moe_ns: u64 = 0, misses: u64 = 0 };
+/// Per routed layer: [0] the first cycle, [1] the warm cycles summed.
+pub var layers: [2][max_layers]Layer = @splat(@splat(.{}));
+/// The decode timers' buckets and routed calls at the first cycle's end.
+pub var cycle1_ns: @TypeOf(dt.ns) = @splat(0);
+pub var cycle1_calls: u64 = 0;
+
+/// First dispatches counted per phase; the first cycle's named.
+pub var new_per_phase: [4]u32 = @splat(0);
+pub const Named = struct { what: []const u8, key: u64 };
+pub var cycle1_new: [96]Named = undefined;
+pub var n_cycle1_new: usize = 0;
+var seen: [16384]u64 = @splat(0);
+
+/// A launch config's template key (`exl3_kernels.Bound.prepare`): its template arguments' names and values.
+pub const TKey = if (enabled) u64 else void;
+
+/// The prompt pass begins (construction's dispatches are behind it).
+pub fn startPrompt() void {
+    if (comptime !enabled) return;
+    phase = .prompt;
+}
+
+/// The decode begins: the per-layer counts cleared, the first cycle's dispatches counted apart.
+pub fn startDecode() void {
+    if (comptime !enabled) return;
+    layers = @splat(@splat(.{}));
+    cycle1_ns = @splat(0);
+    cycle1_calls = 0;
+    n_cycle1_new = 0;
+    phase = .cycle1;
+}
+
+/// A DSpark round has ended: after the first, its buckets are kept and the warm cycles begin.
+pub fn endCycle() void {
+    if (comptime !enabled) return;
+    if (phase != .cycle1) return;
+    cycle1_ns = dt.ns;
+    cycle1_calls = dt.routed_calls;
+    phase = .warm;
+}
+
+/// One routed layer call at decode width (`Experts.run`'s stamps, ns).
+pub fn call(layer: u32, barrier_ns: u64, route_ns: u64, moe_ns: u64, misses: u64) void {
+    if (comptime !enabled) return;
+    const w: usize = switch (phase) {
+        .cycle1 => 0,
+        .warm => 1,
+        else => return,
+    };
+    if (layer >= max_layers) return;
+    const l = &layers[w][layer];
+    l.calls += 1;
+    l.barrier_ns += barrier_ns;
+    l.route_ns += route_ns;
+    l.moe_ns += moe_ns;
+    l.misses += misses;
+}
+
+/// The distinct routed experts a call missed: `waves[i]` > 0 when routed id i reads from a miss part.
+pub fn missedOf(ids: []const u16, waves: []const u8) u64 {
+    var m: std.StaticBitSet(max_experts) = .empty;
+    for (ids, waves) |e, w| {
+        if (w > 0 and e < max_experts) m.set(e);
+    }
+    return m.count();
+}
+
+/// The template key of a launch config's template arguments (name, then the value's bytes).
+pub fn templateKey(names: []const []const u8, values: []const i64) u64 {
+    var h = std.hash.Wyhash.init(0x5eed);
+    for (names, values) |n, v| {
+        h.update(n);
+        h.update(std.mem.asBytes(&v));
+    }
+    return h.final();
+}
+
+/// A registry kernel dispatched (`Bound.applyPrepared`): its variant counted in the phase that first dispatches it.
+pub fn kernel(name: []const u8, tkey: TKey, inputs: []const mlx.mlx_array) void {
+    if (comptime !enabled) return;
+    var h = std.hash.Wyhash.init(tkey);
+    h.update(name);
+    for (inputs) |x| {
+        const d: c_int = @backingInt(mlx.mlx_array_dtype(x));
+        const bind: u8 = if (mlx.mlx_array_ndim(x) == 0) 's' else if (mlx.mlx_array_size(x) < 8) 'c' else 'd';
+        h.update(std.mem.asBytes(&d));
+        h.update(&.{bind});
+    }
+    note(name, h.final());
+}
+
+/// A compiled region applied (`MlxOps.tape`): its input signature (shapes and dtypes) counted in the phase that first
+/// traces it.
+pub fn region(name: []const u8, ctx: usize, inputs: []const mlx.mlx_array) void {
+    if (comptime !enabled) return;
+    var h = std.hash.Wyhash.init(ctx);
+    h.update(name);
+    for (inputs) |x| {
+        const d: c_int = @backingInt(mlx.mlx_array_dtype(x));
+        h.update(std.mem.asBytes(&d));
+        const nd = mlx.mlx_array_ndim(x);
+        if (nd > 0) h.update(std.mem.sliceAsBytes(mlx.mlx_array_shape(x)[0..nd]));
+        h.update("|");
+    }
+    note(name, h.final());
+}
+
+fn note(name: []const u8, hash: u64) void {
+    const key = hash | 1;
+    var i: usize = @intCast(key % seen.len);
+    for (0..seen.len) |_| {
+        if (seen[i] == key) return;
+        if (seen[i] == 0) break;
+        i = (i + 1) % seen.len;
+    } else return;
+    seen[i] = key;
+    new_per_phase[@backingInt(phase)] += 1;
+    if (phase == .cycle1 and n_cycle1_new < cycle1_new.len) {
+        cycle1_new[n_cycle1_new] = .{ .what = name, .key = key };
+        n_cycle1_new += 1;
+    }
+}
+
+/// `DECODE_FIRST {...}`: the first dispatches per phase and the first cycle's new ones by name; the timers' buckets
+/// for the first cycle and the warm cycles' mean; per routed layer the first cycle against the warm cycles' mean; the
+/// first cycle's routed misses beside its stream count (`stream_misses`: every read of the cycle, when known).
+pub fn line(buf: []u8, n_layers: u32, stream_misses: ?u64) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    write(&w, @min(n_layers, max_layers), stream_misses) catch return buf[0..0];
+    return w.buffered();
+}
+
+fn write(w: *std.Io.Writer, n: u32, stream_misses: ?u64) !void {
+    const warm: u64 = dt.cycles -| 1;
+    const ms = struct {
+        fn of(x: u64, per: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e6 / @as(f64, @floatFromInt(@max(per, 1)));
+        }
+    }.of;
+    try w.print("DECODE_FIRST {{\"cycles\": {d}, \"new_dispatches\": {{\"build\": {d}, \"prompt\": {d}, \"cycle1\": {d}, \"warm\": {d}}}, \"cycle1_new\": [", .{ dt.cycles, new_per_phase[0], new_per_phase[1], new_per_phase[2], new_per_phase[3] });
+    for (cycle1_new[0..n_cycle1_new], 0..) |x, i| try w.print("{s}\"{s}\"", .{ if (i == 0) "" else ", ", x.what });
+    try w.writeAll("], \"cycle1_ms\": {");
+    inline for (@typeInfo(dt.Bucket).@"enum".field_names, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, ms(cycle1_ns[i], 1) });
+    try w.writeAll("}, \"warm_ms\": {");
+    inline for (@typeInfo(dt.Bucket).@"enum".field_names, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, ms(dt.ns[i] -| cycle1_ns[i], warm) });
+    var routed: [2]u64 = @splat(0);
+    for (0..2) |c| {
+        for (layers[c][0..n]) |l| routed[c] += l.misses;
+    }
+    try w.print("}}, \"cycle1_routed_calls\": {d}, \"cycle1_routed_misses\": {d}, \"warm_routed_misses_per_cycle\": {d:.2}", .{ cycle1_calls, routed[0], @as(f64, @floatFromInt(routed[1])) / @as(f64, @floatFromInt(@max(warm, 1))) });
+    if (stream_misses) |s| try w.print(", \"cycle1_stream_misses\": {d}", .{s});
+    const Field = enum { barrier, route, moe, misses };
+    inline for (.{ Field.barrier, Field.route, Field.moe, Field.misses }) |f| {
+        inline for (.{ "cycle1", "warm" }, 0..) |label, c| {
+            try w.print(", \"{s}_{s}{s}\": [", .{ label, @tagName(f), if (f == .misses) "" else "_ms" });
+            for (layers[c][0..n], 0..) |l, i| {
+                const per: u64 = if (c == 0) 1 else warm;
+                const v: f64 = switch (f) {
+                    .barrier => ms(l.barrier_ns, per),
+                    .route => ms(l.route_ns, per),
+                    .moe => ms(l.moe_ns, per),
+                    .misses => @as(f64, @floatFromInt(l.misses)) / @as(f64, @floatFromInt(@max(per, 1))),
+                };
+                try w.print("{s}{d:.2}", .{ if (i == 0) "" else ", ", v });
+            }
+            try w.writeAll("]");
+        }
+    }
+    try w.writeAll("}");
+}
+
+test "dsv41 decode first: a variant or signature counts once, in the phase that first dispatches it; the first cycle's are named" {
+    if (comptime !enabled) return error.SkipZigTest;
+    phase = .build;
+    new_per_phase = @splat(0);
+    seen = @splat(0);
+    note("a", 0x10);
+    note("a", 0x10);
+    phase = .prompt;
+    note("b", 0x20);
+    startDecode();
+    note("a", 0x10);
+    note("c", 0x30);
+    note("d", 0x40);
+    endCycle();
+    note("e", 0x50);
+    try std.testing.expectEqual([4]u32{ 1, 1, 2, 1 }, new_per_phase);
+    try std.testing.expectEqual(@as(usize, 2), n_cycle1_new);
+    try std.testing.expectEqualStrings("c", cycle1_new[0].what);
+    try std.testing.expectEqual(@as(u64, 2), missedOf(&.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }));
+    call(2, 5_000_000, 1_000_000, 2_000_000, 3);
+    try std.testing.expectEqual(@as(u64, 0), layers[0][2].calls);
+    phase = .cycle1;
+    call(2, 5_000_000, 1_000_000, 2_000_000, 3);
+    try std.testing.expectEqual(@as(u64, 3), layers[0][2].misses);
+    var buf: [16384]u8 = undefined;
+    const l = line(&buf, 4, 300);
+    try std.testing.expect(std.mem.startsWith(u8, l, "DECODE_FIRST {\"cycles\": "));
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_barrier_ms\": [0.00, 0.00, 5.00, 0.00]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_stream_misses\": 300") != null);
+    try std.testing.expect(std.mem.endsWith(u8, l, "]}"));
+    phase = .build;
+}

@@ -37,6 +37,7 @@ const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
+const first_cycle = @import("dsv41_decode_first.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -1075,6 +1076,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
+    // A0 (profile builds): construction's first dispatches are behind the prompt's.
+    if (comptime first_cycle.enabled) first_cycle.startPrompt();
     const t0 = std.Io.Timestamp.now(io, .boot);
     // The whole prompt in one Module.prefill (the request's bounded lanes: the prompt, the token cap,
     // one verify block; the strategy seeded from every prompt row); its argmax is the primary (the
@@ -1109,6 +1112,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (comptime dt.enabled) {
         dt.reset();
         recall.reset();
+        first_cycle.startDecode();
         // DSV41_CELL_DECODE_RECALL=0 keeps the check off (a decode profile without the predictor on its barriers).
         recall.active = profile and !std.mem.eql(u8, std.mem.span(std.c.getenv("DSV41_CELL_DECODE_RECALL") orelse "1"), "0");
     }
@@ -1141,6 +1145,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
             break :blk rr;
         };
         defer r.deinit(gpa);
+        if (comptime first_cycle.enabled) first_cycle.endCycle();
         try cycles.append(a, .{ .k_eff = lg.k_eff, .accepted = lg.accepted, .verified = lg.verified });
         // The round's tokens: [t1, kept drafts]; t1 of the first round is the primary (already counted).
         for (r.tokens[@intFromBool(first)..]) |tok| {
@@ -1168,6 +1173,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
             var rb: [16384]u8 = undefined;
             std.debug.print("NATIVE {s}\n", .{recall.line(&rb, md.model.c.n_layers)});
         }
+        // A0: the first cycle against the warm ones (its stream misses from the decode profile, when it ran)
+        var fb: [16384]u8 = undefined;
+        std.debug.print("NATIVE {s}\n", .{first_cycle.line(&fb, md.model.c.n_layers, if (prof.items.len > 0) prof.items[0].misses else null)});
     }
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);

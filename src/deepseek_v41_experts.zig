@@ -36,6 +36,7 @@ const xk = @import("exl3_kernels.zig");
 const quant = @import("quant.zig");
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
+const first_cycle = @import("dsv41_decode_first.zig");
 const prof = @import("dsv41_prefill_timers.zig");
 const xq = @import("exl3_quant.zig");
 
@@ -1351,6 +1352,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var score_buf: [expert_lookahead.max_rows * 512]f32 = undefined;
             var scores: []const f32 = &.{};
             var tt = dt.now();
+            // A0 (profile builds): the call's barrier, route and MoE build (`first_cycle.call`).
+            const t_call = tt;
             // A1's recall check (profile builds): the prediction joins the barrier's eval; it reads nothing.
             const pred: ?T = if (comptime recall.enabled) self.recall_pred else null;
             if (comptime recall.enabled) self.recall_pred = null;
@@ -1362,6 +1365,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             } else if (pred) |p| try g.evalAll(&.{ indices, p });
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
             tt = dt.charge(.barrier, tt);
+            const t_barrier = tt;
             var pred_buf: [max_route_ids]u16 = undefined;
             var predicted: []const u16 = &.{};
             var wasted: u64 = 0;
@@ -1370,8 +1374,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 wasted = if (comptime @hasDecl(S, "isResident")) recall.wastedOf(predicted, ids, ResidentAt{ .src = self.source, .layer = layer }, ResidentAt.of) else 0;
                 tt = dt.now();
             }
+            const t_route0 = tt;
             const call = try self.source.route(layer, ids, scores);
-            _ = dt.charge(.route, tt);
+            const t_route = dt.charge(.route, tt);
             dt.countCall();
             var released = false;
             errdefer if (!released) self.source.release(call);
@@ -1399,6 +1404,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             self.source.release(call);
             released = true;
+            if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, first_cycle.missedOf(ids, sv.waves));
             return self.join(g, &acc, n, k);
         }
 

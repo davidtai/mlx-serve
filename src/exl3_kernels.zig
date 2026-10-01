@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const first_cycle = @import("dsv41_decode_first.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
@@ -557,6 +558,8 @@ pub const Prepared = struct {
     kernel: Kernel,
     config: mlx.mlx_fast_metal_kernel_config,
     n_out: usize,
+    /// its template arguments' key (A0's first dispatches; profile builds only)
+    tkey: first_cycle.TKey = if (first_cycle.enabled) 0 else {},
 
     pub fn deinit(self: *Prepared) void {
         _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
@@ -590,7 +593,21 @@ pub const Bound = struct {
             .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name.ptr, v)),
             .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
         };
-        return .{ .kernel = k, .config = c, .n_out = cfg.n_out };
+        var p: Prepared = .{ .kernel = k, .config = c, .n_out = cfg.n_out };
+        if (comptime first_cycle.enabled) {
+            var names: [16][]const u8 = undefined;
+            var values: [16]i64 = undefined;
+            const nt = @min(cfg.template.len, names.len);
+            for (cfg.template[0..nt], names[0..nt], values[0..nt]) |t, *n, *v| {
+                n.* = t.name;
+                v.* = switch (t.value) {
+                    .int => |x| x,
+                    .dtype => |x| @backingInt(x),
+                };
+            }
+            p.tkey = first_cycle.templateKey(names[0..nt], values[0..nt]);
+        }
+        return p;
     }
 
     /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
@@ -599,6 +616,7 @@ pub const Bound = struct {
         defer _ = mlx.mlx_vector_array_free(vin);
         var vout = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vout);
+        if (comptime first_cycle.enabled) first_cycle.kernel(@tagName(p.kernel), p.tkey, inputs);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
         for (outs[0..p.n_out], 0..) |*o, i| {
             o.* = mlx.mlx_array_new();
