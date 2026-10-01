@@ -212,7 +212,6 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
     var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
-    _ = try ex.releaseTransient();
     try ex.grow(&g, grown);
     try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 ar", "slots grown (the residents are loaded lazily, at first use)");
@@ -458,7 +457,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
             _ = mlx.mlx_set_cache_limit(&prev_limit, @import("expert_admission.zig").Envelope.dsv41_pass2.decode_cache_bytes);
             switch (m.arm) {
                 inline else => |t| {
-                    _ = try t.arm.releaseTransient();
+                    if (t.arm.stream.release_installed) _ = try t.arm.releaseTransient();
                     try t.arm.grow(&m.g);
                 },
             }
@@ -911,6 +910,8 @@ const CellReceipt = struct {
     wide_depth: ?u8 = null,
     /// Decode's transient rows after the phase change (window 0 + `decode_staging_rows`; the bill's name).
     transient_decode_rows: ?u32 = null,
+    /// The phase change's transient release as installed (the route; off by default since SERVED17).
+    transient_release: ?bool = null,
     wide_cold_rows: ?u8 = null,
     /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
     wide_read_ahead: ?bool = null,
@@ -1234,6 +1235,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_seed = md.installed.wide.seed,
         .wide_hot_first = md.installed.wide.hot_first,
         .wide_depth = md.installed.wide.depth,
+        .transient_release = md.installed.transient_release,
         .transient_decode_rows = switch (md.arm) {
             inline else => |t| t.arm.stream.transient.rows,
         },
@@ -1360,6 +1362,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
+    if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
@@ -2727,7 +2730,6 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     const Chain = xp.EagerChain(ops.MlxOps, *const xq.Gemv(ops.MlxOps));
     var ex = try xp.Experts(ops.MlxOps, xp.StreamSource, Chain).init(gpa, &g, &ssrc, Chain.init(&kernels.exl3.gemv, &m.c), &m.c);
     defer ex.deinit();
-    _ = try ex.releaseTransient();
     try ex.grow(&g, grown);
     try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 dspark", "residents and the draft head built, slots grown");

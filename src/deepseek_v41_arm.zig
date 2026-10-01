@@ -98,6 +98,8 @@ pub const Options = struct {
     /// each one past the first adds a window of `max_route_ids` transient rows,
     /// charged by the admission (`Inputs.wide_window_bytes`).
     wide_depth: u8 = 1,
+    /// The phase change's transient release (`expert_stream.Options.transient_release`; the Module's route).
+    transient_release: bool = false,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -281,6 +283,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .pool = opt.pool,
                 .wide_depth = opt.wide_depth,
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
+                .transient_release = opt.transient_release,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
@@ -748,7 +751,6 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
     try testing.expectEqual(arm.plan.?.admission.decode_rows, rec.decode_slots_per_layer);
     try testing.expectEqual(@as(u32, 4), rec.stream_decode_rows_per_layer);
     try testing.expect(rec.tcq3_peak_fill != null and rec.q3_rowsx == null);
-    _ = try arm.releaseTransient();
     try arm.grow(&g);
     try testing.expect(arm.grown);
 }
@@ -816,7 +818,6 @@ test "dsv41 arm: a preallocated arm grows nothing at the phase change; split nat
     const arm = try TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag);
     defer arm.deinit();
     for (arm.prefill_rows, arm.decode_rows) |pr, d| try testing.expectEqual(d, pr);
-    _ = try arm.releaseTransient();
     try arm.grow(&g);
     for (arm.stream.layers) |ls| try testing.expect(ls.ext == null);
     o.native_rows = .{ .prefill = 2, .decode = 4 };
@@ -868,7 +869,6 @@ test "dsv41 arm: the stand-in routes every layer of every forward through the ho
     const primary = try d.prefill(arm, &g, &.{ 1, 2, 3, 4, 5, 6, 7 });
     try testing.expect(primary < arm.config.vocab_size);
     try testing.expectEqual(@as(u64, 3 * 5), arm.stream.stats().route_calls);
-    _ = try arm.releaseTransient();
     try arm.grow(&g);
     try testing.expect(!try d.cycle(arm, &g, testing.allocator, &out));
     try testing.expect(try d.cycle(arm, &g, testing.allocator, &out));
@@ -911,7 +911,6 @@ test "dsv41 arm: a lookahead hook routes its scores through the real stream befo
     _ = try d.prefill(arm, &g, &.{ 1, 2, 3, 4, 5, 6, 7 });
     try testing.expectEqual(@as(u64, 3 * 5), arm.stream.stats().route_calls);
     try testing.expectEqual(@as(u64, 0), arm.stream.stats().spec_issued);
-    _ = try arm.releaseTransient();
     try arm.grow(&g);
     try testing.expect(arm.stream.route_lookahead);
     var out: std.ArrayList(u32) = .empty;

@@ -263,6 +263,9 @@ pub const Options = struct {
     /// live route owns a window of `max_route_ids` transient rows, so the
     /// transient rows must hold `wide_depth` windows.
     wide_depth: u8 = 1,
+    /// The phase change's transient release installed (`releaseTransient`, then the grow's window 0); off: the whole
+    /// scratch stays through decode.
+    transient_release: bool = false,
 };
 
 /// DSV41_LOOKAHEAD4=<k>:<tau>:<budget>:<chunks> at horizon 1.
@@ -406,6 +409,8 @@ pub const max_wide_depth = 5;
 /// SERVED16: the phase change frees the transient scratch (`Stream.releaseTransient`) and the grow allocates decode's
 /// window 0 plus `decode_staging_rows`; the bill (deepseek_v41_bill.zig) reads this declaration.
 pub const phase_change_releases_wide_windows = true;
+/// The release as a construction-time route (SERVED17: off by default, SERVED15's stream; on: the +release arm).
+pub const transient_release_default = false;
 /// Slot rows decode reserves beside window 0 for staged reads: none (the lookahead and A1 stage in the read pool).
 pub const decode_staging_rows: u32 = 0;
 const wait_timeout_ns: i64 = 60 * std.time.ns_per_s;
@@ -424,6 +429,8 @@ pub const Stream = struct {
     transient_layer: u32,
     /// `releaseTransient` ran: the scratch is freed until the grow allocates window 0.
     transient_released: bool = false,
+    /// The release route, installed at construction (`Options.transient_release`).
+    release_installed: bool = false,
     memory: SlotMemory = .host,
     max_route_ids: u32,
     records_per_part: u32,
@@ -590,6 +597,7 @@ pub const Stream = struct {
             .transient = transient,
             .transient_meta = transient_meta,
             .transient_layer = @intCast(widest),
+            .release_installed = opt.transient_release,
             .memory = opt.slot_memory,
             .max_route_ids = opt.max_route_ids,
             .records_per_part = opt.records_per_part,
@@ -1201,6 +1209,7 @@ pub const Stream = struct {
     /// whole transient scratch, with grow's preconditions; `grow` allocates decode's window 0. MLX rows: the
     /// allocator's active bytes must drop by the scratch's, else a holder survived. Returns the bytes freed.
     pub fn releaseTransient(self: *Stream) !u64 {
+        if (!self.release_installed) return error.TransientReleaseNotInstalled;
         if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
         if (self.phase != .prefill) return error.AlreadyGrown;
         if (self.failed) return error.StreamFailed;
@@ -1232,7 +1241,7 @@ pub const Stream = struct {
         if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
         if (self.phase != .prefill) return error.AlreadyGrown;
         if (self.failed) return error.StreamFailed;
-        if (phase_change_releases_wide_windows and !self.transient_released) return error.TransientNotReleased;
+        if (self.release_installed and !self.transient_released) return error.TransientNotReleased;
         if (decode_rows.len != self.layers.len) return error.InvalidRows;
         if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
         try self.flush();
@@ -1556,7 +1565,6 @@ test "dsv41 stream: every routed id is served from a slot holding its record" {
         reads += readsOf(r);
         s.release(r);
     }
-    _ = try s.releaseTransient();
     try s.grow(&.{ 6, 4 });
     // Decode: a deterministic pseudo-random trace over both layers.
     var rng = std.Random.DefaultPrng.init(7);
@@ -1665,15 +1673,15 @@ test "dsv41 stream: growth is the one phase change" {
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
     defer s.deinit();
     var r = try serve(s, 0, &.{ 1, 2 });
-    try testing.expectError(error.RoutesLive, s.releaseTransient());
+    try testing.expectError(error.RoutesLive, s.grow(&.{ 4, 4 }));
     s.release(r);
-    try testing.expectError(error.TransientNotReleased, s.grow(&.{ 4, 4 }));
-    _ = try s.releaseTransient();
+    // Off its route (the default) the release is refused by name and the scratch stays whole through decode.
+    try testing.expectError(error.TransientReleaseNotInstalled, s.releaseTransient());
     try testing.expectError(error.InvalidRows, s.grow(&.{ 1, 4 }));
     try testing.expectError(error.InvalidRows, s.grow(&.{4}));
     try s.grow(&.{ 4, 3 });
+    try testing.expectEqual(@as(u32, 12), s.transient.rows);
     try testing.expectError(error.AlreadyGrown, s.grow(&.{ 4, 4 }));
-    try testing.expectError(error.AlreadyGrown, s.releaseTransient());
     try testing.expectError(error.NotPrefill, s.seedPrefill(0, &.{1}));
     // Residents keep their slots and bytes; the added rows fill before any eviction.
     r = try serve(s, 0, &.{ 1, 2, 3, 4 });
@@ -1727,23 +1735,11 @@ test "dsv41 stream: growth from any thread but the one that built the stream is 
             };
             out.* = null;
         }
-        fn release(st: *Stream, out: *?anyerror) void {
-            _ = st.releaseTransient() catch |e| {
-                out.* = e;
-                return;
-            };
-            out.* = null;
-        }
     };
     var got: ?anyerror = null;
     const t = try std.Thread.spawn(.{}, Helper.run, .{ s, &got });
     t.join();
     try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), got);
-    got = null;
-    const t2 = try std.Thread.spawn(.{}, Helper.release, .{ s, &got });
-    t2.join();
-    try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), got);
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 4 });
 }
 
@@ -1830,7 +1826,6 @@ test "dsv41 stream: P1: a route lands its layer's read-ahead first, another laye
     try testing.expect(!s.ahead.live and s.ahead.n == 0);
     try s.readAheadSeed(1, &.{12});
     try testing.expect(s.ahead.live);
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 4 });
     try testing.expect(!s.ahead.live);
     try testing.expectEqual(SlotState.ready, s.locate(1, s.layers[1].policy.slotOf(12).?).meta.state);
@@ -1916,7 +1911,6 @@ fn realBankTrace(memory: SlotMemory) !void {
     for ([_][]const expert_policy.FixPlan{ bt.prefill, bt.routes }, 0..) |plans, phase| {
         if (phase == 1) {
             rows[L] = bt.decode_rows;
-            _ = try s.releaseTransient();
             try s.grow(&rows);
         }
         for (plans) |want| {
@@ -1965,7 +1959,6 @@ test "dsv41 stream: slot refs name each served slot's bank and row" {
     var r = try serve(s, 0, &.{ 1, 2, 3 });
     try testing.expectEqualSlices(SlotRef, &.{ .{ .bank = .base, .row = 0 }, .{ .bank = .base, .row = 1 }, .{ .bank = .transient, .row = 0 } }, s.refsOf(r, &refs));
     s.release(r);
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 2 });
     // Decode: the grown rows of layer 0 are its ext bank.
     r = try serve(s, 0, &.{ 1, 4, 5 });
@@ -2008,7 +2001,6 @@ test "dsv41 stream 0b: MLX slot memory is filled by the pool like host rows" {
     try testing.expectEqual(@as(?BankArrays, null), s.bankArrays(0, .ext));
     s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
     s.release(try serve(s, 1, &.{ 7, 8, 9 }));
-    _ = try s.releaseTransient();
     try s.grow(&.{ 6, 4 });
     try expectShape(s.bankArrays(0, .ext).?.up.rin, .float16, &.{ 2, 64 });
     var rng = std.Random.DefaultPrng.init(7);
@@ -2360,7 +2352,7 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     var buf: [1 << 16]u8 = undefined;
     const base = try ProbeBox.settled(&buf, 3000);
     const b0 = base.b;
-    const s = try Stream.init(a, &bank, .{ .rows = rows, .transient_rows = depth * max_route_ids, .wide_depth = depth, .slot_memory = .{ .mlx = stream } });
+    const s = try Stream.init(a, &bank, .{ .rows = rows, .transient_rows = depth * max_route_ids, .wide_depth = depth, .slot_memory = .{ .mlx = stream }, .transient_release = true });
     defer s.deinit();
     // The prompt's wide reads: five live routes of layer L fill every window with records (no persistent rows).
     var live: [depth]*Route = undefined;
@@ -2445,7 +2437,6 @@ test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed byte
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 8, 8 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .slot_memory = .{ .mlx = stream }, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false }, .event = .{ .backend = .{ .metal = ev.object }, .watchdog_ms = 10_000 } });
     defer s.deinit();
     defer expert_io.clearFaults();
-    _ = try s.releaseTransient();
     try s.grow(&.{ 8, 8 });
     // Expert 4's read is held 300 ms: the GPU, not the host, waits for it.
     const page = std.heap.pageSize();
@@ -2538,7 +2529,6 @@ test "dsv41 stream: the next layer's predicted records are read ahead and claime
     defer sb.close();
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false } });
     defer s.deinit();
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 4 });
     // Layer 0's call predicts layer 1's experts 20 and 21.
     const pred = scoresFor(&.{ 20, 21, 3, 4, 5, 6 });
@@ -2568,7 +2558,6 @@ test "dsv41 stream: pre-read ranges carry a decode call's certain misses to its 
     // Prefill routes never pre-read.
     s.release(try serve(s, 0, &.{ 7, 8 }));
     try testing.expectEqual(@as(i64, 0), s.pool.counter(.pre_calls));
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 4 });
     const ids = [_]u16{ 1, 7, 2, 3, 1, 8 };
     const r = try serve(s, 0, &ids);
@@ -2592,7 +2581,6 @@ test "dsv41 stream: gated routes register the gate/up wave, then each part's dow
     defer sb.close();
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 8, 8 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 }, .event = .{ .watchdog_ms = 10_000 } });
     defer s.deinit();
-    _ = try s.releaseTransient();
     try s.grow(&.{ 8, 8 });
     // Five misses in file order: parts of three and two.
     const ids = [_]u16{ 3, 1, 4, 5, 9 };
@@ -2625,7 +2613,6 @@ test "dsv41 stream: a gate the watchdog forces fails the stream at the next flus
     const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false }, .event = .{ .watchdog_ms = 50 } });
     defer s.deinit();
     defer expert_io.clearFaults();
-    _ = try s.releaseTransient();
     try s.grow(&.{ 4, 4 });
     const page = std.heap.pageSize();
     expert_io.injectFault(sb.bank.spans(0, 11).gu_offset / page * page, 5, 400 * std.time.ns_per_ms);
@@ -2675,7 +2662,6 @@ test "dsv41 stream: a verify trace of 1-8 rows with lookahead, pre-read and gate
     try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
     s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
     s.release(try serve(s, 1, &.{ 7, 8, 9 }));
-    _ = try s.releaseTransient();
     try s.grow(&.{ 6, 4 });
     // Verify forwards of 1..8 rows x top-6 over both layers; layer 0 predicts layer 1.
     var rng = std.Random.DefaultPrng.init(21);
@@ -2718,7 +2704,7 @@ fn transientBytes(s: *const Stream, rows: u64) u64 {
 test "dsv41 stream: the transient release frees the whole scratch with nothing live or held, and the grow allocates decode's window 0" {
     var sb = try SynthBank.open(32);
     defer sb.close();
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 5 * 12, .wide_depth = 5, .pool = test_pool });
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 5 * 12, .wide_depth = 5, .pool = test_pool, .transient_release = true });
     defer s.deinit();
     // The prompt: two live routes of layer 0 (windows 0 and 1), the first one's persistent slots held for a deferred call.
     const r0 = try serve(s, 0, &.{ 1, 2, 3, 4, 5, 6 });
@@ -2737,6 +2723,19 @@ test "dsv41 stream: the transient release frees the whole scratch with nothing l
     try testing.expectEqual(@as(usize, 0), s.transient_meta.len);
     try testing.expectEqual(@as(u8, 1), s.wide_depth);
     try testing.expectError(error.TransientAlreadyReleased, s.releaseTransient());
+    const Off = struct {
+        fn release(st: *Stream, out: *?anyerror) void {
+            _ = st.releaseTransient() catch |e| {
+                out.* = e;
+                return;
+            };
+            out.* = null;
+        }
+    };
+    var got: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, Off.release, .{ s, &got });
+    t.join();
+    try testing.expectEqual(@as(?anyerror, error.NotInferenceThread), got);
     try s.grow(&.{ 6, 6 });
     try testing.expect(!s.transient_released);
     try testing.expectEqual(@as(u32, 12 + decode_staging_rows), s.transient.rows);
@@ -2757,7 +2756,7 @@ test "dsv41 stream: after the transient release, decode with the served lookahea
     var sb = try SynthBank.open(32);
     defer sb.close();
     // The served decode configuration (Lookahead{}: k 8, tau inf, budget 2, 4 chunks, pre-read; event gates) at depth 5.
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .transient_rows = 5 * max_route_ids, .wide_depth = 5, .pool = la_pool, .lookahead = .{}, .event = .{ .watchdog_ms = 10_000 } });
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .transient_rows = 5 * max_route_ids, .wide_depth = 5, .pool = la_pool, .lookahead = .{}, .event = .{ .watchdog_ms = 10_000 }, .transient_release = true });
     defer s.deinit();
     // The prompt fills all five windows of layer 0 (five live routes), then releases them.
     var live: [5]*Route = undefined;
@@ -2807,6 +2806,117 @@ test "dsv41 stream: after the transient release, decode with the served lookahea
     try testing.expect(st.spec_issued > 0 and st.pre_issued > 0 and (st.claimed > 0 or st.adopt_ranges > 0));
 }
 
+/// One replay of the phase-2 fixture's layers 13 and 14 (served lookahead 8:inf:2, 4 chunks, pre-read, gates) at the
+/// served depth 5, with the transient release on its route or not: each decode route's signature (layer, window, hits,
+/// loads with their slots and reads) into `sigs`, every served slot sha256-checked; returns the stream's Stats.
+fn replayLookahead(a: std.mem.Allocator, bank: *const expert_bank.Bank, f: anytype, sfd: std.c.fd_t, release: bool, sigs: *std.ArrayList(u64)) !Stats {
+    const L: u32 = 13;
+    var rows: [40]u32 = @splat(0);
+    rows[L] = 3;
+    rows[L + 1] = 3;
+    const s = try Stream.init(a, bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 5 * 6, .wide_depth = 5, .lookahead = .{}, .event = .{}, .transient_release = release });
+    defer s.deinit();
+    const geom = &bank.layers[L];
+    for ([_]u32{ L, L + 1 }) |l| {
+        var seed: [3]u16 = undefined;
+        const sorted = try a.dupe(u16, f.resident0[l]);
+        defer a.free(sorted);
+        std.sort.pdq(u16, sorted, {}, std.sort.asc(u16));
+        @memcpy(&seed, sorted[0..3]);
+        try s.seedPrefill(l, &seed);
+        s.release(try serve(s, l, &seed));
+    }
+    rows[L] = 4;
+    rows[L + 1] = 4;
+    if (release) _ = try s.releaseTransient();
+    try s.grow(&rows);
+    var routes: u64 = 0;
+    var score_row: [384]f32 = undefined;
+    var raw: [384 * 4]u8 = undefined;
+    var at: u64 = 0;
+    var cycle: usize = 0;
+    outer: while (cycle < f.rows.len) : (cycle += 1) {
+        const m = f.rows[cycle];
+        const c13 = f.calls[cycle * f.layers + L];
+        const c14 = f.calls[cycle * f.layers + L + 1];
+        for (0..m) |r| {
+            if (routes >= 120) break :outer;
+            const off = (at + L * m + r) * 384 * 4;
+            if (std.c.pread(sfd, &raw, raw.len, @intCast(off)) != raw.len) return error.ShortRead;
+            for (&score_row, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, raw[4 * i ..][0..4], .little));
+            for ([_]struct { l: u32, ids: []const u16, scores: []const f32 }{
+                .{ .l = L, .ids = c13.ids[6 * r ..][0..6], .scores = &score_row },
+                .{ .l = L + 1, .ids = c14.ids[6 * r ..][0..6], .scores = &.{} },
+            }) |call| {
+                const rt = try serveGated(s, call.l, call.ids, call.scores);
+                var h = std.hash.Wyhash.init(call.l);
+                h.update(std.mem.asBytes(&rt.window));
+                h.update(std.mem.asBytes(&rt.plan.n_hits));
+                for (rt.plan.loadsOf(), rt.reads[0..rt.plan.n_loads]) |ld, rd| {
+                    h.update(std.mem.asBytes(&ld.expert));
+                    h.update(std.mem.asBytes(&ld.slot));
+                    h.update(std.mem.asBytes(&ld.persistent));
+                    h.update(std.mem.asBytes(&rd));
+                }
+                try sigs.append(a, h.final());
+                for (rt.plan.slotsOf(), call.ids) |slot, e| {
+                    const d = slotDigest(s, call.l, slot, geom);
+                    try testing.expectEqualSlices(u8, &bank.digest(call.l, e).logical, &d);
+                }
+                routes += 1;
+                s.release(rt);
+            }
+        }
+        at += @as(u64, m) * (f.layers - 1);
+    }
+    try s.flush();
+    return s.stats();
+}
+
+// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py>: SERVED16's decode
+// read regression against the release. The release frees only the transient scratch, so the decode routes and reads
+// must be the same with and without it: every route's plan and reads, and the read pool's lookahead and pre-read counts.
+test "dsv41 stream: the recorded lookahead trace on the real bank routes and reads the same with and without the transient release" {
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const fixture = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var diag: expert_bank.Diag = .{};
+    var bank = expert_bank.Bank.open(a, io, dir, expert_bank.dsv41, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, fixture, a, .limited(16 << 20));
+    defer a.free(text);
+    const Fix = struct { layers: u32, experts: u32, rows: []const u32, resident0: []const []const u16, scores_file: []const u8, calls: []const TraceCall };
+    const parsed = try std.json.parseFromSlice(Fix, a, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var pbuf: [1024]u8 = undefined;
+    const spath = try std.fmt.bufPrintSentinel(&pbuf, "{s}/{s}", .{ std.fs.path.dirname(fixture) orelse ".", parsed.value.scores_file }, 0);
+    const sfd = std.c.open(spath.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (sfd < 0) return error.OpenFailed;
+    defer _ = std.c.close(sfd);
+    var sig: [2]std.ArrayList(u64) = .{ .empty, .empty };
+    defer for (&sig) |*x| x.deinit(a);
+    var st: [2]Stats = undefined;
+    var ms: [2]i64 = undefined;
+    for (0..2) |i| {
+        const t0 = std.Io.Timestamp.now(io, .boot);
+        st[i] = try replayLookahead(a, &bank, parsed.value, sfd, i == 1, &sig[i]);
+        ms[i] = @intCast(@divTrunc(t0.untilNow(io, .boot).nanoseconds, std.time.ns_per_ms));
+    }
+    for (st, ms, [_][]const u8{ "release off", "release on" }) |x, t, name| std.debug.print(
+        "replay ({s}): {d} routes; misses {d} hits {d} evictions {d} persistent {d} transient {d} skipped {d}; {d} B read in {d} preadv; lookahead: issued {d} landed {d} claimed {d} adopted {d} ranges / {d} B, spec {d} B; pre-read issued {d} served {d} expired {d}; gates {d} forced {d}; {d} ms\n",
+        .{ name, x.route_calls, x.expert_cache_misses, x.expert_cache_hits, x.expert_cache_evictions, x.persistent_loads, x.transient_loads, x.loads_skipped, x.expert_bytes_read, x.preadv_calls, x.spec_issued, x.spec_landed, x.claimed, x.adopt_ranges, x.adopt_bytes, x.spec_bytes, x.pre_issued, x.pre_served, x.pre_expired, x.gates, x.gates_forced, t },
+    );
+    // The same routes, plans and reads (window 0 throughout), and the same reads issued, claimed and adopted.
+    try testing.expectEqualSlices(u64, sig[0].items, sig[1].items);
+    inline for (.{ "route_calls", "expert_cache_misses", "expert_cache_hits", "expert_cache_evictions", "persistent_loads", "transient_loads", "loads_skipped", "expert_bytes_read", "preadv_calls", "spec_issued", "claimed", "pre_issued", "gates" }) |k|
+        try testing.expectEqual(@field(st[0], k), @field(st[1], k));
+    try testing.expectEqual(@as(u64, 0), st[0].gates_forced + st[1].gates_forced);
+}
+
 /// The phase-2 fixture's calls for one layer as M = 1 routes, and the P1 scores of each row.
 const TraceCall = struct { ids: []const u16, pre: []const u16, sel: []const []const u16, cand: []const []const u16 };
 
@@ -2854,7 +2964,6 @@ test "dsv41 stream: a two-layer recorded trace with lookahead and gates on the r
     }
     rows[L] = 4;
     rows[L + 1] = 4;
-    _ = try s.releaseTransient();
     try s.grow(&rows);
 
     var served: u64 = 0;

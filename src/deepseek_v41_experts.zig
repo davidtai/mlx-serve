@@ -2392,7 +2392,7 @@ test "dsv41 experts: the transient release nulls every layer's binding before th
     const a = testing.allocator;
     var sb = try SynthBank.open(32);
     defer sb.close();
-    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 5 * 12, .wide_depth = 5, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 } });
+    const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 5 * 12, .wide_depth = 5, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .transient_release = true });
     defer s.deinit();
     var src = StreamSource.init(s);
     var g = TraceOps.init(a);
@@ -2441,7 +2441,6 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
     try expectRowsHold(s, &sb, 0, script.calls[0], src.served(&src.calls[0]));
     try testing.expectEqual(@as(u32, 1), src.served(&src.calls[0]).n_parts);
     // Growth binds layer 1's grown rows; decode routes cut parts of <= 3 records.
-    _ = try ex.releaseTransient();
     try ex.grow(&g, &.{ 4, 8 });
     try testing.expect(g.shapeOf(ex.banks[1][@backingInt(BankKind.ext)].?.up.rout).eql(ops.Shape.of(&.{ 4, 32 })));
     try testing.expect(ex.banks[0][@backingInt(BankKind.ext)] == null);
