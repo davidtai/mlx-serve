@@ -81,28 +81,8 @@ pub const Quant = struct {
     }
 };
 
-/// What an expert source declares it does. Comptime: an instance installs a subset at
-/// construction (a route chosen per arm) and reports it once; no call asks again.
-pub const ExpertCaps = struct {
-    /// grow: the prompt rows become the decode rows once
-    two_phase: bool = false,
-    /// releaseTransient at the phase change
-    transient_release: bool = false,
-    /// a whole prompt's ids per layer before its routes
-    prompt_seed: bool = false,
-    /// the prompt pass reads a predicted seed ahead
-    read_ahead: bool = false,
-    /// several live calls per layer, each with its own window
-    wide: bool = false,
-    /// route's scores feed the selector and the speculative records (decode)
-    lookahead: bool = false,
-    /// a decode call pre-reads its certain misses
-    preread: bool = false,
-    /// the GPU waits on the reads' events instead of the host
-    event_gates: bool = false,
-    /// forgetResidents after the arch's install warm-up
-    construction_reset: bool = false,
-};
+/// What an expert source declares it does (`sdk.expert.Caps`).
+pub const ExpertCaps = @import("expert.zig").Caps;
 
 /// Where routed experts live and how they reach the GPU (G6). The arch drives its source per layer through the
 /// source's comptime contract; this table is the registry's: discovery, `/props` and the source's bill terms.

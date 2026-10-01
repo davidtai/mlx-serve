@@ -77,11 +77,8 @@ pub const Quant = kinds.Quant;
 pub const ExpertSource = kinds.ExpertSource;
 pub const Engine = kinds.Engine;
 
-/// The expert_source kind's shared surface; the reader, the event gate, the policy and the source contract
-/// join it with the kind's first registered consumer.
-pub const expert = struct {
-    pub const Caps = kinds.ExpertCaps;
-};
+/// G6, the expert_source kind's shared surface: the record layout, the source contract and the slot types.
+pub const expert = @import("sdk/expert.zig");
 
 pub const kernels = @import("sdk/kernels.zig");
 /// The `quant` kind's contract (C2): the routed-expert quant a weight group's claim binds, and the generic
@@ -104,6 +101,7 @@ test {
     _ = memory_bill;
     _ = lifecycle;
     _ = kinds;
+    _ = expert;
     _ = profile;
     _ = testing;
 }

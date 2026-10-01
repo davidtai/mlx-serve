@@ -6,6 +6,7 @@
 //! routes, deferred release, growth, lookahead and event gates.
 
 const std = @import("std");
+const sdk = @import("sdk");
 /// PROFILE builds only (`-Ddsv41-prefill-timers=true`): P1's read-ahead record; every call compiles to nothing otherwise.
 const prof = @import("dsv41_prefill_timers.zig");
 const mlx = @import("mlx");
@@ -261,11 +262,9 @@ const Rows = struct {
     }
 };
 
-/// Which of a layer's banks holds a slot: its prefill rows, the rows `grow`
-/// added, or the transient scratch every layer shares.
-pub const BankKind = enum(u8) { base, ext, transient };
-/// A slot's bank and its row in that bank (the index the kernels gather).
-pub const SlotRef = struct { bank: BankKind, row: u32 };
+/// The source contract's slot types (`sdk.expert`).
+pub const BankKind = sdk.expert.BankKind;
+pub const SlotRef = sdk.expert.SlotRef;
 /// One projection's arrays in a bank: code int16 [rows, in/16, out/16, 16K],
 /// rout f16 [rows, out], rin f16 [rows, in].
 pub const ProjArrays = struct { code: mlx.mlx_array, rout: mlx.mlx_array, rin: mlx.mlx_array };
@@ -401,76 +400,10 @@ pub const Event = struct {
     watchdog_ms: u32 = 2000,
 };
 
-/// The event values a gated call's waves wait for: its gate/up wave `gu`, the
-/// down wave of part p `down_first + p`.
-pub const Gates = struct { gu: u64, down_first: u64, n_parts: u32 };
-
-pub const Stats = struct {
-    route_calls: u64 = 0,
-    /// Unique experts per route that were resident / had to be loaded.
-    expert_cache_hits: u64 = 0,
-    expert_cache_misses: u64 = 0,
-    expert_cache_evictions: u64 = 0,
-    persistent_loads: u64 = 0,
-    transient_loads: u64 = 0,
-    /// Loads whose slot still held the record: no read.
-    loads_skipped: u64 = 0,
-    expert_bytes_read: u64 = 0,
-    preadv_calls: u64 = 0,
-    /// Sum over read ranges of first syscall to publication.
-    expert_read_seconds: f64 = 0,
-    /// Wall time with a read in flight (the pool's gauge).
-    read_wall_ns: u64 = 0,
-    /// The lookahead class: records claimed by a demand read, physical bytes
-    /// of speculative reads, records issued / fully landed, demand ranges
-    /// copied out of a speculative record (no preadv) and their bytes.
-    claimed: u64 = 0,
-    spec_bytes: u64 = 0,
-    spec_issued: u64 = 0,
-    spec_landed: u64 = 0,
-    adopt_ranges: u64 = 0,
-    adopt_bytes: u64 = 0,
-    /// Pre-read ranges queued, served to a demand read, dropped unbound.
-    pre_issued: u64 = 0,
-    pre_served: u64 = 0,
-    pre_expired: u64 = 0,
-    /// Event gates registered and forced by the watchdog.
-    gates: u64 = 0,
-    gates_forced: u64 = 0,
-    /// P1's read-ahead: records posted; at each barrier, the records read ahead that the call routes (its hits)
-    /// and its seed's records not read ahead (its demand loads); the bytes read ahead (in `expert_bytes_read` too).
-    ahead_posted: u64 = 0,
-    ahead_hits: u64 = 0,
-    ahead_demand: u64 = 0,
-    ahead_bytes: u64 = 0,
-    /// A0 (a)'s warm reads: records issued at the grow, landed / cancelled by their layer's first decode route, and
-    /// that route's hits on landed ones (once per layer; warm_landed + warm_cancelled == warm_issued).
-    warm_issued: u64 = 0,
-    warm_landed: u64 = 0,
-    warm_cancelled: u64 = 0,
-    warm_hits: u64 = 0,
-};
-
-pub const Error = error{
-    StreamFailed,
-    RoutesLive,
-    RoutesExhausted,
-    SlotStillPinned,
-    ReadFailed,
-    Timeout,
-    TicketsBusy,
-    QueueFull,
-    SubmitRefused,
-    InvalidJob,
-    SpecRefused,
-    PreReadRefused,
-    GateInvalid,
-    GatesFull,
-    GateRefused,
-    /// The watchdog released a gate before its bytes landed: the GPU may have
-    /// read them early, so the outputs since are invalid.
-    GateForced,
-};
+/// The contract's gates, counters and refusals (`sdk.expert`).
+pub const Gates = sdk.expert.Gates;
+pub const Stats = sdk.expert.Stats;
+pub const Error = sdk.expert.Error;
 
 const SlotState = enum(u8) { empty, loading, ready, failed };
 

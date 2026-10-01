@@ -56,15 +56,8 @@ pub const Error = expert_stream.Error;
 const Load = expert_policy.Load;
 const n_banks = std.meta.fieldNames(BankKind).len;
 
-/// What one routed-layer call serves, valid until the call is released. Per
-/// routed id, in the router's flat order: the slot's bank and row, and the
-/// wave that computes it (0 = resident at the call; p + 1 = miss part p,
-/// whose gate/up may run after `waitGu(p)` and its down after `waitDown(p)`).
-pub const Served = struct {
-    refs: []const SlotRef,
-    waves: []const u8,
-    n_parts: u32,
-};
+/// What one routed-layer call serves (`sdk.expert.Served`).
+pub const Served = sdk.expert.Served;
 
 /// One projection's slot arrays in a bank (the streamer's `ProjArrays` over
 /// any backend): code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out],
@@ -76,52 +69,9 @@ pub fn BankArraysOf(comptime T: type) type {
     return quant.BankArrays(ProjOf(T));
 }
 
-// ── The source contract ──
+// ── The source contract (`sdk.expert.assertSource`: the required set and each declared capability's) ──
 
-/// Compile-time check that `S` is an expert source:
-///   `Call` (a live route);
-///   `route(*S, layer, ids, scores) Error!*Call` (scores: the next routed
-///       layer's gate scores for the lookahead, or empty; a source reads
-///       them only in the decode phase and ignores them before it);
-///   `served(*S, *const Call) Served`;
-///   `waitGu(*S, *Call, part) Error!void`, `waitDown(*S, *Call, part) Error!void`;
-///   `release(*S, *Call) void` (after the call's waves are built);
-///   `flush(*S) Error!void` (after the forward's last eval);
-///   `grow(*S, decode_rows) !void` (the one phase change);
-///   `stats(*S) Stats`;
-///   `bankRows(*S, layer, BankKind) u32` and `bankArrays(*S, g, layer, BankKind)
-///       !?BankArraysOf(G.T)` (what the math binds; the latter generic over the backend).
-pub fn assertSource(comptime S: type) void {
-    comptime {
-        if (!@hasDecl(S, "Call")) @compileError(@typeName(S) ++ " is not an expert source: no Call");
-        expectMethod(S, "route", &.{ *S, u32, []const u16, []const f32 }, *S.Call);
-        expectMethod(S, "served", &.{ *S, *const S.Call }, Served);
-        expectMethod(S, "waitGu", &.{ *S, *S.Call, u32 }, void);
-        expectMethod(S, "waitDown", &.{ *S, *S.Call, u32 }, void);
-        expectMethod(S, "release", &.{ *S, *S.Call }, void);
-        expectMethod(S, "flush", &.{*S}, void);
-        expectMethod(S, "grow", &.{ *S, []const u32 }, void);
-        expectMethod(S, "stats", &.{*S}, Stats);
-        expectMethod(S, "bankRows", &.{ *S, u32, BankKind }, u32);
-        if (!@hasDecl(S, "bankArrays")) @compileError(@typeName(S) ++ " is not an expert source: no bankArrays");
-    }
-}
-
-fn expectMethod(comptime S: type, comptime name: []const u8, comptime params: []const type, comptime Payload: type) void {
-    const where = @typeName(S) ++ "." ++ name;
-    if (!@hasDecl(S, name)) @compileError(@typeName(S) ++ " is not an expert source: no " ++ name);
-    const info = @typeInfo(@TypeOf(@field(S, name))).@"fn";
-    if (info.param_types.len != params.len) @compileError(where ++ ": the contract takes a different parameter count");
-    for (info.param_types, params) |p, t| {
-        if (p.? != t) @compileError(where ++ ": parameter " ++ @typeName(p.?) ++ " where the contract has " ++ @typeName(t));
-    }
-    const R = info.return_type.?;
-    const P = switch (@typeInfo(R)) {
-        .error_union => |eu| eu.payload,
-        else => R,
-    };
-    if (P != Payload) @compileError(where ++ ": returns " ++ @typeName(P) ++ " where the contract has " ++ @typeName(Payload));
-}
+pub const assertSource = sdk.expert.assertSource;
 
 /// Per routed id of `r`, its wave: 0 for a slot resident at the call (a hit),
 /// p + 1 for a slot part p loads.
@@ -170,6 +120,9 @@ fn traceBank(g: *ops.TraceOps, geom: *const expert_bank.Layer, rows: u32) !BankA
 pub const StreamSource = struct {
     stream: *expert_stream.Stream,
     calls: [n_routes]Call = @splat(.{}),
+
+    /// What the stream supports; an arm installs a subset at construction (`Stream.Options`).
+    pub const caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
 
     const n_routes = @typeInfo(@FieldType(expert_stream.Stream, "routes")).array.len;
 
@@ -384,6 +337,8 @@ pub const FakeSource = struct {
     ahead_log: std.ArrayList(u16) = .empty,
     /// A0 (a): a test's scripted warm wait per layer (`Stream.warmWaitNs`; past its end, 0).
     warm_wait_ns: []const u64 = &.{},
+
+    pub const caps: sdk.expert.Caps = .{ .two_phase = true, .prompt_seed = true, .read_ahead = true, .wide = true, .event_gates = true };
 
     pub const Pick = struct { layer: u32, n: u8 = 0, experts: [expert_lookahead.max_budget]u16 = undefined };
 
@@ -1062,7 +1017,7 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
 pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptime routes: Routes) type {
     comptime {
         assertSource(S);
-        if (routes.gated) expectMethod(S, "gate", &.{ *S, *S.Call }, ?expert_stream.Gates);
+        if (routes.gated and !sdk.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
     }
     return struct {
         const Self = @This();
