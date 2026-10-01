@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
+const sdk = @import("sdk");
 const model = @import("model.zig");
 const expert_admission = @import("expert_admission.zig");
 const kvc = @import("deepseek_v41_cache.zig");
@@ -953,7 +954,7 @@ pub const Kind = union(enum) {
     dense: struct { dtype: StDtype, shape: [2]u64, rank: u8 },
     /// Stored as `<name>.weight` U32 [out, in * bits / 32] + `<name>.scales`
     /// U8 [out, in / 32]; mxfp modes carry no biases.
-    quant: struct { mode: model.QuantMode, out: u64, in: u64 },
+    quant: struct { mode: sdk.QuantMode, out: u64, in: u64 },
 };
 
 pub const Param = struct {
@@ -965,7 +966,7 @@ pub const Param = struct {
     kind: Kind,
 };
 
-pub fn quantBits(mode: model.QuantMode) u64 {
+pub fn quantBits(mode: sdk.QuantMode) u64 {
     return switch (mode) {
         .mxfp8 => 8,
         .mxfp4, .nvfp4 => 4,
@@ -993,7 +994,7 @@ const SpecBuilder = struct {
         try b.list.append(b.a, .{ .name = try std.fmt.allocPrint(b.a, fmt, args), .module = module, .layer = @intCast(layer), .kind = .{ .dense = .{ .dtype = dtype, .shape = s, .rank = @intCast(shape.len) } } });
     }
 
-    fn quant(b: *SpecBuilder, module: Module, layer: u32, comptime fmt: []const u8, args: anytype, mode: model.QuantMode, out: u64, in: u64) !void {
+    fn quant(b: *SpecBuilder, module: Module, layer: u32, comptime fmt: []const u8, args: anytype, mode: sdk.QuantMode, out: u64, in: u64) !void {
         try b.list.append(b.a, .{ .name = try std.fmt.allocPrint(b.a, fmt, args), .module = module, .layer = @intCast(layer), .kind = .{ .quant = .{ .mode = mode, .out = out, .in = in } } });
     }
 

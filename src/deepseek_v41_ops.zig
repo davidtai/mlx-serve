@@ -12,7 +12,6 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
-const model = @import("model.zig");
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
 const first_cycle = @import("dsv41_decode_first.zig");
@@ -101,7 +100,7 @@ pub fn promote(a: Dtype, b: Dtype) Dtype {
     return @fromBackingInt(@intCast(t[@intCast(@backingInt(a))][@intCast(@backingInt(b))]));
 }
 
-pub fn quantBits(mode: model.QuantMode) u32 {
+pub fn quantBits(mode: sdk.QuantMode) u32 {
     return switch (mode) {
         .mxfp8 => 8,
         .mxfp4, .nvfp4 => 4,
@@ -109,7 +108,7 @@ pub fn quantBits(mode: model.QuantMode) u32 {
     };
 }
 
-pub fn quantGroup(mode: model.QuantMode) u32 {
+pub fn quantGroup(mode: sdk.QuantMode) u32 {
     return switch (mode) {
         .nvfp4 => 16,
         else => 32,
@@ -606,7 +605,7 @@ pub const MlxOps = struct {
     }
 
     /// `nn.QuantizedLinear` (transpose, no biases in the fp modes).
-    pub fn qmm(g: *MlxOps, x: T, w: T, sc: T, mode: model.QuantMode) !T {
+    pub fn qmm(g: *MlxOps, x: T, w: T, sc: T, mode: sdk.QuantMode) !T {
         var r = mlx.mlx_array_new();
         mlx.check(mlx.mlx_quantized_matmul(&r, x, w, sc, .{}, true, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), g.s)) catch |e| {
             _ = mlx.mlx_array_free(r);
@@ -616,7 +615,7 @@ pub const MlxOps = struct {
     }
 
     /// `mx.dequantize` with the default output dtype (bf16 for the fp modes).
-    pub fn dequantize(g: *MlxOps, w: T, sc: T, mode: model.QuantMode) !T {
+    pub fn dequantize(g: *MlxOps, w: T, sc: T, mode: sdk.QuantMode) !T {
         var r = mlx.mlx_array_new();
         mlx.check(mlx.mlx_dequantize(&r, w, sc, .{}, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), .{}, .{}, g.s)) catch |e| {
             _ = mlx.mlx_array_free(r);
@@ -626,7 +625,7 @@ pub const MlxOps = struct {
     }
 
     /// `mx.quantize(w, group, bits, mode)` of an fp mode: packed words + scales.
-    pub fn quantize(g: *MlxOps, w: T, mode: model.QuantMode) !struct { w: T, s: T } {
+    pub fn quantize(g: *MlxOps, w: T, mode: sdk.QuantMode) !struct { w: T, s: T } {
         var vec = mlx.mlx_vector_array{ .ctx = null };
         try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), .{}, g.s));
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -877,7 +876,7 @@ pub const MlxOps = struct {
 
     /// `mx.gather_qmm(x, w, scales, rhs_indices=idx, transpose=True, mode)` (the
     /// resident `SwitchLinear`; unsorted, no biases).
-    pub fn gatherQmm(g: *MlxOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
+    pub fn gatherQmm(g: *MlxOps, x: T, w: T, sc: T, idx: T, mode: sdk.QuantMode) !T {
         var r = mlx.mlx_array_new();
         mlx.check(mlx.mlx_gather_qmm(&r, x, w, sc, .{}, .{}, idx, true, mlx.mlx_optional_int.some(@intCast(quantGroup(mode))), mlx.mlx_optional_int.some(@intCast(quantBits(mode))), mode.cstr(), false, g.s)) catch |e| {
             _ = mlx.mlx_array_free(r);
@@ -1399,7 +1398,7 @@ pub const TraceOps = struct {
     }
 
     /// fp-mode `mx.quantize`: `[out, in]` -> words `[out, in * bits / 32]` u32 + scales `[out, in / group]` u8.
-    pub fn quantize(g: *TraceOps, w: T, mode: model.QuantMode) !struct { w: T, s: T } {
+    pub fn quantize(g: *TraceOps, w: T, mode: sdk.QuantMode) !struct { w: T, s: T } {
         const sh = g.shapeOf(w);
         const in_dim = sh.dim(-1);
         var ws = sh;
@@ -1569,7 +1568,7 @@ pub const TraceOps = struct {
 
     /// The resident switch: x [..., 1, K] x w [E, N, K*bits/32] at rhs indices [...]
     /// -> [indices..., 1, N] at x's dtype.
-    pub fn gatherQmm(g: *TraceOps, x: T, w: T, sc: T, idx: T, mode: model.QuantMode) !T {
+    pub fn gatherQmm(g: *TraceOps, x: T, w: T, sc: T, idx: T, mode: sdk.QuantMode) !T {
         const sx = g.shapeOf(x);
         const sw = g.shapeOf(w);
         const si = g.shapeOf(idx);
@@ -1694,7 +1693,7 @@ pub const TraceOps = struct {
 
     /// fp-mode `quantized_matmul(transpose=True)`: `[..., in] -> [..., out]`,
     /// dtype of x (mlx/ops.cpp `quantized_matmul`).
-    pub fn qmm(g: *TraceOps, x: T, w: T, sc: T, mode: model.QuantMode) !T {
+    pub fn qmm(g: *TraceOps, x: T, w: T, sc: T, mode: sdk.QuantMode) !T {
         const sx = g.shapeOf(x);
         const sw = g.shapeOf(w);
         const in_dim = @divExact(sw.dim(-1) * 32, @as(c_int, @intCast(quantBits(mode))));
@@ -1704,7 +1703,7 @@ pub const TraceOps = struct {
         return g.push(.qmm, g.dtypeOf(x), out);
     }
 
-    pub fn dequantize(g: *TraceOps, w: T, _: T, mode: model.QuantMode) !T {
+    pub fn dequantize(g: *TraceOps, w: T, _: T, mode: sdk.QuantMode) !T {
         var out = g.shapeOf(w);
         out.d[out.n - 1] = @divExact(out.d[out.n - 1] * 32, @as(c_int, @intCast(quantBits(mode))));
         return g.push(.dequantize, .bfloat16, out);

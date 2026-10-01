@@ -8,7 +8,7 @@
 //! runs); everything else is here.
 
 const std = @import("std");
-const model = @import("model.zig");
+const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const kvc = @import("deepseek_v41_cache.zig");
@@ -18,7 +18,7 @@ const kr = @import("dsv41_kernel_routes.zig");
 const Dtype = ops.Dtype;
 
 pub fn Q(comptime T: type) type {
-    return struct { w: T, s: T, mode: model.QuantMode = .mxfp8 };
+    return struct { w: T, s: T, mode: sdk.QuantMode = .mxfp8 };
 }
 
 /// One trunk layer's residents (handles owned by the weights map).
@@ -2609,7 +2609,7 @@ const TraceRouted = struct {
     }
 };
 
-fn qIn(g: *TraceOps, out: u64, in: u64, mode: model.QuantMode) !Q(u32) {
+fn qIn(g: *TraceOps, out: u64, in: u64, mode: sdk.QuantMode) !Q(u32) {
     const o: c_int = @intCast(out);
     const i: c_int = @intCast(in);
     const bits: c_int = @intCast(ops.quantBits(mode));
