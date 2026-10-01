@@ -790,6 +790,9 @@ pub fn Model(comptime G: type) type {
                     try probe.put("chunk.fence", hf.moe_in);
                     keepHalf(g, &halves[i]);
                     carries[i].persistShared(g, &shareds[i]);
+                    // Nothing reads the layer's input stream past the fence (the Half carries the residual, the tap is
+                    // settled): on its route it goes here, not at the chunk's HC post.
+                    if (rt.input_stream_early_release) g.release(hs[i]);
                     g.resetTo(wave);
                     try probe.put("chunk.frees", halves[i].moe_in);
                 }
@@ -876,7 +879,7 @@ pub fn Model(comptime G: type) type {
                         try probe.put("moe.y", mo);
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
                         try probe.put("out.h", next);
-                        g.release(hs[k]);
+                        if (!rt.input_stream_early_release) g.release(hs[k]);
                         hs[k] = g.keep(next);
                         g.release(pms[k]);
                         pms[k] = g.keep(halves[k].ffn_pre);
@@ -1203,6 +1206,59 @@ test "dsv41 model: K16 settles each chunk's DSpark main tap in its chunk fence (
     }
     try testing.expectEqual(@as(usize, 3), taps);
     try testing.expect(main_taps_in_chunk_fence);
+}
+
+test "dsv41 model: K16's input-stream release (route): each chunk's layer input goes at its chunk fence, before the layer's routed call; the ops are the same either way" {
+    const m = try Mini.init();
+    defer m.deinit();
+    // Per layer: the streams its HC posts produced (the next layer's inputs) and the releases made by its first routed call.
+    const Rec = struct {
+        g: *TraceOps,
+        layer: usize = 0,
+        outs: [8]std.ArrayList(u32) = @splat(.empty),
+        released_at_routed: [8]?usize = @splat(null),
+        pub fn put(self: *@This(), name: []const u8, x: anytype) !void {
+            if (std.mem.eql(u8, name, "out.h")) try self.outs[self.layer].append(testing.allocator, x);
+            if (std.mem.eql(u8, name, "moe.routed") and self.released_at_routed[self.layer] == null) self.released_at_routed[self.layer] = self.g.released.items.len;
+            if (std.mem.eql(u8, name, "layer.end")) self.layer += 1;
+        }
+        fn deinit(self: *@This()) void {
+            for (&self.outs) |*o| o.deinit(testing.allocator);
+        }
+    };
+    var seqs: [2]?[]ops.Op = .{ null, null };
+    defer for (seqs) |sq| if (sq) |x| testing.allocator.free(x);
+    for ([_]bool{ false, true }, &seqs) |early, *seq| {
+        var g = TraceOps.init(testing.allocator);
+        defer g.deinit();
+        const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+        var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+        tier.routes.input_stream_early_release = early;
+        const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
+        defer model_.deinit(&g);
+        var st = try model_.newState();
+        defer st.deinit(&g, testing.allocator);
+        var rec: Rec = .{ .g = &g };
+        defer rec.deinit();
+        var ids: [20]u32 = undefined;
+        for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+        const mark = g.nodes.items.len;
+        _ = try model_.forward(&g, &st, &ids, .{ .logits = .last, .main_hidden = true }, TraceRouted{}, &rec);
+        seq.* = try g.opsSince(testing.allocator, mark);
+        // Layers 1..: each input stream (the previous layer's HC post output, one per chunk) is released exactly once,
+        // before the layer's first routed call on the route, after it without.
+        try testing.expectEqual(m.c.n_layers, rec.layer);
+        for (1..m.c.n_layers) |l| {
+            const at = rec.released_at_routed[l].?;
+            try testing.expectEqual(@as(usize, 3), rec.outs[l - 1].items.len);
+            for (rec.outs[l - 1].items) |x| {
+                try testing.expectEqual(early, std.mem.indexOfScalar(u32, g.released.items[0..at], x) != null);
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u32, g.released.items, &.{x}));
+            }
+        }
+    }
+    // Lifetime only: the same op sequence with the route on and off.
+    try testing.expectEqualSlices(ops.Op, seqs[0].?, seqs[1].?);
 }
 
 test "dsv41 model: K16 marks each chunk's build, fence start and fence end for a fence probe (D14's timeline), in order" {

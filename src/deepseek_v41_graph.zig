@@ -179,6 +179,10 @@ pub const Routes = struct {
     /// off by default (SERVED16's decode regression is unattributed: one-factor arm, DSV41_CELL_DECODE_MEMOS=1). The
     /// RoPE tables' memo at prompt widths is C22's prompt member and stays on.
     decode_memos: bool = false,
+    /// K16: each chunk's layer input stream released at its chunk fence (nothing reads it after: the Half carries the
+    /// residual, the tap is settled), not at its routed group's HC post; the routed groups then hold one hc-width
+    /// stream. Lifetime only: the same ops.
+    input_stream_early_release: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,

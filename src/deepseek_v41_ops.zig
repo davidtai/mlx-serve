@@ -1104,6 +1104,8 @@ pub const TraceOps = struct {
     evals: std.ArrayList(usize) = .empty,
     /// Every array handed to `evalAll`, in call order (which arrays a fence settled).
     evaluated: std.ArrayList(T) = .empty,
+    /// Every kept array handed to `release`, in call order (when a pass lets a kept array go).
+    released: std.ArrayList(T) = .empty,
     /// Launches of prepared configs, and the prepared configs not yet released.
     prepared_launches: usize = 0,
     prepared_live: usize = 0,
@@ -1131,6 +1133,7 @@ pub const TraceOps = struct {
         g.freed.deinit(g.gpa);
         g.evals.deinit(g.gpa);
         g.evaluated.deinit(g.gpa);
+        g.released.deinit(g.gpa);
         var it = g.host_data.valueIterator();
         while (it.next()) |v| g.gpa.free(v.*);
         g.host_data.deinit(g.gpa);
@@ -1178,7 +1181,9 @@ pub const TraceOps = struct {
     pub fn keep(_: *TraceOps, x: T) T {
         return x;
     }
-    pub fn release(_: *TraceOps, _: T) void {}
+    pub fn release(g: *TraceOps, x: T) void {
+        g.released.append(g.gpa, x) catch @panic("trace: out of memory");
+    }
     pub fn adopt(_: *TraceOps, x: T) !T {
         return x;
     }
