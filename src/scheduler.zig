@@ -9609,18 +9609,23 @@ test "S21: a released module head drops the slot's exclusivity, and the MODEL bi
     try testing.expect(headExclusiveFor(true, true, true, true));
 }
 
-test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
-    // The 2026-08-02 dsv4 fix hardcoded `t.dsv4 != null` here. When a second
-    // module-owned arch arrived — same `Model.state` shape, same
-    // `reset = cache.step == 0` rebuild — the gate did not follow, and two
-    // concurrent requests shared one state. The predicate now lives beside the fields it reads
-    // (`Transformer.module_owned_state_fields`), and this pins the delegation.
-    // Needles are ++-split so this test's source can't satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const delegated = "t.ownsModuleDecode" ++ "State()";
-    try testing.expect(std.mem.indexOf(u8, src, delegated) != null);
-    const hardcoded = "return t.dsv4 " ++ "!= null;";
-    try testing.expect(std.mem.indexOf(u8, src, hardcoded) == null);
+test "modelExclusiveDecode asks the transformer: a registered arch that owns its decode state is single-flight" {
+    const sdk = @import("sdk");
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    var lm: model_registry_mod.LoadedModel = undefined;
+    lm.transformer = &t;
+    try testing.expect(!modelExclusiveDecode(&lm));
+    const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const sharing = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .caps = .{} }));
+    var module: u8 = 0;
+    t.arch = .{ .vt = &owning, .cfg = &module, .module = &module };
+    try testing.expect(modelExclusiveDecode(&lm));
+    t.arch = .{ .vt = &sharing, .cfg = &module, .module = &module };
+    try testing.expect(!modelExclusiveDecode(&lm));
+    lm.transformer = null;
+    try testing.expect(!modelExclusiveDecode(&lm));
 }
 
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {
@@ -9910,12 +9915,20 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     }
 }
 
-test "native draft lane: has_native_draft reads the transformer's readiness signal, never one hardcoded arch" {
-    // `has_native_draft` once read `transformer.?.dsv4 != null`, so deepseek_v41's draft head never reached
-    // the chokepoint and served plain AR. Needles are ++-split so this test's source can't satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    try testing.expect(std.mem.indexOf(u8, src, "transformer.?.nativeDraft" ++ "Block() > 0;") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "slot.model.transformer.?.dsv4 " ++ "!= null;") == null);
+test "native draft lane: has_native_draft is the arch's own draft block; a lane of 5 drafts wires the native intent, none stays serial" {
+    const sdk = @import("sdk");
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    const Lane = sdk.testing.FakeArch(.{ .block_size = 5 });
+    const lane = comptime sdk.Arch.of(Lane);
+    const serial = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    var module: Lane.Module = .{ .gpa = testing.allocator, .calls = &Lane.calls };
+    t.arch = .{ .vt = &lane, .cfg = &module, .module = &module };
+    try testing.expectEqual(@as(u32, 5), t.nativeDraftBlock());
+    try testing.expect(specInitWiring(true, false, t.nativeDraftBlock() > 0, true, false, false, false, false, false).native_intent);
+    t.arch = .{ .vt = &serial, .cfg = &module, .module = &module };
+    try testing.expectEqual(@as(u32, 0), t.nativeDraftBlock());
+    try testing.expect(!specInitWiring(true, false, t.nativeDraftBlock() > 0, true, false, false, false, false, false).native_intent);
 }
 
 test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {

@@ -335,6 +335,28 @@ pub const NativeDraft = union(enum) {
     }
 };
 
+/// The arch's prefill-to-decode handover (`Transformer.decodeHandover`), due once per request at its first decode
+/// step. Built only from the transformer, so no Generator is constructed without its answer.
+pub const HandoverClock = struct {
+    due: bool,
+
+    pub fn of(xfm: *const Transformer) HandoverClock {
+        return .{ .due = xfm.decodeHandoverWanted() };
+    }
+
+    /// A handover arch never pre-forwards t1 inside init: its first forward follows the handover.
+    pub fn skipsLazyPreforward(c: HandoverClock, requested: bool) bool {
+        return requested or c.due;
+    }
+
+    /// True exactly once, at the first decode step, when a handover is due.
+    pub fn fire(c: *HandoverClock) bool {
+        if (!c.due) return false;
+        c.due = false;
+        return true;
+    }
+};
+
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
@@ -1465,9 +1487,8 @@ pub const Generator = struct {
     dspark_stochastic: bool = false,
     /// The armed lane `nextDspark` runs its rounds on (set with `dspark_enabled`).
     native_draft: ?NativeDraft = null,
-    /// The arch's prefill-to-decode handover is still due (`beginDecode`): set at construction from
-    /// `Transformer.decodeHandoverWanted` (a registered arch's phase change), cleared by the request's first decode step.
-    decode_handover_due: bool = false,
+    /// The arch's prefill-to-decode handover (`beginDecode`); no default, so every construction states it.
+    handover: HandoverClock,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
 
@@ -2354,6 +2375,79 @@ pub const Generator = struct {
         return if (stoch_enabled) .stochastic else .off;
     }
 
+    /// What the spec chokepoint armed for a module-owned arch: its own lane, or serial.
+    pub const NativeArming = struct { active: bool = false, stochastic: bool = false, lane: ?NativeDraft = null };
+
+    /// DeepSeek-V4 hard-off, at the ONE chokepoint every init site
+    /// funnels through: dsv4's per-request state lives on the module
+    /// (rings + compressed caches) and a spec VERIFY forward appends
+    /// draft tokens to it with NO rollback — two rejected PLD drafts
+    /// permanently corrupted a live generation (mangled DSML with dropped
+    /// token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
+    /// scheduler.runPrefill demonstrably did not cover the engaged path,
+    /// and per-site wiring is the class the spec-dispatch rule warns
+    /// about).
+    pub fn armNativeDraft(xfm: *Transformer, sampling: SamplingParams, options: *InitOptions) NativeArming {
+        var arming: NativeArming = .{};
+        if (!(xfm.ownsModuleDecodeState() and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled))) return arming;
+        // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
+        // snapshot rollback inside deepseek_v4.zig) may engage when the
+        // checkpoint ships stages and the request is CLEAN (no
+        // penalties, grammar or logprobs — those consume logits the
+        // draft path never shapes and stay serial). Greedy requests get
+        // the raw argmax-equality accept; sampled requests get the
+        // stochastic arm (MTP one-hot Leviathan acceptance over the
+        // request's own filtered probs — the agent-default temp 0.6
+        // traffic that otherwise always ran serial), env-killable via
+        // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
+        // remain hard-off regardless: their verify forwards go through
+        // machinery this arch cannot roll back.
+        // deepseek_v41 rides the same lane: its module's draft head (typical acceptance, greedy
+        // requests), the same round contract, the same kill switch.
+        const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+        const lane = NativeDraft.of(xfm);
+        if (lane) |nd| {
+            switch (nd) {
+                .dsv4 => |mdl_ds| {
+                    const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+                    if (!dspark_env_off and arm != .off) {
+                        arming.active = true;
+                        arming.stochastic = arm == .stochastic;
+                        if (arming.stochastic) {
+                            log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                        } else {
+                            log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                        }
+                    } else {
+                        log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+                    }
+                },
+                .lane => |a| {
+                    const l = a.vt.spec.draft_lane;
+                    if (!dspark_env_off and l.arm(a.module, armRequest(sampling, options.logprobs_n)) != .off) {
+                        arming.active = true;
+                        log.info("  decode lane: {s} ({s} draft head, block={d})\n", .{ l.lane_name(a.module), a.vt.name, l.block_size(a.module) });
+                    } else {
+                        log.info("  decode lane: serial ({s}: {s})\n", .{ a.vt.name, if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalty requests stay serial" });
+                    }
+                },
+            }
+        } else if (xfm.dsv4 != null) {
+            log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+        } else if (xfm.arch) |a| {
+            log.info("  decode lane: serial ({s}: no draft head installed)\n", .{a.vt.name});
+        }
+        if (arming.active) arming.lane = lane;
+        options.pld_enabled = false;
+        options.drafter_enabled = false;
+        options.drafter = null;
+        options.mtp_enabled = false;
+        options.mtp = null;
+        options.dflash_enabled = false;
+        options.dflash = null;
+        return arming;
+    }
+
     /// What a draft lane arms on: clean (no penalties, grammar or logprobs: they consume logits a draft never
     /// shapes) and greedy.
     pub fn armRequest(sampling: SamplingParams, logprobs_n: u32) sdk.ArmRequest {
@@ -2408,76 +2502,11 @@ pub const Generator = struct {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
-        // DeepSeek-V4 hard-off, at the ONE chokepoint every init site
-        // funnels through: dsv4's per-request state lives on the module
-        // (rings + compressed caches) and a spec VERIFY forward appends
-        // draft tokens to it with NO rollback — two rejected PLD drafts
-        // permanently corrupted a live generation (mangled DSML with dropped
-        // token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
-        // scheduler.runPrefill demonstrably did not cover the engaged path,
-        // and per-site wiring is the class the spec-dispatch rule warns
-        // about).
         var options = options_in;
-        var dspark_active = false;
-        var dspark_stochastic = false;
-        var native_draft: ?NativeDraft = null;
-        if (xfm.ownsModuleDecodeState() and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
-            // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
-            // snapshot rollback inside deepseek_v4.zig) may engage when the
-            // checkpoint ships stages and the request is CLEAN (no
-            // penalties, grammar or logprobs — those consume logits the
-            // draft path never shapes and stay serial). Greedy requests get
-            // the raw argmax-equality accept; sampled requests get the
-            // stochastic arm (MTP one-hot Leviathan acceptance over the
-            // request's own filtered probs — the agent-default temp 0.6
-            // traffic that otherwise always ran serial), env-killable via
-            // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
-            // remain hard-off regardless: their verify forwards go through
-            // machinery this arch cannot roll back.
-            // deepseek_v41 rides the same lane: its module's draft head (typical acceptance, greedy
-            // requests), the same round contract, the same kill switch.
-            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const lane = NativeDraft.of(xfm);
-            if (lane) |nd| {
-                switch (nd) {
-                    .dsv4 => |mdl_ds| {
-                        const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
-                        if (!dspark_env_off and arm != .off) {
-                            dspark_active = true;
-                            dspark_stochastic = arm == .stochastic;
-                            if (dspark_stochastic) {
-                                log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
-                            } else {
-                                log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
-                            }
-                        } else {
-                            log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
-                        }
-                    },
-                    .lane => |a| {
-                        const l = a.vt.spec.draft_lane;
-                        if (!dspark_env_off and l.arm(a.module, armRequest(sampling, options.logprobs_n)) != .off) {
-                            dspark_active = true;
-                            log.info("  decode lane: {s} ({s} draft head, block={d})\n", .{ l.lane_name(a.module), a.vt.name, l.block_size(a.module) });
-                        } else {
-                            log.info("  decode lane: serial ({s}: {s})\n", .{ a.vt.name, if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalty requests stay serial" });
-                        }
-                    },
-                }
-            } else if (xfm.dsv4 != null) {
-                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
-            } else if (xfm.arch) |a| {
-                log.info("  decode lane: serial ({s}: no draft head installed)\n", .{a.vt.name});
-            }
-            if (dspark_active) native_draft = lane;
-            options.pld_enabled = false;
-            options.drafter_enabled = false;
-            options.drafter = null;
-            options.mtp_enabled = false;
-            options.mtp = null;
-            options.dflash_enabled = false;
-            options.dflash = null;
-        }
+        const arming = armNativeDraft(xfm, sampling, &options);
+        const dspark_active = arming.active;
+        const dspark_stochastic = arming.stochastic;
+        const native_draft = arming.lane;
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
         // callers either supply one (scheduler) or fall through to
@@ -2487,6 +2516,7 @@ pub const Generator = struct {
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
         // The request's shape, before its first forward: a registered arch's prompt pass reserves from it.
         ctx.request = .{ .prompt_tokens = options.ssm_checkpoint_pos_offset + prompt_ids.len, .max_tokens = max_tokens, .host_context = xfm.config.max_position_embeddings };
+        const handover = HandoverClock.of(xfm);
 
         // Certified lm_head prune gate: the pruned projection proves the
         // ARGMAX, not the tail distribution, so it may engage only when this
@@ -3249,7 +3279,7 @@ pub const Generator = struct {
             }
             var gen = Generator{
                 .xfm = xfm,
-                .decode_handover_due = xfm.decodeHandoverWanted(),
+                .handover = handover,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3302,7 +3332,7 @@ pub const Generator = struct {
                 0;
             var gen = Generator{
                 .xfm = xfm,
-                .decode_handover_due = xfm.decodeHandoverWanted(),
+                .handover = handover,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3371,7 +3401,7 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and the
         // PLD / drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward or xfm.decodeHandoverWanted()) {
+        if (handover.skipsLazyPreforward(options.skip_lazy_preforward)) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -3385,7 +3415,7 @@ pub const Generator = struct {
 
             var gen = Generator{
                 .pending_logprob = first_lp,
-                .decode_handover_due = xfm.decodeHandoverWanted(),
+                .handover = handover,
                 .xfm = xfm,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
@@ -3443,7 +3473,7 @@ pub const Generator = struct {
 
         var gen = Generator{
             .pending_logprob = first_lp,
-            .decode_handover_due = xfm.decodeHandoverWanted(),
+            .handover = handover,
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
@@ -3962,8 +3992,7 @@ pub const Generator = struct {
     /// step: the first thing `next` and `nextDspark` do, the only decode entries a handover arch reaches (module
     /// archs keep PLD, drafters, MTP and DFlash off). The prompt's clock (prefill_ns, TTFT) never includes it.
     fn beginDecode(self: *Generator) !void {
-        if (!self.decode_handover_due) return;
-        self.decode_handover_due = false;
+        if (!self.handover.fire()) return;
         try self.xfm.decodeHandover(.{
             .prompt_tokens = self.prompt_tokens,
             .reserved_tokens = @as(u64, self.prompt_tokens) + self.max_tokens,
@@ -18576,14 +18605,34 @@ test "native draft lane: the request a lane arms on: clean (no penalties, logpro
     try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0, .constraint = &c }, 0));
 }
 
-test "native draft lane: the chokepoint arms every module arch through NativeDraft, never one hardcoded arch" {
-    // It once read `xfm.dsv4 != null` and `self.xfm.dsv4.?`, so deepseek_v41's draft head was never armed
-    // and never dispatched. Needles are ++-split so this test's source can't satisfy the scan.
-    const src = @embedFile("generate.zig");
-    try testing.expect(std.mem.indexOf(u8, src, "const lane = NativeDraft" ++ ".of(xfm);") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "switch (self.native" ++ "_draft.?) {") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "const mdl = self.xfm.dsv4" ++ ".?;\n        const t1 = self.next_token_id;") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "if (xfm.dsv4 != null and (options.pld" ++ "_enabled") == null);
+test "native draft lane: the chokepoint arms an arch's own lane for clean greedy requests and forces every other drafter off" {
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    const Lane = sdk.testing.FakeArch(.{ .block_size = 5 });
+    Lane.calls = .{};
+    const lane = comptime sdk.Arch.of(Lane);
+    var m: Lane.Module = .{ .gpa = testing.allocator, .calls = &Lane.calls, .position = 7 };
+    var cfg: Lane.Config = .{};
+    xfm.arch = .{ .vt = &lane, .cfg = &cfg, .module = &m };
+    var opts: Generator.InitOptions = .{ .pld_enabled = true, .drafter_enabled = true, .mtp_enabled = true, .dflash_enabled = true };
+    const armed = Generator.armNativeDraft(&xfm, .{ .temperature = 0.0 }, &opts);
+    try testing.expect(armed.active and !armed.stochastic and armed.lane.? == .lane);
+    try testing.expectEqual(@as(usize, 7), armed.lane.?.position());
+    try testing.expect(!opts.pld_enabled and !opts.drafter_enabled and !opts.mtp_enabled and !opts.dflash_enabled);
+    // A sampled request stays serial; the other drafters stay off all the same.
+    var sampled: Generator.InitOptions = .{ .mtp_enabled = true };
+    const s_arm = Generator.armNativeDraft(&xfm, .{ .temperature = 0.6, .top_p = 0.95 }, &sampled);
+    try testing.expect(!s_arm.active and s_arm.lane == null and !sampled.mtp_enabled);
+    // No draft lane installed: serial.
+    const serial = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    xfm.arch = .{ .vt = &serial, .cfg = &cfg, .module = &m };
+    var plain: Generator.InitOptions = .{ .mtp_enabled = true };
+    try testing.expect(!Generator.armNativeDraft(&xfm, .{ .temperature = 0.0 }, &plain).active and !plain.mtp_enabled);
+    // An arch that shares its state: the chokepoint leaves the other drafters alone.
+    const sharing = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .caps = .{} }));
+    xfm.arch = .{ .vt = &sharing, .cfg = &cfg, .module = &m };
+    var shared: Generator.InitOptions = .{ .mtp_enabled = true };
+    try testing.expect(!Generator.armNativeDraft(&xfm, .{ .temperature = 0.0 }, &shared).active and shared.mtp_enabled);
 }
 
 test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit invariant (DSV4_MINI)" {
@@ -21730,28 +21779,29 @@ test "keyed sampling draws the softmax distribution" {
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
 }
 
-test "dsv41 handover: every Generator construction reads the arch's handover, and the decode entries it reaches open with it" {
-    const src = @embedFile("generate.zig");
-    // Each Generator literal in init sets the flag from the arch (a construction without it would leave a
-    // handover arch refusing its first round by name). Needles are split with `++` so this test never matches itself.
-    const literal = "var gen = " ++ "Generator{";
-    const flag = ".decode_handover_due = xfm.decodeHandoverWanted(),";
-    var literals: usize = 0;
-    var flagged: usize = 0;
-    var at: usize = 0;
-    while (std.mem.indexOfPos(u8, src, at, literal)) |i| : (at = i + literal.len) {
-        literals += 1;
-        const body = src[i..@min(src.len, i + 400)];
-        if (std.mem.indexOf(u8, body, flag) != null) flagged += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 4), literals);
-    try std.testing.expectEqual(literals, flagged);
-    // The serial step and the native draft rounds run the handover before anything else they do.
-    inline for (.{ "pub fn next" ++ "(self: *Generator, allocator: std.mem.Allocator) !?u32 {", "pub fn nextDspark" ++ "(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {" }) |sig| {
-        const i = std.mem.indexOf(u8, src, sig) orelse return error.EntryMoved;
-        const head = src[i + sig.len ..][0..96];
-        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, head, " \n"), "if (self.done) return null;\n        try self.beginDecode();"));
-    }
-    // A handover arch never pre-forwards t1 inside init (its first forward follows the handover).
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (options.skip_lazy_preforward" ++ " or xfm.decodeHandoverWanted()) {") != null);
+test "dsv41 handover: the clock fires once, at the first decode step, only when the arch takes a handover" {
+    // No handover: the init pre-forwards t1 only when the slot asked, and no decode step fires.
+    var none: HandoverClock = .{ .due = false };
+    try testing.expect(!none.skipsLazyPreforward(false) and none.skipsLazyPreforward(true));
+    try testing.expect(!none.fire() and !none.fire());
+    // A handover is due: t1 is never pre-forwarded inside init (its first forward follows the handover), the first
+    // decode step fires it, and no later step does.
+    var due: HandoverClock = .{ .due = true };
+    try testing.expect(due.skipsLazyPreforward(false));
+    try testing.expect(due.fire());
+    try testing.expect(!due.fire() and !due.fire());
+}
+
+test "dsv41 handover: the clock is the transformer's answer: due exactly when the arch has a handover" {
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    try testing.expect(!HandoverClock.of(&xfm).due);
+    const with = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const without = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .handover = false }));
+    var module: u8 = 0;
+    xfm.arch = .{ .vt = &with, .cfg = &module, .module = &module };
+    try testing.expect(HandoverClock.of(&xfm).due);
+    xfm.arch = .{ .vt = &without, .cfg = &module, .module = &module };
+    try testing.expect(!HandoverClock.of(&xfm).due);
 }
