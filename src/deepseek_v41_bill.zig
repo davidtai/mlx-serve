@@ -268,15 +268,10 @@ pub const model_taps_fenced: bool = blk: {
     break :blk mdl.main_taps_in_chunk_fence;
 };
 
-/// Whether this tree's model also releases the second stream SERVED16 measured live at the routed group's peak with the
-/// fence (the holder; the model lane declares it when released).
-pub const model_group_one_stream: bool = blk: {
-    if (!@hasDecl(mdl, "routed_group_one_stream")) break :blk false;
-    break :blk mdl.routed_group_one_stream;
-};
-
 /// The K16 routed group's live hc-width streams the tight variant bills: four without the fence, two with it (SERVED16's
-/// measured drop), one once the holder is declared released.
+/// measured drop), one when the early-release route frees each chunk's layer input stream at its chunk fence (e499d60:
+/// `module.inputStreamEarlyRelease(ov)`, the route the Module installs; the holder SERVED16's derive could not name, which
+/// held the input streams of every unprocessed chunk to their routed group's HC post).
 pub fn tightGroupStreams(fenced: bool, one_stream: bool) u64 {
     if (!fenced) return 4;
     return if (one_stream) 1 else 2;
@@ -296,6 +291,15 @@ pub const stream_decode_staging_rows: u64 = blk: {
 /// the same overrides the Module builds with, so one binary bills both arms.
 pub fn transientDecodeRows(wide_depth: u8, releases: bool, staging_rows: u64) u64 {
     return if (releases) xp.max_route_ids + staging_rows else @as(u64, wide_depth) * xp.max_route_ids;
+}
+
+/// The request's bounded KV positions the bill charges: what the Module allocates (`Module.maxPositions`, the lanes'
+/// bound at the prompt): on the served path the shell declares no reservation (0), so the prompt plus the generation
+/// headroom (8,192) plus a verify block; a harness that reserves the prompt plus its tokens holds the larger of the two
+/// bills. Until SERVED18 the bill charged prompt + max_tokens + a block (17,416 at the standard request) while the served
+/// Module allocated 24,584 (about 46 MB of lanes and 15 MB of the verify wave's index chain unbilled on servers).
+pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
+    return @max(module.Module.maxPositions(@intCast(prompt_tokens), 0), module.Module.maxPositions(@intCast(prompt_tokens), prompt_tokens + max_tokens));
 }
 
 /// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
@@ -340,8 +344,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
     const variant = try billVariant();
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tightGroupStreams(model_taps_fenced, model_group_one_stream) else 4);
-    const positions = prompt_tokens + max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
+    const tight_streams = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4);
+    const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
     const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
@@ -368,7 +373,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         // without it, the wide lane's routed-output copy. The chunk-major wave keeps its x 5/4 margin.
         .prefill_wave = promptWave(bill, config.dsv41LayerMajor(), joinless, prompt_tokens),
         .variant = variant,
-        .prefill_wave_tight = promptWave(bill.withGroupStreams(tightGroupStreams(model_taps_fenced, model_group_one_stream)), config.dsv41LayerMajor(), joinless, prompt_tokens),
+        .prefill_wave_tight = promptWave(bill.withGroupStreams(tight_streams), config.dsv41LayerMajor(), joinless, prompt_tokens),
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
         .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
         .prefill_cache = module.prefillCacheLimit(.served),
@@ -680,7 +685,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 135, .decode = 169 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 134, .decode = 169 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
     };
     // The release route as the Module resolves it: the default (off), then each override.
@@ -704,8 +709,9 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     std.debug.print("\n", .{});
 }
 
-// DSV41_BANK=<bank> (host): the bounded KV by owner at the fill's request (16,384 + 1,024 + one verify block of
-// positions). SERVED11 (full-length frontier lanes) held 351,152,128 B after the prompt, the lanes, ring and frontier
+// DSV41_BANK=<bank> (host): the bounded KV by owner at the bill's positions (`billedPositions`: since SERVED18 the served
+// Module's bound, 16,384 + 8,192 + one verify block; until then the fill's request, 16,384 + 1,024 + 8, which held the
+// lanes at 111,544,320 B, kvPrompt 309,725,184 B, kvDecode 156,717,056 B, 138,883,072 B at the phase change). SERVED11 (full-length frontier lanes) held 351,152,128 B after the prompt, the lanes, ring and frontier
 // of 57409c7's bill within 0.42 MB. Since 3ebd8a7 the frontier of each ratio-2 kv source (layers 2, 8, 14) is two rings
 // of window 2, so it is billed as rings, per phase.
 test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's request (bank)" {
@@ -716,9 +722,10 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const pb = v41.PrefillBill.of(&c);
-    const positions = fill_prompt_tokens + fill_max_tokens + mdl.Model(ops.MlxOps).scratch_rows;
-    // Compressed 89,235,456 + index 22,308,864 (the four kv sources).
-    try testing.expectEqual(@as(u64, 111_544_320), pb.laneBytes(positions));
+    const positions = billedPositions(fill_prompt_tokens, fill_max_tokens);
+    // Compressed 125,935,616 + index 31,483,904 (the four kv sources): +36,700,160 and +9,175,040 over the fill's request.
+    try testing.expectEqual(@as(u64, 24_584), positions);
+    try testing.expectEqual(@as(u64, 157_419_520), pb.laneBytes(positions));
     // The window ring: 2,160 rows over the prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
     try testing.expectEqual(@as(u64, 174_735_360), pb.ringPromptBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 41_904_128), pb.ringDecodeBytes(fill_prompt_tokens));
@@ -727,11 +734,11 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     try testing.expectEqual(@as(u64, 954), v41.PrefillBill.ringBase(2) + 872);
     try testing.expectEqual(@as(u64, 23_445_504), pb.frontierPromptBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 3_268_608), pb.frontierDecodeBytes(fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 309_725_184), pb.kvPromptBytes(fill_prompt_tokens, positions));
-    try testing.expectEqual(@as(u64, 156_717_056), pb.kvDecodeBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 355_600_384), pb.kvPromptBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 202_592_256), pb.kvDecodeBytes(fill_prompt_tokens, positions));
     // At the phase change: the lanes, the window ring's last chunk (310 rows) and the frontier's (184 a ring).
     const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310 + 3 * 2 * 2048 * 184;
-    try testing.expectEqual(@as(u64, 138_883_072), at_change);
+    try testing.expectEqual(@as(u64, 184_758_272), at_change);
     // The bill carries them per phase.
     var config = try model.parseConfig(testing.io, a, bank_dir);
     // Option B: the ceiling is the bill's argument, not a config field.
@@ -792,8 +799,9 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
 
 // DSV41_BANK=<bank> (host): the bill's variants at the windows' baselines. Conservative (the default) bills the K16
 // routed group's four hc-width streams; tight bills two once the model declares its main taps fenced (ee80e40:
-// `main_taps_in_chunk_fence`; SERVED16 measured the second stream still live), one once it declares the holder released
-// (`routed_group_one_stream`). The tight rows are computed at two streams, whether or not this tree declares the fence.
+// `main_taps_in_chunk_fence`; SERVED16 measured the second stream still live), one when the early-release route frees
+// each chunk's input stream at its fence (`module.inputStreamEarlyRelease`, e499d60). The tight rows are computed at two
+// streams here, whether or not this tree declares the fence; the route's one stream is pinned through billAt below.
 test "dsv41 memory: the bill's variants, conservative and tight, at the windows' baselines (bank)" {
     try testing.expectEqual(BillVariant.conservative, try parseBillVariant(null));
     try testing.expectEqual(BillVariant.tight, try parseBillVariant("tight"));
@@ -830,6 +838,57 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         std.debug.print("\nbill variants at baseline {d:.2} GB (posted gathers on): conservative {d} / {d}, tight {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, cons.prefill, cons.decode, tight.prefill, tight.decode });
         try testing.expectEqual(w.conservative, cons);
         try testing.expectEqual(w.tight, tight);
+    }
+    std.debug.print("\n", .{});
+}
+
+// The KV positions the bill charges follow the Module's own bound (`Module.maxPositions`): the served path's prompt plus
+// the generation headroom plus a verify block, or a harness's larger reservation.
+test "dsv41 memory: the bill charges the KV positions the Module allocates" {
+    try testing.expectEqual(@as(u64, 16384 + 8192 + 8), billedPositions(16384, 1024));
+    try testing.expectEqual(@as(u64, module.Module.maxPositions(16384, 0)), billedPositions(16384, 1024));
+    try testing.expectEqual(@as(u64, 16384 + 8192 + 8), billedPositions(16384, 8192));
+    try testing.expectEqual(@as(u64, 16384 + 10000 + 8), billedPositions(16384, 10000));
+}
+
+// DSV41_BANK=<bank> (host): the tight variant follows the early-release route the Module installs (e499d60): one routed-group
+// stream with it on, two off, through billAt's resolver (`module.inputStreamEarlyRelease`); conservative is unchanged.
+test "dsv41 memory: the tight wave follows the early-release route (bank)" {
+    try testing.expect(!module.inputStreamEarlyRelease(.{}));
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
+    for ([_]Want{
+        .{ .base = 8_990_000_000, .two = .{ .prefill = 140, .decode = 164 }, .one = .{ .prefill = 142, .decode = 164 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 139, .decode = 164 }, .one = .{ .prefill = 142, .decode = 164 } },
+        .{ .base = 9_550_000_000, .two = .{ .prefill = 139, .decode = 163 }, .one = .{ .prefill = 141, .decode = 163 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        const on = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .input_stream_early_release = true });
+        // The tight wave drops by the third stream's bound (the attention side binds below two streams); the
+        // conservative wave, the KV and decode do not move.
+        try testing.expectEqual(@as(u64, 3_950_230_945 - 2_684_354_560), off.prefill_wave_tight - on.prefill_wave_tight);
+        try testing.expectEqual(off.prefill_wave, on.prefill_wave);
+        try testing.expectEqual(off.decodeTotal(), on.decodeTotal());
+        var rows: [2]arm_mod.NativeRows = undefined;
+        for ([_]Bill{ off, on }, 0..) |b0, i| {
+            var b = b0;
+            b.engram_posted = posted;
+            b.prefill_wave = b.prefill_wave_tight;
+            rows[i] = try fillRows(fillBillOf(b), target, b.n_experts);
+        }
+        std.debug.print("\ntight at baseline {d:.2} GB (posted gathers on): early release off {d} / {d} ({d:.3} GB wave), on {d} / {d} ({d:.3} GB)", .{ @as(f64, @floatFromInt(w.base)) / 1e9, rows[0].prefill, rows[0].decode, @as(f64, @floatFromInt(off.prefill_wave_tight)) / 1e9, rows[1].prefill, rows[1].decode, @as(f64, @floatFromInt(on.prefill_wave_tight)) / 1e9 });
+        try testing.expectEqual(w.two, rows[0]);
+        try testing.expectEqual(w.one, rows[1]);
     }
     std.debug.print("\n", .{});
 }
@@ -898,7 +957,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 135, .decode = 164 }, .cons_on = .{ .prefill = 135, .decode = 169 }, .tight_off = .{ .prefill = 140, .decode = 164 }, .tight_on = .{ .prefill = 140, .decode = 169 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 134, .decode = 164 }, .cons_on = .{ .prefill = 134, .decode = 169 }, .tight_off = .{ .prefill = 139, .decode = 164 }, .tight_on = .{ .prefill = 139, .decode = 169 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 134, .decode = 164 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 164 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -940,9 +999,10 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
-        // Without the release (this tree's fill): 164 / 164 / 163 decode rows; with it, +5 at each baseline.
+        // Without the release (this tree's fill): 164 / 164 / 163 decode rows; with it, +5, +4 and +5 (since SERVED18 the
+        // served KV bound's decode lanes and verify chain take the 9.20 GB row's last one).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 135, .decode = 169 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 169 }, .on = .{ .prefill = 134, .decode = 169 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
