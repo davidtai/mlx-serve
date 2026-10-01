@@ -967,6 +967,12 @@ const CellReceipt = struct {
     /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default interval).
     /// until_freed's bound, grow and margin ride in `phase_change`.
     phase_change_settle: ?module.PhaseChangeSettle = null,
+    /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
+    /// returned ride in `phase_change.host_relief_bytes`.
+    host_relief: ?bool = null,
+    /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
+    decode_host_after_grow_bytes: ?u64 = null,
+    decode_host_end_bytes: ?u64 = null,
     /// The verify-row routes the Module installed.
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -1262,6 +1268,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     }
     const s_end = arm.hook.source.stats();
     const wall_s = secondsSince(io, t0);
+    // The decode host side at the end of the timed decode (after the clock; the Module logs it).
+    md.recordDecodeEnd();
     phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     printPhaseMemory(a, phases[3]);
     mlx_peak = @max(mlx_peak, @max(phases[3].mlx_peak_bytes, memProbePeak("dsv41 served cell", "cycles")));
@@ -1347,6 +1355,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change = md.phase_change,
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .phase_change_settle = md.installed.phase_change_settle,
+        .host_relief = md.installed.host_relief,
+        .decode_host_after_grow_bytes = md.decode_host.after_grow,
+        .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
@@ -1468,6 +1479,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     // The phase change's settle condition (interval | until_freed; anything else refused here).
+    if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {

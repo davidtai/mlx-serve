@@ -133,6 +133,41 @@ pub const RouteOverrides = struct {
     phase_change_poll_ms: ?u32 = null,
     /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `interval`.
     phase_change_settle: ?PhaseChangeSettle = null,
+    /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
+    /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
+    host_relief: ?bool = null,
+};
+
+/// The host relief route the Module installs (off by default).
+pub fn hostRelief(ov: RouteOverrides) bool {
+    return ov.host_relief orelse false;
+}
+
+extern "c" fn malloc_zone_pressure_relief(zone: ?*anyopaque, goal: usize) usize;
+
+/// libc malloc's relief over every zone (no goal: everything it can return); the bytes it reports returned.
+pub const LibcRelief = struct {
+    pub fn relieve(_: LibcRelief) u64 {
+        return malloc_zone_pressure_relief(null, 0);
+    }
+};
+
+/// The phase change's one relief call when the route is installed (`relief.relieve()`, once); null when it is not.
+pub fn boundaryRelief(installed: bool, relief: anytype) ?u64 {
+    if (!installed) return null;
+    return relief.relieve();
+}
+
+/// The process's host side at a reading: its footprint less MLX's active and cache.
+pub fn hostSideOf(m: BoundaryMemory) u64 {
+    return m.footprint -| m.active -| m.cache;
+}
+
+/// The decode phase's host side (`hostSideOf`), read once after the grow and once at the end of decode (the next
+/// request's prefill, the harness after its timed decode, or deinit): outside every measured path.
+pub const DecodeHost = struct {
+    after_grow: ?u64 = null,
+    end: ?u64 = null,
 };
 
 /// What the phase change's settle waits for before its one check and the grow (polled every `phase_change_poll_ms`,
@@ -265,6 +300,8 @@ pub const Module = struct {
     phase_change: ?PhaseChangeRecord = null,
     /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
     phase_observer: ?PhaseObserver = null,
+    /// The request's decode host side (`DecodeHost`; reset at each phase change).
+    decode_host: DecodeHost = .{},
     /// The prompt-start reference and the terminal refusal (`PhaseGate`).
     gate: PhaseGate = .{},
     /// The shell's io (the phase change's bounded settle waits on it).
@@ -458,6 +495,8 @@ pub const Module = struct {
         log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
+        self.installed.host_relief = hostRelief(ov);
+        log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
@@ -612,7 +651,19 @@ pub const Module = struct {
         }
     }
 
+    /// The decode phase's host side at its end (`DecodeHost.end`), once per grown request: read and logged when a
+    /// decode ran (after the grow) and its end is not read yet. The cell calls it after its timed decode; the served
+    /// path reads it at the next request's prefill and at deinit (SIGTERM's shutdown path). Outside every measured path.
+    pub fn recordDecodeEnd(self: *Module) void {
+        const after = self.decode_host.after_grow orelse return;
+        if (self.decode_host.end != null) return;
+        const m = BoundaryMemory.now();
+        self.decode_host.end = hostSideOf(m);
+        log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
+    }
+
     pub fn deinit(self: *Module) void {
+        self.recordDecodeEnd();
         const gpa = self.gpa;
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
@@ -711,6 +762,8 @@ pub const Module = struct {
     /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
+        // The previous request's decode end (served path), before this request touches anything.
+        self.recordDecodeEnd();
         try self.gate.begin(.prefill);
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
@@ -980,6 +1033,8 @@ pub const Module = struct {
         self.g.clearCache();
         setCacheLimit(envelope.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
+        // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
+        const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
         const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
             .interval => null,
@@ -988,14 +1043,17 @@ pub const Module = struct {
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = transient_freed, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
         switch (self.arm) {
             inline else => |t| try t.arm.grow(&self.g),
         }
         marks[4] = VmMark.now();
-        self.phase_change.?.grown = BoundaryMemory.now();
+        const grown_m = BoundaryMemory.now();
+        self.phase_change.?.grown = grown_m;
+        self.decode_host = .{ .after_grow = hostSideOf(grown_m) };
+        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
         try self.observe(.grown);
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
@@ -1110,6 +1168,8 @@ pub const Installed = struct {
     phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The phase change's settle condition, as installed (`phaseChangeSettle`).
     phase_change_settle: PhaseChangeSettle = .interval,
+    /// The phase change's host relief, as installed (`hostRelief`).
+    host_relief: bool = false,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -1228,6 +1288,8 @@ pub const PhaseChangeRecord = struct {
     grow_bound_bytes: ?u64 = null,
     grow_bytes: ?u64 = null,
     margin_bytes: ?i64 = null,
+    /// The host relief route only: the bytes malloc reported returned (`malloc_zone_pressure_relief`).
+    host_relief_bytes: ?u64 = null,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
 };
@@ -2164,6 +2226,29 @@ test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a re
         // ... and checkFreed alone (the interval mode's check) would have let that grow through.
         try checkFreed(before, st.after, 0);
     }
+}
+
+test "dsv41 memory: the host relief route calls malloc's relief once at the boundary, never when off; the decode host side reads" {
+    try std.testing.expect(!hostRelief(.{}));
+    try std.testing.expect(!(Installed{}).host_relief);
+    try std.testing.expect(hostRelief(.{ .host_relief = true }));
+    const Counting = struct {
+        n: *u32,
+        pub fn relieve(c: @This()) u64 {
+            c.n.* += 1;
+            return 4096;
+        }
+    };
+    var n: u32 = 0;
+    try std.testing.expectEqual(@as(?u64, null), boundaryRelief(false, Counting{ .n = &n }));
+    try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(@as(?u64, 4096), boundaryRelief(true, Counting{ .n = &n }));
+    try std.testing.expectEqual(@as(u32, 1), n);
+    // The real call is host-only libc (no device): it returns, whatever it reports.
+    _ = boundaryRelief(true, LibcRelief{});
+    // The decode host side: footprint less active and cache (SERVED19 control1 112957's grown reading: 1.047 GB).
+    try std.testing.expectEqual(@as(u64, 1_046_698_048), hostSideOf(.{ .active = 107_371_043_568, .cache = 720, .footprint = 108_417_742_336 }));
+    try std.testing.expectEqual(@as(u64, 0), hostSideOf(.{ .active = 2, .cache = 2, .footprint = 3 }));
 }
 
 test "dsv41 memory: a refused boundary refuses every later request by name (no retry grows over it)" {
