@@ -289,6 +289,11 @@ pub const StreamSource = struct {
         return self.stream.wide_depth;
     }
 
+    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs.
+    pub fn warmWaitNs(self: *const StreamSource, layer: u32) u64 {
+        return self.stream.warmWaitNs(layer);
+    }
+
     pub fn stats(self: *StreamSource) Stats {
         return self.stream.stats();
     }

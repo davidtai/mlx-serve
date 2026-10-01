@@ -100,6 +100,8 @@ pub const Options = struct {
     wide_depth: u8 = 1,
     /// The phase change's transient release (`expert_stream.Options.transient_release`; the Module's route).
     transient_release: bool = false,
+    /// A0 (a): the first verify's warm reads (`expert_stream.Options.first_verify_warm`; the Module's route).
+    first_verify_warm: ?expert_stream.FirstVerifyWarm = null,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -284,6 +286,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .wide_depth = opt.wide_depth,
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
+                .first_verify_warm = opt.first_verify_warm,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
@@ -321,6 +324,15 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             try self.hook.grow(g, self.decode_rows);
             if (self.grown_check) |c| try c.check(c.ctx, self, g);
             self.grown = true;
+        }
+
+        /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
+        /// demand into its empty rows, layer-major (`Stream.warmIssue`). Returns the records issued.
+        pub fn warmIssue(self: *Self) !u32 {
+            var buf: [xp.warm_max_experts]u16 = undefined;
+            var n: u32 = 0;
+            for (0..self.config.n_layers) |l| n += try self.stream.warmIssue(@intCast(l), self.hook.warmSet(@intCast(l), &buf));
+            return n;
         }
     };
 }

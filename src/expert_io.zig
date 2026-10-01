@@ -36,6 +36,9 @@ const c = if (@import("build_options").macos_engines) struct {
     extern fn q3ld_ev_gates(n: i32, values: [*]const u64, counts: [*]const i32, tickets: [*]const i64) i32;
     extern fn q3ld_ev_release(value: u64) i32;
     extern fn q3ld_ev_state(out: *[10]i64) i32;
+    extern fn q3ld_warm_config(busy_max: i32) c_int;
+    extern fn q3ld_submit_warm(fd: i32, file_size: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
+    extern fn q3ld_warm_cancel(first: i64, count: i64) i64;
     extern fn q3ld_monotonic_ns() i64;
     extern fn q3ld_abi() i32;
     extern fn q3ld_counters_n() i32;
@@ -49,7 +52,7 @@ const c = if (@import("build_options").macos_engines) struct {
     extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else @import("expert_io_stub.zig").q3ld;
 
-pub const abi_version = 2026092704;
+pub const abi_version = 2026100101;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -138,8 +141,12 @@ pub const Counter = enum(u8) {
     ev_wd_last_value = 69,
     ev_host_released = 70,
     ev_stop_released = 71,
+    warm_submitted = 72,
+    warm_started = 73,
+    warm_cancelled = 74,
+    warm_max_busy_at_start = 75,
 };
-pub const counters_n = 72;
+pub const counters_n = 76;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -154,6 +161,10 @@ pub const Spec = struct {
     idle_busy: u32 = 0,
 };
 
+/// The warm class (A0 (a)): stock jobs a worker starts only while no demand job or pre-range is queued and fewer than
+/// `busy_max` jobs run, on `tickets` tickets of their own at the top of the ring (demand wraps below them).
+pub const Warm = struct { tickets: u32, busy_max: u32 };
+
 pub const Options = struct {
     workers: u32 = 4,
     /// One page-aligned staging buffer per worker; 9 MiB holds a whole
@@ -161,6 +172,7 @@ pub const Options = struct {
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
     spec: ?Spec = null,
+    warm: ?Warm = null,
 };
 
 /// A speculative staging slot: the page-rounded record plus two pages.
@@ -191,6 +203,9 @@ pub const Pool = struct {
     /// Log entries consumed so far.
     seen: i64 = 0,
     next_ticket: u32 = 0,
+    /// Demand's tickets end here; the warm class's (`Options.warm`) run from here to the end of the ring.
+    demand_tickets: u32 = 0,
+    next_warm: u32 = 0,
     record_bytes: u64 = 0,
 
     /// Starts the process's pool (the speculative class, when given, is
@@ -202,6 +217,8 @@ pub const Pool = struct {
             return error.InvalidOptions;
         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
+        if (opt.warm) |w| if (w.tickets == 0 or w.tickets % 2 != 0 or w.tickets > opt.tickets -| 2 * max_items or w.busy_max == 0 or
+            w.busy_max > opt.workers) return error.InvalidOptions;
         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
             c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
         const self = try allocator.create(Pool);
@@ -217,7 +234,8 @@ pub const Pool = struct {
         @memset(res, 0);
         @memset(log_arr, 0);
         @memset(published, false);
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published };
+        const demand: u32 = if (opt.warm) |w| opt.tickets - w.tickets else opt.tickets;
+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .next_warm = demand };
         var bufs: [max_spec]u64 = undefined;
         var threads: i32 = 0;
         var slot_bytes: u64 = 0;
@@ -241,6 +259,10 @@ pub const Pool = struct {
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
+        if (opt.warm) |w| if (c.q3ld_warm_config(@intCast(w.busy_max)) != 0) {
+            _ = c.q3ld_stop();
+            return error.WarmRefused;
+        };
         return self;
     }
 
@@ -284,7 +306,7 @@ pub const Pool = struct {
         if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n) return error.InvalidJob;
         const count: u32 = @intCast(2 * n);
         self.drain();
-        if (self.next_ticket + count > self.published.len) self.next_ticket = 0;
+        if (self.next_ticket + count > self.demand_tickets) self.next_ticket = 0;
         const first = self.next_ticket;
         var offsets: [2 * max_items]i64 = undefined;
         var row_ptrs: [max_items][*]const u64 = undefined;
@@ -304,6 +326,42 @@ pub const Pool = struct {
         @memset(self.published[first..][0..count], false);
         self.next_ticket = first + count;
         return first;
+    }
+
+    /// The warm class (`Options.warm`): one job queued below demand on the warm tickets, laid out as `submit`'s
+    /// (gate/up of record i = first + i, down = first + n + i). Returns its first ticket.
+    pub fn submitWarm(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) !u32 {
+        const n = rows.len;
+        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or self.demand_tickets == self.published.len) return error.InvalidJob;
+        const count: u32 = @intCast(2 * n);
+        self.drain();
+        if (self.next_warm + count > self.published.len) self.next_warm = self.demand_tickets;
+        const first = self.next_warm;
+        var offsets: [2 * max_items]i64 = undefined;
+        var row_ptrs: [max_items][*]const u64 = undefined;
+        for (0..n) |i| {
+            offsets[i] = @intCast(gu_offsets[i]);
+            offsets[n + i] = @intCast(down_offsets[i]);
+            row_ptrs[i] = &rows[i];
+        }
+        var lens_i: [n_components]i64 = undefined;
+        for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
+        switch (c.q3ld_submit_warm(fd, @intCast(file_size), @intCast(n), gu_components, n_components - gu_components, &offsets, &row_ptrs, &lens_i, first)) {
+            0 => {},
+            -2 => return error.TicketsBusy,
+            -3 => return error.QueueFull,
+            else => return error.SubmitRefused,
+        }
+        @memset(self.published[first..][0..count], false);
+        self.next_warm = first + count;
+        return first;
+    }
+
+    /// The queued warm jobs overlapping tickets [first, first + count), published skipped now (a started job
+    /// finishes). Returns the tickets cancelled.
+    pub fn cancelWarm(_: *Pool, first: u32, count: u32) u32 {
+        const n = c.q3ld_warm_cancel(first, count);
+        return if (n < 0) 0 else @intCast(n);
     }
 
     /// A layer call's speculative step: settles every unclaimed record tagged
@@ -395,6 +453,11 @@ pub const Pool = struct {
         }
     }
 };
+
+/// The reader's monotonic clock (ns), the one its result words use.
+pub fn monotonicNs() i64 {
+    return c.q3ld_monotonic_ns();
+}
 
 /// Test builds (-DQ3LD_INJECT): one scripted preadv fault at an aligned file
 /// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes, 5
@@ -598,6 +661,105 @@ test "dsv41 io: stop joins and restarts" {
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .staging_bytes = std.heap.pageSize() + 1 }));
     const bad_spec: Spec = .{ .threads = 1, .slots = max_spec + 1, .record_bytes = 100, .chunk_bytes = std.heap.pageSize() };
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .spec = bad_spec }));
+}
+
+test "dsv41 io: A0 (a): warm jobs start only with demand idle, after a demand job submitted later, and land a demand read's bytes" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(16 * page);
+    defer f.deinit();
+    // One worker: the order is the queue rule's. Warm tickets 16..31 above demand's 0..15.
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
+    defer pool.stop();
+    defer clearFaults();
+    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
+    // The first demand job holds the worker 80 ms (its first range sleeps), so everything below queues behind it.
+    injectFault(0, 5, 80 * std.time.ns_per_ms);
+    var d = try Dests.init(4, &lens);
+    defer testing.allocator.free(d.buf);
+    const seq0 = c.q3ld_seq();
+    const j0 = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
+    const w0 = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+    const w1 = try pool.submitWarm(f.fd, f.image.len, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
+    const j1 = try pool.submit(f.fd, f.image.len, &.{6 * page + 500}, &.{6 * page + 700}, d.rows[3..4], &lens);
+    try testing.expect(w0 >= 16 and w1 == w0 + 2 and j1 == j0 + 2 and j1 < 16);
+    try pool.wait(j0, 2, 10 * std.time.ns_per_s);
+    try pool.wait(j1, 2, 10 * std.time.ns_per_s);
+    try pool.wait(w0, 4, 10 * std.time.ns_per_s);
+    // Completion order: the held job, the demand job submitted after the warm ones, then the warm jobs.
+    var order: [8]u32 = undefined;
+    const got = pool.logOrder(seq0, c.q3ld_seq(), &order);
+    try testing.expectEqualSlices(u32, &.{ j0, j0 + 1, j1, j1 + 1, w0, w0 + 1, w1, w1 + 1 }, got);
+    for ([_]u64{ 500, 2 * page + 500, 4 * page + 500, 6 * page + 500 }, 0..) |gu, i| try d.expectRecord(i, f.image, gu, gu + 200, &lens);
+    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_submitted));
+    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_started));
+    try testing.expectEqual(@as(i64, 0), pool.counter(.warm_cancelled));
+    try testing.expectEqual(@as(i64, 0), pool.counter(.warm_max_busy_at_start));
+}
+
+test "dsv41 io: A0 (a): a warm cancel publishes the queued jobs skipped at once and lets a started one land" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(16 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
+    defer pool.stop();
+    defer clearFaults();
+    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
+    var d = try Dests.init(3, &lens);
+    defer testing.allocator.free(d.buf);
+    // The started one: its first range sleeps 80 ms, so the two after it stay queued (one worker).
+    injectFault(0, 5, 80 * std.time.ns_per_ms);
+    const w0 = try pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
+    const w1 = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+    const w2 = try pool.submitWarm(f.fd, f.image.len, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
+    while (pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 4), pool.cancelWarm(w0, w2 + 2 - w0));
+    try pool.wait(w1, 4, std.time.ns_per_s);
+    for (0..4) |k| try testing.expectEqual(Status.skipped, pool.result(w1 + @as(u32, @intCast(k))).status);
+    // The cancelled rows were never written; the started one lands.
+    try testing.expect(std.mem.allEqual(u8, d.part(1, 0, &lens), 0xAA) and std.mem.allEqual(u8, d.part(2, 8, &lens), 0xAA));
+    try pool.wait(w0, 2, 10 * std.time.ns_per_s);
+    try testing.expectEqual(Status.ok, pool.result(w0).status);
+    try testing.expectEqual(Status.ok, pool.result(w0 + 1).status);
+    try d.expectRecord(0, f.image, 500, 700, &lens);
+    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_cancelled));
+    try testing.expectEqual(@as(u32, 0), pool.cancelWarm(w0, 2));
+}
+
+test "dsv41 io: A0 (a): demand wraps below the warm tickets; a pool stopping with warm jobs queued returns" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(16 * page);
+    defer f.deinit();
+    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
+    var d = try Dests.init(2, &lens);
+    defer testing.allocator.free(d.buf);
+    {
+        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
+        defer pool.stop();
+        // Demand's 16 tickets: eight 1-record jobs, then the ninth wraps to 0, never into the warm tickets.
+        for (0..9) |k| {
+            const t = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
+            try testing.expectEqual(@as(u32, @intCast((2 * k) % 16)), t);
+            try pool.wait(t, 2, 10 * std.time.ns_per_s);
+        }
+        const w = try pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[1..2], &lens);
+        try testing.expectEqual(@as(u32, 16), w);
+        try pool.wait(w, 2, 10 * std.time.ns_per_s);
+    }
+    {
+        var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
+        defer clearFaults();
+        injectFault(0, 5, 50 * std.time.ns_per_ms);
+        _ = try pool.submit(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens);
+        _ = try pool.submitWarm(f.fd, f.image.len, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
+        pool.stop();
+    }
+    // Refusals at construction: odd or oversized warm tickets, a busy limit of 0 or past the workers.
+    for ([_]Warm{ .{ .tickets = 3, .busy_max = 1 }, .{ .tickets = 32, .busy_max = 1 }, .{ .tickets = 8, .busy_max = 0 }, .{ .tickets = 8, .busy_max = 3 } }) |bad|
+        try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32, .warm = bad }));
+    // Without the class, a warm submit is refused by name.
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32 });
+    defer pool.stop();
+    try testing.expectError(error.InvalidJob, pool.submitWarm(f.fd, f.image.len, &.{500}, &.{700}, d.rows[0..1], &lens));
 }
 
 test "dsv41 io: speculative slots and chunks follow the lane's sizes" {
