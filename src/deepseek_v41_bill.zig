@@ -660,8 +660,8 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_to
 
 /// The bill as the SDK's term-wise view (`sdk.MemoryBill`): each phase's terms in the printed order, the slot banks'
 /// persistent rows apart as `per_row` (one row on every routed layer, the record as `fillBillOf` derives it), the
-/// construction terms marked (`constructionTerms`) and the host side a measured bound. The baseline stays out: the
-/// fill and the admission take it.
+/// construction terms marked (`constructionTerms`, less the retained prompt state the prompt creates) and the host
+/// side a measured bound. The baseline stays out: the fill and the admission take it.
 pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
     const per_row = @as(u64, b.layers) * rec;
@@ -680,7 +680,8 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
         .{ .name = "host side", .bytes = .{ p.host_reserve, d.host_reserve }, .at_construction = true, .measured = true, .construction = c.host_reserve },
         .{ .name = "wide read windows", .bytes = .{ p.wide_window, d.wide_window }, .at_construction = true },
-        .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = true },
+        // Created at the prompt's end, never held from construction (0 in the prompt phase today).
+        .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = false },
         .{ .name = "unbilled process overhead", .bytes = .{ p.unbilled_overhead, d.unbilled_overhead }, .at_construction = true },
         .{ .name = "wire tables", .bytes = .{ p.wire_tables, d.wire_tables }, .at_construction = false, .with_rows = true },
         .{ .name = "decode buffer allowance", .bytes = .{ p.decode_buffer_allowance, d.decode_buffer_allowance }, .at_construction = false },
