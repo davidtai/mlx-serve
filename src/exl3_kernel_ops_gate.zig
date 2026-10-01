@@ -7,7 +7,8 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
-const kr = @import("kernel_routes.zig");
+const sdk = @import("sdk");
+const kr = sdk.kernels.Routes(xk);
 const tr = @import("dsv41_kernel_routes.zig");
 const xq = @import("exl3_quant.zig");
 

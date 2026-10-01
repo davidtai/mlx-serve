@@ -82,9 +82,6 @@ test {
     _ = @import("exl3_kernels.zig");
     _ = @import("exl3_selfcheck.zig");
     _ = @import("exl3_kernel_ops_gate.zig");
-    _ = @import("kernel_routes.zig");
-    _ = @import("kernel_set.zig");
-    _ = @import("kernel_trace.zig");
     _ = @import("quant.zig");
     _ = @import("exl3_quant.zig");
     _ = @import("dsv41_kernel_routes.zig");

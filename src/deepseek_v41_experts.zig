@@ -33,6 +33,7 @@ const expert_stream = @import("expert_stream.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
 const expert_event = @import("expert_event.zig");
 const xk = @import("exl3_kernels.zig");
+const sdk = @import("sdk");
 const quant = @import("quant.zig");
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
@@ -4297,7 +4298,7 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
         std.debug.print("\njoinless merge smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ks = @import("kernel_set.zig");
+    const ks = sdk.kernels.KernelSet(xk);
     const dkr = @import("dsv41_kernel_routes.zig");
     const G = ops.MlxOps;
     const T = G.T;

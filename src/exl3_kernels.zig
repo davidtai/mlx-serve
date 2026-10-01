@@ -8,6 +8,8 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const bo = @import("build_options");
+/// The registry's self-check plan (`sdk.kernels.KernelSet(R)` runs it at each consumer's accept).
+pub const selfcheck = @import("exl3_selfcheck.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;

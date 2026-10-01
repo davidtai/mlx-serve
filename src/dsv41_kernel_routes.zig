@@ -8,9 +8,10 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
+const sdk = @import("sdk");
 const selfcheck = @import("exl3_selfcheck.zig");
-const kr = @import("kernel_routes.zig");
-const ks = @import("kernel_set.zig");
+const kr = sdk.kernels.Routes(xk);
+const ks = sdk.kernels.KernelSet(xk);
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -1318,7 +1319,7 @@ pub fn JoinlessCombine(comptime G: type) type {
 // ── Tests ──
 
 const testing = std.testing;
-const kt = @import("kernel_trace.zig");
+const kt = sdk.kernels.Trace(xk);
 const Trace = kt.Trace;
 const TracePerCall = kt.TracePerCall;
 const testRegistry = kt.testRegistry;

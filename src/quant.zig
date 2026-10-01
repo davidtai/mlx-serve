@@ -36,7 +36,7 @@ const std = @import("std");
 const sdk = @import("sdk");
 const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
-const kernel_set = @import("kernel_set.zig");
+const kernel_set = sdk.kernels.KernelSet(xk);
 const QuantMode = @import("model.zig").QuantMode;
 
 const Allocator = std.mem.Allocator;

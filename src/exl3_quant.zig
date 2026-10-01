@@ -13,8 +13,8 @@ const std = @import("std");
 const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
-const kr = @import("kernel_routes.zig");
-const ks = @import("kernel_set.zig");
+const kr = sdk.kernels.Routes(xk);
+const ks = sdk.kernels.KernelSet(xk);
 const quant = @import("quant.zig");
 const sdk = @import("sdk");
 
@@ -1262,7 +1262,7 @@ const checkProjArrays = checkBank;
 // ── Tests ──
 
 const testing = std.testing;
-const kt = @import("kernel_trace.zig");
+const kt = sdk.kernels.Trace(xk);
 const Trace = kt.Trace;
 const testRegistry = kt.testRegistry;
 const expectLaunch = kt.expectLaunch;
