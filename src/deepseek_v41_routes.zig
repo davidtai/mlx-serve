@@ -112,6 +112,8 @@ pub const served: Tier = blk: {
     // one-factor arm (DSV41_CELL_DECODE_SHARED_MID=1, DSV41_CELL_DECODE_MEMOS=1) until a measured win flips it.
     t.routes.shared_mid = false;
     t.routes.decode_memos = false;
+    // P1's predictor in bf16: a one-factor arm (DSV41_CELL_PREDICT_BF16=1), judged on the read-ahead counters.
+    t.routes.predict_bf16 = false;
     break :blk t;
 };
 
