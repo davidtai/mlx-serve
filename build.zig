@@ -113,11 +113,13 @@ pub fn build(b: *std.Build) void {
     // The slim host (docs/plugins.md): the MLX engine and the registered plugins; ds4, llama.cpp and the ANE bridge
     // are left out for their stubs. Only the server graph is slimmed; the test graph is always the full one.
     const slim = b.option(bool, "slim", "Slim host: the MLX engine and the registered plugins; no ds4, llama.cpp or ANE") orelse false;
+    // The registry's plugin lines (src/plugins.zig): false builds the server without that plugin's files at all.
+    const with_mlx_stream = b.option(bool, "mlx-stream", "Register the mlx-stream plugin (DeepSeek-V4.1 arch, EXL3 quant and expert source)") orelse true;
     var profile: [plugin_build_options.len]bool = undefined;
     for (plugin_build_options, &profile) |o, *on| on.* = b.option(bool, o.name, o.description) orelse o.default;
     const core: CoreOptions = .{ .version = version, .mas = mas, .mlx_c_version = mlx_c_version, .ds4_commit = ds4_commit, .llama_tag = llama_tag, .git_sha = git_sha, .profile = &profile };
-    const build_options = core.add(b, !slim);
-    const test_options = core.add(b, true);
+    const build_options = core.add(b, !slim, with_mlx_stream);
+    const test_options = core.add(b, true, true);
     // The decode profile's command-buffer timeline sources ride the decode-timers profile option.
     const dsv41_decode_timers = for (plugin_build_options, profile) |o, on| {
         if (std.mem.eql(u8, o.field, "dsv41_decode_timers")) break on;
@@ -820,7 +822,7 @@ const CoreOptions = struct {
     /// One value per `plugin_build_options` entry.
     profile: []const bool,
 
-    fn add(c: CoreOptions, b: *std.Build, embedded_engines: bool) *std.Build.Step.Options {
+    fn add(c: CoreOptions, b: *std.Build, embedded_engines: bool, mlx_stream: bool) *std.Build.Step.Options {
         const o = b.addOptions();
         o.addOption([]const u8, "version", c.version);
         o.addOption(bool, "mas", c.mas);
@@ -841,6 +843,8 @@ const CoreOptions = struct {
         // The embedded engines (ds4 Metal, libllama) are linked: the macOS exe and tests, not the
         // slim host, iOS or Linux, which select src/arch/*_stub.zig and src/ds4_ffi_stub.zig.
         o.addOption(bool, "embedded_engines", embedded_engines);
+        // The registry registers mlx-stream (src/plugins.zig); the test graph always does.
+        o.addOption(bool, "plugin_mlx_stream", mlx_stream);
         for (plugin_build_options, c.profile) |opt, on| o.addOption(bool, opt.field, on);
         return o;
     }

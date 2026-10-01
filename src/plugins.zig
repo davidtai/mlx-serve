@@ -6,10 +6,12 @@ const std = @import("std");
 const sdk = @import("sdk");
 const build_options = @import("build_options");
 
-/// One line per plugin: `@import("<its root file>").plugin`.
-pub const all = [_]sdk.Plugin{
+/// One line per plugin: `@import("<its root file>").plugin`. A plugin left out (`-Dmlx-stream=false`) leaves none
+/// of its files in the build: the host reaches a plugin through this table only.
+pub const all = if (registers_mlx_stream) [_]sdk.Plugin{
     @import("mlx_stream.zig").plugin,
-};
+} else [_]sdk.Plugin{};
+const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
 
 /// This build's registry. A macOS-only plugin registers nothing on graphs without the macOS-only sources.
 pub const registry = Registry(&all, .{ .macos = build_options.macos_engines });
@@ -57,6 +59,7 @@ pub fn Registry(comptime plugins: []const sdk.Plugin, comptime platform: Platfor
         }
         /// The quant that claims a weight group (load, once per group); `why` keeps the last decline.
         pub fn quant(group: *const sdk.GroupPeek, why: ?*sdk.Diag, prefer: ?[]const u8) ?*const Entry(sdk.Quant) {
+            if (quants.len == 0) return null;
             var claim: [quants.len]?sdk.Priority = undefined;
             for (&quants, &claim) |*e, *c| c.* = e.kind.claims(group, why);
             const names = comptime namesOf(&quants);
@@ -99,6 +102,7 @@ fn namesOf(comptime table: anytype) [table.len][]const u8 {
 }
 
 fn route(comptime K: type, comptime table: anytype, peek: *const sdk.ConfigPeek, prefer: ?[]const u8) ?*const Entry(K) {
+    if (table.len == 0) return null;
     var claim: [table.len]?sdk.Priority = undefined;
     for (table, &claim) |*e, *c| c.* = e.kind.claims(peek);
     const names = comptime namesOf(table);
@@ -178,6 +182,16 @@ test "plugins registry: claims route each model to the highest claim, ties in or
     try testing.expectEqualStrings("fake-a", R.source(&llama, null).?.plugin);
     try testing.expectEqualStrings("fake-c", R.source(&llama, "fake-c").?.plugin);
     try testing.expectEqualStrings("fake-a", R.source(&llama, "fake-b").?.plugin);
+}
+
+test "plugins registry: a registry without plugins claims nothing (the host built without its plugins)" {
+    const R = Registry(&.{}, .{ .macos = true });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const peek = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
+    try testing.expect(R.arch(&peek, null) == null and R.source(&peek, null) == null and R.engine(&peek, null) == null and R.expertSource(&peek, null) == null);
+    const group: sdk.GroupPeek = .{ .quantization = .null, .hidden = 0, .inter = 0, .n_experts = 0, .n_layers = 0, .layers = &.{} };
+    try testing.expect(R.quant(&group, null, null) == null);
 }
 
 test "plugins registry: the winner of a claims round" {
