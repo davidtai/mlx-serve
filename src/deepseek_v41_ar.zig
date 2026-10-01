@@ -878,6 +878,10 @@ const CellReceipt = struct {
     bill_variant: []const u8 = "conservative",
     /// The window's arm tag (DSV41_CELL_ARM: tight, fusedw, maxops40, mxfp8head), null for arm 1.
     cell_arm: ?[]const u8 = null,
+    /// The server's wired-residency policy as this process applied it after construction (`applyServerWiredPolicy`:
+    /// MLX_SERVE_WIRED, default max): the mode, and the wired limit it set (null: declined).
+    wired_policy: ?[]const u8 = null,
+    wired_limit_bytes: ?u64 = null,
     prompt_file: []const u8,
     /// The fixture case (the fastest prompt), or "sweep-16384-20260829" (the standard prompt).
     prompt_source: []const u8,
@@ -1029,6 +1033,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     defer weights.deinit();
     const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
+    const wired = applyServerWiredPolicy();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
     // The window's own proof (the harness's): the load left no page cache for the kernel to age in later.
     try checkPageCache(constructed.file_cache_created_bytes);
@@ -1043,8 +1048,20 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
 
     // Either arm the configuration builds: host waits (the served default) or event gates (C6).
     switch (md.arm) {
-        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks }),
+        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired }),
     }
+}
+
+/// The server's wired-residency policy at the server's point: the scheduler applies `mlx.applyWiredPolicy()` once the
+/// model is constructed, before its first forward ("[wired] mode=max limit=114688 MB" on this box). The cell (timed,
+/// decode profile and prefill profile alike) applies it right after `Module.initWith`, before the "module constructed"
+/// record, so the window runs the Metal residency setup the server runs. Once per process, outside the timed spans.
+fn applyServerWiredPolicy() mlx.WiredPolicyResult {
+    const r = mlx.applyWiredPolicy();
+    if (r.target) |t| {
+        std.debug.print("NATIVE wired policy: mode={s} limit={d} MB (the server's, after construction)\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+    } else std.debug.print("NATIVE wired policy: mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+    return r;
 }
 
 const CellCtx = struct {
@@ -1065,6 +1082,8 @@ const CellCtx = struct {
     file_backed_start: u64,
     /// The phase change's proof marks (the Module's observer).
     marks: *PhaseMarks,
+    /// The server's wired-residency policy, applied after construction (the receipt stamps it).
+    wired: mlx.WiredPolicyResult,
 };
 
 /// The timed cell over the Module's arm (`arm` the host-waits or the event-gated one).
@@ -1217,6 +1236,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .mlx_max_ops_per_buffer = envStr("MLX_MAX_OPS_PER_BUFFER"),
         .bill_variant = envStr("DSV41_BILL_VARIANT") orelse "conservative",
         .cell_arm = envStr("DSV41_CELL_ARM"),
+        .wired_policy = @tagName(cx.wired.mode),
+        .wired_limit_bytes = if (cx.wired.target) |t| @as(u64, t) else null,
         .prompt_file = prompt_path,
         .prompt_source = case_id orelse "sweep-16384-20260829",
         .prompt_tokens = prompt.len,
@@ -2663,6 +2684,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer weights.deinit();
     const md = try module.Module.initWith(gpa, io, &config, &weights, s, args.ov);
     defer md.deinit();
+    _ = applyServerWiredPolicy();
     const arm = switch (md.arm) {
         .host_waits => |t| t.arm,
         else => return error.CellArmVariant,
