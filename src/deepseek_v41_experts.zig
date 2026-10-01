@@ -121,8 +121,8 @@ pub const StreamSource = struct {
     stream: *expert_stream.Stream,
     calls: [n_routes]Call = @splat(.{}),
 
-    /// What the stream supports; an arm installs a subset at construction (`Stream.Options`).
-    pub const caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
+    /// What the stream supports (`expert_stream.caps`); an arm installs a subset at construction.
+    pub const caps = expert_stream.caps;
 
     const n_routes = @typeInfo(@FieldType(expert_stream.Stream, "routes")).array.len;
 

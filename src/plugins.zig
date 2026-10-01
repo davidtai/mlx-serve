@@ -211,6 +211,15 @@ test "plugins conformance: mlx-stream registers its EXL3 quant, pinned by the ke
     try testing.expectEqualStrings(@import("exl3_kernels.zig").manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
 }
 
+test "plugins conformance: mlx-stream registers its EXL3 source, its capabilities and the one reader" {
+    const R = Registry(&.{@import("mlx_stream.zig").plugin}, .{ .macos = true });
+    try testing.expectEqual(@as(usize, 1), R.expert_sources.len);
+    const k = R.expert_sources[0].kind;
+    try testing.expectEqualStrings("exl3-stream", k.name);
+    try testing.expect(k.caps.two_phase and k.caps.transient_release and k.caps.event_gates and !k.caps.construction_reset);
+    try testing.expect(@import("expert_stream.zig").uses_reader);
+}
+
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
 test "plugins conformance: the CPU lane created no Metal device" {
     try sdk.testing.expectNoDevice();

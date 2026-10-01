@@ -66,6 +66,7 @@ test {
     _ = @import("deepseek_v41_settings.zig");
     _ = @import("deepseek_v41_plugin.zig");
     _ = @import("mlx_stream.zig");
+    _ = @import("exl3_source.zig");
     _ = @import("plugins.zig");
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("dsv41_decode_timers.zig");

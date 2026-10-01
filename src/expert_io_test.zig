@@ -4,7 +4,7 @@
 const std = @import("std");
 const expert_bank = @import("expert_bank.zig");
 const io = @import("sdk").expert.io;
-const c = io.abi;
+const c = io.test_abi.abi;
 const Pool = io.Pool;
 const Status = io.Status;
 const Spec = io.Spec;
@@ -14,7 +14,7 @@ const max_items = io.max_items;
 const max_spec = io.max_spec;
 const max_pre = io.max_pre;
 const max_gate_tickets = io.max_gate_tickets;
-const res_w = io.res_w;
+const res_w = io.test_abi.status_words;
 const spec_state_w = io.spec_state_w;
 const pre_state_w = io.pre_state_w;
 const abi_version = io.abi_version;

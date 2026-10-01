@@ -17,8 +17,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_util = @import("io_util");
 
-// 1:1 mirror of lib/expert_io/q3_lookahead4.h (refusing stand-ins where the sources are not built: the C pool and
-// the event shims compile on macOS graphs only).
+// 1:1 mirror of lib/expert_io/q3_lookahead4.h. The C pool and the event shims compile on macOS graphs only (the host's
+// `macos_engines` graphs: the macOS exe and tests); the Linux exe and the iOS lib get the refusing stand-ins, whose
+// q3ld_abi answers 0 so Pool.start refuses before any read. A macOS artifact that does not link the C objects (the
+// SDK's own tests) references no Pool. `macos_engines` stays the host's switch for its own engines.
 const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
@@ -55,8 +57,12 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else @import("io_stub.zig").q3ld;
 
-/// The reader's C ABI, for its own tests (its state words and scripted faults); served code goes through the Pool.
-pub const abi = c;
+/// Test builds only: the reader's C ABI and its status-word stride, for its own tests (its state words and scripted
+/// faults). Served code goes through the Pool.
+pub const test_abi = if (builtin.is_test) struct {
+    pub const abi = c;
+    pub const status_words = res_w;
+} else struct {};
 
 pub const abi_version = 2026100201;
 pub const max_workers = 8;
@@ -68,7 +74,7 @@ pub const max_pre = 32;
 pub const max_gates = 256;
 pub const max_gate_tickets = 256;
 /// Status words per ticket (`Result`'s fields, in order).
-pub const res_w = 8;
+const res_w = 8;
 pub const spec_state_w = 11;
 pub const pre_state_w = 5;
 /// `q3ld_submit` reads -1 as no deadline; 0 would expire every range at once.

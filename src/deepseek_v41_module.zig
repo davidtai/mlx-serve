@@ -551,6 +551,12 @@ pub const Module = struct {
 
     /// `init` with a harness's route overrides (the served path passes none).
     pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, ov: RouteOverrides) !*Module {
+        // The process's one expert reader (G6), before anything is read: a second Module is refused by name here.
+        if (comptime expert_stream.uses_reader) sdk.expert.takeReader() catch |e| {
+            log.err("refused: {s} (the process's expert reader belongs to a loaded model)", .{@errorName(e)});
+            return e;
+        };
+        errdefer if (comptime expert_stream.uses_reader) sdk.expert.giveReader();
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -1090,6 +1096,7 @@ pub const Module = struct {
         self.dropKernels();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
+        if (comptime expert_stream.uses_reader) sdk.expert.giveReader();
         gpa.destroy(self);
     }
 

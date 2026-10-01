@@ -20,8 +20,10 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn dsv41ev_last_error() [*:0]const u8;
 } else @import("io_stub.zig").ev;
 
-/// The shim's C ABI, for its own tests; served code goes through the functions below.
-pub const abi = c;
+/// Test builds only: the shim's C ABI, for its own tests. Served code goes through the functions below.
+pub const test_abi = if (builtin.is_test) struct {
+    pub const abi = c;
+} else struct {};
 
 pub const abi_version = 2026092801;
 

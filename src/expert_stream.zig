@@ -262,6 +262,13 @@ const Rows = struct {
     }
 };
 
+/// What the stream supports as an expert source (`sdk.expert.Caps`); an arm installs a subset at construction
+/// (`Options`).
+pub const caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
+
+/// It reads through the process's one reader: its arch takes it at construction (`sdk.expert.takeReader`).
+pub const uses_reader = true;
+
 /// The source contract's slot types (`sdk.expert`).
 pub const BankKind = sdk.expert.BankKind;
 pub const SlotRef = sdk.expert.SlotRef;

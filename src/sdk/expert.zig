@@ -26,6 +26,19 @@ pub const Event = event.Event;
 /// The residency policy every source plans with (one admission and replacement policy for every source).
 pub const policy = @import("expert/policy.zig");
 
+/// The one reader per process: an arch whose source declares `uses_reader` takes it at the top of its construction,
+/// before reading anything, and gives it back at its deinit (or when the construction fails). A second is refused by
+/// name, never at the pool's start.
+var reader_taken = std.atomic.Value(bool).init(false);
+
+pub fn takeReader() error{ExpertReaderInUse}!void {
+    if (reader_taken.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ExpertReaderInUse;
+}
+
+pub fn giveReader() void {
+    reader_taken.store(false, .release);
+}
+
 /// The record layout a bank fills when it opens (EXL3: 9 components, 6 gate/up; MXFP4: 6, 4): each component's dtype,
 /// per-row shape, offset in the record and length; the record's bytes and its gate/up range's.
 pub const RecordLayout = struct {
@@ -214,6 +227,14 @@ fn expectMethod(comptime S: type, comptime name: []const u8, comptime params: []
 }
 
 const testing = std.testing;
+
+test "sdk expert: one reader per process: a second taker is refused by name until the first gives it back" {
+    try takeReader();
+    try testing.expectError(error.ExpertReaderInUse, takeReader());
+    giveReader();
+    try takeReader();
+    giveReader();
+}
 
 test "sdk expert: the reader's topology gate is its per-range limit, for both banks" {
     checkTopology(9, 6); // EXL3
