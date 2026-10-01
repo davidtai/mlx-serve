@@ -364,7 +364,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0 },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -1002,6 +1002,8 @@ pub const Installed = struct {
     prefill_fused_down: bool = false,
     /// The phase change's transient release (installed in the stream at construction).
     transient_release: bool = false,
+    /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
+    lookahead_budget: u32 = 0,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -1265,10 +1267,17 @@ pub fn armOptions(config: *const model_io.ModelConfig, ceiling: expert_admission
         .preallocate = false,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
-        .lookahead = lookahead,
+        .lookahead = lookaheadFor(config),
         .ceiling = ceiling,
         .wide_depth = config.dsv41WideDepth(),
     };
+}
+
+/// The read-ahead at the config's speculative budget (`expert_lookahead_budget`; the bill reads the same options).
+pub fn lookaheadFor(config: *const model_io.ModelConfig) expert_stream.Lookahead {
+    var la = lookahead;
+    la.budget = config.dsv41LookaheadBudget();
+    return la;
 }
 
 /// The fill's shape and target (the bill module's), re-exported for the module's callers.
@@ -1440,6 +1449,22 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     try std.testing.expect(!try layerMajor(&c));
     // Cold rows keep the per-group base calls (the deferred call is off with them).
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
+}
+
+test "dsv41 module: the read-ahead's speculative budget: 2 unless set, the stream and the staging bill read the setting" {
+    var c: model_io.ModelConfig = undefined;
+    c.expert_lookahead_budget = null;
+    try std.testing.expectEqual(lookahead, lookaheadFor(&c));
+    c.expert_lookahead_budget = 1;
+    const la = lookaheadFor(&c);
+    try std.testing.expectEqual(@as(u32, 1), la.budget);
+    try std.testing.expectEqual(lookahead.k, la.k);
+    try std.testing.expectEqual(lookahead.chunks, la.chunks);
+    try std.testing.expectEqual(lookahead.preread, la.preread);
+    // the staging charge follows the budget (2 x budget slots): budget 1 bills two slots fewer
+    const f = bill_mod.fill_fixture;
+    const slot = std.mem.alignForward(u64, f.record, 16384) + 2 * 16384;
+    try std.testing.expectEqual(2 * slot, expert_admission.lookaheadCharge(f.record, 2 * lookahead.budget, 16384) - expert_admission.lookaheadCharge(f.record, 2 * la.budget, 16384));
 }
 
 test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {

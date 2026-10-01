@@ -443,6 +443,8 @@ pub const ModelConfig = struct {
     /// P1b: the seed's deferred base call run as soon as the seed has landed (`expert_wide_base_at_seed`; null =
     /// on wherever the wide seed and the deferred base call both are).
     expert_wide_base_at_seed: ?bool = null,
+    /// The decode read-ahead's speculative records per layer call (`expert_lookahead_budget`, 1..4; null = 2).
+    expert_lookahead_budget: ?u8 = null,
     /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group
     /// (`expert_wide_seed_aligned`; null = on wherever P1b's base call at the seed and the hottest-first order are).
     expert_wide_seed_aligned: ?bool = null,
@@ -709,6 +711,11 @@ pub const ModelConfig = struct {
     /// tier, whose prompt forwards are decode-width: none).
     pub fn dsv41LayerMajor(self: *const ModelConfig) bool {
         return self.layer_major_prefill orelse self.dsv41ServedTier();
+    }
+
+    /// The decode read-ahead's speculative records per layer call: 2 unless set.
+    pub fn dsv41LookaheadBudget(self: *const ModelConfig) u8 {
+        return self.expert_lookahead_budget orelse 2;
     }
 
     /// The served tier reads 3 groups ahead (P1's v1b: the SSD kept busy through the routed stage's drains).

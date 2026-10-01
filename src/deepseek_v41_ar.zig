@@ -932,6 +932,8 @@ const CellReceipt = struct {
     prefill_hc_post: ?bool = null,
     /// The DIG-X waves' fused down GEMM, as installed (read back from the Module).
     prefill_fused_down: ?bool = null,
+    /// The decode read-ahead's speculative records per layer call, as installed (read back from the Module).
+    lookahead_budget: ?u32 = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
     engram_posted: ?bool = null,
     deferred_base: ?bool = null,
@@ -1255,6 +1257,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .embedding_rows = md.installed.embedding_rows,
         .prefill_hc_post = md.installed.prefill_hc_post,
         .prefill_fused_down = md.installed.prefill_fused_down,
+        .lookahead_budget = md.installed.lookahead_budget,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
@@ -1354,6 +1357,12 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
     if (envStr("DSV41_CELL_PREFILL_FUSED_DOWN")) |v| ov.prefill_fused_down = try cellBool("DSV41_CELL_PREFILL_FUSED_DOWN", v);
+    // The decode read-ahead's speculative budget (1..4 records per layer call; the stream and the bill read it).
+    if (envStr("DSV41_CELL_LOOKAHEAD_BUDGET")) |v| {
+        const b = std.fmt.parseInt(u8, v, 10) catch return error.CellLookaheadBudget;
+        if (b < 1 or b > @import("expert_lookahead.zig").max_budget) return error.CellLookaheadBudget;
+        config.expert_lookahead_budget = b;
+    }
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
