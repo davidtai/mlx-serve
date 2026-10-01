@@ -1912,12 +1912,7 @@ pub const PhaseChangeRecord = struct {
 /// path. `start`: after the first synchronize, before any free; `released`: after the release, the clear and the
 /// boundary check, before the grow allocates; `grown`: after the grow and the grown banks' check; `tail` (the tail release
 /// route only): at the prompt's last trunk chunk, synchronized, before its frees.
-pub const PhaseObserver = struct {
-    ctx: *anyopaque,
-    mark: *const fn (ctx: *anyopaque, stage: Stage) anyerror!void,
-
-    pub const Stage = enum { start, released, grown, tail };
-};
+pub const PhaseObserver = @import("sdk").PhaseObserver;
 
 /// The request's phase gate: every public Module entry asks it first, so the order of a request's entries is
 /// proven by construction here, with no model and no device (host-tested below).

@@ -33,6 +33,7 @@
 //!   deinit(*, *G) void
 
 const std = @import("std");
+const sdk = @import("sdk");
 const mlx = @import("mlx");
 const xk = @import("exl3_kernels.zig");
 const kernel_set = @import("kernel_set.zig");
@@ -43,33 +44,13 @@ const Dtype = mlx.mlx_dtype;
 
 pub const Diag = xk.Diag;
 
-/// How strongly a quant claims a weight group (PLG's `?Priority`; PLG fixes the values, these
-/// are provisional): the load path asks every quant and takes the highest.
-pub const Priority = enum(u8) {
-    /// served through a generic path (MLX's own gather kernels)
-    generic = 1,
-    /// the group's own format, every tensor and layer covered by the quant's kernels
-    native = 2,
-};
+/// How strongly a quant claims a weight group: the load path asks every quant and takes the highest.
+pub const Priority = sdk.Priority;
 
-/// One per-expert tensor of a weight group, as the group's description names it.
-pub const Segment = struct { name: []const u8, dtype: []const u8, shape: []const u64 };
-
-/// One layer of a weight group: its bits per weight (EXL3's K; a quantization_config's bits)
-/// and its per-expert tensors.
-pub const LayerPeek = struct { bits: u32, segments: []const Segment };
-
-/// A routed-expert weight group's description at load. `quantization` is opaque to the host:
-/// each quant reads its own fields (EXL3: the bank manifest's `quantization` object; the
-/// gather quant: the group's quantization_config, `null` for dense experts).
-pub const BankPeek = struct {
-    quantization: std.json.Value,
-    hidden: u64,
-    inter: u64,
-    n_experts: u64,
-    n_layers: u64,
-    layers: []const LayerPeek,
-};
+/// A weight group's per-expert tensor, its layers, and its description at load (the SDK's `GroupPeek`).
+pub const Segment = sdk.Segment;
+pub const LayerPeek = sdk.LayerPeek;
+pub const BankPeek = sdk.GroupPeek;
 
 /// The routed experts' activation between gate / up and down. It is the arch's: a quant whose
 /// texts fuse it declares the one they fuse and refuses the rest at accept.

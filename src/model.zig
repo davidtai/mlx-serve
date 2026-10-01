@@ -23,31 +23,7 @@ pub const MAX_VISION_LAYERS = 64;
 /// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
 pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 
-pub const QuantMode = enum {
-    affine,
-    nvfp4,
-    mxfp4,
-    mxfp8,
-
-    pub fn fromString(name: []const u8) ?QuantMode {
-        return std.meta.stringToEnum(QuantMode, name);
-    }
-
-    /// Mode string for mlx_quantized_matmul / mlx_gather_qmm / mlx_dequantize.
-    pub fn cstr(self: QuantMode) [*:0]const u8 {
-        return switch (self) {
-            .affine => "affine",
-            .nvfp4 => "nvfp4",
-            .mxfp4 => "mxfp4",
-            .mxfp8 => "mxfp8",
-        };
-    }
-
-    /// Affine is the only mode whose checkpoints carry per-group biases.
-    pub fn hasBiases(self: QuantMode) bool {
-        return self == .affine;
-    }
-};
+pub const QuantMode = @import("sdk").QuantMode;
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
@@ -124,7 +100,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 /// Upstream's prefill-to-decode handover, passed to a module-owned-state arch (`Transformer.decodeHandover`):
 /// the request's prompt length, the positions it reserved, and whether the shell drives native draft rounds.
-pub const DecodeHandover = struct { prompt_tokens: u32, reserved_tokens: u64, native_draft: bool };
+pub const DecodeHandover = @import("sdk").DecodeHandover;
 
 pub const ModelConfig = struct {
     // Architecture identity

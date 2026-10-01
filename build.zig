@@ -23,6 +23,10 @@ comptime {
 /// (`zig build test` is Debug and ran 6 crashed tests without it).
 const stb_write_flags: []const []const u8 = &.{ "-O2", "-fno-sanitize=undefined" };
 
+/// Build options the registered plugins declare (G7, docs/plugins.md): profile code each compiles in on request and
+/// out of every served build. One line per plugin that declares any.
+const plugin_build_options = @import("src/mlx_stream_options.zig").options;
+
 pub fn build(b: *std.Build) void {
     // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
     // libmlx is built at deployment target 26.2 (NAX kernels, scripts/
@@ -105,29 +109,19 @@ pub fn build(b: *std.Build) void {
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", version);
-    build_options.addOption(bool, "mas", mas);
-    build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-    build_options.addOption([]const u8, "ds4_commit", ds4_commit);
-    build_options.addOption([]const u8, "llama_tag", llama_tag);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
-    build_options.addOption([]const u8, "git_sha", git_sha);
-    // The DSV4.1 DSpark cycle's host split (src/dsv41_decode_timers.zig): profile builds only.
-    const dsv41_decode_timers = b.option(bool, "dsv41-decode-timers", "Compile the DSV4.1 DSpark cycle's phase timers in (profile builds only)") orelse false;
-    build_options.addOption(bool, "dsv41_decode_timers", dsv41_decode_timers);
-    // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
-    // builds its own options with ios=true so the engine swaps the macOS-only
-    // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
-    build_options.addOption(bool, "ios", false);
-    // True only when the macOS-only embedded engines (ds4 Metal, libllama) are
-    // actually linked: macOS exe = yes; iOS static lib and Linux exe = no, they
-    // get compile-time stubs (src/arch/*_stub.zig, src/ds4_ffi_stub.zig) and
-    // src/ane_stub.c on Linux. The stub selection reads this option, NOT `ios`
-    // — `ios` keeps its own meaning (low-mem policy, sandboxing assumptions).
-    build_options.addOption(bool, "macos_engines", true);
-    // The DSV4.1 prompt pass routed-call timers (src/dsv41_prefill_timers.zig): profile builds only.
-    build_options.addOption(bool, "dsv41_prefill_timers", b.option(bool, "dsv41-prefill-timers", "Compile the DSV4.1 prompt pass routed-call timers in (profile builds only)") orelse false);
+    // The slim host (docs/plugins.md): the MLX engine and the registered plugins; ds4, llama.cpp and the ANE bridge
+    // are left out for their stubs. Only the server graph is slimmed; the test graph is always the full one.
+    const slim = b.option(bool, "slim", "Slim host: the MLX engine and the registered plugins; no ds4, llama.cpp or ANE") orelse false;
+    var profile: [plugin_build_options.len]bool = undefined;
+    for (plugin_build_options, &profile) |o, *on| on.* = b.option(bool, o.name, o.description) orelse o.default;
+    const core: CoreOptions = .{ .version = version, .mas = mas, .mlx_c_version = mlx_c_version, .ds4_commit = ds4_commit, .llama_tag = llama_tag, .git_sha = git_sha, .profile = &profile };
+    const build_options = core.add(b, !slim);
+    const test_options = core.add(b, true);
+    // The decode profile's command-buffer timeline sources ride the decode-timers profile option.
+    const dsv41_decode_timers = for (plugin_build_options, profile) |o, on| {
+        if (std.mem.eql(u8, o.field, "dsv41_decode_timers")) break on;
+    } else false;
     const shared = addShared(b, target, optimize);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
@@ -188,20 +182,23 @@ pub fn build(b: *std.Build) void {
     // `lib/ds4/` submodule pinned at 9139e2a and `src/arch/ds4.zig`. Kernel
     // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
-    addDs4Sources(b, mod);
-    mod.addIncludePath(b.path("lib/ds4"));
+    if (!slim) {
+        addDs4Sources(b, mod);
+        mod.addIncludePath(b.path("lib/ds4"));
+    }
     addExpertIoSources(b, mod, false, dsv41_decode_timers);
 
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
     // returns unavailable on machines/OSes without it) + the per-layer MLP
     // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
-    addAneSources(b, mod);
+    // The slim host links the Linux graph's unavailable stubs instead.
+    if (slim) mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} }) else addAneSources(b, mod);
 
     // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
-    addLlamaLib(b, mod);
+    if (!slim) addLlamaLib(b, mod);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -239,6 +236,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
 
+    // The server graph's semantic check: nothing depends on this artifact's binary, so no code is generated.
+    const check_exe = b.addExecutable(.{ .name = "mlx-serve-check", .root_module = mod });
+    b.step("check", "Check that the server graph compiles, without codegen (with -Dslim: the slim host)").dependOn(&check_exe.step);
+
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
@@ -246,7 +247,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libcpp = true,
         .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = test_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
@@ -311,7 +312,7 @@ pub fn build(b: *std.Build) void {
 
     // Only the test root's module runs its `test` decls, so each shared module gets its own artifact.
     // mlx.zig's tests create arrays (the device): the full suite runs them, the hermetic lanes never do.
-    // mlx-test gets its own module instance: linking MLX into the shared one would link it everywhere.
+    // mlx-test gets its own module instance: linking MLX into the shared one would link it into the CPU lane.
     const mlx_test_mod = b.createModule(.{
         .root_source_file = b.path("src/mlx.zig"),
         .target = target,
@@ -326,6 +327,25 @@ pub fn build(b: *std.Build) void {
         b.addTest(.{ .name = "mlx-test", .root_module = mlx_test_mod }),
     };
     for (shared_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
+
+    // The plugin SDK's tests and the conformance suite's CPU lane (docs/plugins.md): sdk.testing over every
+    // registered plugin, rooted at the registry. No device: neither links MLX.
+    const registry_mod = b.createModule(.{
+        .root_source_file = b.path("src/plugins.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = test_options.createModule() }},
+    });
+    shared.importInto(registry_mod);
+    const sdk_tests = b.addTest(.{ .name = "sdk-test", .root_module = shared.sdk, .filters = if (test_filter) |f| &.{f} else &.{} });
+    const conformance_tests = b.addTest(.{ .name = "conformance", .root_module = registry_mod, .filters = if (test_filter) |f| &.{f} else &.{} });
+    const conformance = b.step("conformance", "Run the SDK's tests and the plugin conformance suite (CPU lane, no device)");
+    conformance.dependOn(&b.addRunArtifact(sdk_tests).step);
+    conformance.dependOn(&b.addRunArtifact(conformance_tests).step);
+    test_step.dependOn(conformance);
+    const sdk_test_build = b.step("sdk-test-build", "Compile the SDK, conformance and shared-module tests without running them (mlx-test creates arrays)");
+    for ([_]*std.Build.Step.Compile{ sdk_tests, conformance_tests } ++ shared_tests) |t| sdk_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -405,6 +425,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
+    build_options.addOption(bool, "embedded_engines", false);
 
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
@@ -589,6 +610,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     // member named 'mas'/...").
     ios_options.addOption(bool, "mas", true);
     ios_options.addOption(bool, "macos_engines", false);
+    ios_options.addOption(bool, "embedded_engines", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
@@ -777,17 +799,57 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/ane"));
 }
 
-/// The modules every graph shares by name (docs/plugins.md, PR 1): the MLX FFI, logging and the I/O helpers.
-/// One instance per graph, so every module that imports them sees one set of types.
+/// The build options a macOS graph's sources read. The server and the test graph differ only in
+/// `embedded_engines` (the slim host's switch).
+const CoreOptions = struct {
+    version: []const u8,
+    mas: bool,
+    mlx_c_version: []const u8,
+    ds4_commit: []const u8,
+    llama_tag: []const u8,
+    git_sha: []const u8,
+    /// One value per `plugin_build_options` entry.
+    profile: []const bool,
+
+    fn add(c: CoreOptions, b: *std.Build, embedded_engines: bool) *std.Build.Step.Options {
+        const o = b.addOptions();
+        o.addOption([]const u8, "version", c.version);
+        o.addOption(bool, "mas", c.mas);
+        o.addOption([]const u8, "mlx_c_version", c.mlx_c_version);
+        o.addOption([]const u8, "ds4_commit", c.ds4_commit);
+        o.addOption([]const u8, "llama_tag", c.llama_tag);
+        o.addOption([]const u8, "git_sha", c.git_sha);
+        // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
+        // builds its own options with ios=true so the engine swaps the macOS-only
+        // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
+        o.addOption(bool, "ios", false);
+        // True on every macOS graph: the macOS-only sources (the expert reader's C pool and
+        // event shims, the native module archs) are compiled in. iOS static lib and Linux exe =
+        // no: they get compile-time stubs (src/*_stub.zig) and src/ane_stub.c on Linux. The stub
+        // selection reads this option, NOT `ios` — `ios` keeps its own meaning (low-mem policy,
+        // sandboxing assumptions).
+        o.addOption(bool, "macos_engines", true);
+        // The embedded engines (ds4 Metal, libllama) are linked: the macOS exe and tests, not the
+        // slim host, iOS or Linux, which select src/arch/*_stub.zig and src/ds4_ffi_stub.zig.
+        o.addOption(bool, "embedded_engines", embedded_engines);
+        for (plugin_build_options, c.profile) |opt, on| o.addOption(bool, opt.field, on);
+        return o;
+    }
+};
+
+/// The modules every graph shares by name (docs/plugins.md, PR 1): the MLX FFI, logging, the I/O helpers and the
+/// plugin SDK over them. One instance per graph, so the host and its plugins see one set of types.
 const Shared = struct {
     mlx: *std.Build.Module,
     log: *std.Build.Module,
     io_util: *std.Build.Module,
+    sdk: *std.Build.Module,
 
     fn importInto(s: Shared, m: *std.Build.Module) void {
         m.addImport("mlx", s.mlx);
         m.addImport("log", s.log);
         m.addImport("io_util", s.io_util);
+        m.addImport("sdk", s.sdk);
     }
 };
 
@@ -801,7 +863,14 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
         .imports = &.{.{ .name = "log", .module = log }},
     });
-    return .{ .mlx = mlx, .log = log, .io_util = io_util };
+    const sdk = b.createModule(.{
+        .root_source_file = b.path("src/sdk.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
+    });
+    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk };
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {
