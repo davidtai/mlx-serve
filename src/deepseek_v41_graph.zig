@@ -183,6 +183,9 @@ pub const Routes = struct {
     /// residual, the tap is settled), not at its routed group's HC post; the routed groups then hold one hc-width
     /// stream. Lifetime only: the same ops.
     input_stream_early_release: bool = false,
+    /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
+    /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
+    predict_bf16: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,
@@ -1951,10 +1954,12 @@ pub fn Trunk(comptime G: type) type {
             return predictTopk(g, c, try g.reshape(x, &.{ -1, @as(c_int, @intCast(c.hidden_size)) }), wf, w.gate_bias);
         }
 
-        /// The predictor's selection over `x` [rows, dim]: `gatePrefix`'s biased scores (the gate `wf` in f32)
-        /// and each row's top-k ids by `gateSelect`'s partition, unordered, int32 [rows, k].
+        /// The predictor's selection over `x` [rows, dim]: `gatePrefix`'s biased scores and each row's top-k ids by
+        /// `gateSelect`'s partition, unordered, int32 [rows, k]. The GEMM runs in `wf`'s dtype: the gate in f32 (the
+        /// router's numerics) or as stored in bf16 (`Routes.predict_bf16`); the scores are f32 either way.
         pub fn predictTopk(g: *G, c: *const v41.Config, x: T, wf: T, bias: T) !T {
-            const biased = try g.add(try g.sqrt(try g.softplus(try linear(g, try g.astype(x, .float32), wf))), bias);
+            const logits = try g.astype(try linear(g, try g.astype(x, g.dtypeOf(wf)), wf), .float32);
+            const biased = try g.add(try g.sqrt(try g.softplus(logits)), bias);
             const k: c_int = @intCast(c.n_experts_per_tok);
             return g.astype(try sliceLast(g, try g.argpartition(try g.neg(biased), k - 1, -1), 0, k), .int32);
         }

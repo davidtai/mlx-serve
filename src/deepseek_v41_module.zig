@@ -115,6 +115,8 @@ pub const RouteOverrides = struct {
     decode_memos: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
+    /// P1's predictor GEMM on the gate as stored (bf16) instead of an f32 copy; exact outputs (it only chooses reads).
+    predict_bf16: ?bool = null,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
@@ -339,6 +341,7 @@ pub const Module = struct {
         if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
         if (ov.decode_memos) |v| tier.routes.decode_memos = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
+        if (ov.predict_bf16) |v| tier.routes.predict_bf16 = v;
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
@@ -385,11 +388,13 @@ pub const Module = struct {
         self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
         self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
+        self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
+        log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
@@ -1041,6 +1046,8 @@ pub const Installed = struct {
     decode_memos: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
+    /// P1's predictor GEMM in bf16, as installed.
+    predict_bf16: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).
     head_mode: graph.Routes.Head = .f32,
 
