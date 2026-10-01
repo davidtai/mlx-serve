@@ -3781,7 +3781,7 @@ fn replayLookahead(a: std.mem.Allocator, bank: *const expert_bank.Bank, f: anyty
     var rows: [40]u32 = @splat(0);
     rows[L] = 3;
     rows[L + 1] = 3;
-    const s = try Stream.init(a, bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 5 * 6, .wide_depth = 5, .lookahead = .{}, .event = .{}, .transient_release = release });
+    const s = try Stream.init(a, bank, .{ .rows = &rows, .max_route_ids = 6, .transient_rows = 5 * 6, .wide_depth = 5, .lookahead = .{}, .event = .{ .watchdog_ms = 10_000 }, .transient_release = release });
     defer s.deinit();
     const geom = &bank.layers[L];
     for ([_]u32{ L, L + 1 }) |l| {
