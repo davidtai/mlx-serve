@@ -15,7 +15,7 @@ const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const kr = sdk.kernels.Routes(xk);
 const ks = sdk.kernels.KernelSet(xk);
-const quant = @import("quant.zig");
+const quant = @import("sdk").quant;
 const sdk = @import("sdk");
 
 const Allocator = std.mem.Allocator;
@@ -347,7 +347,8 @@ const checked_at_accept = blk: {
 };
 
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
-    const set = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
+    const ref = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
+    const set = ks.Set.of(ref) orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted with a kernel set over another registry (manifest {s})", .{ref.manifest_sha256});
     try checkSpec(spec, diag);
     const acc = try a.create(Accepted(G));
     acc.* = .{ .a = a, .reg = &set.reg, .gemv = undefined, .prep = undefined, .tok = undefined };
@@ -2484,7 +2485,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
     defer set.deinit();
     set.install(Trace, &tb);
-    const acc = try accept(Trace, a, &tb, .{ .kernels = set }, v41_spec, &diag);
+    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref() }, v41_spec, &diag);
     defer acc.deinit(&tb);
     const bb = try namedBank(&tb, 64);
     var lane_log: std.ArrayList(u8) = .empty;
@@ -2502,7 +2503,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         var tf: Trace = .{ .a = a };
         defer tf.deinit();
         set.install(Trace, &tf);
-        const accf = try accept(Trace, a, &tf, .{ .kernels = set }, v41_spec, &diag);
+        const accf = try accept(Trace, a, &tf, .{ .kernels = set.ref() }, v41_spec, &diag);
         defer accf.deinit(&tf);
         try accf.routeFusedDown(set, &diag);
         try testing.expect(accf.fused_down and !acc.fused_down);

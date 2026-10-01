@@ -12,6 +12,14 @@ const std = @import("std");
 const mlx = @import("mlx");
 const profile = @import("profile.zig");
 
+/// A load's kernel set as a quant's accept receives it (`sdk.quant.Context.kernels`): the set, erased, and the pin
+/// of the registry it is built over. A quant takes it back as its own registry's set (`KernelSet(R).Set.of`); a set
+/// over another registry is refused by name there, never cast.
+pub const SetRef = struct {
+    set: *const anyopaque,
+    manifest_sha256: []const u8,
+};
+
 /// The kernel set over registry `R`, which supplies `Kernel`, `Check`, `Texts`, `embedded`, `manifest_sha256`,
 /// `Registry`, `Bound` (with `observe`), `Diag`, `n_kernels`, `n_headers` and its self-check plan (`R.selfcheck`:
 /// `Report`, `runSubset`, `judge`).
@@ -84,6 +92,17 @@ pub fn KernelSet(comptime R: type) type {
                     .stub => .{ .reg = &s.reg, .stream = .{}, .kernels = @splat(.{}) },
                 };
                 return s;
+            }
+
+            /// The set as a quant's accept takes it (`sdk.quant.Context.kernels`), pinned to `R`.
+            pub fn ref(self: *const Set) SetRef {
+                return .{ .set = self, .manifest_sha256 = xk.manifest_sha256 };
+            }
+
+            /// `r` as a set over `R`; null when it is built over another registry (another pin).
+            pub fn of(r: SetRef) ?*const Set {
+                if (!std.mem.eql(u8, r.manifest_sha256, xk.manifest_sha256)) return null;
+                return @ptrCast(@alignCast(r.set));
             }
 
             /// After every consumer's `deinit` and `uninstall`.

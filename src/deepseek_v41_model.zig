@@ -1754,7 +1754,7 @@ test "dsv41 model: A1's recall check (profile builds): every decode-width layer 
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
     const xp = @import("deepseek_v41_experts.zig");
-    const quant = @import("quant.zig");
+    const quant = @import("sdk").quant;
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);
@@ -1817,7 +1817,7 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
 
 test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted ids, hands the seed's ranking to the hook, and the call lands it before routing" {
     const xp = @import("deepseek_v41_experts.zig");
-    const quant = @import("quant.zig");
+    const quant = @import("sdk").quant;
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);

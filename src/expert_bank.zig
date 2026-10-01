@@ -611,7 +611,7 @@ const ManifestSource = struct {
 
 // ── C2: the bank's description for the quants' claims ──
 
-const quant = @import("quant.zig");
+const quant = @import("sdk").quant;
 
 /// The bank's description (`quant.BankPeek`) from its v2 manifest, for the load path's quant
 /// `claims`: the `quantization` object whole (each quant reads its own fields), the dims, and

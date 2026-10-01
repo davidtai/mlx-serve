@@ -11,7 +11,7 @@ const selfcheck = @import("exl3_selfcheck.zig");
 const kr = sdk.kernels.Routes(xk);
 const ks = sdk.kernels.KernelSet(xk);
 const kt = sdk.kernels.Trace(xk);
-const quant = @import("quant.zig");
+const quant = @import("sdk").quant;
 const eq = @import("exl3_quant.zig");
 const tr = @import("dsv41_kernel_routes.zig");
 
@@ -115,7 +115,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     var plan: usize = 0;
     for (&set.reg.entries) |*e| plan += e.checks.count();
     // the EXL3 quant: exactly its 60 checks (49 + the take2 retune's 3 + the 128-row GEMMs' 8), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
-    const acc = try eq.accept(Trace, a, &t, .{ .kernels = set }, v41_spec, &diag);
+    const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
     try testing.expectEqual(@as(usize, 60), acc.report.results.items.len);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
@@ -178,13 +178,13 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
         var want: [96]u8 = undefined;
         const name = try std.fmt.bufPrint(&want, "{t} {t}", .{ f.k, f.c });
         if (f.exl3) {
-            try testing.expectError(error.SelfCheckFailed, eq.accept(Trace, a, &t, .{ .kernels = bad }, v41_spec, &diag));
+            try testing.expectError(error.SelfCheckFailed, eq.accept(Trace, a, &t, .{ .kernels = bad.ref() }, v41_spec, &diag));
             try testing.expect(std.mem.indexOf(u8, diag.message(), name) != null);
             try tr.accept(a, bad, &r2, &diag);
         } else {
             try testing.expectError(error.SelfCheckFailed, tr.accept(a, bad, &r2, &diag));
             try testing.expect(std.mem.indexOf(u8, diag.message(), name) != null);
-            const ok = try eq.accept(Trace, a, &t, .{ .kernels = bad }, v41_spec, &diag);
+            const ok = try eq.accept(Trace, a, &t, .{ .kernels = bad.ref() }, v41_spec, &diag);
             ok.deinit(&t);
         }
     }
@@ -911,7 +911,7 @@ test "dsv41 kernels ops: the routes launch the same through the profiling backen
     const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
     defer set.deinit();
     set.install(P, &pt);
-    const acc = try eq.accept(P, a, &pt, .{ .kernels = set }, v41_spec, &diag);
+    const acc = try eq.accept(P, a, &pt, .{ .kernels = set.ref() }, v41_spec, &diag);
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), pt.inner.launcher.?);
     try testing.expectEqual(@as(isize, 288), pt.inner.prepared_live);
     // the router at the lane's samples, wrapped (inside a phase) and not

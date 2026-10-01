@@ -94,7 +94,7 @@ fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps, c: *const v41.Config) !
     errdefer set.deinit();
     set.install(ops.MlxOps, g);
     errdefer kernel_set.Set.uninstall(ops.MlxOps, g);
-    const exl3 = try xq.accept(ops.MlxOps, gpa, g, .{ .kernels = set }, .{
+    const exl3 = try xq.accept(ops.MlxOps, gpa, g, .{ .kernels = set.ref() }, .{
         .hidden = c.hidden_size,
         .inter = c.moe_intermediate_size,
         .top_k = c.n_experts_per_tok,

@@ -1875,7 +1875,7 @@ test "dsv41 dspark loop: the MLX instantiation of the loop analyses (host, nothi
 /// A wide route that records each call: its layer (routes are built in layer
 /// order), rows, act rows and slots, in the order the forward makes them.
 const WideLog = struct {
-    const quant = @import("quant.zig");
+    const quant = @import("sdk").quant;
     var next_layer: u32 = 0;
     var order: [512]u32 = undefined;
     var n_order: usize = 0;

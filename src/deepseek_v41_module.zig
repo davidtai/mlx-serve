@@ -1098,7 +1098,7 @@ pub const Module = struct {
         errdefer self.set.deinit();
         self.set.install(G, &self.g);
         errdefer kernel_set.Set.uninstall(G, &self.g);
-        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set }, .{
+        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set.ref() }, .{
             .hidden = c.hidden_size,
             .inter = c.moe_intermediate_size,
             .top_k = c.n_experts_per_tok,

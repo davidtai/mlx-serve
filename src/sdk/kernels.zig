@@ -12,6 +12,8 @@ pub const Pin = struct {
 
 /// The kernel set over registry `R`: `Set`, its `Device`, the consumers' partition checks.
 pub const KernelSet = @import("kernel_set.zig").KernelSet;
+/// A load's kernel set as a quant's accept receives it, erased with its registry's pin.
+pub const SetRef = @import("kernel_set.zig").SetRef;
 /// One load's kernel set over registry `R`.
 pub fn Set(comptime R: type) type {
     return KernelSet(R).Set;

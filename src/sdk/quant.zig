@@ -33,24 +33,23 @@
 //!   deinit(*, *G) void
 
 const std = @import("std");
-const sdk = @import("sdk");
 const mlx = @import("mlx");
-const xk = @import("exl3_kernels.zig");
-const kernel_set = sdk.kernels.KernelSet(xk);
-const QuantMode = @import("model.zig").QuantMode;
+const pk = @import("peek.zig");
+const kernel_reg = @import("kernels.zig");
+const QuantMode = @import("quant_mode.zig").QuantMode;
 
 const Allocator = std.mem.Allocator;
 const Dtype = mlx.mlx_dtype;
 
-pub const Diag = xk.Diag;
+pub const Diag = pk.Diag;
 
 /// How strongly a quant claims a weight group: the load path asks every quant and takes the highest.
-pub const Priority = sdk.Priority;
+pub const Priority = pk.Priority;
 
 /// A weight group's per-expert tensor, its layers, and its description at load (the SDK's `GroupPeek`).
-pub const Segment = sdk.Segment;
-pub const LayerPeek = sdk.LayerPeek;
-pub const BankPeek = sdk.GroupPeek;
+pub const Segment = pk.Segment;
+pub const LayerPeek = pk.LayerPeek;
+pub const BankPeek = pk.GroupPeek;
 
 /// The routed experts' activation between gate / up and down. It is the arch's: a quant whose
 /// texts fuse it declares the one they fuse and refuses the rest at accept.
@@ -73,9 +72,10 @@ pub const Spec = struct {
 };
 
 /// What the load context hands a quant's accept: the kernel set it owns (a quant with pinned
-/// texts self-checks its subset there) and the claimed group's description.
+/// texts takes it back as its own registry's set and self-checks its subset there) and the
+/// claimed group's description.
 pub const Context = struct {
-    kernels: ?*const kernel_set.Set = null,
+    kernels: ?kernel_reg.SetRef = null,
     peek: ?*const BankPeek = null,
 };
 

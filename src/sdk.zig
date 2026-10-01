@@ -84,6 +84,9 @@ pub const expert = struct {
 };
 
 pub const kernels = @import("sdk/kernels.zig");
+/// The `quant` kind's contract (C2): the routed-expert quant a weight group's claim binds, and the generic
+/// gather quant (`GatherQmm` through `FromGatherMatmul`).
+pub const quant = @import("sdk/quant.zig");
 /// G7: a plugin's profile probes, injected by its arch's backend type (`of(Backend)`); off everywhere else.
 pub const profile = @import("sdk/profile.zig");
 pub const BuildOption = @import("sdk/build_option.zig").BuildOption;
