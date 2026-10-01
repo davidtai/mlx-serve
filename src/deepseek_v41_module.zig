@@ -1747,11 +1747,16 @@ const WaveBound = struct {
     reset: u64,
     outside: u64,
     widest: u64,
+    /// The same bound in buffers (`graph.heldArrays`): the nodes outside every wave plus the widest wave's kept ones
+    /// and its widest sub-wave's two.
+    arrays: u64,
 
     fn of(g: *const ops.TraceOps, from: usize, to: usize, freed: []const ops.TraceOps.Freed) WaveBound {
         const total = graph.heldBytes(g, from, to).sum;
         var in_waves: u64 = 0;
         var widest: u64 = 0;
+        var in_waves_n: u64 = 0;
+        var widest_n: u64 = 0;
         for (freed, 0..) |w, i| {
             if (w.to <= w.from) continue;
             const inner = for (freed, 0..) |v, j| {
@@ -1760,10 +1765,16 @@ const WaveBound = struct {
             if (inner) continue;
             const all = graph.heldBytes(g, w.from, w.to).sum;
             in_waves += all;
+            const all_n = graph.heldArrays(g, w.from, w.to, false);
+            in_waves_n += all_n;
+            var kept_n = all_n;
+            var live_n: u64 = 0;
             var kept = all;
             var live: u64 = 0;
             for (freed) |r| {
                 if (r.from >= w.from and r.to <= w.to and (r.from != w.from or r.to != w.to) and r.to > r.from) {
+                    kept_n = (kept_n -| graph.heldArrays(g, r.from, r.to, false)) + 1;
+                    live_n = 2;
                     var a: u64 = 0;
                     var b: u64 = 0;
                     var out: u64 = 0;
@@ -1781,8 +1792,9 @@ const WaveBound = struct {
                 }
             }
             widest = @max(widest, kept + live);
+            widest_n = @max(widest_n, kept_n + live_n);
         }
-        return .{ .reset = total, .outside = total -| in_waves, .widest = widest };
+        return .{ .reset = total, .outside = total -| in_waves, .widest = widest, .arrays = (graph.heldArrays(g, from, to, false) -| in_waves_n) + widest_n };
     }
 };
 
@@ -1842,16 +1854,25 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     g.host_values = rid.values();
     const prompt = try aa.alloc(u32, 16384);
     for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    // wire_tables' buffer counts (`bill.wire_arrays_*`), the served tier's: what the model builds beyond the checkpoint's
+    // tensors (the bill counts those from the headers) plus the state's KV, and the most buffers one forward holds at
+    // once at decode rows (<= 8) and at prompt rows.
+    var state_n: u64 = 0;
+    var wave_n: [2]u64 = .{ 0, 0 };
     for ([_]struct { name: []const u8, tier: routes.Tier, attn: v41.PrefillBill.Tier }{
         .{ .name = "stock", .tier = routes.stock, .attn = .stock },
         .{ .name = "served", .tier = routes.served, .attn = .served },
     }) |t| {
+        const m0 = g.nodes.items.len;
         const model_ = try TM.initWith(a, &g, c, t.tier, &lookup, &src, .{ .registry = &reg });
         defer model_.deinit(&g);
+        const model_n = graph.heldArrays(&g, m0, g.nodes.items.len, false);
         // (positions already in the state, rows): the decode lane, the gate's prompt, wide chunks, the 16K prompt.
         for ([_][2]u32{ .{ 0, 8 }, .{ 0, 63 }, .{ 0, 953 }, .{ 1024, 953 }, .{ 0, 16384 } }) |pn| {
+            const s0 = g.nodes.items.len;
             var st = try model_.newState();
             defer st.deinit(&g, a);
+            if (t.attn == .served) state_n = @max(state_n, model_n + graph.heldArrays(&g, s0, g.nodes.items.len, true));
             if (pn[0] > 0) {
                 const r0 = try model_.forward(&g, &st, prompt[0..pn[0]], .{ .logits = .none }, &ex, graph.NoProbe{});
                 try TM.fence(&g, &st, &.{r0.hidden});
@@ -1869,10 +1890,15 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
             // The widest wave is a whole chunk's: the model's chunk, reading the whole prompt at its end.
             const chunk = @min(n, bill.chunkRows(pn[0] + n));
             const billed = bill.waveBytes(chunk, pn[0] + n, t.attn);
-            std.debug.print("\nDSV41_HELD {{\"tier\": \"{s}\", \"positions\": {d}, \"rows\": {d}, \"outside\": {d}, \"widest\": {d}, \"billed\": {d}}}", .{ t.name, pn[0], n, h.outside, h.widest, billed });
+            std.debug.print("\nDSV41_HELD {{\"tier\": \"{s}\", \"positions\": {d}, \"rows\": {d}, \"outside\": {d}, \"widest\": {d}, \"billed\": {d}, \"arrays\": {d}}}", .{ t.name, pn[0], n, h.outside, h.widest, billed, h.arrays });
             try std.testing.expect(h.outside + h.widest <= billed);
+            if (t.attn == .served) wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)] = @max(wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)], h.arrays);
         }
     }
+    std.debug.print("\nDSV41_WIRE_ARRAYS {{\"built_and_state\": {d}, \"decode_wave\": {d}, \"prompt_wave\": {d}}}", .{ state_n, wave_n[0], wave_n[1] });
+    try std.testing.expect(state_n <= bill_mod.wire_arrays_state);
+    try std.testing.expect(wave_n[0] <= bill_mod.wire_arrays_decode_wave);
+    try std.testing.expect(wave_n[1] <= bill_mod.wire_arrays_prompt_wave);
     // The bill's chunk is the model's.
     for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
         try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));

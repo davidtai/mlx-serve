@@ -1400,6 +1400,25 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
                 // trace cannot bound it from above here; the chunk-major tiers keep their ratio rules below.
                 try testing.expect(nst.peak + halves <= billed);
                 if (!t.tier.routes.prefill_index) try testing.expect(billed <= nst.peak + halves + (nst.peak + halves) / 2);
+                // wire_tables' prompt wave in buffers: every node of the widest layer wave (no frees inside it
+                // credited), the nodes outside the layer waves, and each chunk's kept Halves (four arrays).
+                const end = g.nodes.items.len;
+                const freed = g.freed.items[w0..];
+                var in_layers: u64 = 0;
+                var widest: u64 = 0;
+                for (freed, 0..) |w, wi| {
+                    if (w.to <= w.from) continue;
+                    const inner = for (freed, 0..) |o, oi| {
+                        if (oi != wi and o.from <= w.from and w.to <= o.to and (o.from != w.from or o.to != w.to)) break true;
+                    } else false;
+                    if (inner) continue;
+                    const n = graph.heldArrays(&g, w.from, w.to, false);
+                    in_layers += n;
+                    widest = @max(widest, n);
+                }
+                const k16_arrays = (graph.heldArrays(&g, f0, end, false) -| in_layers) + widest + 4 * spans.len;
+                std.debug.print("DSV41_WIRE_ARRAYS_K16 {{\"prompt_wave\": {d}}}\n", .{k16_arrays});
+                try testing.expect(k16_arrays <= @import("deepseek_v41_bill.zig").wire_arrays_prompt_wave);
             }
             const h = if (t.tier.layer_major) Held{ .reset = 0, .outside = 0, .layer = 0, .wave = 0, .widest_at = 0 } else Held.of(&g, f0, g.nodes.items.len, g.freed.items[w0..]);
             if (i == 0 or h.outside + h.layer > worst.outside + worst.layer) {
