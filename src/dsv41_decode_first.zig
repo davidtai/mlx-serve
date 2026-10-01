@@ -4,6 +4,10 @@
 //! What it counts:
 //!   - per routed layer call: the routing barrier's wait, the route, the MoE's build and commit (hit, hoist and miss
 //!     waves), and the distinct experts the call missed; the first cycle apart, the warm cycles summed;
+//!   - per layer, the demand reads' drive time: the stream's read gauge from one barrier's end to the next layer's
+//!     (the reads a route issues land before the next barrier returns), against that barrier;
+//!   - the prompt's last `tail_rows` rows' routed experts per layer, and in the first cycle how many of each layer's
+//!     misses they hold and how many reads they would cost (A0's first-verify reads at the grow);
 //!   - the decode timers' buckets at the first cycle's end;
 //!   - the first dispatches of each phase (construction, the prompt pass, the first cycle, the warm cycles): a
 //!     registry kernel's variant (MLX builds one library per kernel, template and input binding: scalar, `constant`
@@ -22,12 +26,23 @@ pub var phase: Phase = .build;
 
 pub const max_layers = 64;
 pub const max_experts = 512;
-pub const Layer = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, moe_ns: u64 = 0, misses: u64 = 0 };
+pub const Layer = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, moe_ns: u64 = 0, misses: u64 = 0, read_ns: u64 = 0 };
 /// Per routed layer: [0] the first cycle, [1] the warm cycles summed.
 pub var layers: [2][max_layers]Layer = @splat(@splat(.{}));
 /// The decode timers' buckets and routed calls at the first cycle's end.
 pub var cycle1_ns: @TypeOf(dt.ns) = @splat(0);
 pub var cycle1_calls: u64 = 0;
+/// The previous routed call's layer and the read gauge at its barrier's end (`call`).
+var last_layer: ?u32 = null;
+var last_wall: u64 = 0;
+
+/// The prompt rows whose experts make the tail set: the prompt's last rows per layer (its last call's).
+pub const tail_rows = 8;
+pub const Tail = struct { size: u64 = 0, reads: u64 = 0, hits: u64 = 0 };
+var tail: [max_layers]std.StaticBitSet(max_experts) = @splat(.empty);
+/// Per layer in the first cycle: the tail set's size, its experts not resident (the reads it costs), and the
+/// call's misses it holds.
+pub var tails: [max_layers]Tail = @splat(.{});
 
 /// First dispatches counted per phase; the first cycle's named.
 pub var new_per_phase: [4]u32 = @splat(0);
@@ -52,7 +67,31 @@ pub fn startDecode() void {
     cycle1_ns = @splat(0);
     cycle1_calls = 0;
     n_cycle1_new = 0;
+    last_layer = null;
+    tails = @splat(.{});
     phase = .cycle1;
+}
+
+/// A prompt call's routed ids (`n` rows x `k`, row order): its last `tail_rows` rows' experts become the layer's
+/// tail set (a later call of the layer replaces it, so the prompt's last call's rows stand).
+pub fn tailRecord(layer: u32, ids: []const u16, n: u32, k: u32) void {
+    if (comptime !enabled) return;
+    if (phase != .prompt or layer >= max_layers or n == 0) return;
+    const r = @min(n, tail_rows);
+    tail[layer] = .empty;
+    for (ids[(n - r) * k .. n * k]) |e| {
+        if (e < max_experts) tail[layer].set(e);
+    }
+}
+
+/// The tail set's experts at `layer` not resident there now (before its first-cycle route): the reads it costs.
+pub fn tailReads(layer: u32, ctx: anytype, comptime resident: fn (@TypeOf(ctx), u16) bool) u64 {
+    if (comptime !enabled) return 0;
+    if (phase != .cycle1 or layer >= max_layers) return 0;
+    var n: u64 = 0;
+    var it = tail[layer].iterator(.{});
+    while (it.next()) |e| n += @intFromBool(!resident(ctx, @intCast(e)));
+    return n;
 }
 
 /// A DSpark round has ended: after the first, its buckets are kept and the warm cycles begin.
@@ -64,8 +103,10 @@ pub fn endCycle() void {
     phase = .warm;
 }
 
-/// One routed layer call at decode width (`Experts.run`'s stamps, ns).
-pub fn call(layer: u32, barrier_ns: u64, route_ns: u64, moe_ns: u64, misses: u64) void {
+/// One routed layer call at decode width (`Experts.run`'s stamps, ns): its ids and their waves (its misses), the
+/// stream's read gauge at its barrier's end (`read_wall_ns`; the previous layer's demand reads landed by then), and
+/// in the first cycle the tail set's reads (`tailReads`, before the route).
+pub fn call(layer: u32, barrier_ns: u64, route_ns: u64, moe_ns: u64, ids: []const u16, waves: []const u8, read_wall_ns: u64, tail_reads: u64) void {
     if (comptime !enabled) return;
     const w: usize = switch (phase) {
         .cycle1 => 0,
@@ -73,12 +114,23 @@ pub fn call(layer: u32, barrier_ns: u64, route_ns: u64, moe_ns: u64, misses: u64
         else => return,
     };
     if (layer >= max_layers) return;
+    // the gauge between the previous layer's barrier and this one's: the previous route's demand reads
+    if (last_layer) |ll| if (layer == ll + 1) {
+        layers[w][ll].read_ns += read_wall_ns -| last_wall;
+    };
+    last_layer = layer;
+    last_wall = read_wall_ns;
+    var m: std.StaticBitSet(max_experts) = .empty;
+    for (ids, waves) |e, wv| {
+        if (wv > 0 and e < max_experts) m.set(e);
+    }
     const l = &layers[w][layer];
     l.calls += 1;
     l.barrier_ns += barrier_ns;
     l.route_ns += route_ns;
     l.moe_ns += moe_ns;
-    l.misses += misses;
+    l.misses += m.count();
+    if (w == 0) tails[layer] = .{ .size = tail[layer].count(), .reads = tail_reads, .hits = m.intersectWith(tail[layer]).count() };
 }
 
 /// The distinct routed experts a call missed: `waves[i]` > 0 when routed id i reads from a miss part.
@@ -174,8 +226,8 @@ fn write(w: *std.Io.Writer, n: u32, stream_misses: ?u64) !void {
     }
     try w.print("}}, \"cycle1_routed_calls\": {d}, \"cycle1_routed_misses\": {d}, \"warm_routed_misses_per_cycle\": {d:.2}", .{ cycle1_calls, routed[0], @as(f64, @floatFromInt(routed[1])) / @as(f64, @floatFromInt(@max(warm, 1))) });
     if (stream_misses) |s| try w.print(", \"cycle1_stream_misses\": {d}", .{s});
-    const Field = enum { barrier, route, moe, misses };
-    inline for (.{ Field.barrier, Field.route, Field.moe, Field.misses }) |f| {
+    const Field = enum { barrier, route, moe, misses, read_busy };
+    inline for (.{ Field.barrier, Field.route, Field.moe, Field.misses, Field.read_busy }) |f| {
         inline for (.{ "cycle1", "warm" }, 0..) |label, c| {
             try w.print(", \"{s}_{s}{s}\": [", .{ label, @tagName(f), if (f == .misses) "" else "_ms" });
             for (layers[c][0..n], 0..) |l, i| {
@@ -185,11 +237,25 @@ fn write(w: *std.Io.Writer, n: u32, stream_misses: ?u64) !void {
                     .route => ms(l.route_ns, per),
                     .moe => ms(l.moe_ns, per),
                     .misses => @as(f64, @floatFromInt(l.misses)) / @as(f64, @floatFromInt(@max(per, 1))),
+                    .read_busy => ms(l.read_ns, per),
                 };
                 try w.print("{s}{d:.2}", .{ if (i == 0) "" else ", ", v });
             }
             try w.writeAll("]");
         }
+    }
+    // the tail set (the prompt's last rows' experts) against the first cycle's misses
+    var tt: Tail = .{};
+    for (tails[0..n]) |t| {
+        tt.size += t.size;
+        tt.reads += t.reads;
+        tt.hits += t.hits;
+    }
+    try w.print(", \"tail_rows\": {d}, \"cycle1_tail_size\": {d}, \"cycle1_tail_reads\": {d}, \"cycle1_tail_hits\": {d}, \"cycle1_tail_recall\": {d:.3}", .{ tail_rows, tt.size, tt.reads, tt.hits, @as(f64, @floatFromInt(tt.hits)) / @as(f64, @floatFromInt(@max(routed[0], 1))) });
+    inline for (.{ "size", "reads", "hits" }) |name| {
+        try w.print(", \"cycle1_tail_{s}_by_layer\": [", .{name});
+        for (tails[0..n], 0..) |t, i| try w.print("{s}{d}", .{ if (i == 0) "" else ", ", @field(t, name) });
+        try w.writeAll("]");
     }
     try w.writeAll("}");
 }
@@ -213,16 +279,29 @@ test "dsv41 decode first: a variant or signature counts once, in the phase that 
     try std.testing.expectEqual(@as(usize, 2), n_cycle1_new);
     try std.testing.expectEqualStrings("c", cycle1_new[0].what);
     try std.testing.expectEqual(@as(u64, 2), missedOf(&.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }));
-    call(2, 5_000_000, 1_000_000, 2_000_000, 3);
+    // past the first cycle a call counts with the warm ones
+    call(2, 5_000_000, 1_000_000, 2_000_000, &.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }, 0, 0);
     try std.testing.expectEqual(@as(u64, 0), layers[0][2].calls);
-    phase = .cycle1;
-    call(2, 5_000_000, 1_000_000, 2_000_000, 3);
-    try std.testing.expectEqual(@as(u64, 3), layers[0][2].misses);
+    try std.testing.expectEqual(@as(u64, 2), layers[1][2].misses);
+    // the prompt's last 8 rows (of 10, one expert each) are layer 2's tail set
+    phase = .prompt;
+    tailRecord(2, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, 10, 1);
+    startDecode();
+    // layers 1 and 2 in one verify: the gauge between their barriers is layer 1's reads; layer 2 misses 3 and 9,
+    // both in its tail set, whose 5 non-resident experts are its reads
+    call(1, 1_000_000, 0, 0, &.{4}, &.{0}, 1_000_000, 0);
+    call(2, 5_000_000, 1_000_000, 2_000_000, &.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }, 4_000_000, 5);
+    try std.testing.expectEqual(@as(u64, 3_000_000), layers[0][1].read_ns);
+    try std.testing.expectEqual(@as(u64, 2), layers[0][2].misses);
+    try std.testing.expectEqual(Tail{ .size = 8, .reads = 5, .hits = 2 }, tails[2]);
     var buf: [16384]u8 = undefined;
     const l = line(&buf, 4, 300);
     try std.testing.expect(std.mem.startsWith(u8, l, "DECODE_FIRST {\"cycles\": "));
-    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_barrier_ms\": [0.00, 0.00, 5.00, 0.00]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_barrier_ms\": [0.00, 1.00, 5.00, 0.00]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_read_busy_ms\": [0.00, 3.00, 0.00, 0.00]") != null);
     try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_stream_misses\": 300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_tail_size\": 8, \"cycle1_tail_reads\": 5, \"cycle1_tail_hits\": 2, \"cycle1_tail_recall\": 1.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "\"cycle1_tail_hits_by_layer\": [0, 0, 2, 0]") != null);
     try std.testing.expect(std.mem.endsWith(u8, l, "]}"));
     phase = .build;
 }
