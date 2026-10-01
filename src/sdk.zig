@@ -64,6 +64,8 @@ pub const Rows = memory_bill.Rows;
 pub const fill = memory_bill.fill;
 pub const admit = memory_bill.admit;
 pub const checkMeasured = memory_bill.checkMeasured;
+pub const checkRows = memory_bill.checkRows;
+pub const checkConstruction = memory_bill.checkConstruction;
 
 pub const lifecycle = @import("sdk/lifecycle.zig");
 pub const PhaseObserver = lifecycle.PhaseObserver;

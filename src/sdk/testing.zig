@@ -328,7 +328,7 @@ test "sdk testing: claims fixtures, admission triples and route-following run on
         .{ .config = "{\"architectures\":[\"X\"]}", .want = null },
     });
     const gb: u64 = 1_000_000_000;
-    const terms = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb } }, .{ .name = "waves", .bytes = .{ 14 * gb, 2 * gb } } };
+    const terms = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb }, .at_construction = true }, .{ .name = "waves", .bytes = .{ 14 * gb, 2 * gb }, .at_construction = false } };
     const b: bill.MemoryBill = .{ .terms = &terms, .per_row = gb / 4 };
     try expectAdmission(b, 128, 16, &.{
         // the decode rows capped by the experts, the prompt rows by the decode rows
@@ -338,7 +338,7 @@ test "sdk testing: claims fixtures, admission triples and route-following run on
         .{ .baseline = 9 * gb, .ceiling = 100 * gb, .stop = 8 * (1 << 30), .want = .{ .rows = .{ .prompt = 33, .decode = 85 } } },
         .{ .baseline = 21 * gb, .ceiling = 100 * gb, .stop = 2 * gb, .want = .{ .refused = error.NativeBillDoesNotFit } },
     });
-    const release = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb } }, .{ .name = "waves", .bytes = .{ 14 * gb, 1 * gb } } };
+    const release = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb }, .at_construction = true }, .{ .name = "waves", .bytes = .{ 14 * gb, 1 * gb }, .at_construction = false } };
     try expectRouteFollowing(b, .{ .terms = &release, .per_row = gb / 4 }, &.{"waves"});
     try testing.expectError(error.RouteMovedForeignTerm, expectRouteFollowing(b, .{ .terms = &release, .per_row = gb / 4 }, &.{"residents"}));
     try testing.expectError(error.RouteMovedNothing, expectRouteFollowing(b, b, &.{"waves"}));
