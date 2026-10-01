@@ -73,233 +73,44 @@ pub fn BankArraysOf(comptime T: type) type {
 
 pub const assertSource = sdk.expert.assertSource;
 
-/// Per routed id of `r`, its wave: 0 for a slot resident at the call (a hit),
-/// p + 1 for a slot part p loads.
-fn wavesOf(plan: *const expert_policy.Plan, hit_slots: []const u32, part_loads: []const []const Load, out: []u8) void {
-    var keys: [max_route_ids]u32 = undefined;
-    var vals: [max_route_ids]u8 = undefined;
-    var n: usize = 0;
-    for (hit_slots) |s| {
-        keys[n] = s;
-        vals[n] = 0;
-        n += 1;
-    }
-    for (part_loads, 1..) |loads, w| for (loads) |l| {
-        keys[n] = l.slot;
-        vals[n] = @intCast(w);
-        n += 1;
-    };
-    for (plan.slotsOf(), out) |s, *w| w.* = vals[std.mem.indexOfScalar(u32, keys[0..n], s).?];
+/// The stream's wave numbering of a call's ids (`expert_stream.wavesOf`).
+const wavesOf = expert_stream.wavesOf;
+
+/// Trace arrays in one record's geometry (`expert_stream.traceBank`).
+const traceBank = expert_stream.traceBank;
+
+// ── StreamSource: the streamer's Stream, the EXL3 source's side of the contract (`expert_stream.StreamSource`) ──
+
+pub const StreamSource = expert_stream.StreamSource;
+
+/// The lookahead's predictor (router math, the arch's), folded by the model into the router barrier's eval: the
+/// next routed layer's own gate on this layer's router input,
+/// s = sqrt(softplus(f32(x @ w^T))) + bias (x [M, hidden], w [n_experts,
+/// hidden], bias [n_experts] f32). The lane compiles this chain; the op chain
+/// may differ in the last bits, which only changes what is read ahead.
+pub fn nextLayerScores(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, stream: mlx.mlx_stream) !mlx.mlx_array {
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, w, stream));
+    var z = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(z);
+    try mlx.check(mlx.mlx_matmul(&z, x, wt, stream));
+    var zf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zf);
+    try mlx.check(mlx.mlx_astype(&zf, z, .float32, stream));
+    const zero = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(zero);
+    var sp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sp);
+    try mlx.check(mlx.mlx_logaddexp(&sp, zf, zero, stream));
+    var root = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(root);
+    try mlx.check(mlx.mlx_sqrt(&root, sp, stream));
+    var scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(scores);
+    try mlx.check(mlx.mlx_add(&scores, root, bias, stream));
+    return scores;
 }
-
-/// Trace arrays in one record's geometry, `rows` rows.
-fn traceBank(g: *ops.TraceOps, geom: *const expert_bank.Layer, rows: u32) !BankArraysOf(u32) {
-    var a: [expert_bank.n_components]u32 = undefined;
-    for (&a, geom.segments) |*x, seg| {
-        var shape: [4]c_int = undefined;
-        shape[0] = @intCast(rows);
-        for (seg.shape[0..seg.rank], 1..) |d, i| shape[i] = @intCast(d);
-        x.* = try g.input(shape[0 .. seg.rank + 1], switch (seg.dtype) {
-            .I16 => .int16,
-            .F16 => .float16,
-        });
-    }
-    return .{
-        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2] },
-        .up = .{ .code = a[3], .rout = a[4], .rin = a[5] },
-        .down = .{ .code = a[6], .rout = a[7], .rin = a[8] },
-    };
-}
-
-// ── StreamSource: the streamer's Stream ──
-
-/// The streamer as an expert source. Routes, waits, release, flush and growth
-/// are the Stream's own; the call view comes from `refsOf` and the parts'
-/// loads (`Route.partLoads`); the MLX arrays from `bankArrays` (slot memory
-/// `.mlx`: with host rows the MLX executor refuses at construction).
-pub const StreamSource = struct {
-    stream: *expert_stream.Stream,
-    calls: [n_routes]Call = @splat(.{}),
-
-    /// What the stream supports (`expert_stream.caps`); an arm installs a subset at construction.
-    pub const caps = expert_stream.caps;
-
-    const n_routes = @typeInfo(@FieldType(expert_stream.Stream, "routes")).array.len;
-
-    pub const Call = struct {
-        route: ?*expert_stream.Route = null,
-        n_ids: u32 = 0,
-        refs: [max_route_ids]SlotRef = undefined,
-        waves: [max_route_ids]u8 = undefined,
-    };
-
-    pub fn init(stream: *expert_stream.Stream) StreamSource {
-        return .{ .stream = stream };
-    }
-
-    /// Calls mirror the Stream's route ring one to one.
-    fn callOf(self: *StreamSource, r: *expert_stream.Route) *Call {
-        const i = (@intFromPtr(r) - @intFromPtr(&self.stream.routes[0])) / @sizeOf(expert_stream.Route);
-        return &self.calls[i];
-    }
-
-    pub fn route(self: *StreamSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
-        const r = try self.stream.route(layer, ids, scores);
-        const call = self.callOf(r);
-        call.* = .{ .route = r, .n_ids = @intCast(ids.len) };
-        _ = self.stream.refsOf(r, &call.refs);
-        var bufs: [max_route_ids][max_route_ids]Load = undefined;
-        var parts: [max_route_ids][]const Load = undefined;
-        for (0..r.n_parts) |p| parts[p] = r.partLoads(@intCast(p), &bufs[p]);
-        wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], call.waves[0..ids.len]);
-        return call;
-    }
-
-    pub fn served(_: *StreamSource, call: *const Call) Served {
-        return .{ .refs = call.refs[0..call.n_ids], .waves = call.waves[0..call.n_ids], .n_parts = call.route.?.n_parts };
-    }
-
-    pub fn waitGu(self: *StreamSource, call: *Call, part: u32) Error!void {
-        return self.stream.waitGu(call.route.?, part);
-    }
-
-    pub fn waitDown(self: *StreamSource, call: *Call, part: u32) Error!void {
-        return self.stream.waitDown(call.route.?, part);
-    }
-
-    pub fn release(self: *StreamSource, call: *Call) void {
-        self.stream.release(call.route.?);
-    }
-
-    pub fn flush(self: *StreamSource) Error!void {
-        return self.stream.flush();
-    }
-
-    pub fn grow(self: *StreamSource, decode_rows: []const u32) !void {
-        return self.stream.grow(decode_rows);
-    }
-
-    /// The phase change's first free (`Stream.releaseTransient`): the bytes freed.
-    pub fn releaseTransient(self: *StreamSource) !u64 {
-        return self.stream.releaseTransient();
-    }
-
-    /// The reverse phase change's free (`Stream.shrink`): the bytes freed.
-    pub fn shrink(self: *StreamSource, prompt_rows: []const u32) !u64 {
-        return self.stream.shrink(prompt_rows);
-    }
-
-    /// The reverse phase change's allocation (`Stream.regrowTransient`): the bytes allocated.
-    pub fn regrowTransient(self: *StreamSource) !u64 {
-        return self.stream.regrowTransient();
-    }
-
-    pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
-        return self.stream.seedPrefill(layer, ids);
-    }
-
-    /// The last seedPrefill's seed ranks (`LayerPolicy.seed_ranks`).
-    pub fn seedRanks(self: *const StreamSource, layer: u32) u32 {
-        return self.stream.seedRanks(layer);
-    }
-
-    /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`).
-    pub fn readAheadSeed(self: *StreamSource, layer: u32, experts: []const u16) !void {
-        return self.stream.readAheadSeed(layer, experts);
-    }
-
-    /// P1: the layer's read-ahead landed (`Stream.awaitReadAhead`).
-    pub fn awaitReadAhead(self: *StreamSource, layer: u32) Error!void {
-        return self.stream.awaitReadAhead(layer);
-    }
-
-    /// P1's construction self-check over `n` experts of `layer` not resident there (the highest ids):
-    /// read ahead == demand read, bit for bit (`Stream.checkReadAhead`). Returns how many were checked.
-    pub fn checkReadAhead(self: *StreamSource, layer: u32, n: u32) !u32 {
-        const policy = &self.stream.layers[layer].policy;
-        var experts: [max_route_ids]u16 = undefined;
-        var k: u32 = 0;
-        var e: u32 = policy.n_experts;
-        while (e > 0 and k < @min(n, max_route_ids)) {
-            e -= 1;
-            if (policy.slotOf(@intCast(e)) != null) continue;
-            experts[k] = @intCast(e);
-            k += 1;
-        }
-        try self.stream.checkReadAhead(layer, experts[0..k]);
-        return k;
-    }
-
-    /// Whether `expert` holds one of `layer`'s persistent slots now (the recall check's residency, before a route).
-    pub fn isResident(self: *const StreamSource, layer: u32, expert: u16) bool {
-        return self.stream.layers[layer].policy.slotOf(expert) != null;
-    }
-
-    /// The pool's demand read gauge now: wall ns with a demand (or pre-) read in flight (A0's per-layer split).
-    pub fn readWallNs(self: *StreamSource) u64 {
-        return @intCast(@max(self.stream.pool.readGauge()[4], 0));
-    }
-
-    /// A live prefill call's persistent slots kept pinned and held past its release (`Wide.defer_base`).
-    pub fn holdBase(self: *StreamSource, call: *Call) !void {
-        return self.stream.holdBase(call.route.?);
-    }
-
-    pub fn releaseHeld(self: *StreamSource) void {
-        self.stream.releaseHeld();
-    }
-
-    /// Prefill routes one layer may hold live at once (`Stream.Options.wide_depth`).
-    pub fn wideDepth(self: *const StreamSource) u8 {
-        return self.stream.wide_depth;
-    }
-
-    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs.
-    pub fn warmWaitNs(self: *const StreamSource, layer: u32) u64 {
-        return self.stream.warmWaitNs(layer);
-    }
-
-    pub fn stats(self: *StreamSource) Stats {
-        return self.stream.stats();
-    }
-
-    /// Event gates of the call's reads (a stream built with `event`).
-    pub fn gate(self: *StreamSource, call: *Call) Error!?expert_stream.Gates {
-        return self.stream.gate(call.route.?);
-    }
-
-    /// The end of a decode cycle (option (b)'s clock; `Stream.cycleEnd`).
-    pub fn cycleEnd(self: *StreamSource) !void {
-        return self.stream.cycleEnd();
-    }
-
-    pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {
-        const ls = &self.stream.layers[layer];
-        return switch (kind) {
-            .base => ls.base.rows,
-            .ext => if (ls.ext) |e| e.rows else 0,
-            .transient => self.stream.transient.rows,
-        };
-    }
-
-    /// MLX: the stream's own arrays (never freed here); null for host rows or
-    /// a bank without rows. Trace: inputs in the bank's geometry.
-    pub fn bankArrays(self: *StreamSource, g: anytype, layer: u32, kind: BankKind) !?BankArraysOf(@TypeOf(g.*).T) {
-        const G = @TypeOf(g.*);
-        if (G == ops.MlxOps) {
-            const b = self.stream.bankArrays(layer, kind) orelse return null;
-            return .{
-                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin },
-                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin },
-                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
-            };
-        } else if (G == ops.TraceOps) {
-            const rows = self.bankRows(layer, kind);
-            if (rows == 0) return null;
-            return try traceBank(g, &self.stream.bank.layers[layer], rows);
-        } else @compileError("StreamSource binds MlxOps or TraceOps arrays");
-    }
-};
 
 // ── FakeSource: the streamer's residency with no reads (host tests) ──
 
@@ -1018,6 +829,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
     comptime {
         assertSource(S);
         if (routes.gated and !sdk.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
+        // A source's slot arrays are its quant's: a source and a quant that disagree on the format do not compile.
+        if (@hasDecl(S, "Arrays") and S.Arrays(G.T) != ProjOf(G.T)) @compileError(@typeName(S) ++ ": its slot arrays are not the quant's");
     }
     return struct {
         const Self = @This();
@@ -1186,7 +999,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return if (layer + 1 < self.gates.len) self.gates[layer + 1] else null;
         }
 
-        /// `expert_lookahead.nextLayerScores`: sqrt(softplus(f32(x @ w^T))) + bias.
+        /// `nextLayerScores`: sqrt(softplus(f32(x @ w^T))) + bias.
         fn nextScores(g: *G, xf: T, gate: Gate) !T {
             const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
@@ -4469,111 +4282,52 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     try testing.expectEqual(@as(usize, words), finite);
 }
 
-/// A decode math whose outputs carry, per row, its slot row and the arrays it read (host arrays the trace records):
-/// the per-bank calls and the banked calls (packed ids) must hand every routed position the same words.
-const BankEnc = struct {
-    pub const has_banked = true;
-    const w = 4;
+fn predictorBf16Bits(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
+}
 
-    fn rowsOf(g: *TraceOps, x: u32) ![]const u32 {
-        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
-        return std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(b)));
-    }
+fn predictorFromBf16(h: u16) f32 {
+    return @bitCast(@as(u32, h) << 16);
+}
 
-    fn floatsOf(g: *TraceOps, x: u32) ![]const f32 {
-        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
-        return std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(b)));
-    }
-
-    fn emit(g: *TraceOps, v: []const f32) !u32 {
-        return g.hostArray(std.mem.sliceAsBytes(v), &.{ @intCast(v.len / w), w }, .float32);
-    }
-
-    pub fn gateUp(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
-        var v: [max_route_ids * w]f32 = undefined;
-        const r = try rowsOf(g, ids);
-        for (r, 0..) |row, i| v[i * w ..][0..w].* = .{ @floatFromInt(row), @floatFromInt(gate.code), @floatFromInt(up.rin), 0 };
-        return emit(g, v[0 .. r.len * w]);
-    }
-
-    pub fn down(_: *const BankEnc, g: *TraceOps, h: u32, _: u32, d: ProjOf(u32)) !u32 {
-        var v: [max_route_ids * w]f32 = undefined;
-        const hv = try floatsOf(g, h);
-        @memcpy(v[0..hv.len], hv);
-        for (0..hv.len / w) |i| v[i * w + 3] = @floatFromInt(d.rout);
-        return emit(g, v[0..hv.len]);
-    }
-
-    pub fn gateUpBanked(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
-        var v: [max_route_ids * w]f32 = undefined;
-        const r = try rowsOf(g, ids);
-        for (r, 0..) |p, i| {
-            const b = &banks[p >> 24];
-            v[i * w ..][0..w].* = .{ @floatFromInt(p & 0xFFFFFF), @floatFromInt(b.gate.code), @floatFromInt(b.up.rin), 0 };
-        }
-        return emit(g, v[0 .. r.len * w]);
-    }
-
-    pub fn downBanked(_: *const BankEnc, g: *TraceOps, h: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
-        var v: [max_route_ids * w]f32 = undefined;
-        const hv = try floatsOf(g, h);
-        const r = try rowsOf(g, ids);
-        @memcpy(v[0..hv.len], hv);
-        for (r, 0..) |p, i| v[i * w + 3] = @floatFromInt(banks[p >> 24].down.rout);
-        return emit(g, v[0..hv.len]);
-    }
-};
-
-test "dsv41 experts: the banked waves (ROUTED_BANKED) hand every routed position the per-bank route's words, one group per wave" {
-    const a = testing.allocator;
-    var c = testConfig(64, 32, 1);
-    c.n_routed_experts = 30;
-    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 30, .rows = &.{16} });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    g.record_host = true;
-    const Ex = ExpertsWith(TraceOps, FakeSource, BankEnc, .{});
-    // One hook, both bindings (the arrays bound once): the option binds the banked stages at construction.
-    var banked = try Ex.initWith(a, &g, &src, .{}, &c, .{ .banked = true });
-    defer banked.deinit();
-    try testing.expect(banked.gate_up_wave == &Ex.gateUpWaveBanked and banked.down_wave == &Ex.downWaveBanked);
-    var grouped = banked;
-    grouped.gate_up_wave = Ex.gateUpWaveGrouped;
-    grouped.down_wave = Ex.downWaveGrouped;
-    // The ext bank is unbound: the banked arrays fill it with another bank's (never indexed).
-    try testing.expect(banked.banks[0][@backingInt(BankKind.ext)] == null);
-    try testing.expect(banked.banks[0][@backingInt(BankKind.base)].?.gate.code != banked.banks[0][@backingInt(BankKind.transient)].?.gate.code);
-    // One token, top-6, both banks in each wave.
-    const refs = [_]SlotRef{ .{ .bank = .base, .row = 3 }, .{ .bank = .transient, .row = 5 }, .{ .bank = .base, .row = 7 }, .{ .bank = .transient, .row = 0 }, .{ .bank = .base, .row = 1 }, .{ .bank = .transient, .row = 2 } };
-    const waves = [_]u8{ 0, 0, 1, 1, 0, 1 };
-    const sv: Served = .{ .refs = &refs, .waves = &waves, .n_parts = 1 };
-    const xf = try g.input(&.{ 1, 64 }, .bfloat16);
-    var words: [2][6][BankEnc.w]f32 = undefined;
-    for ([_]*Ex{ &grouped, &banked }, 0..) |ex, arm| {
-        var acc: Ex.Acc = .{};
-        for (0..2) |wv| {
-            const wave = try ex.gate_up_wave(ex, &g, 0, xf, 6, sv, @intCast(wv), null);
-            try testing.expectEqual(@as(usize, if (arm == 0) 2 else 1), wave.n);
-            _ = try ex.down_wave(ex, &g, 0, &wave, &acc, null);
-        }
-        try testing.expectEqual(@as(usize, if (arm == 0) 4 else 2), acc.n_outs);
-        var j: usize = 0;
-        for (acc.outs[0..acc.n_outs]) |o| {
-            const v = try BankEnc.floatsOf(&g, o);
-            for (0..v.len / BankEnc.w) |r| {
-                words[arm][acc.pos[j]] = v[r * BankEnc.w ..][0..BankEnc.w].*;
-                j += 1;
-            }
-        }
-        try testing.expectEqual(@as(usize, 6), j);
-    }
-    for (words[0], words[1], refs) |x, y, ref| {
-        try testing.expectEqual(x, y);
-        try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), x[0]);
-        try testing.expectEqual(@as(f32, @floatFromInt(grouped.banks[0][@backingInt(ref.bank)].?.gate.code)), x[1]);
-    }
-    // A math without the banked route refuses the option at construction.
-    const Plain = ExpertsWith(TraceOps, FakeSource, TraceMath, .{});
-    try testing.expectError(error.BankedNotInMath, Plain.initWith(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c, .{ .banked = true }));
+// DSV41_PHASE0B_MLX=1, inside a guarded window (creates MLX arrays).
+test "dsv41 lookahead 0b: the predictor graph scores like its host reference" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const m = 3;
+    const d = 64;
+    const e_n = 16;
+    var rng = std.Random.DefaultPrng.init(3);
+    const rand = rng.random();
+    var xb: [m * d]u16 = undefined;
+    var wb: [e_n * d]u16 = undefined;
+    var bias: [e_n]f32 = undefined;
+    for (&xb) |*v| v.* = predictorBf16Bits(rand.float(f32) * 2 - 1);
+    for (&wb) |*v| v.* = predictorBf16Bits((rand.float(f32) * 2 - 1) * 0.5);
+    for (&bias) |*v| v.* = rand.float(f32) * 0.2;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    const x = mlx.mlx_array_new_data(&xb, &[_]c_int{ m, d }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    const w = mlx.mlx_array_new_data(&wb, &[_]c_int{ e_n, d }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(w);
+    const b = mlx.mlx_array_new_data(&bias, &[_]c_int{e_n}, 1, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    const s = try nextLayerScores(x, w, b, stream);
+    defer _ = mlx.mlx_array_free(s);
+    try mlx.check(mlx.mlx_array_eval(s));
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(s));
+    try testing.expectEqual(@as(usize, m * e_n), mlx.mlx_array_size(s));
+    const got = (mlx.mlx_array_data_float32(s) orelse return error.MlxNoData)[0 .. m * e_n];
+    // Host: the product rounded to bf16 (the matmul's output dtype), then the f32 tail.
+    var worst: f32 = 0;
+    for (0..m) |r| for (0..e_n) |e| {
+        var acc: f32 = 0;
+        for (0..d) |k| acc += predictorFromBf16(xb[r * d + k]) * predictorFromBf16(wb[e * d + k]);
+        const z = predictorFromBf16(predictorBf16Bits(acc));
+        const want = @sqrt(@max(z, 0) + std.math.log1p(@exp(-@abs(z)))) + bias[e];
+        worst = @max(worst, @abs(got[r * e_n + e] - want));
+    };
+    std.debug.print("predictor graph: worst |mlx - host| {d:.6}\n", .{worst});
+    try testing.expect(worst < 2e-2);
 }

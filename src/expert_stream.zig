@@ -14,6 +14,7 @@ const expert_bank = @import("expert_bank.zig");
 const expert_io = sdk.expert.io;
 const expert_policy = @import("sdk").expert.policy;
 const expert_lookahead = @import("expert_lookahead.zig");
+const exl3_quant = @import("exl3_quant.zig");
 
 const n_components = expert_bank.n_components;
 const gu_components = expert_bank.gu_components;
@@ -264,7 +265,7 @@ const Rows = struct {
 
 /// What the stream supports as an expert source (`sdk.expert.Caps`); an arm installs a subset at construction
 /// (`Options`).
-pub const caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
+pub const source_caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
 
 /// It reads through the process's one reader: its arch takes it at construction (`sdk.expert.takeReader`).
 pub const uses_reader = true;
@@ -1748,6 +1749,238 @@ pub const Stream = struct {
     /// Live pins on a layer's slot (tests).
     fn pinsOf(self: *Stream, layer: u32, slot: u32) u16 {
         return self.locate(layer, slot).meta.pins;
+    }
+};
+
+
+/// A bank's arrays by projection, as the quant binds them (`sdk.quant.BankArrays` of the EXL3 quant's `Arrays`).
+pub fn BankArraysOf(comptime T: type) type {
+    return sdk.quant.BankArrays(exl3_quant.Arrays(T));
+}
+
+/// Per routed id of `r`, its wave: 0 for a slot resident at the call (a hit),
+/// p + 1 for a slot part p loads.
+pub fn wavesOf(plan: *const Plan, hit_slots: []const u32, part_loads: []const []const expert_policy.Load, out: []u8) void {
+    var keys: [max_route_ids]u32 = undefined;
+    var vals: [max_route_ids]u8 = undefined;
+    var n: usize = 0;
+    for (hit_slots) |s| {
+        keys[n] = s;
+        vals[n] = 0;
+        n += 1;
+    }
+    for (part_loads, 1..) |loads, w| for (loads) |l| {
+        keys[n] = l.slot;
+        vals[n] = @intCast(w);
+        n += 1;
+    };
+    for (plan.slotsOf(), out) |s, *w| w.* = vals[std.mem.indexOfScalar(u32, keys[0..n], s).?];
+}
+
+/// Trace arrays in one record's geometry, `rows` rows (a trace backend's `input`).
+pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeOf(g.*).T) {
+    var a: [n_components]@TypeOf(g.*).T = undefined;
+    for (&a, geom.segments) |*x, seg| {
+        var shape: [4]c_int = undefined;
+        shape[0] = @intCast(rows);
+        for (seg.shape[0..seg.rank], 1..) |d, i| shape[i] = @intCast(d);
+        x.* = try g.input(shape[0 .. seg.rank + 1], switch (seg.dtype) {
+            .I16 => .int16,
+            .F16 => .float16,
+        });
+    }
+    return .{
+        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2] },
+        .up = .{ .code = a[3], .rout = a[4], .rin = a[5] },
+        .down = .{ .code = a[6], .rout = a[7], .rin = a[8] },
+    };
+}
+
+// ── StreamSource: the stream as an expert source (the EXL3 source's side of the contract) ──
+
+/// The streamer as an expert source. Routes, waits, release, flush and growth
+/// are the Stream's own; the call view comes from `refsOf` and the parts'
+/// loads (`Route.partLoads`); the MLX arrays from `bankArrays` (slot memory
+/// `.mlx`: with host rows the MLX executor refuses at construction).
+pub const StreamSource = struct {
+    stream: *Stream,
+    calls: [n_routes]Call = @splat(.{}),
+
+    /// What the stream supports; an arm installs a subset at construction.
+    pub const caps = source_caps;
+    /// The slot arrays it fills are the EXL3 quant's (`sdk.expert`: a source's arrays are its quant's).
+    pub const Arrays = exl3_quant.Arrays;
+
+    /// One call per live route of the Stream's ring.
+    pub const n_routes = @typeInfo(@FieldType(Stream, "routes")).array.len;
+
+    pub const Call = struct {
+        route: ?*Route = null,
+        n_ids: u32 = 0,
+        refs: [max_route_ids]SlotRef = undefined,
+        waves: [max_route_ids]u8 = undefined,
+    };
+
+    pub fn init(stream: *Stream) StreamSource {
+        return .{ .stream = stream };
+    }
+
+    /// Calls mirror the Stream's route ring one to one.
+    fn callOf(self: *StreamSource, r: *Route) *Call {
+        const i = (@intFromPtr(r) - @intFromPtr(&self.stream.routes[0])) / @sizeOf(Route);
+        return &self.calls[i];
+    }
+
+    pub fn route(self: *StreamSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
+        const r = try self.stream.route(layer, ids, scores);
+        const call = self.callOf(r);
+        call.* = .{ .route = r, .n_ids = @intCast(ids.len) };
+        _ = self.stream.refsOf(r, &call.refs);
+        var bufs: [max_route_ids][max_route_ids]expert_policy.Load = undefined;
+        var parts: [max_route_ids][]const expert_policy.Load = undefined;
+        for (0..r.n_parts) |p| parts[p] = r.partLoads(@intCast(p), &bufs[p]);
+        wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], call.waves[0..ids.len]);
+        return call;
+    }
+
+    pub fn served(_: *StreamSource, call: *const Call) sdk.expert.Served {
+        return .{ .refs = call.refs[0..call.n_ids], .waves = call.waves[0..call.n_ids], .n_parts = call.route.?.n_parts };
+    }
+
+    pub fn waitGu(self: *StreamSource, call: *Call, part: u32) Error!void {
+        return self.stream.waitGu(call.route.?, part);
+    }
+
+    pub fn waitDown(self: *StreamSource, call: *Call, part: u32) Error!void {
+        return self.stream.waitDown(call.route.?, part);
+    }
+
+    pub fn release(self: *StreamSource, call: *Call) void {
+        self.stream.release(call.route.?);
+    }
+
+    pub fn flush(self: *StreamSource) Error!void {
+        return self.stream.flush();
+    }
+
+    pub fn grow(self: *StreamSource, decode_rows: []const u32) !void {
+        return self.stream.grow(decode_rows);
+    }
+
+    /// The phase change's first free (`Stream.releaseTransient`): the bytes freed.
+    pub fn releaseTransient(self: *StreamSource) !u64 {
+        return self.stream.releaseTransient();
+    }
+
+    /// The reverse phase change's free (`Stream.shrink`): the bytes freed.
+    pub fn shrink(self: *StreamSource, prompt_rows: []const u32) !u64 {
+        return self.stream.shrink(prompt_rows);
+    }
+
+    /// The reverse phase change's allocation (`Stream.regrowTransient`): the bytes allocated.
+    pub fn regrowTransient(self: *StreamSource) !u64 {
+        return self.stream.regrowTransient();
+    }
+
+    pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
+        return self.stream.seedPrefill(layer, ids);
+    }
+
+    /// The last seedPrefill's seed ranks (`LayerPolicy.seed_ranks`).
+    pub fn seedRanks(self: *const StreamSource, layer: u32) u32 {
+        return self.stream.seedRanks(layer);
+    }
+
+    /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`).
+    pub fn readAheadSeed(self: *StreamSource, layer: u32, experts: []const u16) !void {
+        return self.stream.readAheadSeed(layer, experts);
+    }
+
+    /// P1: the layer's read-ahead landed (`Stream.awaitReadAhead`).
+    pub fn awaitReadAhead(self: *StreamSource, layer: u32) Error!void {
+        return self.stream.awaitReadAhead(layer);
+    }
+
+    /// P1's construction self-check over `n` experts of `layer` not resident there (the highest ids):
+    /// read ahead == demand read, bit for bit (`Stream.checkReadAhead`). Returns how many were checked.
+    pub fn checkReadAhead(self: *StreamSource, layer: u32, n: u32) !u32 {
+        const policy = &self.stream.layers[layer].policy;
+        var experts: [max_route_ids]u16 = undefined;
+        var k: u32 = 0;
+        var e: u32 = policy.n_experts;
+        while (e > 0 and k < @min(n, max_route_ids)) {
+            e -= 1;
+            if (policy.slotOf(@intCast(e)) != null) continue;
+            experts[k] = @intCast(e);
+            k += 1;
+        }
+        try self.stream.checkReadAhead(layer, experts[0..k]);
+        return k;
+    }
+
+    /// Whether `expert` holds one of `layer`'s persistent slots now (the recall check's residency, before a route).
+    pub fn isResident(self: *const StreamSource, layer: u32, expert: u16) bool {
+        return self.stream.layers[layer].policy.slotOf(expert) != null;
+    }
+
+    /// The pool's demand read gauge now: wall ns with a demand (or pre-) read in flight (A0's per-layer split).
+    pub fn readWallNs(self: *StreamSource) u64 {
+        return @intCast(@max(self.stream.pool.readGauge()[4], 0));
+    }
+
+    /// A live prefill call's persistent slots kept pinned and held past its release (`Wide.defer_base`).
+    pub fn holdBase(self: *StreamSource, call: *Call) !void {
+        return self.stream.holdBase(call.route.?);
+    }
+
+    pub fn releaseHeld(self: *StreamSource) void {
+        self.stream.releaseHeld();
+    }
+
+    /// Prefill routes one layer may hold live at once (`Stream.Options.wide_depth`).
+    pub fn wideDepth(self: *const StreamSource) u8 {
+        return self.stream.wide_depth;
+    }
+
+    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs.
+    pub fn warmWaitNs(self: *const StreamSource, layer: u32) u64 {
+        return self.stream.warmWaitNs(layer);
+    }
+
+    pub fn stats(self: *StreamSource) Stats {
+        return self.stream.stats();
+    }
+
+    /// Event gates of the call's reads (a stream built with `event`).
+    pub fn gate(self: *StreamSource, call: *Call) Error!?Gates {
+        return self.stream.gate(call.route.?);
+    }
+
+    pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {
+        const ls = &self.stream.layers[layer];
+        return switch (kind) {
+            .base => ls.base.rows,
+            .ext => if (ls.ext) |e| e.rows else 0,
+            .transient => self.stream.transient.rows,
+        };
+    }
+
+    /// MLX backends: the stream's own arrays (never freed here); null for host rows or a bank without rows.
+    /// Trace backends: inputs in the bank's geometry.
+    pub fn bankArrays(self: *StreamSource, g: anytype, layer: u32, kind: BankKind) !?BankArraysOf(@TypeOf(g.*).T) {
+        const G = @TypeOf(g.*);
+        if (G.T == mlx.mlx_array) {
+            const b = self.stream.bankArrays(layer, kind) orelse return null;
+            return .{
+                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin },
+                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin },
+                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
+            };
+        } else {
+            const rows = self.bankRows(layer, kind);
+            if (rows == 0) return null;
+            return try traceBank(g, &self.stream.bank.layers[layer], rows);
+        }
     }
 };
 

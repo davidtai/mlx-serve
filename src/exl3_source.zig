@@ -6,7 +6,7 @@ const sdk = @import("sdk");
 const expert_stream = @import("expert_stream.zig");
 
 pub const name = "exl3-stream";
-pub const caps = expert_stream.caps;
+pub const caps = expert_stream.source_caps;
 pub const uses_reader = expert_stream.uses_reader;
 
 /// A model directory holding an expert bank's v2 manifest, by presence. The bank's format, quantization and geometry
