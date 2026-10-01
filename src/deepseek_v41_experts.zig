@@ -360,6 +360,8 @@ pub const FakeSource = struct {
     /// and every admission in order (the tests' view of the seed the model handed over).
     ahead_layer: ?u32 = null,
     ahead_log: std.ArrayList(u16) = .empty,
+    /// A0 (a): a test's scripted warm wait per layer (`Stream.warmWaitNs`; past its end, 0).
+    warm_wait_ns: []const u64 = &.{},
 
     pub const Pick = struct { layer: u32, n: u8 = 0, experts: [expert_lookahead.max_budget]u16 = undefined };
 
@@ -628,6 +630,11 @@ pub const FakeSource = struct {
 
     pub fn isResident(self: *const FakeSource, layer: u32, expert: u16) bool {
         return self.policies[layer].slotOf(expert) != null;
+    }
+
+    /// A0 (a): the ns `layer`'s first decode route waited for its started warm jobs (the test's script).
+    pub fn warmWaitNs(self: *const FakeSource, layer: u32) u64 {
+        return if (layer < self.warm_wait_ns.len) self.warm_wait_ns[layer] else 0;
     }
 
     pub fn bankRows(self: *FakeSource, layer: u32, kind: BankKind) u32 {
@@ -1463,6 +1470,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.source.release(call);
             released = true;
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
+            // A0 (a) (profile builds): what this layer's first decode route waited for its started warm jobs.
+            if (comptime first_cycle.enabled and @hasDecl(S, "warmWaitNs")) first_cycle.warmWait(layer, self.source.warmWaitNs(layer));
             return self.join(g, &acc, n, k);
         }
 
@@ -1979,6 +1988,38 @@ test "dsv41 experts: a decode call runs the residents, then each part's gate/up 
     try ex.flush();
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
     try testing.expectEqual(FakeSource.Event.Kind.flush, src.log.items[src.log.items.len - 1].kind);
+}
+
+test "dsv41 experts: A0 (a) (profile builds): a first-cycle decode call records its layer's warm wait; later cycles do not" {
+    if (comptime !first_cycle.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = Experts(TraceOps, FakeSource, Chain);
+    var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try ex.grow(&g, &.{ 8, 8 });
+    var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 7, 1, 7, 9, 3 }, &.{ 1, 2, 3, 4, 5, 6 } } };
+    g.host_values = script.values();
+    const xf = try g.input(&.{ 2, 256 }, .bfloat16);
+    const idx = try g.input(&.{ 2, 3 }, .int32);
+    src.warm_wait_ns = &.{ 0, 5_000_000 };
+    first_cycle.startDecode();
+    defer first_cycle.phase = .build;
+    _ = try ex.at(0).routed(&g, xf, idx);
+    _ = try ex.at(1).routed(&g, xf, idx);
+    try testing.expectEqual(@as(u64, 0), first_cycle.cycle1_warm_wait_ns[0]);
+    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
+    // past the first cycle a call records nothing
+    first_cycle.endCycle();
+    src.warm_wait_ns = &.{ 0, 9_000_000 };
+    _ = try ex.at(1).routed(&g, xf, idx);
+    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
+    try ex.flush();
 }
 
 test "dsv41 experts: a wider call is the prefill lane's (not ported), refused before any route" {
