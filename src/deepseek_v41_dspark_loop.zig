@@ -88,6 +88,9 @@ inline fn mark(stamp: anytype, p: Phase) void {
     if (@TypeOf(stamp) != void) stamp.mark(p);
 }
 
+/// The owner's call at the prompt's last trunk chunk (the Module's tail release route).
+pub const PromptTail = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
+
 pub fn Loop(comptime G: type) type {
     return struct {
         const Self = @This();
@@ -111,6 +114,8 @@ pub fn Loop(comptime G: type) type {
         /// The lookup's history already ends with `primary` (the cell's prefill and every cycle
         /// append it); the shell's prompt pass and serial steps commit only forwarded tokens.
         lookup_has_primary: bool = false,
+        /// Called once per prompt at its last trunk chunk, after the logits' argmax and before the seed (`PromptTail`).
+        tail: ?PromptTail = null,
 
         /// The draft depth and the widest verify a request under `cfg` reaches with `head`.
         pub const Shapes = struct { k_cap: u32, max_rows: u32 };
@@ -196,6 +201,8 @@ pub fn Loop(comptime G: type) type {
             const r = try self.model.forward(g, self.st, ids, .{ .logits = .last, .main_hidden = true }, ex, graph.NoProbe{});
             try M.fence(g, self.st, &.{ r.logits.?, r.main_hidden.? });
             try ex.flush();
+            // A split prompt's final part (`tail` set only then): after its routed work, before the seed.
+            if (self.tail) |t| try t.run(t.ctx);
             const logits = g.keep(r.logits.?);
             errdefer g.release(logits);
             const mains = r.main_hidden.?;
@@ -234,6 +241,7 @@ pub fn Loop(comptime G: type) type {
                 if (last) {
                     self.primary = try g.hostArgmax(r.logits.?);
                     if (keep_logits) kept = g.keep(r.logits.?);
+                    if (self.tail) |t| try t.run(t.ctx);
                 }
                 g.reset();
                 i = end;
