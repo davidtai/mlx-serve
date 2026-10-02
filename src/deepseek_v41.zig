@@ -272,6 +272,14 @@ pub const PrefillBill = struct {
     /// W107). Every kv source holds its compressed lane and its index lane, `boundedCompCap` rows of head_dim and
     /// index_head_dim f32 (an index-only source reads its kv source's lane). The compressor frontier is a ring
     /// (`frontierPromptBytes`, 3ebd8a7), not a lane.
+    /// The largest single lane array (a kv source's kv rows at its cap, head_dim f32).
+    pub fn laneMaxBytes(b: PrefillBill, positions: u64) u64 {
+        const m: u32 = @intCast(positions);
+        var n: u64 = 0;
+        for (b.kv_sources[0..b.n_kv_sources]) |r| n = @max(n, @as(u64, kvc.boundedCompCap(m, r).?) * @max(b.head_dim, b.index_head_dim) * 4);
+        return n;
+    }
+
     pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
         const m: u32 = @intCast(positions);
         var n: u64 = 0;

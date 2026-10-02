@@ -2094,6 +2094,26 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
             if (t.attn == .served) wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)] = @max(wave_n[@intFromBool(n > mdl.Model(ops.TraceOps).scratch_rows)], h.arrays);
         }
     }
+    // The K16 prompt pass (the served tier, layer-major) at the fill's 16K prompt: its largest buffer is under the bill's
+    // prompt overshoot term (MLX's cache can end one freed buffer over its limit).
+    {
+        var tier = routes.served;
+        tier.layer_major = true;
+        const model_ = try TM.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        var st = try model_.newState();
+        defer st.deinit(&g, a);
+        const f0 = g.nodes.items.len;
+        const r = try model_.forward(&g, &st, prompt, .{ .logits = .last, .main_hidden = true }, &ex, graph.NoProbe{});
+        const big = largestBuffer(&g, f0, g.nodes.items.len);
+        const pb = bill.withJoinless(.{ .wave_experts = xq.PrefillShape.tier.wave, .wave_rows = xq.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids });
+        const term = bill_mod.cacheOvershootPrompt(pb, prompt.len);
+        std.debug.print("\nDSV41_CACHE_OVERSHOOT_PROMPT {{\"rows\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\", \"largest_dtype\": \"{t}\", \"largest_shape\": {any}, \"term\": {d}}}", .{ prompt.len, big.bytes, big.node.op, big.node.dtype, big.node.shape.d[0..big.node.shape.n], term });
+        try std.testing.expect(big.bytes <= term);
+        try TM.fence(&g, &st, &.{r.logits.?});
+        try ex.flush();
+        g.reset();
+    }
     std.debug.print("\nDSV41_WIRE_ARRAYS {{\"built_and_state\": {d}, \"decode_wave\": {d}, \"prompt_wave\": {d}}}", .{ state_n, wave_n[0], wave_n[1] });
     try std.testing.expect(state_n <= bill_mod.wire_arrays_state);
     try std.testing.expect(wave_n[0] <= bill_mod.wire_arrays_decode_wave);
@@ -2196,7 +2216,12 @@ test "dsv41 memory: verify_wave covers a served decode forward's layer waves, it
     _ = try head.draftBlock(&g, lp.main_h.?, 1, caches[0..n_st], model_.embed, model_.head);
     const dh_ = LayerHeld.of(&g, d0, g.nodes.items.len, g.freed.items[dw0..]);
     g.reset();
-    if (std.c.getenv("DSV41_CACHE_SIM") != null) printCacheSim(&g, &.{ .{ v0, d0 }, .{ d0, g.nodes.items.len } });
+    // MLX's cache can end one freed buffer over its limit: the decode cycle's largest buffer is under the bill's term.
+    const big_v = largestBuffer(&g, v0, d0);
+    const big_d = largestBuffer(&g, d0, g.nodes.items.len);
+    const big = if (big_v.bytes >= big_d.bytes) big_v else big_d;
+    std.debug.print("\nDSV41_CACHE_OVERSHOOT_DECODE {{\"buffers\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\", \"largest_dtype\": \"{t}\", \"largest_shape\": {any}, \"term\": {d}}}\n", .{ big_v.count + big_d.count, big.bytes, big.node.op, big.node.dtype, big.node.shape.d[0..big.node.shape.n], bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c), positions) });
+    try std.testing.expect(big.bytes <= bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c), positions));
     const form = bill_mod.verifyWaveBytes(&c, verify_rows, positions, c.dspark.block_size);
     std.debug.print("\nDSV41_VERIFY_WAVE {{\"positions\": {d}, \"rows\": {d}, \"verify_layer\": {d}, \"verify_outside\": {d}, \"draft_layer\": {d}, \"draft_outside\": {d}, \"form\": {d}, \"decode_wave_today\": 365449216}}\n", .{ positions, verify_rows, vh.layer, vh.outside, dh_.layer, dh_.outside, form });
     try std.testing.expect(vh.layer + vh.outside <= form);
@@ -2204,27 +2229,22 @@ test "dsv41 memory: verify_wave covers a served decode forward's layer waves, it
     try std.testing.expect(form <= 365_449_216);
 }
 
-/// DSV41_CACHE_SIM=1 with the verify_wave test (bank, trace backend): one decode cycle's traced buffers (the verify
-/// forward and the draft block; views, inputs and host values excluded) and the largest one. MLX's cache recycles a
-/// freed buffer while it holds less than its limit (metal/allocator.cpp `free`), so it can end one buffer over: the
-/// decode cache's geometric bound is the limit plus the largest buffer a decode cycle frees.
-fn printCacheSim(g: *const ops.TraceOps, parts: []const [2]usize) void {
+/// A traced range's largest buffer (views, inputs, host values and scalars allocate none), page-rounded.
+fn largestBuffer(g: *const ops.TraceOps, from: usize, to: usize) struct { bytes: u64, node: ops.TraceOps.Node, count: u64 } {
     const sim = @import("dsv41_cache_sim.zig");
-    var count: u64 = 0;
-    var largest: u64 = 0;
-    var largest_op: ops.Op = .input;
-    for (parts) |p| for (g.nodes.items[p[0]..p[1]]) |node| switch (node.op) {
+    var out: @TypeOf(largestBuffer(g, 0, 0)) = .{ .bytes = 0, .node = undefined, .count = 0 };
+    for (g.nodes.items[from..to]) |node| switch (node.op) {
         .input, .host, .scalar, .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => {},
         else => {
-            count += 1;
+            out.count += 1;
             const b = sim.rounded(@as(u64, @intCast(node.shape.numel())) * ops.dtypeSize(node.dtype));
-            if (b > largest) {
-                largest = b;
-                largest_op = node.op;
+            if (b > out.bytes) {
+                out.bytes = b;
+                out.node = node;
             }
         },
     };
-    std.debug.print("\nDSV41_CACHE_SIM {{\"traced_buffers_per_cycle\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\"}}\n", .{ count, largest, largest_op });
+    return out;
 }
 
 /// The routed hook with a record of each forward's rows (layer 0's routed call), the order the model feeds it.
