@@ -7,6 +7,7 @@
 const std = @import("std");
 const io_util = @import("io_util");
 const expert_io = @import("sdk").expert.io;
+const mlx = @import("mlx");
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
 /// down span the last three.
@@ -181,6 +182,25 @@ pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const 
         down[i] = sp.down_offset;
     }
     return Records.submit(pool, bank.sidecar, gu[0..records.len], down[0..records.len], rows, &lens);
+}
+
+// The stream's bank contract (sdk.expert.assertBank; expert_stream_of.zig): with the topology, `Component`, `Layer`,
+// `Records` and `Bank` above and below, a segment's MLX dtype and the slot arrays by projection.
+
+pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {
+    return switch (d) {
+        .I16 => .int16,
+        .F16 => .float16,
+    };
+}
+
+/// One projection's slot arrays: code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out], rin f16 [rows, in].
+pub const ProjArrays = struct { code: mlx.mlx_array, rout: mlx.mlx_array, rin: mlx.mlx_array };
+/// A bank's nine slot arrays by projection.
+pub const BankArrays = struct { gate: ProjArrays, up: ProjArrays, down: ProjArrays };
+
+pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
+    return .{ .gate = .{ .code = x[0], .rout = x[1], .rin = x[2] }, .up = .{ .code = x[3], .rout = x[4], .rin = x[5] }, .down = .{ .code = x[6], .rout = x[7], .rin = x[8] } };
 }
 
 pub const Bank = struct {

@@ -80,6 +80,7 @@ test {
     _ = @import("nocache_reader.zig");
     _ = @import("mlx_stream/expert_policy_test.zig");
     _ = @import("mlx_stream/expert_stream.zig");
+    _ = @import("mlx_stream/expert_stream_of_test.zig");
     _ = @import("mlx_stream/exl3_kernels.zig");
     _ = @import("mlx_stream/exl3_selfcheck.zig");
     _ = @import("mlx_stream/exl3_kernel_ops_gate.zig");

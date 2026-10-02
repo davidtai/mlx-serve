@@ -214,6 +214,34 @@ pub fn assertSource(comptime S: type) void {
     }
 }
 
+/// The bank contract a stream reads (a bank MODULE `B`: one record file, fixed per-layer geometry):
+/// - topology: `n_components`, `gu_components` (the gate/up range is segments [0, gu_components), the down range the rest,
+///   each contiguous in the record), `Records` = `io.Records(n_components, gu_components)`, `Component` (an enum over the
+///   segments);
+/// - `Layer`: `segments: [n_components]` (each `offset` from the record start, `length`, `dtype`, `shape`, `rank`) and
+///   `logical_bytes` (a record's bytes); `mlxDtype(dtype) mlx_dtype` (a slot array's dtype);
+/// - `Bank`: fields `layers: []Layer` (the arch's routed layers), `n_experts`, `sidecar: UncachedFd`; methods
+///   `recordOffset(*const Bank, layer, expert) u64` and `spans(*const Bank, layer, expert)` (`.gu_offset`, `.down_offset`);
+/// - `BankArrays` and `bankArraysOf([n_components]mlx_array) BankArrays`: the slot arrays as the bank's quant binds them.
+/// The stream allocates the slot rows, plans routes, reads, gates and releases; the arch keeps the MoE math.
+pub fn assertBank(comptime B: type) void {
+    comptime {
+        const where = @typeName(B) ++ " is not an expert bank: ";
+        for ([_][]const u8{ "n_components", "gu_components", "Records", "Component", "Layer", "Bank", "mlxDtype", "BankArrays", "bankArraysOf" }) |d|
+            if (!@hasDecl(B, d)) @compileError(where ++ "no " ++ d);
+        if (B.Records != io.Records(B.n_components, B.gu_components)) @compileError(where ++ "Records is not io.Records(n_components, gu_components)");
+        if (!@hasField(B.Layer, "segments") or !@hasField(B.Layer, "logical_bytes")) @compileError(where ++ "Layer needs segments and logical_bytes");
+        // A slot array is [rows] ++ a segment's shape: at most 3 axes of its own (the stream's shapes are [4]c_int).
+        const Seg = @typeInfo(@FieldType(B.Layer, "segments")).array.child;
+        if (@typeInfo(@FieldType(Seg, "shape")).array.len > 3) @compileError(where ++ "a segment shape has more than 3 axes");
+        for ([_][]const u8{ "layers", "n_experts", "sidecar" }) |f|
+            if (!@hasField(B.Bank, f)) @compileError(where ++ "Bank has no " ++ f);
+        if (@FieldType(B.Bank, "sidecar") != io.UncachedFd) @compileError(where ++ "Bank.sidecar is not an UncachedFd");
+        for ([_][]const u8{ "recordOffset", "spans" }) |m|
+            if (!@hasDecl(B.Bank, m)) @compileError(where ++ "Bank has no " ++ m);
+    }
+}
+
 fn expectMethod(comptime S: type, comptime name: []const u8, comptime params: []const type, comptime Payload: type) void {
     const where = @typeName(S) ++ "." ++ name;
     if (!@hasDecl(S, name)) @compileError(@typeName(S) ++ " is not an expert source: no " ++ name);
