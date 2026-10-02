@@ -36,6 +36,7 @@ const xk = @import("exl3_kernels.zig");
 const quant = @import("quant.zig");
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
+const timeline = @import("dsv41_verify_timeline.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const prof = @import("dsv41_prefill_timers.zig");
 const xq = @import("exl3_quant.zig");
@@ -1405,6 +1406,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
         };
 
+        /// The stream's read-busy gauge (ns), for the profile builds' timeline.
+        fn readGauge(self: *const Self) u64 {
+            return if (comptime @hasDecl(S, "readWallNs")) self.source.readWallNs() else 0;
+        }
+
         pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
@@ -1427,6 +1433,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var tt = dt.now();
             // A0 (profile builds): the call's barrier, route and MoE build (`first_cycle.call`).
             const t_call = tt;
+            if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
             // A1's recall check (profile builds): the prediction joins the barrier's eval; it reads nothing.
             const pred: ?T = if (comptime recall.enabled) self.recall_pred else null;
             if (comptime recall.enabled) self.recall_pred = null;
@@ -1439,6 +1446,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
             tt = dt.charge(.barrier, tt);
             const t_barrier = tt;
+            if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
             // A0 (profile builds): the read gauge at the barrier's end; in the first cycle the tail set's reads (before
             // the route plans); in the prompt the tail set itself (a decode-width prompt call).
             const wall_b: u64 = if (comptime first_cycle.enabled and @hasDecl(S, "readWallNs")) self.source.readWallNs() else 0;
@@ -1459,6 +1467,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const call = try self.source.route(layer, ids, scores);
             const t_route = dt.charge(.route, tt);
             dt.countCall();
+            if (comptime timeline.enabled) timeline.point(layer, .route, 0, false);
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
@@ -1469,8 +1478,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc, null));
             // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave.
             if (hoist.len > 0) try g.asyncEval(hoist);
+            if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             if (routes.gated) {
-                if (try self.source.gate(call)) |gates| try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
+                if (try self.source.gate(call)) |gates| {
+                    if (comptime timeline.enabled) timeline.gate(layer, gates.gu, gates.down_first, gates.n_parts);
+                    try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
+                }
             } else for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
                 tt = dt.now();
@@ -1485,6 +1498,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             self.source.release(call);
             released = true;
+            if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
             // A0 (a) (profile builds): what this layer's first decode route waited for its started warm jobs.
             if (comptime first_cycle.enabled and @hasDecl(S, "warmWaitNs")) first_cycle.warmWait(layer, self.source.warmWaitNs(layer));

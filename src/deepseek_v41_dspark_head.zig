@@ -14,6 +14,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const xk = @import("exl3_kernels.zig");
 const kr = @import("dsv41_kernel_routes.zig");
+const draft_routes = @import("dsv41_draft_routes.zig");
 const xsc = @import("expert_slot_cache.zig");
 const expert_io = @import("expert_io.zig");
 const expert_policy = @import("expert_policy.zig");
@@ -223,6 +224,8 @@ pub fn Head(comptime G: type) type {
             logits: T,
             /// `confidence_head` scores `[1, block_size]` f32 (before the sigmoid).
             conf: T,
+            /// Profile builds with the draft routes active: each stage's routed ids, kept (`draft_routes.take`).
+            stage_ids: draft_routes.StageIds(T) = draft_routes.noIds(T),
         };
 
         /// K33 (`MTPLX_DSV41_DRAFT_COMPILE`): at rows <= `draft_rows` the stages
@@ -556,6 +559,8 @@ pub fn Head(comptime G: type) type {
             limit: f64,
             /// The compact banks' slot of every routed id (a subset head).
             lut: ?T = null,
+            /// Profile builds: where the stage's routed ids go (before the lut), when the draft routes are active.
+            capture: Capture = no_capture,
 
             pub fn at(self: Resident, _: u32) Resident {
                 return self;
@@ -564,6 +569,7 @@ pub fn Head(comptime G: type) type {
             pub fn routed(self: Resident, g: *G, xf: T, routed_ids: T) !T {
                 const si = g.shapeOf(routed_ids);
                 if (si.numel() >= 64) return error.SortedSwitchNotPorted;
+                keepIds(self.capture, routed_ids);
                 // `_CompactMTPExpertSwitch.__call__`: `mapped = mx.take(LUT, indices)`.
                 const indices = if (self.lut) |l| try g.take(l, routed_ids, 0) else routed_ids;
                 return switchGlu(g, self.ex, self.limit, xf, indices);
@@ -596,6 +602,8 @@ pub fn Head(comptime G: type) type {
             /// The stage's group in the cache and its experts' id offset there (`DraftGeometry`, fixed at construction).
             group: u32,
             offset: u16,
+            /// Profile builds: as `Resident.capture`.
+            capture: Capture = no_capture,
 
             pub fn at(self: Cached, _: u32) Cached {
                 return self;
@@ -605,6 +613,7 @@ pub fn Head(comptime G: type) type {
                 const si = g.shapeOf(routed_ids);
                 const n: usize = @intCast(si.numel());
                 if (n > expert_policy.max_route_ids) return error.DraftCacheRouteWidth;
+                keepIds(self.capture, routed_ids);
                 var id_buf: [expert_policy.max_route_ids]u16 = undefined;
                 // The shared pool's bill (H + 15 rows) rests on this barrier: it completes the previous stage's gathers before any row is reused.
                 _ = try g.hostIds(routed_ids, id_buf[0..n]);
@@ -634,14 +643,24 @@ pub fn Head(comptime G: type) type {
             }
         };
 
-        fn sourceOf(self: *const Self, st: *const Stage, s: usize) Source {
-            if (self.cache) |dc| return .{ .cached = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .dc = dc, .group = dc.geom.group_of[s], .offset = @intCast(dc.geom.offset_of[s]) } };
-            return .{ .resident = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .lut = st.lut } };
+        /// Profile builds: a stage's routed-ids slot (`Draft.stage_ids`); void elsewhere.
+        const Capture = if (draft_routes.enabled) ?*?T else void;
+        const no_capture: Capture = if (draft_routes.enabled) null else {};
+
+        fn keepIds(capture: Capture, routed_ids: T) void {
+            if (comptime draft_routes.enabled) if (capture) |c| {
+                c.* = routed_ids;
+            };
+        }
+
+        fn sourceOf(self: *const Self, st: *const Stage, s: usize, capture: Capture) Source {
+            if (self.cache) |dc| return .{ .cached = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .dc = dc, .group = dc.geom.group_of[s], .offset = @intCast(dc.geom.offset_of[s]), .capture = capture } };
+            return .{ .resident = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .lut = st.lut, .capture = capture } };
         }
 
         /// `DSparkBlock.__call__` (draft): HC attention prep, the draft
         /// attention, HC ffn prep, the stage MoE, HC post.
-        fn stage(self: *const Self, g: *G, st: *const Stage, s: usize, h: T, pre_mix: T, main_x: T, cache: *const Cache) !Tr.Out {
+        fn stage(self: *const Self, g: *G, st: *const Stage, s: usize, h: T, pre_mix: T, main_x: T, cache: *const Cache, capture: Capture) !Tr.Out {
             const c = &self.c;
             const w = &st.w;
             if (self.rc) |d| if (self.stageRc(g, h, s) != null) {
@@ -650,7 +669,7 @@ pub fn Head(comptime G: type) type {
                 const a = try Tr.hcAttnPrep(g, c, lk, h, pre_mix, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm);
                 const ao = try self.attention(g, st, s, a[0], main_x, cache);
                 const f = try Tr.hcFfnPrep(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
-                const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, lk, w, f[0], self.sourceOf(st, s));
+                const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, lk, w, f[0], self.sourceOf(st, s, capture));
                 return .{ .h = try Tr.hcPostRoute(g, c, &self.stage_rt, lk, mo, f[1], f[2], f[3]), .pre_mix = f[4] };
             };
             const sh = g.shapeOf(h);
@@ -664,7 +683,7 @@ pub fn Head(comptime G: type) type {
             if (use) {
                 try g.tape(Tr.HcFfnPrep, &self.mc, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
             } else f = try Tr.hcFfnPrep(g, c, .{}, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm);
-            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, .{}, w, f[0], self.sourceOf(st, s));
+            const mo = try Tr.moe(g, graph.NoProbe{}, &self.mc, &self.stage_rt, .{}, w, f[0], self.sourceOf(st, s, capture));
             if (use) {
                 var o: [1]T = undefined;
                 try g.tape(Tr.HcPost, &self.mc, &.{ mo, f[1], f[2], f[3] }, &o);
@@ -693,10 +712,17 @@ pub fn Head(comptime G: type) type {
             // One wave per stage, as the trunk's layers (`Tr.Carry`).
             var carry: Tr.Carry = .{};
             errdefer carry.release(g);
+            var stage_ids = draft_routes.noIds(T);
+            errdefer draft_routes.drop(G, g, &stage_ids);
             for (self.stages, caches, 0..) |*st, *cache, s| {
                 const wave = g.mark();
-                cur = try self.stage(g, st, s, cur.h, cur.pre_mix, main_x, cache);
+                const capture: Capture = if (comptime draft_routes.enabled) (if (draft_routes.active and s < stage_ids.len) &stage_ids[s] else null) else {};
+                cur = try self.stage(g, st, s, cur.h, cur.pre_mix, main_x, cache, capture);
                 carry.persist(g, &cur.h, &cur.pre_mix, null);
+                // the stage's routed ids outlive its wave (read after the block's eval)
+                if (comptime draft_routes.enabled) if (s < stage_ids.len) if (stage_ids[s]) |x| {
+                    stage_ids[s] = g.keep(x);
+                };
                 g.resetTo(wave);
             }
             // forward_head
@@ -742,6 +768,7 @@ pub fn Head(comptime G: type) type {
                 .ids = try g.stack(outs[0..n], 1),
                 .logits = try g.stack(logit_cols[0..n], 1),
                 .conf = try g.reshape(conf, &.{ 1, bs }),
+                .stage_ids = stage_ids,
             };
         }
     };
@@ -1315,6 +1342,56 @@ test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks a
 
 test "dsv41 dspark head: DRAFTCACHE shared pool: every stage binds one bank of H + 15 rows and gathers at the shared policy's slots for its offset ids" {
     try checkCachedHead(.shared);
+}
+
+test "dsv41 dspark head: draft routes (profile builds): every expert source hands the block each stage's router ids, not the cache's slots" {
+    if (comptime !draft_routes.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    const TraceOps = ops.TraceOps;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const json = try v41.testConfigJson(a, .real);
+    defer a.free(json);
+    const c = try v41.Config.parse(a, json, null);
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const H = Head(TraceOps);
+    const rt: graph.Routes = .{ .rc_draft = true, .head = .bf16, .draft_rows = graph.draft_compile_max_rows };
+    try draft_routes.install(.{ .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .top_k = c.dspark.n_experts_per_tok, .block = c.dspark.block_size }, 8);
+    defer draft_routes.uninstall();
+    // the resident head, then the cache's two forms (per stage; one pool whose ids carry a stage offset)
+    for (0..3) |form| {
+        // one backend per head (each binds its own compiled-region contexts)
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = try v41.residentSpec(arena.allocator(), &c) };
+        const table = try g.input(&.{ @intCast(c.vocab_size), 5120 }, .bfloat16);
+        var script: ScriptIds = .{ .prng = std.Random.DefaultPrng.init(5), .n_experts = 128, .k = 3 };
+        g.host_values = script.values();
+        const dc: ?*DraftCache = switch (form) {
+            0 => null,
+            1 => try DraftCache.planOnly(a, &c, 128, .per_stage),
+            else => try DraftCache.planOnly(a, &c, 128, .shared),
+        };
+        defer if (dc) |x| x.deinit();
+        if (dc) |x| _ = try x.seedFirstIds();
+        const h = try H.initWith(a, &g, c, rt, &lookup, .{ .registry = &reg, .cache = dc });
+        defer h.deinit(&g);
+        const caches = try arena.allocator().alloc(H.Cache, h.nStages());
+        for (caches) |*x| x.* = .{};
+        defer for (caches) |*x| x.deinit(&g);
+        try h.seedMain(&g, try g.input(&.{ 1, 3, 15360 }, .float32), caches);
+        var d = try h.draftBlock(&g, try g.input(&.{ 1, 1, 15360 }, .bfloat16), 7, caches, .{ .table = table }, .{ .dense = table });
+        for (d.stage_ids[0..c.dspark.n_stages]) |k| {
+            const x = k orelse return error.TestUnexpectedResult;
+            // the router's [5, 3] int32 ids, never the slot array the cache's arm builds on the host
+            try testing.expect(g.shapeOf(x).eql(ops.Shape.of(&.{ 5, 3 })));
+            try testing.expectEqual(ops.Dtype.int32, g.dtypeOf(x));
+            try testing.expect(g.nodes.items[x].op != .host);
+        }
+        draft_routes.drop(TraceOps, &g, &d.stage_ids);
+    }
 }
 
 test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, refused by name when a stage's slots hold every expert" {

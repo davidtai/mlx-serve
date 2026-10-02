@@ -84,6 +84,7 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   - a demand range holds `readers` on the slot while copying: a slot is never reclaimed under a copy.
  *
  * Counters (Python-owned int64[SC_N], written under the pool mutex, read at teardown): see SC_*.
+ * Profile builds (-DQ3LD_EVSIG, -Ddsv41-decode-timers=true) keep only the event's signal log (q3ld_test_ev_log).
  * Test build (-DQ3LD_INJECT): the q3ni injection rules/delays, a speculative per-chunk delay and an event
  * log of demand submit / demand start / speculative chunk start with (qlen, busy, nearer-queued) at that
  * instant.
@@ -835,7 +836,7 @@ static void gate_ticket_done(int64_t t) {
     }
 }
 
-#ifdef Q3LD_INJECT
+#if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
 static int64_t *evsig = 0, evsig_cap = 0, evsig_n = 0;   /* signal log (under sig_mu): value, t_call, t_target, ns */
 #endif
 
@@ -859,7 +860,7 @@ static void ev_flush(void) {
             __atomic_fetch_add(&sc[SC_EV_SIGNAL_NS], t1 - t0, __ATOMIC_RELAXED);
             __atomic_fetch_add(&sc[SC_EV_LAG_NS], t0 > tt ? t0 - tt : 0, __ATOMIC_RELAXED);
         }
-#ifdef Q3LD_INJECT
+#if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
         if (evsig && evsig_n < evsig_cap) {
             int64_t *e = evsig + 4 * evsig_n++;
             e[0] = (int64_t)target; e[1] = t0; e[2] = tt; e[3] = t1 - t0;
@@ -1937,7 +1938,7 @@ int32_t q3ld_ev_state(int64_t *out) {
     return live;
 }
 
-#ifdef Q3LD_INJECT
+#if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
 /* Python-owned int64[4 * cap] signal log (value, backend call start, prefix-advance time, backend ns); buf = 0 keeps
  * the current log, cap < 0 detaches it (the owner frees the buffer).  Returns the entries written so far. */
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {

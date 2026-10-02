@@ -114,7 +114,8 @@ pub fn build(b: *std.Build) void {
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
     // The DSV4.1 DSpark cycle's host split (src/dsv41_decode_timers.zig): profile builds only.
-    build_options.addOption(bool, "dsv41_decode_timers", b.option(bool, "dsv41-decode-timers", "Compile the DSV4.1 DSpark cycle's phase timers in (profile builds only)") orelse false);
+    const dsv41_decode_timers = b.option(bool, "dsv41-decode-timers", "Compile the DSV4.1 DSpark cycle's phase timers in (profile builds only)") orelse false;
+    build_options.addOption(bool, "dsv41_decode_timers", dsv41_decode_timers);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -187,7 +188,7 @@ pub fn build(b: *std.Build) void {
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
     mod.addIncludePath(b.path("lib/ds4"));
-    addExpertIoSources(b, mod, false);
+    addExpertIoSources(b, mod, false, dsv41_decode_timers);
 
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
@@ -263,7 +264,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/xatlas"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
-    addExpertIoSources(b, test_mod, true);
+    addExpertIoSources(b, test_mod, true, dsv41_decode_timers);
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
@@ -713,10 +714,13 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
 /// Packed expert streamer I/O (lib/expert_io): the lookahead read pool
 /// (pthreads, pread + memcpy into slot rows, never MLX) and its MTLSharedEvent
 /// signal (non-ARC objc). `inject` compiles the pool's scripted-fault hooks,
-/// for the test module only.
-fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) void {
+/// for the test module only; `timeline` the DSV4.1 decode profile's command
+/// buffer timeline (profile builds only).
+fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool, timeline: bool) void {
     const flags: []const []const u8 = if (inject)
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+    else if (timeline)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
     else
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
     module.addCSourceFile(.{ .file = b.path("lib/expert_io/q3_lookahead4_exl3.c"), .flags = flags });
@@ -728,6 +732,10 @@ fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool) vo
     module.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
     module.addIncludePath(b.path("lib/mlxc-src"));
     module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+    if (timeline) {
+        module.addCSourceFile(.{ .file = b.path("lib/expert_io/dsv41_cb_timeline.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+        module.addCSourceFile(.{ .file = b.path("lib/expert_io/dsv41_tl_mlx.cpp"), .flags = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" } });
+    }
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and

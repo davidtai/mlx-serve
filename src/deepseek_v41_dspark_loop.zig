@@ -15,6 +15,8 @@ const ds = @import("deepseek_v41_dspark.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const dt = @import("dsv41_decode_timers.zig");
+const draft_routes = @import("dsv41_draft_routes.zig");
+const timeline = @import("dsv41_verify_timeline.zig");
 
 pub const Config = struct {
     /// Requested native draft depth (capped by the head's block size).
@@ -442,11 +444,12 @@ pub fn Loop(comptime G: type) type {
             const m = g.mark();
             const before = first_cycle.memNow(dev);
             t = dt.now();
-            const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
+            var d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
             const sig = try g.sigmoid(try g.astype(d.conf, .float32));
             const built = dt.now();
             try g.evalAll(&.{ d.ids, sig });
             const waited = dt.now();
+            draft_routes.drop(G, g, &d.stage_ids);
             first_cycle.recordDraft(0, built - t, waited - built, before, first_cycle.memNow(dev));
             g.resetTo(m);
             return first_cycle.memNow(dev);
@@ -459,6 +462,7 @@ pub fn Loop(comptime G: type) type {
             var drafts: []const u32 = &.{};
             var k_eff: u32 = 0;
             var native: [ds.max_block]u32 = undefined;
+            timeline.cycleBegin();
             var tt = dt.now();
             if (self.k_cap > 0) {
                 // A0 (c)'s D1 (profile builds, the decode's first cycle): the pending state and a dropped draft block
@@ -472,7 +476,7 @@ pub fn Loop(comptime G: type) type {
                     }
                 }
                 const t_build = tt;
-                const d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
+                var d = try self.head.draftBlock(g, self.main_h.?, self.primary, self.caches, self.model.embed, self.model.head);
                 const bs = self.head.blockSize();
                 // CYCLE_TRIM draftfold: the confidence sigmoid is realised by the draft's own eval (one
                 // sync), which also realises the main row and window update the previous commit left.
@@ -481,6 +485,8 @@ pub fn Loop(comptime G: type) type {
                 const t_wait = tt;
                 try g.evalAll(&.{ d.ids, sig });
                 tt = dt.charge(.draft_wait, tt);
+                // Profile builds: the stages' routed ids, realised by that eval, read in place.
+                try draft_routes.take(G, g, &d.stage_ids);
                 if (comptime first_cycle.enabled) {
                     if (doubled) first_cycle.recordDraft(1, t_wait - t_build, tt - t_wait, mem0, first_cycle.memNow(G == ops.MlxOps));
                 }
@@ -513,6 +519,7 @@ pub fn Loop(comptime G: type) type {
             var hiddens: [ds.max_block + 1]T = undefined;
             var n_hidden: usize = 0;
             var start: u32 = 0;
+            timeline.verifyBegin();
             while (start < n_block) {
                 const end = @min(start + self.max_rows, n_block);
                 const r = try self.model.forward(g, self.st, block[start..end], .{ .logits = .all, .main_hidden = true }, ex, graph.NoProbe{});
@@ -549,6 +556,7 @@ pub fn Loop(comptime G: type) type {
                 start = end;
                 if (done) break;
             }
+            timeline.verifyEnd();
             const correction = o.correction.?; // acceptChunk sets it on the chunk that ends the verify
             st.endCycle(o, k_eff);
             const verify_hidden = if (n_hidden == 1) hiddens[0] else try g.concat(hiddens[0..n_hidden], 1);
@@ -851,6 +859,162 @@ test "dsv41 dspark loop: A0 (c) D1 (profile builds): the first cycle evaluates i
     try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
     try testing.expectEqual(script.u32s.len, script.nu);
     try testing.expectEqual(script.f32s.len, script.nf);
+}
+
+/// `Script` with the routed ids drawn from a counter and every ids read logged (its values, per call).
+const IdLog = struct {
+    base: Script,
+    next: u32 = 0,
+    vals: [8192]u16 = undefined,
+    n_vals: usize = 0,
+    starts: [1024]usize = undefined,
+    n_calls: usize = 0,
+
+    fn values(self: *IdLog) TraceOps.HostValues {
+        var v = self.base.values();
+        v.ctx = self;
+        v.ids = ids;
+        v.argmax = argmax;
+        v.u32s = u32s_;
+        v.f32s = f32s_;
+        v.bools = bools_;
+        return v;
+    }
+    fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
+        const s: *IdLog = @ptrCast(@alignCast(ctx));
+        s.starts[s.n_calls] = s.n_vals;
+        s.n_calls += 1;
+        for (out) |*o| {
+            o.* = @intCast((s.next * 5 + 3) % s.base.n_experts);
+            s.next += 1;
+            s.vals[s.n_vals] = o.*;
+            s.n_vals += 1;
+        }
+    }
+    fn call(s: *const IdLog, i: usize) []const u16 {
+        const end = if (i + 1 < s.n_calls) s.starts[i + 1] else s.n_vals;
+        return s.vals[s.starts[i]..end];
+    }
+    fn argmax(ctx: *anyopaque) anyerror!u32 {
+        return Script.argmax(&@as(*IdLog, @ptrCast(@alignCast(ctx))).base);
+    }
+    fn u32s_(ctx: *anyopaque, out: []u32) anyerror!void {
+        return Script.u32s_(&@as(*IdLog, @ptrCast(@alignCast(ctx))).base, out);
+    }
+    fn f32s_(ctx: *anyopaque, out: []f32) anyerror!void {
+        return Script.f32s_(&@as(*IdLog, @ptrCast(@alignCast(ctx))).base, out);
+    }
+    fn bools_(ctx: *anyopaque, out: []bool) anyerror!void {
+        return Script.bools_(&@as(*IdLog, @ptrCast(@alignCast(ctx))).base, out);
+    }
+};
+
+test "dsv41 dspark loop: draft routes (profile builds): each cycle records every stage's routed ids, read after the draft's eval; the tokens are unchanged" {
+    if (comptime !draft_routes.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const c = &rig.m.c;
+    const dsc = c.dspark;
+    var log: IdLog = .{ .base = .{
+        .n_experts = @intCast(dsc.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+    } };
+    rig.g.host_values = log.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    try draft_routes.install(.{ .n_stages = dsc.n_stages, .n_experts = dsc.n_routed_experts, .top_k = dsc.n_experts_per_tok, .block = dsc.block_size }, 6);
+    defer draft_routes.uninstall();
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    // a cycle's ids reads: its draft stages' (after the draft's eval), then the verify's routed layers
+    var first_call: [4]usize = undefined;
+    for (&first_call) |*f| {
+        f.* = log.n_calls;
+        _ = try lp.cycle(&rig.ex, &out, a, null);
+        try testing.expectEqual(f.* + dsc.n_stages + c.n_layers, log.n_calls);
+    }
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
+    try testing.expectEqual(@as(u32, 4), draft_routes.cycles);
+    // the stream is the stage reads, in order; the histogram is their fold
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try draft_routes.writeStreamJson(&aw.writer);
+    var want: std.Io.Writer.Allocating = .init(a);
+    defer want.deinit();
+    var hand: [4][512]u32 = @splat(@splat(0));
+    try want.writer.print("{{\"stages\": {d}, \"experts_per_stage\": {d}, \"top_k\": {d}, \"block\": {d}, \"global_id\": \"stage * experts_per_stage + id\", \"cycles\": [", .{ dsc.n_stages, dsc.n_routed_experts, dsc.n_experts_per_tok, dsc.block_size });
+    for (first_call, 0..) |f, ci| {
+        try want.writer.writeAll(if (ci == 0) "[" else ", [");
+        for (0..dsc.n_stages) |st| {
+            const v = log.call(f + st);
+            try testing.expectEqual(@as(usize, dsc.block_size * dsc.n_experts_per_tok), v.len);
+            try want.writer.writeAll(if (st == 0) "[" else ", [");
+            for (v, 0..) |e, i| {
+                try want.writer.print("{s}{d}", .{ if (i == 0) "" else ",", e });
+                hand[st][e] += 1;
+            }
+            try want.writer.writeAll("]");
+        }
+        try want.writer.writeAll("]");
+    }
+    try want.writer.writeAll("]}");
+    try testing.expectEqualStrings(want.written(), aw.written());
+    var cs: [512]u32 = undefined;
+    for (0..dsc.n_stages) |st| {
+        _ = draft_routes.counts(st, cs[0..dsc.n_routed_experts]);
+        try testing.expectEqualSlices(u32, hand[st][0..dsc.n_routed_experts], cs[0..dsc.n_routed_experts]);
+    }
+    // the cell's lines over this run (the host dry run of their format)
+    var hb: [8192]u8 = undefined;
+    for (0..dsc.n_stages) |st| std.debug.print("NATIVE {s}\n", .{draft_routes.histLine(&hb, st)});
+    std.debug.print("NATIVE {s}\n", .{draft_routes.lruLine(&hb)});
+}
+
+test "dsv41 dspark loop: verify timeline (profile builds): every verify is stamped, each routed layer's submits in order inside it" {
+    if (comptime !timeline.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const c = &rig.m.c;
+    var script: Script = .{
+        .n_experts = @intCast(c.n_routed_experts),
+        .pick = 3,
+        .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+        .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } },
+    };
+    rig.g.host_values = script.values();
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 });
+    defer lp.deinit();
+    var prompt: [20]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    _ = try lp.prefill(a, &rig.ex, &prompt);
+    // the prompt's routed calls come before the arming: no verify, no stamp
+    timeline.armHost(c.n_layers);
+    defer timeline.uninstall();
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    for (0..4) |_| _ = try lp.cycle(&rig.ex, &out, a, null);
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, out.items);
+    try testing.expectEqual(@as(u32, 4), timeline.cycles);
+    for (0..4) |ci| {
+        const v = timeline.verifyOf(ci);
+        try testing.expect(v.begin > 0 and v.end >= v.begin);
+        for (timeline.layersOf(ci)) |l| {
+            try testing.expect(l.t[0] >= v.begin and l.t[4] <= v.end);
+            for (l.t[1..], l.t[0..4]) |later, earlier| try testing.expect(later >= earlier and earlier > 0);
+        }
+    }
+    // the cell's line over this run (no shim armed: no buffer rows; the host dry run of its format)
+    var tb: [8192]u8 = undefined;
+    std.debug.print("NATIVE {s}\n", .{timeline.line(&tb, 0)});
 }
 
 test "dsv41 dspark loop: CYCLE_TRIM: one eval per draft with its sigmoid, the commit's window update dispatched and waited by the next draft" {

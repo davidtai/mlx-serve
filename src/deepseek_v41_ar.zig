@@ -39,6 +39,9 @@ const printPhaseMemory = bill_mod.printPhaseMemory;
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
+const draft_routes = @import("dsv41_draft_routes.zig");
+const timeline = @import("dsv41_verify_timeline.zig");
+const host_heap = @import("dsv41_host_heap.zig");
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -596,6 +599,70 @@ fn readState(a: std.mem.Allocator, lines: *std.ArrayList(LayerStateLine), m: *mo
 
 fn envStr(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+}
+
+/// A profile build's read-outs, armed by a decode-profile run (DSV41_CELL_DECODE_PROFILE), each off with its env set
+/// to 0: the draft's routed ids, the verify's GPU timeline, the host heap at three marks.
+const ProfReadOuts = struct {
+    routes: bool,
+    timeline: bool,
+    heap: bool,
+    heap_samples: [host_heap.marks.len]host_heap.Mark = @splat(.{}),
+
+    fn of(profile: bool) ProfReadOuts {
+        const on = struct {
+            fn f(name: [*:0]const u8) bool {
+                return !std.mem.eql(u8, envStr(name) orelse "1", "0");
+            }
+        }.f;
+        return .{ .routes = profile and on("DSV41_CELL_DRAFT_ROUTE_HIST"), .timeline = profile and on("DSV41_CELL_VERIFY_GPU_TIMELINE"), .heap = profile and on("DSV41_CELL_HOST_HEAP") };
+    }
+
+    fn any(self: *const ProfReadOuts) bool {
+        return self.routes or self.timeline or self.heap;
+    }
+
+    /// The receipt with the armed read-outs' objects added before its closing brace.
+    fn receipt(self: *const ProfReadOuts, a: std.mem.Allocator, json: []const u8) ![]const u8 {
+        if (!self.any()) return json;
+        const close = std.mem.lastIndexOfScalar(u8, json, '}') orelse return error.ReceiptShape;
+        var aw: std.Io.Writer.Allocating = .init(a);
+        const w = &aw.writer;
+        try w.writeAll(std.mem.trimEnd(u8, json[0..close], " \n"));
+        if (self.routes) {
+            try w.writeAll(",\n \"draft_route_stream\": ");
+            try draft_routes.writeStreamJson(w);
+        }
+        if (self.timeline) {
+            try w.writeAll(",\n \"verify_gpu_timeline\": ");
+            try timeline.writeJson(w);
+        }
+        if (self.heap) {
+            try w.writeAll(",\n \"host_heap\": ");
+            try host_heap.writeJson(w, &self.heap_samples);
+        }
+        try w.writeAll("\n}");
+        return aw.written();
+    }
+};
+
+test "dsv41 ar: profile read-outs (profile builds): the receipt keeps its fields and gains the armed read-outs' objects, as valid JSON" {
+    if (comptime !dt.enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json0 = try std.json.Stringify.valueAlloc(a, .{ .runtime = "native", .cycles = 2 }, .{ .whitespace = .indent_1 });
+    const off: ProfReadOuts = .{ .routes = false, .timeline = false, .heap = false };
+    try testing.expectEqualStrings(json0, try off.receipt(a, json0));
+    var ro: ProfReadOuts = .{ .routes = true, .timeline = true, .heap = true };
+    ro.heap_samples[2] = .{ .total = .{ .blocks_in_use = 3, .size_in_use = 300, .size_allocated = 1300 } };
+    const json = try ro.receipt(a, json0);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    try testing.expectEqualStrings("native", v.object.get("runtime").?.string);
+    try testing.expectEqual(@as(i64, 2), v.object.get("cycles").?.integer);
+    try testing.expect(v.object.get("draft_route_stream").?.object.get("cycles") != null);
+    try testing.expect(v.object.get("verify_gpu_timeline").?.object.get("buffers") != null);
+    try testing.expectEqual(@as(i64, 1000), v.object.get("host_heap").?.object.get("decode_end").?.object.get("cached").?.integer);
 }
 
 test "dsv41 ar: the served schedule's variants parse by name and plan their Module calls (pass3ab)" {
@@ -1171,6 +1238,11 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (@as(f32, @floatCast(delta)) != module.dspark_typical_delta) return error.CellDeltaNotTheModules;
 
     const profile = std.c.getenv("DSV41_CELL_DECODE_PROFILE") != null;
+    var ro = if (comptime dt.enabled) ProfReadOuts.of(profile) else {};
+    _ = &ro;
+    if (comptime dt.enabled) if (ro.heap) {
+        ro.heap_samples[0] = host_heap.sample();
+    };
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
     // A0 (profile builds): construction's first dispatches are behind the prompt's.
@@ -1201,6 +1273,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     phases[2] = phaseMemory("phase change", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     if (md.phase_change) |pc| phases[2].settle_ms = pc.settle_ms;
     printPhaseMemory(a, phases[2]);
+    if (comptime dt.enabled) if (ro.heap) {
+        ro.heap_samples[1] = host_heap.sample();
+    };
     mlx_peak = @max(mlx_peak, @max(phases[2].mlx_peak_bytes, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)")));
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
@@ -1212,6 +1287,11 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         first_cycle.startDecode();
         // DSV41_CELL_DECODE_RECALL=0 keeps the check off (a decode profile without the predictor on its barriers).
         recall.active = profile and !std.mem.eql(u8, std.mem.span(std.c.getenv("DSV41_CELL_DECODE_RECALL") orelse "1"), "0");
+        // The read-outs' storage bounds are checked here, before the first cycle.
+        const ds_c = md.model.c.dspark;
+        if (ro.routes) try draft_routes.install(.{ .n_stages = ds_c.n_stages, .n_experts = ds_c.n_routed_experts, .top_k = ds_c.n_experts_per_tok, .block = ds_c.block_size }, max_tokens);
+        if (ro.timeline) try timeline.install(md.g.s, max_tokens, md.model.c.n_layers);
+        if (ro.any()) std.debug.print("NATIVE profile read-outs: draft_route_hist={s} ({d} B static), verify_gpu_timeline={s} ({d} B static), host_heap={s}\n", .{ if (ro.routes) "on" else "off", draft_routes.storage_bytes, if (ro.timeline) "on" else "off", timeline.storage_bytes, if (ro.heap) "on" else "off" });
     }
     const t2 = std.Io.Timestamp.now(io, .boot);
     var finish: dsl.Finish = .stop;
@@ -1264,6 +1344,19 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     }
     const decode_s = secondsSince(io, t2);
     if (comptime dt.enabled) {
+        // The read-outs stop with the decode; the timeline's buffers settle (sync + handlers) after its clock.
+        const pending: u32 = if (ro.timeline) timeline.settle(md.g.s, 2000) else 0;
+        if (ro.routes) {
+            draft_routes.uninstall();
+            var hb: [8192]u8 = undefined;
+            for (0..draft_routes.geo.n_stages) |st| std.debug.print("NATIVE {s}\n", .{draft_routes.histLine(&hb, st)});
+            std.debug.print("NATIVE {s}\n", .{draft_routes.lruLine(&hb)});
+        }
+        if (ro.timeline) {
+            timeline.uninstall();
+            var tb: [8192]u8 = undefined;
+            std.debug.print("NATIVE {s}\n", .{timeline.line(&tb, pending)});
+        }
         var lb: [2048]u8 = undefined;
         std.debug.print("\nNATIVE {s}\n", .{dt.line(&lb)});
         if (recall.active) {
@@ -1280,6 +1373,11 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     md.recordDecodeEnd();
     phases[3] = phaseMemory("decode", cx.bill.decodeTerms(), 0, cx.file_backed_start);
     printPhaseMemory(a, phases[3]);
+    if (comptime dt.enabled) if (ro.heap) {
+        ro.heap_samples[2] = host_heap.sample();
+        var hb: [8192]u8 = undefined;
+        std.debug.print("NATIVE {s}\n", .{host_heap.line(&hb, &ro.heap_samples)});
+    };
     mlx_peak = @max(mlx_peak, @max(phases[3].mlx_peak_bytes, memProbePeak("dsv41 served cell", "cycles")));
 
     const ids = try a.alloc(u32, out.items.len + 1);
@@ -1382,7 +1480,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
-    const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
+    const json0 = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
+    const json = if (comptime dt.enabled) try ro.receipt(a, json0) else json0;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
     if (comptime dt.enabled) recall.active = false;
     std.debug.print("\nNATIVE dsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
