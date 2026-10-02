@@ -1414,4 +1414,23 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
         }
     }
     std.debug.print("\n", .{});
+    // The shared pool: one bank of H + 15 rows; decode / prompt rows at hot 96 / 128 / 201 / 256.
+    const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
+    for ([_]Shared{
+        .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 147, 145, 143, 141 } },
+        .{ .base = 8_990_000_000, .decode = .{ 178, 177, 174, 172 }, .prefill = .{ 143, 142, 140, 138 } },
+        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 143, 142, 139, 137 } },
+        .{ .base = 9_550_000_000, .decode = .{ 177, 175, 173, 171 }, .prefill = .{ 142, 141, 139, 137 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        for (hots, 0..) |hot, hi| {
+            var b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .draft_cache_hot = hot, .draft_cache_pool = .shared });
+            const r_rows: u64 = hot + 15;
+            const term = r_rows * 18_800_640 + 3 * (std.mem.alignForward(u64, r_rows * 368_640, 16384) - r_rows * 368_640);
+            try testing.expectEqual(term, b.draft_cache);
+            b.engram_posted = posted;
+            const r = try fillRows(fillBillOf(b), target, b.n_experts);
+            try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[hi], .decode = w.decode[hi] }, r);
+        }
+    }
 }
