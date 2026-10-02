@@ -36,7 +36,9 @@ pub fn parse(gpa: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) 
     };
     const c = try gpa.create(Config);
     errdefer gpa.destroy(c);
-    c.* = .{ .dsv41_prefill = .of(&c41), .num_experts = c41.n_routed_experts, .num_hidden_layers = c41.n_layers };
+    // The prompt admission bills the rings only on the served tier (`promptBytes`; stock bills its full history), so its
+    // bill rows them at the served tier's states' geometry (`module.kvGeometry` of a served config).
+    c.* = .{ .dsv41_prefill = .of(&c41, module.numericTier(.served).kv), .num_experts = c41.n_routed_experts, .num_hidden_layers = c41.n_layers };
     if (p.model_dir.len > 0) {
         c.expert_bank_dir = try gpa.dupe(u8, p.model_dir);
         errdefer gpa.free(c.expert_bank_dir.?);

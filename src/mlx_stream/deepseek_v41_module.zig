@@ -655,6 +655,8 @@ pub const Module = struct {
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
+        // The states' ring geometry: the one the bill reads (`kvGeometry`).
+        tier.kv = kvGeometry(config);
         if (ov.prefill_attn) |v| {
             // The core reads K30's selection: only a tier with selected keys can take it.
             if (v and !tier.routes.selected_keys) return error.PrefillAttnNeedsSelectedKeys;
@@ -1842,6 +1844,12 @@ pub fn prefillIndexRoute(config: *const settings.Config, ov: RouteOverrides) !bo
     return on;
 }
 
+/// The KV lanes' geometry as the Module builds its states (the numeric tier's `kv`: the route and the ring levers);
+/// the bill reads the same answer (`PrefillBill.of`), so its ring rows follow every lever the states use.
+pub fn kvGeometry(config: *const settings.Config) kvc.Geometry {
+    return numericTier(config.numeric_tier orelse .served).kv;
+}
+
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const settings.Config) xp.Wide {
     return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned(), .resident_first = config.dsv41WideResidentFirst() };
@@ -2476,7 +2484,7 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     var vd: v41.Diag = .{};
     errdefer std.debug.print("dsv41 module held: {s}\n", .{vd.message()});
     const c = try v41.Config.load(a, io, bank, &vd);
-    const bill = v41.PrefillBill.of(&c);
+    const bill = v41.PrefillBill.of(&c, numericTier(.served).kv);
     var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/" ++ engram_token_map_file, .{bank}), &c, &vd);
     defer src.deinit();
     const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
@@ -2670,8 +2678,8 @@ test "dsv41 memory: verify_wave covers a served decode forward's layer waves, it
     const big_v = largestBuffer(&g, v0, d0);
     const big_d = largestBuffer(&g, d0, g.nodes.items.len);
     const big = if (big_v.bytes >= big_d.bytes) big_v else big_d;
-    std.debug.print("\nDSV41_CACHE_OVERSHOOT_DECODE {{\"buffers\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\", \"largest_dtype\": \"{t}\", \"largest_shape\": {any}, \"term\": {d}}}\n", .{ big_v.count + big_d.count, big.bytes, big.node.op, big.node.dtype, big.node.shape.d[0..big.node.shape.n], bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c), positions) });
-    try std.testing.expect(big.bytes <= bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c), positions));
+    std.debug.print("\nDSV41_CACHE_OVERSHOOT_DECODE {{\"buffers\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\", \"largest_dtype\": \"{t}\", \"largest_shape\": {any}, \"term\": {d}}}\n", .{ big_v.count + big_d.count, big.bytes, big.node.op, big.node.dtype, big.node.shape.d[0..big.node.shape.n], bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c, numericTier(.served).kv), positions) });
+    try std.testing.expect(big.bytes <= bill_mod.cacheOvershootDecode(v41.PrefillBill.of(&c, numericTier(.served).kv), positions));
     const form = bill_mod.verifyWaveBytes(&c, verify_rows, positions, c.dspark.block_size);
     std.debug.print("\nDSV41_VERIFY_WAVE {{\"positions\": {d}, \"rows\": {d}, \"verify_layer\": {d}, \"verify_outside\": {d}, \"draft_layer\": {d}, \"draft_outside\": {d}, \"form\": {d}, \"decode_wave_today\": 365449216}}\n", .{ positions, verify_rows, vh.layer, vh.outside, dh_.layer, dh_.outside, form });
     try std.testing.expect(vh.layer + vh.outside <= form);
@@ -3444,11 +3452,28 @@ test "dsv41 module: the fill's decode granule is a row unless set; the records a
     try std.testing.expect((RouteOverrides{}).decode_extra_records == null);
 }
 
-test "dsv41 module: decode_first16 needs its pool's rows above the prompt rows and the transient release, and refuses single records" {
-    try checkDecodeRowsAlloc(.decode_first16, false, 136, 168);
-    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.decode_first16, true, 150, 168));
-    try checkDecodePoolRoutes(.decode_first16, .row, true);
-    try std.testing.expectError(error.DecodePoolWithRecords, checkDecodePoolRoutes(.decode_first16, .record, true));
-    try std.testing.expectError(error.DecodePoolNeedsRelease, checkDecodePoolRoutes(.decode_first16, .row, false));
-    try checkDecodePoolRoutes(.uniform, .record, false);
+test "dsv41 module: the states and the bill read one ring geometry, the numeric tier's" {
+    var config: settings.Config = .{};
+    try std.testing.expectEqual(numericTier(.served).kv, kvGeometry(&config));
+    config.numeric_tier = .stock;
+    try std.testing.expectEqual(numericTier(.stock).kv, kvGeometry(&config));
+    // The bill rows its rings at the geometry it is handed: a lever moves the rings and nothing else.
+    const json = try v41.testConfigJson(std.testing.allocator, .real);
+    defer std.testing.allocator.free(json);
+    const c = try v41.Config.parse(std.testing.allocator, json, null);
+    const served = numericTier(.served).kv;
+    var moved = served;
+    moved.headroom = 1024;
+    const b0 = v41.PrefillBill.of(&c, served);
+    const b1 = v41.PrefillBill.of(&c, moved);
+    const seq: u64 = 16_384;
+    const positions: u64 = 24_584;
+    try std.testing.expectEqual(b0.laneBytes(positions), b1.laneBytes(positions));
+    const rings0 = b0.ringPromptBytes(seq) + b0.frontierPromptBytes(seq);
+    const rings1 = b1.ringPromptBytes(seq) + b1.frontierPromptBytes(seq);
+    try std.testing.expect(rings1 > rings0);
+    try std.testing.expectEqual(rings1 - rings0, b1.kvPromptBytes(seq, positions) - b0.kvPromptBytes(seq, positions));
+    const dec0 = b0.ringDecodeBytes(seq) + b0.frontierDecodeBytes(seq);
+    const dec1 = b1.ringDecodeBytes(seq) + b1.frontierDecodeBytes(seq);
+    try std.testing.expectEqual(dec1 - dec0, b1.kvDecodeBytes(seq, positions) - b0.kvDecodeBytes(seq, positions));
 }

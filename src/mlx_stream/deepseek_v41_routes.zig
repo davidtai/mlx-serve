@@ -60,6 +60,28 @@ pub const Tier = struct {
     }
 };
 
+/// The ring levers a model is built with (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM): the box the bill's ring tests
+/// cover (the memory lane's bounds, 10-02). The parser keeps a lever's u32; the model refuses outside the box.
+pub const ring_lever_box = struct {
+    pub const max_verify_max: u32 = 64;
+    pub const slack_max: u32 = 64;
+    pub const headroom_min: u32 = 1;
+    pub const headroom_max: u32 = 4096;
+};
+
+pub const RingRefusal = error{ RingVerifyBelowForward, RingLeverRange };
+
+/// A model's ring geometry, checked once at its construction. The verify margin must hold the widest block one
+/// forward appends (`widest_append`, the model's scratch rows): a smaller one lets a verify block push rows its
+/// queries still read out of the ring. Every lever sits inside `ring_lever_box`, so every geometry a model runs is
+/// one whose bill the tests pin (and the ring's u32 rows cannot overflow).
+pub fn checkRingGeometry(kv: kvc.Geometry, widest_append: u32) RingRefusal!void {
+    if (kv.max_verify < widest_append) return error.RingVerifyBelowForward;
+    const box = ring_lever_box;
+    if (kv.max_verify > box.max_verify_max or kv.slack > box.slack_max or kv.headroom < box.headroom_min or kv.headroom > box.headroom_max)
+        return error.RingLeverRange;
+}
+
 /// Every lever unset: the Python stock path (the parity harnesses' references).
 pub const stock: Tier = .{};
 
@@ -507,4 +529,23 @@ test "dsv41 routes: every lever the build cannot run the same way refuses, by na
     try testing.expectEqual(graph.Routes{}, none.routes);
     try testing.expectEqual(stock.routes, none.routes);
     try testing.expectEqual(stock.kv, none.kv);
+}
+
+test "dsv41 routes: a ring geometry below the widest forward or outside the tested box is refused by name" {
+    // The defaults (8 / 8 / 64) and the box's corners pass.
+    try checkRingGeometry(.{}, 8);
+    try checkRingGeometry(.{ .max_verify = 8, .slack = 0, .headroom = 1 }, 8);
+    try checkRingGeometry(.{ .max_verify = 64, .slack = 64, .headroom = 4096 }, 8);
+    try testing.expectError(error.RingVerifyBelowForward, checkRingGeometry(.{ .max_verify = 7 }, 8));
+    try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .max_verify = 65 }, 8));
+    try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .slack = 65 }, 8));
+    try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .headroom = 0 }, 8));
+    try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .headroom = 4097 }, 8));
+    // The parser keeps the u32 a lever names; the model's construction refuses it.
+    const a = testing.allocator;
+    const pairs = try splitPairs(a, "MTPLX_DSV41_WINDOW_RING=1 MTPLX_DSV41_WINDOW_RING_HEADROOM=4294967295");
+    defer a.free(pairs);
+    const t = try parse(pairs, null);
+    try testing.expectEqual(@as(u32, 4294967295), t.kv.headroom);
+    try testing.expectError(error.RingLeverRange, checkRingGeometry(t.kv, 8));
 }

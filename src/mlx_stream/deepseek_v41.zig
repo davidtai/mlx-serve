@@ -39,6 +39,10 @@ pub const PrefillBill = struct {
     kv_sources: [max_layers]u8 = @splat(0),
     n_kv_sources: u8 = 0,
     ring_row_bytes: u64 = 0,
+    /// The ring geometry the states are built with (`module.kvGeometry`: the numeric tier's `kv`), handed to `of`. The
+    /// rings' rows (`ringBase`, `ringPromptRows`, `ringDecodeRows`) follow every WINDOW_RING_* lever the allocation
+    /// reads, so no lever value can under-bill them.
+    ring_geo: kvc.Geometry,
     /// The stock head's f32 promotion inside the logits matmul (a bf16 `[vocab, hidden]` weight against f32 rows).
     head_promotion_bytes: u64,
     /// The allocator cache the module holds MLX to during the prefill: the stock tier's (the envelope's
@@ -158,7 +162,7 @@ pub const PrefillBill = struct {
     /// `default_chunk_target_bytes` of the chunk rule the model forwards its prompt by.
     pub const chunk_target_bytes: f64 = 8e9;
 
-    pub fn of(c: *const Config) PrefillBill {
+    pub fn of(c: *const Config, ring_geo: kvc.Geometry) PrefillBill {
         var min_ratio: u64 = 0;
         var kv: u64 = 0;
         var src: u64 = 0;
@@ -192,6 +196,7 @@ pub const PrefillBill = struct {
             .kv_sources = sources,
             .n_kv_sources = n_sources,
             .ring_row_bytes = ring_row,
+            .ring_geo = ring_geo,
             .head_promotion_bytes = @as(u64, c.vocab_size) * c.hidden_size * 4,
             .cache_bytes = expert_admission.Envelope.dsv41_pass2.prefill_cache_bytes,
             .served_cache_bytes = served_prefill_cache_bytes,
@@ -304,10 +309,6 @@ pub const PrefillBill = struct {
         return sdk.kv.lanesBytes(b.kvPlan(positions, &buf));
     }
 
-    /// The bill reads the rings at the default geometry (`kvc.Geometry{}`: the served tier sets no WINDOW_RING_*
-    /// geometry lever).
-    const ring_geo: kvc.Geometry = .{};
-
     pub const PlanBuf = struct { lanes: [max_layers]sdk.kv.LanePlan, rings: [max_layers + 1]sdk.kv.RingPlan };
 
     /// The served tier's KV plan (`sdk.kv.Plan`) for a request of `positions`: per kv source its compressed and index
@@ -330,20 +331,20 @@ pub const PrefillBill = struct {
 
     /// A `deepseek_v41_cache` Ring of `window` rows (the window ring: the model's window; the compressor frontier: the
     /// source's ratio): its base, the window plus a verify block, its slack and the headroom.
-    pub fn ringBase(window: u64) u64 {
-        return sdk.kv.ringBase(window, ring_geo);
+    pub fn ringBase(b: PrefillBill, window: u64) u64 {
+        return sdk.kv.ringBase(window, b.ring_geo);
     }
 
     /// A ring's rows through the prompt pass: from the third chunk on both of its slots at the compaction size (a
     /// chunk plus the window less one, at least the base); a shorter prompt holds one.
     pub fn ringPromptRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        return sdk.kv.ringPromptRows(window, b.chunkRows(seq), seq, ring_geo);
+        return sdk.kv.ringPromptRows(window, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus
     /// the window less one, at least the base) beside a new base; steady decode holds two bases.
     pub fn ringDecodeRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        return sdk.kv.ringDecodeRows(window, b.chunkRows(seq), seq, ring_geo);
+        return sdk.kv.ringDecodeRows(window, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// The window ring (one row over every layer: bf16 on layer 0, f32 after) through the prompt and in decode.
@@ -377,12 +378,12 @@ pub const PrefillBill = struct {
     /// frontier rings at their widest in the phase.
     pub fn kvPromptBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
         var buf: PlanBuf = undefined;
-        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .prompt, b.chunkRows(seq), seq, ring_geo);
+        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .prompt, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     pub fn kvDecodeBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
         var buf: PlanBuf = undefined;
-        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, ring_geo);
+        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
@@ -414,7 +415,7 @@ pub const PrefillBill = struct {
 /// The 3.0 bank's geometry as `PrefillBill.of` reads it (text_config: 64 heads, 32 index heads, window
 /// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets).
 fn bank30Bill() PrefillBill {
-    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512, .n_experts = 384 };
+    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512, .n_experts = 384, .ring_geo = .{} };
 }
 
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {

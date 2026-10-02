@@ -462,7 +462,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
     const variant = try billVariant();
     const tight_streams = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4).withInputRelease(module.prefillInputRelease(ov));
+    const bill = v41.PrefillBill.of(&c, module.kvGeometry(config)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4).withInputRelease(module.prefillInputRelease(ov));
     const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).
@@ -881,7 +881,7 @@ test "dsv41 memory: KV lanes at the request's declared bound against the fill's 
     const json = try v41.testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(json);
     const c = try v41.Config.parse(testing.allocator, json, null);
-    const pb = v41.PrefillBill.of(&c);
+    const pb = v41.PrefillBill.of(&c, module.numericTier(.served).kv);
     const seq = fill_prompt_tokens;
     const headroom = billedPositions(seq, fill_max_tokens);
     const declared = module.Module.maxPositions(@intCast(seq), seq + fill_max_tokens);
@@ -1171,7 +1171,7 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     const a = arena.allocator();
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
-    const pb = v41.PrefillBill.of(&c);
+    const pb = v41.PrefillBill.of(&c, module.numericTier(.served).kv);
     const positions = billedPositions(fill_prompt_tokens, fill_max_tokens);
     // Compressed 125,935,616 + index 31,483,904 (the four kv sources): +36,700,160 and +9,175,040 over the fill's request.
     try testing.expectEqual(@as(u64, 24_584), positions);
@@ -1181,7 +1181,7 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     try testing.expectEqual(@as(u64, 41_904_128), pb.ringDecodeBytes(fill_prompt_tokens));
     // The frontier rings (window 2, 2,048 B a row, two a source, three sources): 1,908 rows a ring over the prompt
     // (2 x (953 + 1)), 266 at decode's first step (184 + 82), against 214,106,112 B of full-length lanes.
-    try testing.expectEqual(@as(u64, 954), v41.PrefillBill.ringBase(2) + 872);
+    try testing.expectEqual(@as(u64, 954), pb.ringBase(2) + 872);
     try testing.expectEqual(@as(u64, 23_445_504), pb.frontierPromptBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 3_268_608), pb.frontierDecodeBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 355_600_384), pb.kvPromptBytes(fill_prompt_tokens, positions));
@@ -1270,7 +1270,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const fenced = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
+    const fenced = v41.PrefillBill.of(&c, module.kvGeometry(&config)).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
@@ -1455,7 +1455,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const pb = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape);
+    const pb = v41.PrefillBill.of(&c, module.kvGeometry(&config)).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape);
     const Rows = arm_mod.NativeRows;
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{

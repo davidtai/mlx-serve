@@ -164,6 +164,9 @@ pub fn Model(comptime G: type) type {
                 if (tier.routes.head != .mxfp8) return error.HeadMxNeedsMxfp8;
                 if (opts.registry == null) return error.HeadMxNeedsKernels;
             }
+            // The ring's verify margin holds the widest block a forward appends (`scratch_rows`), and every ring lever
+            // sits in the box the bill's ring tests cover: refused here, once, by name.
+            try routes.checkRingGeometry(tier.kv, scratch_rows);
             const self = try gpa.create(Self);
             self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed = undefined, .norm_w = undefined, .head = undefined };
             errdefer self.deinit(g);
@@ -2099,4 +2102,19 @@ test "dsv41 model: each layer of a forward is one wave, freed at the layer's end
 
 test "dsv41 model: the MLX instantiation of the model analyses (host, nothing runs)" {
     try testing.expect(@TypeOf(&mlxSmoke) != void);
+}
+
+test "dsv41 model: a ring geometry below the widest forward or outside the tested box is refused at construction" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    // A verify margin under the widest forward (scratch_rows, 8): a verify block would push read rows out of the ring.
+    var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_WINDOW_RING", "1" }, .{ "MTPLX_DSV41_WINDOW_RING_MAX_VERIFY", "7" } }, null);
+    try testing.expectError(error.RingVerifyBelowForward, TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src));
+    // A lever past the box the bill's ring tests cover.
+    tier.kv.max_verify = TM.scratch_rows;
+    tier.kv.headroom = routes.ring_lever_box.headroom_max + 1;
+    try testing.expectError(error.RingLeverRange, TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src));
 }
