@@ -1670,7 +1670,7 @@ test "dsv41 memory: per-layer decode rows (prompt_stats) bill exactly what unifo
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 9_200_000_000;
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;

@@ -282,7 +282,7 @@ pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
 
 /// The read pool's scheduling the Module installs, the server's and a harness's alike (the `expert_reader_sched` model
 /// setting on the shell's config; off by default): handed to the pool at its start.
-pub fn readerSched(config: *const model_io.ModelConfig) expert_io.Sched {
+pub fn readerSched(config: *const settings.Config) expert_io.Sched {
     return config.expert_reader_sched orelse .{};
 }
 
@@ -625,7 +625,7 @@ pub const Module = struct {
             if (ov.decode_extra_records != null) return error.DecodeExtraRecordsAreDerived;
             if (decodeFillGranule(ov) == .record) {
                 self.overrides.decode_extra_records = bill_mod.fillExtraRecords(b, target);
-                b = try bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, self.overrides);
+                b = try bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, self.overrides);
             }
             self.fill_target = target;
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
@@ -3417,7 +3417,7 @@ test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) a
 }
 
 test "dsv41 module: the reader scheduling is off by default and follows the shell's model setting" {
-    var c: model_io.ModelConfig = undefined;
+    var c: settings.Config = .{};
     c.expert_reader_sched = null;
     try std.testing.expectEqual(expert_io.Sched{}, readerSched(&c));
     try std.testing.expectEqual(expert_io.Sched{}, (Installed{}).reader_sched);

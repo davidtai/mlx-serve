@@ -1687,7 +1687,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
     // The read pool's scheduling, through the same config field the server's model setting sets.
-    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("model_settings.zig").ReaderSched.parse(v) orelse return error.CellReaderSched;
+    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("sdk").expert.Sched.parse(v) orelse return error.CellReaderSched;
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The feed's halves on their own (each overrides the feed's value for its half).
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);

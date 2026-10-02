@@ -31,7 +31,7 @@ pub const Config = struct {
     /// The routed waves wait on the reads' events instead of the host (null = the tier's default).
     expert_event_gates: ?bool = null,
     /// The read pool threads' scheduling (null = off).
-    expert_reader_sched: ?@import("model_settings.zig").ReaderSched = null,
+    expert_reader_sched: ?sdk.expert.Sched = null,
     /// The numerics, chosen at construction (null = served).
     numeric_tier: ?NumericTier = null,
     /// The prompt pass layer by layer (null = the tier's default).
@@ -89,7 +89,7 @@ pub const Config = struct {
             }
         };
         if (obj.get("expert_reader_sched")) |v| if (v == .string) {
-            if (@import("model_settings.zig").ReaderSched.parse(v.string)) |rs| {
+            if (sdk.expert.Sched.parse(v.string)) |rs| {
                 c.expert_reader_sched = rs;
                 any = true;
             }

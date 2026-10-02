@@ -38,9 +38,6 @@ pub const q3ld = struct {
     pub fn q3ld_sched_config(_: i32) c_int {
         return -1;
     }
-    pub fn q3ld_sched_config(_: i32) c_int {
-        return -1;
-    }
     pub fn q3ld_stop() c_int {
         return 0;
     }
