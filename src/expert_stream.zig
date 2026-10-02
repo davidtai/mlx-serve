@@ -3154,6 +3154,90 @@ test "dsv41 stream: the transient release frees the whole scratch with nothing l
     try s.flush();
 }
 
+test "dsv41 stream 0b: REVERSE: two requests through MLX slot rows: the reverse change's frees leave the footprint and the box, the scratch comes back, and request 2 serves request 1's bytes" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    _ = mlx.applyWiredPolicy();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var diag: expert_bank.Diag = .{};
+    var bank = expert_bank.Bank.open(a, testing.io, dir, expert_bank.dsv41, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer bank.deinit();
+    const depth = max_wide_depth;
+    if (bank.n_experts < depth * max_route_ids + max_route_ids) return error.TooFewExperts;
+    const L: u32 = 0;
+    const prompt_rows = try a.alloc(u32, bank.layers.len);
+    defer a.free(prompt_rows);
+    @memset(prompt_rows, 0);
+    prompt_rows[L] = 4;
+    const decode_rows = try a.dupe(u32, prompt_rows);
+    defer a.free(decode_rows);
+    decode_rows[L] = 4 + 24;
+    var buf: [1 << 16]u8 = undefined;
+    const s = try Stream.init(a, &bank, .{ .rows = prompt_rows, .transient_rows = depth * max_route_ids, .wide_depth = depth, .slot_memory = .{ .mlx = stream }, .transient_release = true });
+    defer s.deinit();
+    const geom = &bank.layers[L];
+    var served: [2][max_route_ids][32]u8 = undefined;
+    var l: [3][320]u8 = undefined;
+    var ms: [2][24]u8 = undefined;
+    for (0..2) |req| {
+        // The prompt: every window of layer L filled, the GPU reads every scratch row, then the routes end.
+        var live: [depth]*Route = undefined;
+        for (&live, 0..) |*r, w| {
+            var ids: [max_route_ids]u16 = undefined;
+            for (&ids, 0..) |*e, i| e.* = @intCast(w * max_route_ids + i);
+            r.* = try serve(s, L, &ids);
+        }
+        var sums: [n_components]mlx.mlx_array = @splat(.{});
+        for (&sums, s.transient.backing.mlx.arrays) |*x, arr| {
+            x.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_sum(x, arr, false, stream));
+        }
+        try evalArrays(&sums);
+        for (sums) |x| _ = mlx.mlx_array_free(x);
+        for (live) |r| s.release(r);
+        _ = mlx.mlx_synchronize(stream);
+        _ = try s.releaseTransient();
+        _ = mlx.mlx_clear_cache();
+        try s.grow(decode_rows);
+        // Decode: the same misses every request, served into the grown rows and window 0.
+        var ids: [max_route_ids]u16 = undefined;
+        for (&ids, 0..) |*e, i| e.* = @intCast(bank.n_experts - 1 - i);
+        const r = try serve(s, L, &ids);
+        for (ids, r.plan.slotsOf(), 0..) |e, slot, i| {
+            served[req][i] = slotDigest(s, L, slot, geom);
+            try testing.expectEqualSlices(u8, &bank.digest(L, e).logical, &served[req][i]);
+        }
+        s.release(r);
+        try s.flush();
+        if (req == 1) break;
+        // The reverse change: synchronize, the frees, the cache clear; the footprint falls by them (within 10 %) and the
+        // pages outside it do not rise (10 %); only then the scratch.
+        _ = mlx.mlx_synchronize(stream);
+        const b1 = try ProbeBox.mark(&buf);
+        const freed = try s.shrink(prompt_rows);
+        try testing.expectEqual(transientBytes(s, 24 + max_route_ids + decode_staging_rows), freed);
+        _ = mlx.mlx_synchronize(stream);
+        _ = mlx.mlx_clear_cache();
+        const limit: i64 = @intCast(freed / 10);
+        const f1 = try ProbeBox.settleFootprint(b1, &buf, 2000, limit - @as(i64, @intCast(freed)));
+        const r1 = try ProbeBox.settle(b1, &buf, 2000, limit);
+        const regrown = try s.regrowTransient();
+        const b2 = try ProbeBox.mark(&buf);
+        std.debug.print("\nREVERSE_PHASE_PROBE {{\"freed_bytes\": {d}, \"regrown_bytes\": {d}, \"released\": {s}, \"footprint_settle_ms\": {s}, \"outside_settle_ms\": {s}, \"regrown\": {s}, \"limit\": {d}}}\n", .{
+            freed, regrown, ProbeBox.line(b1, r1.b, &l[0]), ProbeBox.msOf(f1.ms, &ms[0]), ProbeBox.msOf(r1.ms, &ms[1]), ProbeBox.line(b1, b2, &l[1]), limit,
+        });
+        if (f1.ms == null) return error.ReverseKeptFootprint;
+        if (r1.ms == null) return error.ReverseOutsideFootprint;
+        try testing.expectEqual(transientBytes(s, depth * max_route_ids), regrown);
+    }
+    for (served[0], served[1]) |x, y| try testing.expectEqualSlices(u8, &x, &y);
+}
+
 test "dsv41 stream: after the transient release, decode with the served lookahead, pre-reads and gates loads only window 0" {
     var sb = try SynthBank.open(32);
     defer sb.close();
