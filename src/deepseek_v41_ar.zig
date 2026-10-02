@@ -1049,6 +1049,9 @@ const CellReceipt = struct {
     /// and the rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
     decode_rows_alloc: ?[]const u8 = null,
     decode_rows_layers: ?struct { layers: []const u32, total: u64, min: u32, max: u32 } = null,
+    /// The fill's decode granule as installed ("row" | "record") and the single records past the rows it admitted.
+    decode_fill_granule: ?[]const u8 = null,
+    decode_extra_records: ?u32 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1471,6 +1474,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
         .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
+        .decode_fill_granule = @tagName(md.installed.decode_fill_granule),
+        .decode_extra_records = md.decode_extra,
         .decode_rows_layers = blk: {
             const gr = md.grownRows();
             const s = module.rowsSummary(gr);
@@ -1608,6 +1613,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
     // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
     if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
+    // The fill's decode granule (row | record: the leftover below one row as single records, billed).
+    if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
@@ -1668,8 +1675,14 @@ fn gbOf(x: u64) f64 {
 }
 
 /// The harness's bill (`bill_mod.billAt` at the window's wired bytes).
+/// The record granule (`DSV41_CELL_DECODE_FILL_GRANULE=record`): the single decode records the Module derives at the same
+/// target (`bill_mod.fillExtraRecords`), billed.
 fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
-    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, args.ov);
+    const b = try bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, args.ov);
+    if (module.decodeFillGranule(args.ov) == .row) return b;
+    var ov = args.ov;
+    ov.decode_extra_records = bill_mod.fillExtraRecords(b, args.ceiling -| args.stop);
+    return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, ov);
 }
 
 /// The harness's fill (`bill_mod.fill` at the window's wired bytes), to the guard's ceiling less the window's stop
@@ -2261,7 +2274,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "buffer allowances (provisional; pass3br's mark readings)", .p = b.prefillTerms().prompt_buffer_allowance, .d = b.decodeTerms().decode_buffer_allowance },
     }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
-    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"decode_extra_records\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, b.decode_extra_records, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes });
 }
 
 test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {

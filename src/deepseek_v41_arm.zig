@@ -203,6 +203,15 @@ pub fn wideWindowBytes(depth: u8, record: u64) u64 {
 /// (`DecodeRows`: the same total, shifted toward the layers whose own prompt routing is spread widest).
 pub const DecodeRowsAlloc = enum { uniform, prompt_stats };
 
+/// The fill's granule at decode: `row` (one record on every layer, today's) or `record` (the leftover below one row
+/// handed out as single records: `bill.fillExtraRecords`).
+pub const DecodeFillGranule = enum { row, record };
+
+/// The uniform route's rows with `extra` single records: one more on layers 0 .. extra - 1.
+pub fn uniformRows(out: []u32, uniform: u32, extra: u32) void {
+    for (out, 0..) |*r, l| r.* = uniform + @intFromBool(l < extra);
+}
+
 /// prompt_stats moves a layer at most this many rows from the admitted count.
 pub const decode_rows_shift_cap: u32 = 20;
 
@@ -259,9 +268,16 @@ pub const DecodeRows = struct {
 
     /// The rows per layer from the filled counts, the prompt rows and the admitted count `uniform`.
     pub fn plan(self: *DecodeRows, prompt_rows: []const u32, uniform: u32) ![]const u32 {
+        return self.planWith(prompt_rows, uniform, 0);
+    }
+
+    /// `plan` with `extra` single records past L x uniform (`fillExtraRecords`: the fill's leftover below one row),
+    /// taken by the same order (each layer's next row).
+    pub fn planWith(self: *DecodeRows, prompt_rows: []const u32, uniform: u32, extra: u32) ![]const u32 {
         const n_layers = self.rows.len;
         if (prompt_rows.len != n_layers or uniform > self.n_experts) return error.InvalidRows;
-        var k: u64 = @as(u64, n_layers) * uniform;
+        if (extra >= n_layers or (extra > 0 and uniform >= self.n_experts)) return error.InvalidRows;
+        var k: u64 = @as(u64, n_layers) * uniform + extra;
         var nc: usize = 0;
         for (0..n_layers) |l| {
             const c = self.layerCounts(l);
@@ -425,9 +441,9 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         }
 
         /// prompt_stats' rows: each layer's prompt routing counts (`Stream.promptCounts`) through `DecodeRows.plan`.
-        pub fn promptRows(self: *Self, dr: *DecodeRows) ![]const u32 {
+        pub fn promptRows(self: *Self, dr: *DecodeRows, extra: u32) ![]const u32 {
             for (0..self.config.n_layers) |l| @memcpy(dr.layerCounts(l), self.stream.promptCounts(@intCast(l)));
-            return dr.plan(self.prefill_rows, self.decode_rows[0]);
+            return dr.planWith(self.prefill_rows, self.decode_rows[0], extra);
         }
 
         /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
@@ -1119,7 +1135,7 @@ test "dsv41 rows: an arm grows each layer to prompt_stats' rows from its prompt 
     }
     var dr = try DecodeRows.init(a, 5, 8);
     defer dr.deinit(a);
-    const rows = try arm.promptRows(&dr);
+    const rows = try arm.promptRows(&dr, 0);
     try testing.expectEqual(@as(u32, 8), rows[3]);
     var total: u32 = 0;
     for (rows) |r| total += r;
@@ -1135,4 +1151,63 @@ test "dsv41 rows: an arm grows each layer to prompt_stats' rows from its prompt 
         grown_bytes += (r - 2) * arm.bank.layers[l].logical_bytes;
     }
     try testing.expectEqual(@as(u64, 5) * (4 - 2) * arm.inputs.record_bytes, grown_bytes);
+}
+
+test "dsv41 rows: the record granule's single records: uniform hands them out from layer 0, prompt_stats by its order; totals to the record" {
+    const a = testing.allocator;
+    var rows: [5]u32 = undefined;
+    uniformRows(&rows, 30, 3);
+    try testing.expectEqualSlices(u32, &.{ 31, 31, 31, 30, 30 }, &rows);
+    uniformRows(&rows, 30, 0);
+    try testing.expectEqualSlices(u32, &.{ 30, 30, 30, 30, 30 }, &rows);
+    var dr = try DecodeRows.init(a, 5, 64);
+    defer dr.deinit(a);
+    const p10: [5]u32 = @splat(10);
+    // Layer 3 flat, the others on one expert: the records follow the order (layer 3 first, to its cap).
+    for (0..5) |l| {
+        const c = dr.layerCounts(l);
+        @memset(c, 0);
+        if (l == 3) @memset(c, 9) else c[l] = 500;
+    }
+    const got = try dr.planWith(&p10, 30, 4);
+    var total: u64 = 0;
+    for (got) |r| {
+        total += r;
+        try testing.expect(r >= 10 and r <= 50);
+    }
+    try testing.expectEqual(@as(u64, 5 * 30 + 4), total);
+    try testing.expectEqual(@as(u32, 50), got[3]);
+    // Equal counts: uniform plus the records from layer 0, as the uniform route.
+    for (0..5) |l| @memset(dr.layerCounts(l), 1);
+    try testing.expectEqualSlices(u32, &.{ 31, 31, 31, 31, 30 }, try dr.planWith(&p10, 30, 4));
+    // At most layers - 1 records; none when every expert is resident.
+    try testing.expectError(error.InvalidRows, dr.planWith(&p10, 30, 5));
+    try testing.expectError(error.InvalidRows, dr.planWith(&p10, 64, 1));
+}
+
+test "dsv41 rows: an arm grows the record granule's single records into its existing ext banks; grown bytes are the billed records" {
+    const tm = try TestModel.createWith(true, 8);
+    defer tm.destroy();
+    var g = ops.TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var diag: Diag = .{};
+    var o = tm.options();
+    o.envelope_record = false;
+    o.implemented.n_experts = 8;
+    o.native_rows = .{ .prefill = 2, .decode = 4 };
+    const arm = try TraceArm.init(testing.allocator, std.testing.io, &g, {}, o, &diag);
+    defer arm.deinit();
+    var rows: [5]u32 = undefined;
+    uniformRows(&rows, 4, 3);
+    try arm.growRows(&g, &rows);
+    var grown: u64 = 0;
+    var exts: u32 = 0;
+    for (rows, 0..) |r, l| {
+        try testing.expectEqual(r, arm.stream.layers[l].policy.capacity);
+        grown += (r - 2) * arm.bank.layers[l].logical_bytes;
+        exts += @intFromBool(arm.stream.layers[l].ext != null);
+    }
+    try testing.expectEqual((5 * (4 - 2) + 3) * arm.inputs.record_bytes, grown);
+    // The records land in the layers' own ext banks: no array beyond uniform's.
+    try testing.expectEqual(@as(u32, 5), exts);
 }

@@ -146,7 +146,16 @@ pub const RouteOverrides = struct {
     decode_cache_bytes: ?u64 = null,
     /// The phase change's per-layer decode rows (`arm_mod.DecodeRowsAlloc`). null: the default, uniform.
     decode_rows_alloc: ?arm_mod.DecodeRowsAlloc = null,
+    /// The fill's decode granule (`arm_mod.DecodeFillGranule`). null: the default, a row.
+    decode_fill_granule: ?arm_mod.DecodeFillGranule = null,
+    /// Set by the Module only (the record granule's `bill.fillExtraRecords` at the admitted rows; refused when given).
+    decode_extra_records: ?u32 = null,
 };
+
+/// The fill granule the Module installs (a row unless set).
+pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
+    return ov.decode_fill_granule orelse .row;
+}
 
 /// The decode rows route the Module installs (uniform unless set).
 pub fn decodeRowsAlloc(ov: RouteOverrides) arm_mod.DecodeRowsAlloc {
@@ -363,6 +372,10 @@ pub const Module = struct {
     /// prompt_stats' scratch (built at construction when installed) and the rows the phase change grew to.
     decode_rows: ?arm_mod.DecodeRows = null,
     grown_rows: ?[]const u32 = null,
+    /// The record granule's single decode records (`RouteOverrides.decode_extra_records`) and, on the uniform route,
+    /// its rows (layers 0 .. extra - 1 one more), built at construction.
+    decode_extra: u32 = 0,
+    uniform_rows: []u32 = &.{},
     /// The request's decode host side (`DecodeHost`; reset at each phase change).
     decode_host: DecodeHost = .{},
     /// The prompt-start reference and the terminal refusal (`PhaseGate`).
@@ -452,10 +465,16 @@ pub const Module = struct {
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, ov) catch |e| {
+            var b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
+            // The record granule: the fill's leftover below one row as single decode records, billed (slot_decode).
+            if (ov.decode_extra_records != null) return error.DecodeExtraRecordsAreDerived;
+            if (decodeFillGranule(ov) == .record) {
+                self.overrides.decode_extra_records = bill_mod.fillExtraRecords(b, target);
+                b = try bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, status.vmBytes().wired, ceiling_bytes, self.overrides);
+            }
             self.fill_target = target;
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             admitPhases(b, self.fill_target) catch |e| {
@@ -599,6 +618,16 @@ pub const Module = struct {
             },
         }
         self.installed.decode_rows_alloc = rows_alloc;
+        self.installed.decode_fill_granule = decodeFillGranule(ov);
+        self.decode_extra = self.overrides.decode_extra_records orelse 0;
+        if (rows_alloc == .uniform and self.decode_extra > 0) switch (self.arm) {
+            inline else => |t| {
+                self.uniform_rows = try gpa.alloc(u32, t.arm.decode_rows.len);
+                arm_mod.uniformRows(self.uniform_rows, t.arm.decode_rows[0], self.decode_extra);
+                self.grown_rows = self.uniform_rows;
+            },
+        };
+        log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)", .{ self.installed.decode_fill_granule, self.decode_extra });
         log.info("NATIVE decode rows alloc: {s}", .{switch (rows_alloc) {
             .uniform => "uniform",
             .prompt_stats => std.fmt.comptimePrint("prompt_stats (shift cap {d}; floor max(prompt rows, U - {d}); total U x layers)", .{ arm_mod.decode_rows_shift_cap, arm_mod.decode_rows_shift_cap }),
@@ -786,9 +815,9 @@ pub const Module = struct {
                 if (t.arm.prefill_rows[0] >= t.arm.decode_rows[0]) return error.NoRoomAbovePromptRows;
                 var dr = try arm_mod.DecodeRows.init(self.gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
                 defer dr.deinit(self.gpa);
-                const would = try t.arm.promptRows(&dr);
+                const would = try t.arm.promptRows(&dr, self.decode_extra);
                 const s = rowsSummary(would);
-                const json = try std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{});
+                const json = try std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .extra = self.decode_extra, .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{});
                 defer self.gpa.free(json);
                 log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
             },
@@ -803,6 +832,7 @@ pub const Module = struct {
         self.head.deinit(&self.g);
         if (self.draft_cache) |dc| dc.deinit();
         if (self.decode_rows) |*dr| dr.deinit(gpa);
+        gpa.free(self.uniform_rows);
         self.model.deinit(&self.g);
         self.embed_rows.close();
         self.engram.deinit();
@@ -1177,7 +1207,7 @@ pub const Module = struct {
         // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
         if (self.decode_rows) |*dr| {
             self.grown_rows = switch (self.arm) {
-                inline else => |t| t.arm.promptRows(dr) catch |e| return self.refuseBoundary(e),
+                inline else => |t| t.arm.promptRows(dr, self.decode_extra) catch |e| return self.refuseBoundary(e),
             };
             self.logDecodeRows(dr);
         }
@@ -1220,7 +1250,7 @@ pub const Module = struct {
         // A stack buffer: the phase change allocates nothing on the heap.
         var buf: [8192]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buf);
-        const json = std.json.Stringify.valueAlloc(fba.allocator(), .{ .alloc = "prompt_stats", .uniform = self.bill.decode_rows, .layers = dr.rows, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{}) catch return;
+        const json = std.json.Stringify.valueAlloc(fba.allocator(), .{ .alloc = "prompt_stats", .uniform = self.bill.decode_rows, .extra = self.decode_extra, .layers = dr.rows, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{}) catch return;
         log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
     }
 
@@ -1342,6 +1372,8 @@ pub const Installed = struct {
     decode_cache_bytes: u64 = envelope.decode_cache_bytes,
     /// The phase change's per-layer decode rows, as installed (`decodeRowsAlloc`, past `checkDecodeRowsAlloc`).
     decode_rows_alloc: arm_mod.DecodeRowsAlloc = .uniform,
+    /// The fill's decode granule, as installed (`decodeFillGranule`).
+    decode_fill_granule: arm_mod.DecodeFillGranule = .row,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -2720,4 +2752,11 @@ test "dsv41 module: per-layer decode rows are uniform unless set; prompt_stats n
     try std.testing.expectError(error.DecodeRowsAllocNeedsSeed, checkDecodeRowsAlloc(.prompt_stats, false, 136, 171));
     try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.prompt_stats, true, 171, 171));
     try std.testing.expectEqual(RowsSummary{ .total = 12, .min = 2, .max = 6 }, rowsSummary(&.{ 4, 2, 6 }));
+}
+
+test "dsv41 module: the fill's decode granule is a row unless set; the records are the Module's to derive" {
+    try std.testing.expectEqual(arm_mod.DecodeFillGranule.row, decodeFillGranule(.{}));
+    try std.testing.expectEqual(arm_mod.DecodeFillGranule.record, decodeFillGranule(.{ .decode_fill_granule = .record }));
+    try std.testing.expect((Installed{}).decode_fill_granule == .row);
+    try std.testing.expect((RouteOverrides{}).decode_extra_records == null);
 }
