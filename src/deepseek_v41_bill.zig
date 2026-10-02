@@ -540,7 +540,7 @@ pub fn draftResidentBytes(m: *const v41.WeightMap, ov: module.RouteOverrides) u6
 /// pool staging (in the host side): nothing else.
 pub fn draftCacheBytes(c: *const v41.Config, ov: module.RouteOverrides) !u64 {
     const hot = module.draftCacheHot(ov) orelse return 0;
-    return dspark_head.draftCacheBytes(c, hot);
+    return dspark_head.draftCacheBytes(c, hot, try module.draftCachePool(ov));
 }
 
 /// The prompt pass's billed transient: K16's layer-major wave (JOINLESS: the wave alone; else with the wide lane's
@@ -1404,7 +1404,7 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
         try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[0], .decode = w.decode[0] }, r0);
         for (hots, 1..) |hot, hi| {
             var b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .draft_cache_hot = hot });
-            const term = try dspark_head.draftCacheBytes(&c, hot);
+            const term = try dspark_head.draftCacheBytes(&c, hot, .per_stage);
             try testing.expectEqual(term, b.draft_cache);
             try testing.expectEqual(@as(i64, @intCast(term)) - 7_219_445_760, @as(i64, @intCast(b.residents)) - @as(i64, @intCast(b0.residents)));
             b.engram_posted = posted;

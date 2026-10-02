@@ -423,3 +423,52 @@ test "dsv41 slot cache: no memory plans only (the trace backend), with the polic
     // 58 + 57 rows: weights a page multiple, scales rounded up to the page per array.
     try testing.expectEqual(@as(u64, 115 * 5_898_240 + std.mem.alignForward(u64, 58 * 368_640, 16384) + std.mem.alignForward(u64, 57 * 368_640, 16384)), cache.geom.billBytes());
 }
+
+test "dsv41 slot cache: one group shared by consecutive routes reuses a row the previous route served as early as the policy allows; every route's rows are its records" {
+    // Three "stages" of 12 experts in one group (global id = stage x 12 + e), 2 hot + 6 transient rows: each route is a
+    // stage's 2 rows x top-3; stage s + 1 routes right after stage s, the next block's stage 0 right after stage 2.
+    const a = testing.allocator;
+    const n_stages = 3;
+    const per = 12;
+    var fx = try Fixture.init(a, 1, n_stages * per, &test_comps, 41);
+    defer fx.deinit(a);
+    var pool = try expert_io.Pool.start(a, .{ .workers = 3, .staging_bytes = 4 * std.heap.pageSize(), .tickets = 256 });
+    defer pool.stop();
+    const cache = try Cache.init(a, .{ .n_experts = n_stages * per, .components = &test_comps, .capacity = &.{2}, .transient = 6 }, .host, pool);
+    defer cache.deinit();
+    const f = try cache.openFile(fx.path);
+    for (0..n_stages * per) |e| for (0..test_comps.len) |k| cache.setLoc(0, e, k, .{ .file = f, .offset = fx.offsets[e * test_comps.len + k] });
+    try cache.checkLocs();
+    _ = try cache.seed(0, &.{ 0, 12 });
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    var prev: [6]u32 = undefined;
+    var prev_ids: [6]u16 = undefined;
+    var have_prev = false;
+    var reuse_in_block: u32 = 0;
+    var reuse_across: u32 = 0;
+    for (0..20) |blk| for (0..n_stages) |st| {
+        var ids: [6]u16 = undefined;
+        for (&ids, 0..) |*d, i| {
+            while (true) {
+                d.* = @intCast(st * per + rnd.uintLessThan(u16, per));
+                if (std.mem.indexOfScalar(u16, ids[i - i % 3 .. i], d.*) == null) break;
+            }
+        }
+        var slots: [6]u32 = undefined;
+        try cache.route(0, &ids, &slots);
+        // The kernel's input at this route's evaluation (before the next route plans): its records' bytes, row for row.
+        for (ids, slots) |e, slot| for (0..test_comps.len) |k| {
+            try testing.expectEqualSlices(u8, fx.part(&test_comps, n_stages * per, 0, e, k), cache.row(0, k, slot));
+        };
+        // A row the previous route read now holds another record: the earliest reuse there is.
+        if (have_prev) for (slots, ids) |slot, e| for (prev, prev_ids) |ps, pe| if (slot == ps and e != pe) {
+            if (st == 0) reuse_across += 1 else reuse_in_block += 1;
+        };
+        _ = blk;
+        prev = slots;
+        prev_ids = ids;
+        have_prev = true;
+    };
+    try testing.expect(reuse_in_block > 0 and reuse_across > 0);
+}

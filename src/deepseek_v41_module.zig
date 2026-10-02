@@ -139,11 +139,19 @@ pub const RouteOverrides = struct {
     /// DRAFTCACHE: the DSpark experts behind an exact adaptive cache of this many hot slots (split over the stages),
     /// plus one draft block's transient slots per stage; none resident. null: the default, all resident.
     draft_cache_hot: ?u32 = null,
+    /// DRAFTCACHE's slot pool form (`dh.DraftPool`; null: per_stage). Only with `draft_cache_hot`.
+    draft_cache_pool: ?dh.DraftPool = null,
 };
 
 /// DRAFTCACHE's hot slots as the Module installs it and the bill charges it (one resolver; off by default).
 pub fn draftCacheHot(ov: RouteOverrides) ?u32 {
     return ov.draft_cache_hot;
+}
+
+/// DRAFTCACHE's pool form as installed and billed (per_stage unless set); a form without a hot count is refused by name.
+pub fn draftCachePool(ov: RouteOverrides) error{DraftCachePoolWithoutHot}!dh.DraftPool {
+    if (ov.draft_cache_hot == null and ov.draft_cache_pool != null) return error.DraftCachePoolWithoutHot;
+    return ov.draft_cache_pool orelse .per_stage;
 }
 
 /// The host relief route the Module installs (off by default).
@@ -526,16 +534,18 @@ pub const Module = struct {
             const pool = switch (self.arm) {
                 inline else => |t| t.arm.stream.pool,
             };
-            self.draft_cache = dh.DraftCache.open(gpa, &ck, &c, hot, .{ .mlx = s }, pool) catch |e| {
+            self.draft_cache = dh.DraftCache.open(gpa, &ck, &c, hot, try draftCachePool(ov), .{ .mlx = s }, pool) catch |e| {
                 log.err("draft cache refused at hot {d}: {s}", .{ hot, @errorName(e) });
                 return e;
             };
         }
         errdefer if (self.draft_cache) |dc| dc.deinit();
+        _ = try draftCachePool(ov);
         self.installed.draft_cache_hot = draftCacheHot(ov);
+        self.installed.draft_cache_pool = if (self.draft_cache) |dc| dc.geom.pool else null;
         if (self.draft_cache) |dc| {
-            const caps = dc.geom.caps[0..dc.n_stages];
-            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per stage, {d} B of slot banks; misses read past the page cache by the stream's pool; each stage seeded with its first ids)", .{ dc.hot, caps, dc.geom.transient, dc.cache.geom.billBytes() });
+            const caps = dc.geom.caps[0..dc.geom.n_groups];
+            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.cache.geom.billBytes() });
         } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
         self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache });
         errdefer self.head.deinit(&self.g);
@@ -1211,6 +1221,8 @@ pub const Installed = struct {
     host_relief: bool = false,
     /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
     draft_cache_hot: ?u32 = null,
+    /// DRAFTCACHE's pool form, as installed (null: the route off).
+    draft_cache_pool: ?dh.DraftPool = null,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -2567,4 +2579,7 @@ test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) a
     try std.testing.expectEqual(@as(?u32, null), draftCacheHot(.{}));
     try std.testing.expectEqual(@as(?u32, null), (Installed{}).draft_cache_hot);
     try std.testing.expectEqual(@as(?u32, 201), draftCacheHot(.{ .draft_cache_hot = 201 }));
+    try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
+    try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
+    try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
 }

@@ -402,12 +402,13 @@ pub fn Head(comptime G: type) type {
 
         /// Component `k` of stage `s`'s slot bank: the cache's MLX array (borrowed), or on the trace backend a leaf of its shape.
         fn cacheBank(g: *G, dc: *const DraftCache, s: usize, k: usize) !T {
+            const grp = dc.geom.group_of[s];
             if (comptime G == ops.MlxOps) {
                 if (dc.cache.memory != .mlx) return error.DraftCacheMemory;
-                return dc.cache.arrays[s][k];
+                return dc.cache.arrays[grp][k];
             }
             var shape: [3]c_int = undefined;
-            shape[0] = @intCast(dc.cache.geom.rows(s));
+            shape[0] = @intCast(dc.cache.geom.rows(grp));
             @memcpy(shape[1..3], &dc.geom.shapes[k]);
             return g.input(&shape, dc.geom.comps[k].dtype);
         }
@@ -592,7 +593,9 @@ pub fn Head(comptime G: type) type {
             ex: *const Experts,
             limit: f64,
             dc: *DraftCache,
-            stage: u32,
+            /// The stage's group in the cache and its experts' id offset there (`DraftGeometry`, fixed at construction).
+            group: u32,
+            offset: u16,
 
             pub fn at(self: Cached, _: u32) Cached {
                 return self;
@@ -603,9 +606,10 @@ pub fn Head(comptime G: type) type {
                 const n: usize = @intCast(si.numel());
                 if (n > expert_policy.max_route_ids) return error.DraftCacheRouteWidth;
                 var id_buf: [expert_policy.max_route_ids]u16 = undefined;
-                const ids = try g.hostIds(routed_ids, id_buf[0..n]);
+                _ = try g.hostIds(routed_ids, id_buf[0..n]);
+                for (id_buf[0..n]) |*e| e.* += self.offset;
                 var slots: [expert_policy.max_route_ids]u32 = undefined;
-                try self.dc.cache.route(self.stage, ids, slots[0..n]);
+                try self.dc.cache.route(self.group, id_buf[0..n], slots[0..n]);
                 var sl: [expert_policy.max_route_ids]i32 = undefined;
                 for (sl[0..n], slots[0..n]) |*d, v| d.* = @intCast(v);
                 const indices = try g.hostArray(std.mem.sliceAsBytes(sl[0..n]), si.slice(), .int32);
@@ -630,7 +634,7 @@ pub fn Head(comptime G: type) type {
         };
 
         fn sourceOf(self: *const Self, st: *const Stage, s: usize) Source {
-            if (self.cache) |dc| return .{ .cached = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .dc = dc, .stage = @intCast(s) } };
+            if (self.cache) |dc| return .{ .cached = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .dc = dc, .group = dc.geom.group_of[s], .offset = @intCast(dc.geom.offset_of[s]) } };
             return .{ .resident = .{ .ex = &st.experts, .limit = self.c.swiglu_limit, .lut = st.lut } };
         }
 
@@ -772,22 +776,53 @@ fn partShape(c: *const v41.Config, k: usize) [2]c_int {
     return .{ out_dim, if (k % 2 == 0) @divExact(in_dim, 8) else @divExact(in_dim, 32) };
 }
 
-/// The cache's geometry at `hot` (owned by `DraftCache`, or the caller's for a bill). Refuses by name when a stage's
-/// slots would hold every expert (no byte saved).
+/// The slot pool's form: one bank per stage (the hot count split evenly), or one bank all stages share (one policy
+/// over every stage's experts, global id = stage x experts + expert; one block's transient rows serve every stage).
+pub const DraftPool = enum { per_stage, shared };
+
+/// The cache's geometry at `hot` (owned by `DraftCache`, or the caller's for a bill). Refuses by name when a group's
+/// slots would hold every expert it serves (no byte saved).
 pub const DraftGeometry = struct {
     comps: [draft_parts.len]xsc.Component = undefined,
     shapes: [draft_parts.len][2]c_int = undefined,
     caps: [max_draft_stages]u32 = undefined,
+    pool: DraftPool = .per_stage,
     n_stages: u32 = 0,
+    /// The cache's groups: one per stage, or one shared.
+    n_groups: u32 = 0,
+    /// Experts per group: a stage's, or every stage's when shared.
     n_experts: u32 = 0,
     transient: u32 = 0,
+    /// Each stage's group and the offset of its expert 0 in that group's ids.
+    group_of: [max_draft_stages]u32 = undefined,
+    offset_of: [max_draft_stages]u32 = undefined,
 
-    pub fn of(c: *const v41.Config, hot: u32) error{DraftCacheGeometry}!DraftGeometry {
+    pub fn of(c: *const v41.Config, hot: u32, pool: DraftPool) error{DraftCacheGeometry}!DraftGeometry {
         const ds = c.dspark;
         if (ds.n_stages == 0 or ds.n_stages > max_draft_stages) return error.DraftCacheGeometry;
-        var d: DraftGeometry = .{ .n_stages = ds.n_stages, .n_experts = ds.n_routed_experts, .transient = draftTransient(c) };
-        hotSplit(hot, ds.n_stages, &d.caps);
-        for (d.caps[0..ds.n_stages]) |cap| if (cap + d.transient >= ds.n_routed_experts) return error.DraftCacheGeometry;
+        var d: DraftGeometry = .{ .pool = pool, .n_stages = ds.n_stages, .transient = draftTransient(c) };
+        switch (pool) {
+            .per_stage => {
+                d.n_groups = ds.n_stages;
+                d.n_experts = ds.n_routed_experts;
+                hotSplit(hot, ds.n_stages, &d.caps);
+                for (0..ds.n_stages) |st| {
+                    d.group_of[st] = @intCast(st);
+                    d.offset_of[st] = 0;
+                }
+            },
+            .shared => {
+                d.n_groups = 1;
+                d.n_experts = ds.n_stages * ds.n_routed_experts;
+                d.caps[0] = hot;
+                for (0..ds.n_stages) |st| {
+                    d.group_of[st] = 0;
+                    d.offset_of[st] = @intCast(st * ds.n_routed_experts);
+                }
+            },
+        }
+        if (d.n_experts > expert_policy.no_expert) return error.DraftCacheGeometry;
+        for (d.caps[0..d.n_groups]) |cap| if (cap + d.transient >= d.n_experts) return error.DraftCacheGeometry;
         for (&d.shapes, 0..) |*sh, k| sh.* = partShape(c, k);
         return d;
     }
@@ -799,27 +834,29 @@ pub const DraftGeometry = struct {
             .shape = sh,
             .dtype = if (k % 2 == 0) .uint32 else .uint8,
         };
-        return .{ .n_experts = d.n_experts, .components = &d.comps, .capacity = d.caps[0..d.n_stages], .transient = d.transient };
+        return .{ .n_experts = d.n_experts, .components = &d.comps, .capacity = d.caps[0..d.n_groups], .transient = d.transient };
     }
 
-    /// The bill's term: every stage's slot arrays, each rounded to the allocator's page.
+    /// The bill's term: every group's slot arrays, each rounded to the allocator's page.
     pub fn billBytes(d: *DraftGeometry) u64 {
         return d.geometry().billBytes();
     }
 };
 
-/// The bill's DRAFTCACHE term at `hot` (replacing the resident experts).
-pub fn draftCacheBytes(c: *const v41.Config, hot: u32) error{DraftCacheGeometry}!u64 {
-    var d = try DraftGeometry.of(c, hot);
+/// The bill's DRAFTCACHE term at `hot` in `pool`'s form (replacing the resident experts).
+pub fn draftCacheBytes(c: *const v41.Config, hot: u32, pool: DraftPool) error{DraftCacheGeometry}!u64 {
+    var d = try DraftGeometry.of(c, hot, pool);
     return d.billBytes();
 }
 
-/// Every part of stages [0, n_stages) of `cache` placed at its checkpoint tensor, each shard opened once past the page
-/// cache; a tensor of another dtype or shape than the geometry's is refused by name.
-pub fn placeParts(cache: *xsc.Cache, a: std.mem.Allocator, ck: *const v41.Checkpoint, shapes: *const [draft_parts.len][2]c_int, n_stages: u32) !void {
+/// Every part of stages [0, n_stages) placed at its checkpoint tensor in `cache` (stage s's expert e at its group's id
+/// offset + e, `geom`), each shard opened once past the page cache; a tensor of another dtype or shape than the
+/// geometry's is refused by name.
+pub fn placeParts(cache: *xsc.Cache, a: std.mem.Allocator, ck: *const v41.Checkpoint, geom: *const DraftGeometry, n_stages: u32, n_stage_experts: u32) !void {
+    const shapes = &geom.shapes;
     var file_of: [64]?u16 = @splat(null);
     var name: [96]u8 = undefined;
-    for (0..n_stages) |s| for (0..cache.geom.n_experts) |e| for (draft_parts, 0..) |part, k| {
+    for (0..n_stages) |s| for (0..n_stage_experts) |e| for (draft_parts, 0..) |part, k| {
         const n = try std.fmt.bufPrint(&name, "mtp.{d}.ffn.experts.{d}.{s}", .{ s, e, part });
         const t = ck.tensors.get(n) orelse return error.MissingWeight;
         const want: v41.StDtype = if (k % 2 == 0) .U32 else .U8;
@@ -833,7 +870,7 @@ pub fn placeParts(cache: *xsc.Cache, a: std.mem.Allocator, ck: *const v41.Checkp
             file_of[t.shard] = idx;
             break :blk idx;
         };
-        cache.setLoc(s, e, k, .{ .file = f, .offset = t.begin });
+        cache.setLoc(geom.group_of[s], geom.offset_of[s] + e, k, .{ .file = f, .offset = t.begin });
     };
 }
 
@@ -847,36 +884,46 @@ pub const DraftCache = struct {
     cache: *xsc.Cache,
 
     /// The policy alone, no slot memory and no file (the trace backend's stand-in).
-    pub fn planOnly(a: std.mem.Allocator, c: *const v41.Config, hot: u32) !*DraftCache {
+    pub fn planOnly(a: std.mem.Allocator, c: *const v41.Config, hot: u32, pool: DraftPool) !*DraftCache {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, pool), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), .none, null);
         return self;
     }
 
     /// The cache at `hot` over `ck`'s shards (each opened past the page cache), every part's place checked against the
     /// header (dtype, shape, inside the file) by name before any read.
-    pub fn open(a: std.mem.Allocator, ck: *const v41.Checkpoint, c: *const v41.Config, hot: u32, memory: xsc.Memory, pool: ?*expert_io.Pool) !*DraftCache {
+    pub fn open(a: std.mem.Allocator, ck: *const v41.Checkpoint, c: *const v41.Config, hot: u32, form: DraftPool, memory: xsc.Memory, pool: ?*expert_io.Pool) !*DraftCache {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, form), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), memory, pool);
         errdefer self.cache.deinit();
-        try placeParts(self.cache, a, ck, &self.geom.shapes, self.n_stages);
+        try placeParts(self.cache, a, ck, &self.geom, self.n_stages, self.n_experts);
         try self.cache.checkLocs();
         return self;
     }
 
     /// Construction, after the install warm-up (which routed its draft block through the cache): the policies
-    /// anew, then each stage's first `Hs` ids read into its persistent slots (prompt-independent: any id is a priori
-    /// as good as any other, and a seeded slot can only spare a first-use miss). Returns the records read.
+    /// anew, then the hot slots seeded with first ids (prompt-independent: any id is a priori as good as any other,
+    /// and a seeded slot can only spare a first-use miss): per stage, each stage's first `Hs`; shared, the stages'
+    /// ids interleaved (stage 0 id 0, stage 1 id 0, ..., then id 1, ...) until `hot`. Returns the records read.
     pub fn seedFirstIds(self: *DraftCache) !u32 {
         try self.cache.forgetAll();
-        var ids: [512]u16 = undefined;
-        for (&ids, 0..) |*d, i| d.* = @intCast(i);
+        var ids: [max_draft_stages * 512]u16 = undefined;
         var n: u32 = 0;
-        for (0..self.n_stages) |s| n += try self.cache.seed(s, ids[0..self.geom.caps[s]]);
+        switch (self.geom.pool) {
+            .per_stage => for (0..self.n_stages) |s| {
+                for (ids[0..self.geom.caps[s]], 0..) |*d, i| d.* = @intCast(i);
+                n += try self.cache.seed(s, ids[0..self.geom.caps[s]]);
+            },
+            .shared => {
+                const cap = self.geom.caps[0];
+                for (ids[0..cap], 0..) |*d, j| d.* = @intCast((j % self.n_stages) * self.n_experts + j / self.n_stages);
+                n += try self.cache.seed(0, ids[0..cap]);
+            },
+        }
         return n;
     }
 
@@ -1154,7 +1201,10 @@ const ScriptIds = struct {
     }
 };
 
-test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks and gathers each block at the cache's slots for the router's ids" {
+/// The DRAFTCACHE trace check at `pool`: the head binds the cache's banks, each block gathers at a twin cache's slots
+/// for the replayed ids, the banks are within the bill, and each block is evaluated (the loop's draft read) before the
+/// next block's first routing barrier.
+fn checkCachedHead(pool: DraftPool) !void {
     const a = testing.allocator;
     const TraceOps = ops.TraceOps;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1172,28 +1222,35 @@ test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks a
     const H = Head(TraceOps);
     const rt: graph.Routes = .{ .rc_draft = true, .head = .bf16, .draft_rows = graph.draft_compile_max_rows };
     const hot: u32 = 128;
-    const dc = try DraftCache.planOnly(a, &c, hot);
+    const dc = try DraftCache.planOnly(a, &c, hot, pool);
     defer dc.deinit();
     // The twin replays the same ids on its own policy: the slots the graph must gather at.
-    const twin = try DraftCache.planOnly(a, &c, hot);
+    const twin = try DraftCache.planOnly(a, &c, hot, pool);
     defer twin.deinit();
-    try testing.expectEqual(@as(u32, 43 + 43 + 42), try dc.seedFirstIds());
+    try testing.expectEqual(@as(u32, 128), try dc.seedFirstIds());
     _ = try twin.seedFirstIds();
     const h = try H.initWith(a, &g, c, rt, &lookup, .{ .registry = &reg, .cache = dc });
     defer h.deinit(&g);
-    const caps = [_]u32{ 43, 43, 42 };
-    for (h.stages, caps) |st, cap| {
-        try testing.expect(g.shapeOf(st.experts.w1.w).eql(ops.Shape.of(&.{ @intCast(cap + 15), 2304, 640 })));
-        try testing.expect(g.shapeOf(st.experts.w2.s).eql(ops.Shape.of(&.{ @intCast(cap + 15), 5120, 72 })));
+    const rows: [3]u32 = switch (pool) {
+        .per_stage => .{ 43 + 15, 43 + 15, 42 + 15 },
+        .shared => .{ 128 + 15, 128 + 15, 128 + 15 },
+    };
+    for (h.stages, rows) |st, r| {
+        try testing.expect(g.shapeOf(st.experts.w1.w).eql(ops.Shape.of(&.{ @intCast(r), 2304, 640 })));
+        try testing.expect(g.shapeOf(st.experts.w2.s).eql(ops.Shape.of(&.{ @intCast(r), 5120, 72 })));
         try testing.expectEqual(ops.Dtype.uint8, g.dtypeOf(st.experts.w3.s));
     }
     for (g.nodes.items) |nd| try testing.expect(nd.op != .stack or nd.shape.dim(0) != 128);
-    // The route's device allocations on the trace: the eighteen slot arrays, within the bill's term by its rounding only.
+    // The route's device allocations: each group's six slot arrays (the stages of a shared pool bind the same ones),
+    // within the bill's term by its rounding only.
     var banks: u64 = 0;
-    for (h.stages) |st| inline for (.{ "w1", "w3", "w2" }) |name| for ([_]u32{ @field(st.experts, name).w, @field(st.experts, name).s }) |x| {
-        banks += @as(u64, @intCast(g.shapeOf(x).numel())) * ops.dtypeSize(g.dtypeOf(x));
-    };
-    const term = try draftCacheBytes(&c, hot);
+    for (h.stages, 0..) |st, si| {
+        if (si > 0 and dc.geom.group_of[si] == dc.geom.group_of[si - 1]) continue;
+        inline for (.{ "w1", "w3", "w2" }) |name| for ([_]u32{ @field(st.experts, name).w, @field(st.experts, name).s }) |x| {
+            banks += @as(u64, @intCast(g.shapeOf(x).numel())) * ops.dtypeSize(g.dtypeOf(x));
+        };
+    }
+    const term = try draftCacheBytes(&c, hot, pool);
     try testing.expect(banks <= term and term - banks < 18 * xsc.alloc_page_bytes);
     const caches = try arena.allocator().alloc(H.Cache, h.nStages());
     for (caches) |*x| x.* = .{};
@@ -1204,24 +1261,31 @@ test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks a
     g.host_values = script.values();
     try h.seedMain(&g, try g.input(&.{ 1, 3, 15360 }, .float32), caches);
     const n_block0 = g.nodes.items.len;
+    var last_eval: ?usize = null;
     for (0..4) |_| {
         const n0 = g.nodes.items.len;
-        _ = try h.draftBlock(&g, try g.input(&.{ 1, 1, 15360 }, .bfloat16), 7, caches, .{ .table = table }, .{ .dense = table });
+        const d = try h.draftBlock(&g, try g.input(&.{ 1, 1, 15360 }, .bfloat16), 7, caches, .{ .table = table }, .{ .dense = table });
         // Per stage: one routing barrier, then one [5, 3] int32 host array: the twin's slots for the same ids.
         var stage: usize = 0;
         for (g.nodes.items[n0..], n0..) |nd, i| {
+            if (nd.op == .host_read and stage == 0) if (last_eval) |le| try testing.expect(le <= i);
             if (nd.op != .host or !nd.shape.eql(ops.Shape.of(&.{ 5, 3 }))) continue;
             try testing.expectEqual(ops.Dtype.int32, nd.dtype);
             var ids: [15]u16 = undefined;
             try ScriptIds.ids(&replay, &ids);
+            for (&ids) |*e| e.* += @intCast(dc.geom.offset_of[stage]);
             var want: [15]u32 = undefined;
-            try twin.cache.route(stage, &ids, &want);
+            try twin.cache.route(dc.geom.group_of[stage], &ids, &want);
             var want_i: [15]i32 = undefined;
-            for (&want_i, want) |*d, v| d.* = @intCast(v);
+            for (&want_i, want) |*w, v| w.* = @intCast(v);
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_i), g.hostBytesOf(@intCast(i)).?);
             stage += 1;
         }
         try testing.expectEqual(@as(usize, 3), stage);
+        // The loop reads the block's drafts (an eval over everything its last stage's gathers feed) before it verifies
+        // and drafts again: the next block's rows are written only after it.
+        try g.evalAll(&.{ d.ids, d.conf });
+        last_eval = g.nodes.items.len;
     }
     try testing.expectEqual(twin.cache.stats.expert_cache_misses, dc.cache.stats.expert_cache_misses);
     // Beyond the resident head's block, the route allocates per block only its three [5, 3] int32 index arrays.
@@ -1244,6 +1308,14 @@ test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks a
     try testing.expectEqual(4 * (host0 + 3 * 15 * 4), host_bytes);
 }
 
+test "dsv41 dspark head: DRAFTCACHE binds the stages to the cache's slot banks and gathers each block at the cache's slots for the router's ids" {
+    try checkCachedHead(.per_stage);
+}
+
+test "dsv41 dspark head: DRAFTCACHE shared pool: every stage binds one bank of H + 15 rows and gathers at the shared policy's slots for its offset ids" {
+    try checkCachedHead(.shared);
+}
+
 test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, refused by name when a stage's slots hold every expert" {
     const a = testing.allocator;
     const json = try v41.testConfigJson(a, .real);
@@ -1261,13 +1333,28 @@ test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, 
             const r: u64 = cap + 15;
             round += 3 * (std.mem.alignForward(u64, r * 368_640, 16384) - r * 368_640);
         }
-        try testing.expectEqual((hot + 45) * rec + round, try draftCacheBytes(&c, hot));
+        try testing.expectEqual((hot + 45) * rec + round, try draftCacheBytes(&c, hot, .per_stage));
         try testing.expect(round < 9 * 16384);
+        // Shared: one bank of hot + 15 rows (its three scales arrays rounded).
+        const r: u64 = hot + 15;
+        try testing.expectEqual((hot + 15) * rec + 3 * (std.mem.alignForward(u64, r * 368_640, 16384) - r * 368_640), try draftCacheBytes(&c, hot, .shared));
     }
-    const none = try draftCacheBytes(&c, 0);
+    const none = try draftCacheBytes(&c, 0, .per_stage);
     try testing.expect(none >= 45 * rec and none < 45 * rec + 9 * 16384);
-    try testing.expectError(error.DraftCacheGeometry, draftCacheBytes(&c, 3 * 113));
-    try testing.expect((try draftCacheBytes(&c, 3 * 112)) < 384 * rec);
+    try testing.expectError(error.DraftCacheGeometry, draftCacheBytes(&c, 3 * 113, .per_stage));
+    try testing.expect((try draftCacheBytes(&c, 3 * 112, .per_stage)) < 384 * rec);
+    try testing.expectError(error.DraftCacheGeometry, draftCacheBytes(&c, 384 - 15, .shared));
+    try testing.expect((try draftCacheBytes(&c, 384 - 16, .shared)) < 384 * rec);
+    // The shared geometry: every stage in group 0 at its offset; the seed interleaves the stages.
+    const d = try DraftGeometry.of(&c, 201, .shared);
+    try testing.expectEqual(@as(u32, 1), d.n_groups);
+    try testing.expectEqual(@as(u32, 384), d.n_experts);
+    try testing.expectEqualSlices(u32, &.{ 0, 128, 256 }, d.offset_of[0..3]);
+    const dc = try DraftCache.planOnly(a, &c, 7, .shared);
+    defer dc.deinit();
+    try testing.expectEqual(@as(u32, 7), try dc.seedFirstIds());
+    for ([_]u16{ 0, 128, 256, 1, 129, 257, 2 }) |e| try testing.expect(dc.cache.slotOf(0, e) != null);
+    try testing.expect(dc.cache.slotOf(0, 130) == null);
 }
 
 // DSV41_BANK=<bank> (host): stage 0's real records through the cache at 2 hot + 3 transient slots (94 MB of host rows),
@@ -1280,7 +1367,7 @@ test "dsv41 dspark head: DRAFTCACHE on the bank: every routed id's slot rows are
     const c = try v41.Config.load(a, testing.io, bank, &vd);
     var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank, &vd);
     defer ck.deinit();
-    var dg = try DraftGeometry.of(&c, 0);
+    var dg = try DraftGeometry.of(&c, 0, .per_stage);
     var geom = dg.geometry();
     geom.capacity = &.{2};
     geom.transient = 3;
@@ -1288,7 +1375,7 @@ test "dsv41 dspark head: DRAFTCACHE on the bank: every routed id's slot rows are
     defer pool.stop();
     const cache = try xsc.Cache.init(a, geom, .host, pool);
     defer cache.deinit();
-    try placeParts(cache, a, &ck, &dg.shapes, 1);
+    try placeParts(cache, a, &ck, &dg, 1, c.dspark.n_routed_experts);
     try cache.checkLocs();
     try testing.expectEqual(@as(u32, 2), try cache.seed(0, &.{ 0, 1 }));
     const want = try a.alloc(u8, 5_898_240);
@@ -1321,8 +1408,9 @@ test "dsv41 dspark head: DRAFTCACHE on the bank: every routed id's slot rows are
 }
 
 // DSV41_PHASE0B_MLX=1 DSV41_BANK=<bank> (device, the window's smoke step): stage 0's switch over the cache's MLX slots
-// (8 hot + 15 transient rows, misses read by the pool) against the resident bank of all 128 experts (stacked as the
-// head does), 16 blocks of 5 rows x top-3 forcing evictions, f32 and bf16 inputs: outputs equal bit for bit. Peak
+// (8 hot + 15 transient rows, misses read by the pool; per stage, then shared with a stage-1 route between stage-0 routes)
+// against the resident bank of all 128 experts (stacked as the head does), 16 blocks of 5 rows x top-3 forcing
+// evictions per form, f32 and bf16 inputs: outputs equal bit for bit. Peak
 // device ~5.3 GB (the 2.41 GB bank, its 2.41 GB of sources while it stacks, 0.43 GB of slots); a few seconds.
 test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots equals the resident bank's, bit for bit, on real records" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
@@ -1371,45 +1459,55 @@ test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots 
     };
     w.deinit();
     w = model_io.Weights.init(a);
-    // The cache: stage 0 at 8 hot + 15 transient MLX rows, reads through a pool, the first 8 ids seeded.
-    var dg = try DraftGeometry.of(&c, 0);
-    var geom = dg.geometry();
-    geom.capacity = &.{8};
-    var pool = try expert_io.Pool.start(a, .{ .workers = 4, .tickets = 256 });
-    defer pool.stop();
-    const cache = try xsc.Cache.init(a, geom, .{ .mlx = s }, pool);
-    defer cache.deinit();
-    try placeParts(cache, a, &ck, &dg.shapes, 1);
-    try cache.checkLocs();
-    _ = try cache.seed(0, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
-    const cached: H.Experts = .{ .w1 = .{ .w = cache.arrays[0][0], .s = cache.arrays[0][1], .mode = .mxfp4 }, .w3 = .{ .w = cache.arrays[0][2], .s = cache.arrays[0][3], .mode = .mxfp4 }, .w2 = .{ .w = cache.arrays[0][4], .s = cache.arrays[0][5], .mode = .mxfp4 } };
-    var script: ScriptIds = .{ .prng = std.Random.DefaultPrng.init(23), .n_experts = 40, .k = 3 };
-    var prng = std.Random.DefaultPrng.init(29);
-    var xs: [5 * 5120]f32 = undefined;
-    var out_r: [15 * 5120]f32 = undefined;
-    var out_c: [15 * 5120]f32 = undefined;
-    for (0..16) |blk| {
-        for (&xs) |*v| v.* = prng.random().floatNorm(f32);
-        const mark = g.mark();
-        defer g.resetTo(mark);
-        var xf = try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ 5, 5120 }, .float32);
-        if (blk % 2 == 1) xf = try g.astype(xf, .bfloat16);
-        var ids: [15]u16 = undefined;
-        try ScriptIds.ids(&script, &ids);
-        var ids_i: [15]i32 = undefined;
-        for (&ids_i, ids) |*d, v| d.* = v;
-        const ids_dev = try g.hostArray(std.mem.sliceAsBytes(&ids_i), &.{ 5, 3 }, .int32);
-        var slots: [15]u32 = undefined;
-        try cache.route(0, &ids, &slots);
-        var sl: [15]i32 = undefined;
-        for (&sl, slots) |*d, v| d.* = @intCast(v);
-        const idx = try g.hostArray(std.mem.sliceAsBytes(&sl), &.{ 5, 3 }, .int32);
-        const yr = try g.astype(try H.switchGlu(&g, &res, c.swiglu_limit, xf, ids_dev), .float32);
-        const yc = try g.astype(try H.switchGlu(&g, &cached, c.swiglu_limit, xf, idx), .float32);
-        _ = try g.hostF32(yr, &out_r);
-        _ = try g.hostF32(yc, &out_c);
-        try testing.expectEqualSlices(u32, @ptrCast(&out_r), @ptrCast(&out_c));
+    // The cache: 8 hot + 15 transient MLX rows, reads through a pool, the first 8 ids seeded. Per stage: stage 0's bank;
+    // shared: one bank over stages 0 and 1, a stage-1 route (ids + 128) before every stage-0 route, so stage 0 reads
+    // rows stage 1 just used. Only stage 0 is compared (its resident bank is the one loaded).
+    for ([_]DraftPool{ .per_stage, .shared }) |form| {
+        var dg = try DraftGeometry.of(&c, 0, form);
+        var geom = dg.geometry();
+        geom.capacity = &.{8};
+        var pool = try expert_io.Pool.start(a, .{ .workers = 4, .tickets = 256 });
+        defer pool.stop();
+        const cache = try xsc.Cache.init(a, geom, .{ .mlx = s }, pool);
+        defer cache.deinit();
+        try placeParts(cache, a, &ck, &dg, if (form == .shared) 2 else 1, c.dspark.n_routed_experts);
+        try cache.checkLocs();
+        _ = try cache.seed(0, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
+        const cached: H.Experts = .{ .w1 = .{ .w = cache.arrays[0][0], .s = cache.arrays[0][1], .mode = .mxfp4 }, .w3 = .{ .w = cache.arrays[0][2], .s = cache.arrays[0][3], .mode = .mxfp4 }, .w2 = .{ .w = cache.arrays[0][4], .s = cache.arrays[0][5], .mode = .mxfp4 } };
+        var script: ScriptIds = .{ .prng = std.Random.DefaultPrng.init(23), .n_experts = 40, .k = 3 };
+        var prng = std.Random.DefaultPrng.init(29);
+        var xs: [5 * 5120]f32 = undefined;
+        var out_r: [15 * 5120]f32 = undefined;
+        var out_c: [15 * 5120]f32 = undefined;
+        for (0..16) |blk| {
+            for (&xs) |*v| v.* = prng.random().floatNorm(f32);
+            const mark = g.mark();
+            defer g.resetTo(mark);
+            var xf = try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ 5, 5120 }, .float32);
+            if (blk % 2 == 1) xf = try g.astype(xf, .bfloat16);
+            var ids: [15]u16 = undefined;
+            try ScriptIds.ids(&script, &ids);
+            var ids_i: [15]i32 = undefined;
+            for (&ids_i, ids) |*d, v| d.* = v;
+            const ids_dev = try g.hostArray(std.mem.sliceAsBytes(&ids_i), &.{ 5, 3 }, .int32);
+            var slots: [15]u32 = undefined;
+            if (form == .shared) {
+                var other: [15]u16 = undefined;
+                try ScriptIds.ids(&script, &other);
+                for (&other) |*e| e.* += 128;
+                try cache.route(0, &other, &slots);
+            }
+            try cache.route(0, &ids, &slots);
+            var sl: [15]i32 = undefined;
+            for (&sl, slots) |*d, v| d.* = @intCast(v);
+            const idx = try g.hostArray(std.mem.sliceAsBytes(&sl), &.{ 5, 3 }, .int32);
+            const yr = try g.astype(try H.switchGlu(&g, &res, c.swiglu_limit, xf, ids_dev), .float32);
+            const yc = try g.astype(try H.switchGlu(&g, &cached, c.swiglu_limit, xf, idx), .float32);
+            _ = try g.hostF32(yr, &out_r);
+            _ = try g.hostF32(yc, &out_c);
+            try testing.expectEqualSlices(u32, @ptrCast(&out_r), @ptrCast(&out_c));
+        }
+        std.debug.print("\ndraft cache smoke ({t}): 16 blocks bit for bit (f32 and bf16 inputs); {d} hits, {d} misses, {d} evictions, {d} B read\n", .{ form, cache.stats.expert_cache_hits, cache.stats.expert_cache_misses, cache.stats.expert_cache_evictions, cache.stats.expert_bytes_read });
+        try testing.expect(cache.stats.expert_cache_evictions > 0);
     }
-    std.debug.print("\ndraft cache smoke: 16 blocks bit for bit (f32 and bf16 inputs); {d} hits, {d} misses, {d} evictions, {d} B read\n", .{ cache.stats.expert_cache_hits, cache.stats.expert_cache_misses, cache.stats.expert_cache_evictions, cache.stats.expert_bytes_read });
-    try testing.expect(cache.stats.expert_cache_evictions > 0);
 }
