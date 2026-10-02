@@ -9,6 +9,8 @@
 #import <Metal/Metal.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include <atomic>
 #include <string.h>
 #include <time.h>
@@ -31,7 +33,13 @@ static std::atomic<uint64_t> g_tag{0};
 static std::atomic<uint64_t> g_calls{0};
 static std::atomic<uint64_t> g_tagged{0};
 static std::atomic<uint64_t> g_other_queue{0};
+/* The thread's current outer call: the object whose -commit is running and how deep along its chain. A -commit of
+ * another object made from inside it starts at depth 0 (its own outermost call, recorded). */
 static thread_local int t_depth = 0;
+static thread_local id t_self = nil;
+/* install / rehook run on one thread (the inference thread): hook_chain is not reentrant. */
+static pthread_t g_owner;
+static int g_owned = 0;
 
 uint64_t dsv41tl_now(void) {
   return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -55,8 +63,9 @@ static CommitImp original_for(id self, int depth) {
 }
 
 static void tl_commit(id self, SEL sel) {
-  int depth = t_depth;
+  int depth = self == t_self ? t_depth : 0;
   CommitImp orig = original_for(self, depth);
+  if (orig == NULL) abort();   /* dispatch reached the override through a hooked class: the original exists */
   if (depth == 0) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
     uint64_t tag = g_tag.load(std::memory_order_relaxed);
@@ -82,10 +91,13 @@ static void tl_commit(id self, SEL sel) {
       }
     }
   }
-  if (orig == NULL) return;   /* unreachable: dispatch reached the override through a hooked class */
+  id saved_self = t_self;
+  int saved_depth = t_depth;
+  t_self = self;
   t_depth = depth + 1;
   orig(self, sel);
-  t_depth = depth;
+  t_self = saved_self;
+  t_depth = saved_depth;
 }
 
 /* Every class of obj's chain that implements -commit itself, not yet hooked: hooked. Returns the classes added, or
@@ -95,6 +107,12 @@ static Class g_seen[TL_MAX_SEEN];
 static int g_nseen = 0;
 
 static int hook_chain(id obj) {
+  if (!g_owned) {
+    g_owner = pthread_self();
+    g_owned = 1;
+  } else if (!pthread_equal(g_owner, pthread_self())) {
+    return -4;   /* not the thread that installed: hook_chain is not reentrant */
+  }
   Class dyn = object_getClass(obj);
   for (int i = 0; i < g_nseen; i++) if (g_seen[i] == dyn) return 0;   /* this dynamic class's chain is done */
   int added = 0;
@@ -194,6 +212,14 @@ static void fs_commit(id self, SEL sel) {
   ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel);
 }
 static void fo_commit(id, SEL) { st_other++; }
+static int st_nest = 0;
+static id st_inner = nil;
+static void fn_commit(id self, SEL sel) {   /* commits another buffer from inside its own commit, then its super's */
+  st_nest++;
+  [st_inner commit];
+  struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+  ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel);
+}
 
 static int selftest_body(Dsv41tlRow *rows, uint32_t cap);
 
@@ -230,6 +256,9 @@ int dsv41tl_selftest(Dsv41tlRow *rows, uint32_t cap) {
     class_addMethod(other, @selector(GPUEndTime), (IMP)fb_end, "d@:");
     class_addMethod(other, @selector(status), (IMP)fb_status, "Q@:");
     objc_registerClassPair(other);
+    Class nest = st_class("Dsv41tlFakeNest", base);
+    class_addMethod(nest, @selector(commit), (IMP)fn_commit, "v@:");
+    objc_registerClassPair(nest);
   }
   done = selftest_body(rows, cap);
   return done;
@@ -263,6 +292,14 @@ static int selftest_body(Dsv41tlRow *rows, uint32_t cap) {
   if (st_other != 2 || g_committed.load() != 3) return 8;
   dsv41tl_hook_stats(st);
   if (st[0] != 4 || st[1] != 3 || st[2] != 0 || st[3] < 3) return 9;
+  // a commit of another buffer made from inside a commit is its own outermost call: recorded, its original run
+  id nest = [[objc_getClass("Dsv41tlFakeNest") alloc] init];
+  st_inner = sib;
+  if (dsv41tl_rehook((void *)nest) != 1) return 10;
+  int base0 = st_base;
+  [nest commit];
+  if (st_nest != 1 || st_base != base0 + 2 || g_committed.load() != 5) return 11;
+  [nest release];
   dsv41tl_tag(0);
   [sub release];
   [sib release];
