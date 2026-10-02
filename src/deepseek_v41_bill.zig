@@ -341,7 +341,12 @@ pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 /// 0.385; SERVED18H server B 1.109 GB at the grow vs the cells' 1.047), so about 1.18 GB served, + 0.07 GB for a
 /// decode longer than 604 tokens (the memory lane, ledger sec. 69; provisional until SERVED19H's servers record
 /// their decode host side). The prompt and decode phases bill this; construction keeps its own term below.
-pub const measured_host_side_bytes: u64 = 1_250_000_000;
+/// SERVED19H (memory lane ledger sec. 124): the max-shape decode-end host side 1.235 GB, + 0.02 GB for a long decode,
+/// + 0.06 GB the server's own, rounded up to the next 50 MB.
+pub const host_side_decode_end_bytes: u64 = 1_235_000_000;
+pub const host_side_long_decode_bytes: u64 = 20_000_000;
+pub const host_side_server_bytes: u64 = 60_000_000;
+pub const measured_host_side_bytes: u64 = (std.math.divCeil(u64, host_side_decode_end_bytes + host_side_long_decode_bytes + host_side_server_bytes, 50_000_000) catch unreachable) * 50_000_000;
 
 /// The constructed module's host side as billed by the construction check (`Bill.constructionTerms`): measured
 /// 0.385-0.446 GB (cells and servers); the prompt pass's host heap (`measured_host_side_bytes`) is not there yet, so
@@ -759,15 +764,15 @@ pub fn admitPhases(b: Bill, target: u64) error{ PromptOverTarget, DecodeOverTarg
 
 const testing = std.testing;
 
-test "dsv41 memory: the host side bills 1.25 GB in the prompt and decode phases, 0.90 GB at construction" {
-    try testing.expectEqual(@as(u64, 1_250_000_000), measured_host_side_bytes);
+test "dsv41 memory: the host side bills 1.35 GB in the prompt and decode phases, 0.90 GB at construction" {
+    try testing.expectEqual(@as(u64, 1_350_000_000), measured_host_side_bytes);
     var b = cell4Bill();
     b.host_reserve = measured_host_side_bytes;
-    try testing.expectEqual(@as(u64, 1_250_000_000), b.prefillTerms().host_reserve);
-    try testing.expectEqual(@as(u64, 1_250_000_000), b.decodeTerms().host_reserve);
+    try testing.expectEqual(@as(u64, 1_350_000_000), b.prefillTerms().host_reserve);
+    try testing.expectEqual(@as(u64, 1_350_000_000), b.decodeTerms().host_reserve);
     // The construction check keeps its own term (the constructed host side measures 0.385-0.446 GB).
     try testing.expectEqual(@as(u64, 900_000_000), b.constructionTerms().host_reserve);
-    try testing.expectEqual(b.prefillTerms().sum() - 350_000_000 - b.prefill_wave - b.kv - b.prefill_cache - b.engram_posted - b.prefillTerms().wire_tables - b.prefillTerms().prompt_buffer_allowance, b.constructionTerms().sum());
+    try testing.expectEqual(b.prefillTerms().sum() - (measured_host_side_bytes - 900_000_000) - b.prefill_wave - b.kv - b.prefill_cache - b.engram_posted - b.prefillTerms().wire_tables - b.prefillTerms().prompt_buffer_allowance, b.constructionTerms().sum());
     // A bill billing less than the construction term keeps its own (cell4's 408,944,640 B).
     try testing.expectEqual(@as(u64, 408_944_640), cell4Bill().constructionTerms().host_reserve);
 }
@@ -944,11 +949,11 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     // The prompt phase charges the served tier's cache limit exactly (the limit it sets).
     try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
     try testing.expectEqual(@as(u64, 2 << 30), b.prefill_cache);
-    // The host side billed as measured, the named host terms folded into it: 1.25 GB in the prompt and decode
+    // The host side billed as measured, the named host terms folded into it: 1.35 GB in the prompt and decode
     // phases (SERVED19's decode host side on libc malloc), the construction check's term at 0.90 GB.
-    try testing.expectEqual(@as(u64, 1_250_000_000), b.host_reserve);
-    try testing.expectEqual(@as(u64, 1_250_000_000), b.prefillTerms().host_reserve);
-    try testing.expectEqual(@as(u64, 1_250_000_000), b.decodeTerms().host_reserve);
+    try testing.expectEqual(@as(u64, 1_350_000_000), b.host_reserve);
+    try testing.expectEqual(@as(u64, 1_350_000_000), b.prefillTerms().host_reserve);
+    try testing.expectEqual(@as(u64, 1_350_000_000), b.decodeTerms().host_reserve);
     try testing.expectEqual(@as(u64, 900_000_000), b.constructionTerms().host_reserve);
     try testing.expectEqual(@as(u64, 0), b.lookahead_staging + b.wide_window + b.unbilled_overhead);
     // The verify and draft waves bill verify_wave (G3) at M 8, the fill's positions and the DSpark block.
@@ -995,14 +1000,14 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 162 }, .on = .{ .prefill = 130, .decode = 162 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 162 }, .on = .{ .prefill = 130, .decode = 162 } },
     };
     // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
     };
     // The release route as the Module resolves it: the default (on), then each override.
@@ -1143,7 +1148,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
         // 5 prompt rows.
         .{ .base = 8_990_000_000, .conservative = .{ .prefill = 131, .decode = 168 }, .tight = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 131, .decode = 167 }, .tight = .{ .prefill = 136, .decode = 167 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 130, .decode = 167 }, .tight = .{ .prefill = 135, .decode = 167 } },
         .{ .base = 9_550_000_000, .conservative = .{ .prefill = 130, .decode = 167 }, .tight = .{ .prefill = 135, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1193,7 +1198,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .two = .{ .prefill = 136, .decode = 168 }, .one = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 136, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 135, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
         .{ .base = 9_550_000_000, .two = .{ .prefill = 135, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1237,9 +1242,9 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, stock: arm_mod.NativeRows, zero: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .stock = .{ .prefill = 134, .decode = 171 }, .zero = .{ .prefill = 134, .decode = 172 } },
+        .{ .base = 7_290_000_000, .stock = .{ .prefill = 134, .decode = 171 }, .zero = .{ .prefill = 134, .decode = 171 } },
         .{ .base = 8_990_000_000, .stock = .{ .prefill = 131, .decode = 168 }, .zero = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .stock = .{ .prefill = 131, .decode = 167 }, .zero = .{ .prefill = 131, .decode = 168 } },
+        .{ .base = 9_200_000_000, .stock = .{ .prefill = 130, .decode = 167 }, .zero = .{ .prefill = 130, .decode = 168 } },
         .{ .base = 9_550_000_000, .stock = .{ .prefill = 130, .decode = 167 }, .zero = .{ .prefill = 130, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1280,7 +1285,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 131, .decode = 168 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 131, .decode = 167 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 130, .decode = 167 }, .mxfp8 = .{ .prefill = 132, .decode = 168 } },
         .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 130, .decode = 167 }, .mxfp8 = .{ .prefill = 131, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1319,7 +1324,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 168 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 167 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 167 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 130, .decode = 162 }, .cons_on = .{ .prefill = 130, .decode = 167 }, .tight_off = .{ .prefill = 135, .decode = 162 }, .tight_on = .{ .prefill = 135, .decode = 167 } },
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 130, .decode = 162 }, .cons_on = .{ .prefill = 130, .decode = 167 }, .tight_off = .{ .prefill = 135, .decode = 162 }, .tight_on = .{ .prefill = 135, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1364,7 +1369,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1474,10 +1479,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // Decode rows / prompt rows by baseline: stock, then hot 96 / 128 / 201 / 256.
     const Want = struct { base: u64, decode: [5]u32, prefill: [5]u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 178, 176, 174 }, .prefill = .{ 134, 143, 142, 139, 137 } },
-        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 140, 138, 136, 134 } },
-        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 131, 139, 138, 135, 133 } },
-        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 130, 138, 137, 135, 133 } },
+        .{ .base = 7_290_000_000, .decode = .{ 171, 179, 178, 176, 174 }, .prefill = .{ 134, 143, 141, 139, 137 } },
+        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 139, 138, 136, 134 } },
+        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 130, 139, 138, 135, 133 } },
+        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 171, 170 }, .prefill = .{ 130, 138, 137, 135, 133 } },
     }) |w| {
         const base = w.base;
         config.memory_baseline_bytes = base;
@@ -1501,10 +1506,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // The shared pool: one bank of H + 15 rows; decode / prompt rows at hot 96 / 128 / 201 / 256.
     const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
     for ([_]Shared{
-        .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 144, 143, 140, 138 } },
-        .{ .base = 8_990_000_000, .decode = .{ 178, 176, 174, 172 }, .prefill = .{ 141, 139, 137, 135 } },
-        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 136, 135 } },
-        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 140, 138, 136, 134 } },
+        .{ .base = 7_290_000_000, .decode = .{ 181, 179, 177, 175 }, .prefill = .{ 144, 142, 140, 138 } },
+        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 140, 139, 137, 135 } },
+        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 136, 134 } },
+        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 139, 138, 136, 134 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         for (hots, 0..) |hot, hi| {
@@ -1615,4 +1620,5 @@ test "dsv41 memory: MLX's cache overshoot (one freed buffer over the limit) is b
     try testing.expectEqual(@as(u64, 1_041_448_960), b.prefillTerms().mlx_cache_overshoot);
     try testing.expectEqual(cache_overshoot_decode_traced, b.decodeTerms().mlx_cache_overshoot);
 }
+
 
