@@ -1820,8 +1820,8 @@ test "dsv41 dspark head: DRAFTCACHE policies on the recorded draft routes reprod
     defer a.free(json);
     const c = try v41.Config.parse(a, json, null);
     const Want = struct { text: []const u8, hot: u32, shipped: u64, lru: u64 };
-    const fastest = @embedFile("fixtures/dsv41_draft_routes_fastest_20261001.json");
-    const standard = @embedFile("fixtures/dsv41_draft_routes_standard_20261001.json");
+    const fastest = @embedFile("../fixtures/dsv41_draft_routes_fastest_20261001.json");
+    const standard = @embedFile("../fixtures/dsv41_draft_routes_standard_20261001.json");
     // The decode lane's replay (decode note sec. 35): the Python oracle of the streamer's policy, LRU at H + 15.
     for ([_]Want{
         .{ .text = fastest, .hot = 96, .shipped = 246, .lru = 195 },

@@ -245,7 +245,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.* = .{};
             }
 
-            fn row(self: *const Rows, c: Component, r: u32) []u8 {
+            pub fn row(self: *const Rows, c: Component, r: u32) []u8 {
                 const n = self.row_bytes[@intFromEnum(c)];
                 const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
                 return p[0..n];

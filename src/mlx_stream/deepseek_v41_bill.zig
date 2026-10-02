@@ -676,6 +676,7 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "waves", .bytes = .{ p.waves, d.waves }, .at_construction = false },
         .{ .name = "KV", .bytes = .{ p.kv, d.kv }, .at_construction = false },
         .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
+        .{ .name = "MLX cache overshoot", .bytes = .{ p.mlx_cache_overshoot, d.mlx_cache_overshoot }, .at_construction = true },
         .{ .name = "host side", .bytes = .{ p.host_reserve, d.host_reserve }, .at_construction = true, .measured = true, .construction = c.host_reserve },
         .{ .name = "wide read windows", .bytes = .{ p.wide_window, d.wide_window }, .at_construction = true },
         // Created at the prompt's end, never held from construction (0 in the prompt phase today).

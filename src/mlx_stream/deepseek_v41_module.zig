@@ -43,10 +43,9 @@ const log = std.log.scoped(.dsv41);
 
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
-const expert_bank = @import("expert_bank.zig");
 const expert_event = sdk.expert.event;
 const expert_io = sdk.expert.io;
-const xsc = @import("expert_slot_cache.zig");
+const xsc = sdk.expert.slot_cache;
 const expert_bank = @import("expert_bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
