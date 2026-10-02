@@ -1289,6 +1289,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
+    // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
+    const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
+    if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
@@ -1365,7 +1368,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change_settle = md.installed.phase_change_settle,
         .host_relief = md.installed.host_relief,
         .draft_cache_hot = md.installed.draft_cache_hot,
-        .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
+        .draft_cache_stats = dcs,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
         .draft_cache_policy = if (md.installed.draft_cache_policy) |p| @tagName(p) else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,

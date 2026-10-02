@@ -16,6 +16,7 @@ const xk = @import("exl3_kernels.zig");
 const kr = @import("dsv41_kernel_routes.zig");
 const xsc = @import("expert_slot_cache.zig");
 const expert_io = @import("expert_io.zig");
+const expert_stream = @import("expert_stream.zig");
 const expert_policy = @import("expert_policy.zig");
 
 /// Bytes of one DSpark head expert (gate, up and down, mxfp4 with one e8m0
@@ -888,6 +889,18 @@ pub const DraftCache = struct {
     n_experts: u32,
     hot: u32,
     cache: *xsc.Cache,
+    /// `cache.stats` at the previous `takeRequestStats` (zero: construction).
+    request_base: expert_stream.Stats = .{},
+
+    /// The statistics since the previous call (the first: since construction, its seed included), for one request's
+    /// receipt; the cache itself carries over to the next request.
+    pub fn takeRequestStats(self: *DraftCache) expert_stream.Stats {
+        const now = self.cache.stats;
+        var d: expert_stream.Stats = .{};
+        inline for (@typeInfo(expert_stream.Stats).@"struct".field_names) |n| @field(d, n) = @field(now, n) - @field(self.request_base, n);
+        self.request_base = now;
+        return d;
+    }
 
     /// The policy alone, no slot memory and no file (the trace backend's stand-in).
     pub fn planOnly(a: std.mem.Allocator, c: *const v41.Config, hot: u32, pool: DraftPool) !*DraftCache {
@@ -1383,6 +1396,18 @@ test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, 
     try dc.cache.route(0, &.{@intCast(dc.geom.offset_of[1] + 2)}, &slots);
     try testing.expectEqual(miss0 + 1, dc.cache.stats.expert_cache_misses);
     for ([_]u32{ 0, 1, 2 }) |st| try testing.expectEqual(@as(u32, 0), dc.geom.group_of[st]);
+    // Per request: the first take counts from construction (the seed and the route above), the next only its own
+    // routes; the residents carry over (expert 130 hits in request 2).
+    const r1 = dc.takeRequestStats();
+    try testing.expectEqual(dc.cache.stats.expert_cache_misses, r1.expert_cache_misses);
+    try testing.expectEqual(@as(u64, 1), r1.route_calls);
+    var slots2: [2]u32 = undefined;
+    try dc.cache.route(0, &.{ 130, 3 }, &slots2);
+    const r2 = dc.takeRequestStats();
+    try testing.expectEqual(@as(u64, 1), r2.route_calls);
+    try testing.expectEqual(@as(u64, 1), r2.expert_cache_hits);
+    try testing.expectEqual(@as(u64, 1), r2.expert_cache_misses);
+    try testing.expectEqual(r1.expert_cache_misses + 1, dc.cache.stats.expert_cache_misses);
 }
 
 // DSV41_BANK=<bank> (host): stage 0's real records through the cache at 2 hot + 3 transient slots (94 MB of host rows),
