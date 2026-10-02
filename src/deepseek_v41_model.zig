@@ -864,10 +864,30 @@ pub fn Model(comptime G: type) type {
                     // below, h1 / post / comb with each post's evaluation).
                     probeGroupHalves(probe, halves[i..j], i);
                     if (parts != null) probeGroupMerge(probe, hook);
+                    // Each chunk's rows and MoE output shape and dtype, read before the inputs may be released.
+                    const nks = try a.alloc(c_int, j - i);
+                    const mo_shape = try a.alloc(ops.Shape, j - i);
+                    const mo_dt = try a.alloc(ops.Dtype, j - i);
+                    for (i..j, nks, mo_shape, mo_dt) |k, *nk, *ms, *md| {
+                        nk.* = g.shapeOf(xfs[k]).dim(0);
+                        ms.* = g.shapeOf(halves[k].moe_in);
+                        md.* = g.dtypeOf(halves[k].moe_in);
+                    }
+                    // PREFILL_INPUT_RELEASE: the group's MoE inputs (each chunk's moe_in, its row view and their concat)
+                    // are dead once the wide call's waves drained and the shared experts were issued from them: freed
+                    // here, before the group's final evaluation.
+                    const released = rt.prefill_input_release and parts != null;
+                    if (released) {
+                        if (j - i > 1) g.drop(cat_xf);
+                        for (i..j) |k| {
+                            g.drop(xfs[k]);
+                            halves[k].moe_in = g.dropKept(halves[k].moe_in);
+                        }
+                    }
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         probeChunk(probe, k);
-                        const nk = g.shapeOf(xfs[k]).dim(0);
+                        const nk = nks[k - i];
                         const y = if (parts) |pt| blk: {
                             const loc = if (j - i == 1) pt.loc else try g.slice(pt.loc, &.{ pos, 0, 0 }, &.{ pos + nk, top, 2 }, &.{ 1, 1, 1 });
                             const shared = pre_shared[k - i] orelse try g.astype(try Tr.sharedExpert(g, c, lw, xfs[k]), .float32);
@@ -878,8 +898,7 @@ pub fn Model(comptime G: type) type {
                             break :blk try Tr.combineRouted(g, probe, c, rt, lk, lw, part, routes_[k].weights, xfs[k], pre_shared[k - i]);
                         };
                         pos += nk;
-                        const sh = g.shapeOf(halves[k].moe_in);
-                        const mo = try g.reshape(try g.astype(y, g.dtypeOf(halves[k].moe_in)), sh.slice());
+                        const mo = try g.reshape(try g.astype(y, mo_dt[k - i]), mo_shape[k - i].slice());
                         try probe.put("moe.y", mo);
                         const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
                         try probe.put("out.h", next);
@@ -891,7 +910,7 @@ pub fn Model(comptime G: type) type {
                     }
                     // The profile's mark before the group's final evaluation (the merge, the combines, the HC posts and the new
                     // streams at once, as the timed pass runs it), then that evaluation's own stage.
-                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], cat_xf);
+                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], if (released) null else cat_xf);
                     try g.evalAll(hs[i..j]);
                     probeChunk(probe, i);
                     try probe.put("group.eval", hs[i]);
@@ -968,7 +987,7 @@ pub fn Model(comptime G: type) type {
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupHalves")) probe.groupHalves(halves, first_chunk);
         }
 
-        fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T, cat_xf: T) void {
+        fn probeGroupEval(probe: anytype, outs: []const T, loc: ?T, shared: []const ?T, next: []const T, cat_xf: ?T) void {
             const P = @TypeOf(probe);
             if (comptime @typeInfo(P) == .pointer and @hasDecl(@typeInfo(P).pointer.child, "groupEval")) probe.groupEval(outs, loc, shared, next, cat_xf);
         }
@@ -1068,6 +1087,21 @@ fn stToDtype(d: v41.StDtype) ops.Dtype {
 }
 
 /// The routed stand-in's shape: unweighted `[n, k, dim]` f32.
+/// A wide routed source on the trace backend that hands out its outputs unjoined (test helper).
+const PartsHook = struct {
+    outs: *[1]u32,
+    k: c_int,
+    pub fn routed(_: PartsHook, g: *TraceOps, xf: u32, idx: u32) !u32 {
+        return g.input(&.{ g.shapeOf(xf).dim(0), g.shapeOf(idx).dim(1), g.shapeOf(xf).dim(1) }, .float32);
+    }
+    pub fn routedParts(h: PartsHook, g: *TraceOps, xf: u32, _: u32) !struct { outs: []const u32, loc: u32 } {
+        const n = g.shapeOf(xf).dim(0);
+        h.outs[0] = try g.input(&.{ n * h.k, g.shapeOf(xf).dim(1) }, .float32);
+        return .{ .outs = h.outs[0..1], .loc = try g.input(&.{ n, h.k, 2 }, .int32) };
+    }
+    pub fn releaseParts(_: PartsHook, _: *TraceOps) void {}
+};
+
 const TraceRouted = struct {
     pub fn at(self: TraceRouted, _: u32) TraceRouted {
         return self;
@@ -1284,6 +1318,63 @@ test "dsv41 model: K16's input-stream release (route): each chunk's layer input 
                 try testing.expectEqual(early, std.mem.indexOfScalar(u32, g.released.items[0..at], x) != null);
                 try testing.expectEqual(@as(usize, 1), std.mem.count(u32, g.released.items, &.{x}));
             }
+        }
+    }
+    // Lifetime only: the same op sequence with the route on and off.
+    try testing.expectEqualSlices(ops.Op, seqs[0].?, seqs[1].?);
+}
+
+test "dsv41 model: PREFILL_INPUT_RELEASE (route): each routed group's MoE inputs are dropped after the wide call and never read again; the ops are the same either way" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    var c = try v41.Config.parse(testing.allocator, json, null);
+    // Two real-geometry layers (JOINLESS's combine is derived for them), no Engram.
+    c.n_layers = 2;
+    c.engram.n_layers = 0;
+    for (c.layers[0..2]) |*li| li.engram_slot = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try v41.residentSpec(arena.allocator(), &c);
+    const k: c_int = @intCast(c.n_experts_per_tok);
+    // A wide routed source that hands out its outputs unjoined (one output, every assignment's row in it).
+    const Parts = struct {
+        outs: [1]u32 = undefined,
+        k: c_int,
+        pub fn at(self: *@This(), _: u32) PartsHook {
+            return .{ .outs = &self.outs, .k = self.k };
+        }
+    };
+    var seqs: [2]?[]ops.Op = .{ null, null };
+    defer for (seqs) |sq| if (sq) |x| testing.allocator.free(x);
+    for ([_]bool{ false, true }, &seqs) |rel, *seq| {
+        var g = TraceOps.init(testing.allocator);
+        defer g.deinit();
+        const lookup: SpecLookup = .{ .g = &g, .spec = spec };
+        var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+        tier.routes.prefill_joinless = true;
+        tier.routes.prefill_host_shared = true;
+        tier.routes.prefill_input_release = rel;
+        const model_ = try TM.initWith(testing.allocator, &g, c, tier, &lookup, null, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        var st = try model_.newState();
+        defer st.deinit(&g, testing.allocator);
+        var src: Parts = .{ .k = k };
+        var ids: [20]u32 = undefined;
+        for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 1000);
+        const mark = g.nodes.items.len;
+        _ = try model_.forward(&g, &st, &ids, .{ .logits = .last }, &src, graph.NoProbe{});
+        seq.* = try g.opsSince(testing.allocator, mark);
+        // Off: nothing dropped. On: per layer, three chunks' moe_in and row views and the group's concat, none of them
+        // read (shape, dtype or evaluation) after the drop.
+        try testing.expectEqual(@as(usize, if (rel) 2 * (3 + 3 + 1) else 0), g.dropped.items.len);
+        try testing.expectEqual(@as(u32, 0), g.use_after_drop);
+        if (rel) {
+            // The detector itself: a read of a dropped array counts.
+            _ = g.shapeOf(g.dropped.items[0]);
+            try testing.expectEqual(@as(u32, 1), g.use_after_drop);
         }
     }
     // Lifetime only: the same op sequence with the route on and off.

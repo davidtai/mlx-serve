@@ -692,6 +692,14 @@ pub fn Profiled(comptime Ops: type) type {
             return g.inner.release(a1);
         }
 
+        pub fn drop(g: *Self, a1: P("drop", 1)) R("drop") {
+            return g.inner.drop(a1);
+        }
+
+        pub fn dropKept(g: *Self, a1: P("dropKept", 1)) R("dropKept") {
+            return g.inner.dropKept(a1);
+        }
+
         pub fn adopt(g: *Self, a1: P("adopt", 1)) R("adopt") {
             return g.inner.adopt(a1);
         }

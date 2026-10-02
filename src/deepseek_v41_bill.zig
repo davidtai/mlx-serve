@@ -449,7 +449,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
     const variant = try billVariant();
     const tight_streams = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
-    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4);
+    const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4).withInputRelease(module.prefillInputRelease(ov));
     const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).

@@ -1061,6 +1061,8 @@ const CellReceipt = struct {
     decode_memos: ?bool = null,
     /// K16's input streams released at each chunk fence (installed).
     input_stream_early_release: ?bool = null,
+    /// K16's routed groups' MoE inputs freed after the wide call (installed).
+    prefill_input_release: ?bool = null,
     /// P1's predictor GEMM in bf16 (installed): the gate as stored, not its f32 copy.
     predict_bf16: ?bool = null,
     /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
@@ -1478,6 +1480,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_shared_mid = md.installed.decode_shared_mid,
         .decode_memos = md.installed.decode_memos,
         .input_stream_early_release = md.installed.input_stream_early_release,
+        .prefill_input_release = md.installed.prefill_input_release,
         .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .file_backed_start_bytes = cx.file_backed_start,
@@ -1588,6 +1591,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
     if (envStr("DSV41_CELL_DECODE_MEMOS")) |v| ov.decode_memos = try cellBool("DSV41_CELL_DECODE_MEMOS", v);
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
+    if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
@@ -2810,11 +2814,11 @@ const PrefillProbe = struct {
 
     /// Right before the group's final evaluation: MLX's active mark and the geometry it reads and writes. The combine is
     /// one kernel over the sources in place (it gathers nothing): its f32 output and the cast are rows x hidden each.
-    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T, cat_xf: ops.MlxOps.T) void {
+    pub fn groupEval(self: *PrefillProbe, outs: []const ops.MlxOps.T, loc: ?ops.MlxOps.T, shared: []const ?ops.MlxOps.T, next: []const ops.MlxOps.T, cat_xf: ?ops.MlxOps.T) void {
         var a: usize = 0;
         _ = mlx.mlx_get_active_memory(&a);
         self.group.active_before = a;
-        self.group.cat_xf = bytesOf(cat_xf);
+        self.group.cat_xf = if (cat_xf) |x| bytesOf(x) else 0;
         if (self.group.merge_copied_rows > 0 and outs.len > 0) {
             const last = outs[outs.len - 1];
             const rows: u64 = @intCast(self.g.shapeOf(last).dim(0));
