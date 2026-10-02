@@ -78,6 +78,8 @@ pub fn Model(comptime G: type) type {
         kx: Tr.Kernels = .{},
         /// C11: the verify head's m1rows route (rows <= 8), over the dense bf16 head.
         head_rows: ?kr.HeadRows(G) = null,
+        /// HEAD_MODE mxfp8 on RCPROJ (rows <= 8: the verify rows and the draft block), over the quantized head.
+        head_mx: ?kr.HeadMx(G) = null,
         /// C29: the Engram wkv's M-invariant rows route per Engram slot (rows <= 8).
         engram_m1: [eng.max_layers]?kr.Mxfp8Rows(G) = @splat(null),
 
@@ -158,6 +160,10 @@ pub fn Model(comptime G: type) type {
 
         pub fn initWith(gpa: std.mem.Allocator, g: *G, c: v41.Config, tier: routes.Tier, lookup: anytype, engram_src: ?*const eng.RowSource, opts: Options) !*Self {
             if (Tr.Kernels.needed(&tier.routes) and opts.registry == null) return error.TierNeedsKernels;
+            if (tier.routes.rc_head_mxfp8) {
+                if (tier.routes.head != .mxfp8) return error.HeadMxNeedsMxfp8;
+                if (opts.registry == null) return error.HeadMxNeedsKernels;
+            }
             const self = try gpa.create(Self);
             self.* = .{ .gpa = gpa, .c = c, .tier = tier, .layers = &.{}, .inv_swa = undefined, .inv_yarn = undefined, .embed = undefined, .norm_w = undefined, .head = undefined };
             errdefer self.deinit(g);
@@ -212,6 +218,9 @@ pub fn Model(comptime G: type) type {
                 if (tier.routes.rc_mxfp8_rows) if (self.engram) |en| {
                     for (0..cp.engram.n_layers) |i| self.engram_m1[i] = try Tr.m1Site(g, reg, .engram_wkv, en.w[i].wkv);
                 };
+                if (tier.routes.rc_head_mxfp8) {
+                    self.head_mx = kr.HeadMx(G).init(g, reg, self.head.mxfp8.w, self.head.mxfp8.s, null) catch |e| return if (e == error.RouteInput) error.HeadMxGeometry else e;
+                }
             }
             try Tr.prepareRegions(g, &self.c, &self.tier.routes, self.tier.layer_major);
             try g.evalAll(self.owned.items);
@@ -223,6 +232,7 @@ pub fn Model(comptime G: type) type {
             self.owned.deinit(self.gpa);
             self.kx.deinit(g);
             if (self.head_rows) |*x| x.deinit(g);
+            if (self.head_mx) |*x| x.deinit(g);
             for (&self.engram_m1) |*x| if (x.*) |*r| r.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
@@ -595,11 +605,16 @@ pub fn Model(comptime G: type) type {
             return res;
         }
 
-        /// The head under its route: C11's m1rows at <= 8 rows when bound (a phase route), else `Tr.head`.
+        /// The head under its route: C11's m1rows (bf16) or RCPROJ (mxfp8) at <= 8 rows when bound (a phase route), else
+        /// `Tr.head`.
         fn headOf(self: *const Self, g: *G, x: T) !T {
             if (self.head_rows) |*hr| {
                 const s = g.shapeOf(x);
                 if (s.d[0] * s.d[1] <= graph.rc_max_rows) return Tr.headRows(g, hr, x);
+            }
+            if (self.head_mx) |*hm| {
+                const s = g.shapeOf(x);
+                if (s.d[0] * s.d[1] <= graph.rc_max_rows) return Tr.headMx(g, hm, x);
             }
             return Tr.head(g, &self.tier.routes, x, self.head);
         }
@@ -1156,6 +1171,25 @@ test "dsv41 model: the mini model binds every resident and runs prefill, decode 
     try testing.expectEqual(@as(u32, 23), st.offset);
     try testing.expectEqual(@as(u32, 23), st.layers[3].compress.rows());
     try testing.expectEqual(@as(usize, 23), st.hash.?.hist.items.len);
+}
+
+test "dsv41 model: the mxfp8 head's RCPROJ route is refused off the mxfp8 codec, without kernels and off the head site's geometry" {
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_WINDOW_RING", "1" }, .{ "MTPLX_DSV41_SELECTED_KEYS", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    tier.routes.rc_head_mxfp8 = true;
+    tier.routes.head = .bf16;
+    try testing.expectError(error.HeadMxNeedsMxfp8, TM.initWith(testing.allocator, &g, m.c, tier, &lookup, &m.src, .{ .registry = &reg }));
+    tier.routes.head = .mxfp8;
+    try testing.expectError(error.HeadMxNeedsKernels, TM.initWith(testing.allocator, &g, m.c, tier, &lookup, &m.src, .{}));
+    // The mini head (64 x 64) is not RCPROJ's head site (129280 x 5120).
+    try testing.expectError(error.HeadMxGeometry, TM.initWith(testing.allocator, &g, m.c, tier, &lookup, &m.src, .{ .registry = &reg }));
 }
 
 test "dsv41 model: ENGRAM=prefetch at decode width: the forward's posted Engram gathers feed the blocking read's bytes" {

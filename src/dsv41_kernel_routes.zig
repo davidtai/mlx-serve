@@ -883,6 +883,43 @@ pub fn HeadRows(comptime G: type) type {
     };
 }
 
+/// HEAD_MODE mxfp8 on RCPROJ's `head` site: the quantized output head at M = 1..8 (the verify rows and
+/// the draft block), the head's packed codes and e8m0 scales as MLX's mxfp8 quantize lays them out.
+pub fn HeadMx(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        pub const max_rows = 8;
+        e: *const Entry,
+        plans: RowPlans(G, max_rows),
+        w: G.T,
+        scales: G.T,
+
+        /// `w` u32 [129280, 1280], `scales` u8 [129280, 160] (checked against the site here, once).
+        pub fn init(g: *G, reg: *const xk.Registry, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
+            const e = reg.get(.q3rc_mxfp8_fma);
+            const s = e.site("head") orelse return refuse(diag, error.RouteInput, "exl3 kernel ops: q3rc_mxfp8_fma has no head site", .{});
+            var vars: Vars = .initFill(0);
+            xk.siteVars(s, &vars);
+            try expectInput(G, g, e, "w", w, &vars, diag);
+            try expectInput(G, g, e, "scales", scales, &vars, diag);
+            return .{ .e = e, .plans = try .init(g, e, "head", diag), .w = g.keep(w), .scales = g.keep(scales) };
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.plans.deinit(g);
+            g.release(self.w);
+            g.release(self.scales);
+        }
+
+        /// x [M, 5120] bf16, M = 1..8 -> y [M, 129280] bf16.
+        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
+            var out: [1]G.T = undefined;
+            try self.plans.launch(g, rowsOf(G, g, x, 0), &.{ self.w, self.scales, x }, &out);
+            return out[0];
+        }
+    };
+}
+
 /// The minvariant attention member's sites the RC tiers still run (RCTAIL owns the HC premix and
 /// the MoE gate there): the compressor wkv / wgate (f32 x on the ratio-2 layers, bf16 on ratio 1),
 /// the indexer wk (f32 / bf16 latent) and the indexer weights_proj (bf16).
@@ -1433,6 +1470,33 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
             try expectLaunch(t.back(1), e, s, &.{ r.w, x });
         }
         try testing.expectError(error.RouteInput, HeadRows(Trace).init(&t, &reg, try t.node(&.{ 129280, 5120 }, .float16, &.{}), null));
+    }
+    // the mxfp8 head (HEAD_MODE mxfp8 on RCPROJ's head site): the registered plan per M, the quantized layout checked
+    {
+        const e = reg.get(.q3rc_mxfp8_fma);
+        var vars: Vars = .initFill(0);
+        xk.siteVars(e.site("head").?, &vars);
+        const w = try t.arg(e, "w", &vars);
+        const sc = try t.arg(e, "scales", &vars);
+        var r = try HeadMx(Trace).init(&t, &reg, w, sc, null);
+        defer r.deinit(&t);
+        for (1..HeadMx(Trace).max_rows + 1) |m| {
+            const x = try t.node(&.{ @intCast(m), 5120 }, .bfloat16, &.{});
+            _ = try r.call(&t, x);
+            const l = t.back(1);
+            try testing.expect(l.prepared);
+            try testing.expectEqual(Kernel.q3rc_mxfp8_fma, l.k);
+            try testing.expectEqualSlices(Trace.T, &.{ w, sc, x }, l.inputs[0..l.n_in]);
+            var mv = vars;
+            mv.set(.rows, m);
+            const want = try xk.launchFor(e, &mv, "head");
+            try testing.expectEqual(want.grid, l.cfg.grid);
+            try testing.expectEqual([4]c_int{ @intCast(m), 129280, 0, 0 }, l.cfg.out_shapes[0]);
+        }
+        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .bfloat16, &.{})));
+        // a bf16 head, or another site's codes, is refused at the bind
+        try testing.expectError(error.RouteInput, HeadMx(Trace).init(&t, &reg, try t.node(&.{ 129280, 5120 }, .bfloat16, &.{}), sc, null));
+        try testing.expectError(error.RouteInput, HeadMx(Trace).init(&t, &reg, w, try t.node(&.{ 129280, 320 }, .uint8, &.{}), null));
     }
     // smallm_all's live sites: f32 x on the text of record, bf16 x on its variant
     {

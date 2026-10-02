@@ -122,6 +122,9 @@ pub const RouteOverrides = struct {
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
     head_mode: ?graph.Routes.Head = null,
+    /// HEAD_MODE mxfp8's head on RCPROJ at <= 8 rows (the verify rows and the draft block) instead of MLX's quantized
+    /// matmul; needs head_mode mxfp8. Rounding-class like the codec itself. null: the default, off.
+    head_mxfp8_rc: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -479,6 +482,10 @@ pub const Module = struct {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
         }
+        if (ov.head_mxfp8_rc) |v| {
+            if (v and tier.routes.head != .mxfp8) return error.HeadMxfp8RcNeedsMxfp8;
+            tier.routes.rc_head_mxfp8 = v;
+        }
         if (ov.prefill_oproj) |v| {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
@@ -523,9 +530,11 @@ pub const Module = struct {
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
+        self.installed.head_mxfp8_rc = self.model.head_mx != null;
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
+        if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
@@ -563,7 +572,7 @@ pub const Module = struct {
             const caps = dc.geom.caps[0..dc.geom.n_groups];
             log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.cache.geom.billBytes() });
         } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache, .head_mx = if (self.model.head_mx) |*hm| hm else null });
         errdefer self.head.deinit(&self.g);
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
@@ -1271,6 +1280,8 @@ pub const Installed = struct {
     predict_bf16: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).
     head_mode: graph.Routes.Head = .f32,
+    /// The mxfp8 head's apply route as installed: RCPROJ (true) or MLX's quantized matmul.
+    head_mxfp8_rc: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.

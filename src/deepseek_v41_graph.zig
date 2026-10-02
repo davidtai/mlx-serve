@@ -135,6 +135,8 @@ pub const Routes = struct {
     /// order per row), M 5 / 7 padded to M + 1 (RCTAIL headpad: the kernel's odd-M cliff; every
     /// row is the kernel's M-invariant row); bound by the model over its head weight.
     rc_head: bool = false,
+    /// HEAD_MODE mxfp8's head on RCPROJ at <= 8 rows (verify and draft); needs `head == .mxfp8`.
+    rc_head_mxfp8: bool = false,
     /// C16 DRAFTRC: the DSpark draft block's RC routes at rows <= 8 (proj at bf16 / f32 x, the HC
     /// tapes at the draft's stream dtypes, the 128-expert router, the premix, the Sinkhorn), bound
     /// by the draft head; the draft head's own head call stays MLX's (RCTAIL drafthead).
@@ -931,6 +933,17 @@ pub fn Trunk(comptime G: type) type {
             if (pad) y = try g.slice(y, &.{ 0, 0 }, &.{ m, n }, &.{ 1, 1 });
             var out = sh;
             out.d[out.n - 1] = n;
+            return g.astype(try g.reshape(y, out.slice()), .float32);
+        }
+
+        /// HEAD_MODE mxfp8 on RCPROJ (x [..., K] with <= 8 rows, cast to bf16) -> f32 logits [..., N].
+        pub fn headMx(g: *G, hm: *const kr.HeadMx(G), x: T) !T {
+            const sh = g.shapeOf(x);
+            const k = sh.dim(-1);
+            const m = rowsOf(g, x, 1);
+            const y = try hm.call(g, try g.reshape(try g.astype(x, .bfloat16), &.{ m, k }));
+            var out = sh;
+            out.d[out.n - 1] = g.shapeOf(y).dim(-1);
             return g.astype(try g.reshape(y, out.slice()), .float32);
         }
 
