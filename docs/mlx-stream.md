@@ -98,7 +98,7 @@ The arch kind takes the opt-in the proposal leans toward in its open questions: 
 | | Module | What it does |
 |---|---|---|
 | G5 | `sdk.kernels` | A pinned kernel registry. One manifest pins every Metal source by its sha256. `KernelSet(R)` builds the registry's kernels once per load and splits them among its consumers; each consumer runs the manifest's self-checks for its own kernels when it accepts the set. |
-| G6 | `sdk.expert` | The expert source surface: the reader (one per process), the event gate, the residency policy, the record layout and the source contract. |
+| G6 | `sdk.expert` | The expert source surface: the reader (one per process), the event gate, the residency policy, the lookahead selector, the record layout, the source contract, the bank contract and the stream over it (`sdk.expert.stream`), and a slot cache for experts at offsets in several files (`sdk.expert.slot_cache`). |
 | G7 | `sdk.profile` | Profile timers across a plugin's kinds, with no imports between them. Generic code reads the probes its backend type declares (`sdk.profile.of`). A non-generic site, such as the kernel launcher or the expert stream, gets a probe its arch installs at construction; outside profile builds the probe's type is `void`. The SDK has no timers of its own. |
 
 ## The quant kind
@@ -132,6 +132,24 @@ record has `components` tensors, the first `gate_up` of them for the gate and up
 (EXL3: 9 and 6; MXFP4: 6 and 4). A read range covers 1 to 6 components, the reader's limit, checked at compile time.
 Reads go through an `UncachedFd` from `openUncached` (`O_NOFOLLOW`, `F_NOCACHE`, read-ahead off), so bank reads bypass
 the page cache.
+
+A plugin whose experts live in one record file gets the whole stream (slot rows, routes, residency, reads, lookahead,
+event gates, the transient release, growth) from `sdk.expert.stream.StreamOf(B, probed)`, where `B` is its bank module,
+checked by `sdk.expert.assertBank` at compile time. The bank module provides:
+
+- the record topology: `n_components`, `gu_components` (the gate/up range is segments `[0, gu_components)`, the down range
+  the rest, each contiguous in the record), `Records = Records(n_components, gu_components)` and a `Component` enum;
+- `Layer`: `segments` (each segment's offset from the record start, length, dtype and a shape of at most 3 axes) and
+  `logical_bytes`, and `mlxDtype(dtype)`, the MLX dtype of a segment's slot array;
+- `Bank`: `layers` (one per routed layer), `n_experts`, `sidecar` (the record file's `UncachedFd`), `recordOffset(layer,
+  expert)` and `spans(layer, expert)` (the gate/up and down offsets);
+- `BankArrays` and `bankArraysOf`: the slot arrays as its quant binds them.
+
+The stream is the same code for every bank: the instance is fixed at compile time, with no runtime branch on the bank.
+mlx-stream instantiates it over its EXL3 bank (9 components, 6 in gate/up). An MXFP4 bank of six components (4 in
+gate/up) is tested through the same code in the CPU lane. Experts at per-tensor offsets in several files (safetensors
+as published) go through `sdk.expert.slot_cache` instead, which drives the same policy and reader without the stream's
+lookahead or gates.
 
 ## Conformance
 

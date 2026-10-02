@@ -184,7 +184,7 @@ pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const 
     return Records.submit(pool, bank.sidecar, gu[0..records.len], down[0..records.len], rows, &lens);
 }
 
-// The stream's bank contract (sdk.expert.assertBank; expert_stream_of.zig): with the topology, `Component`, `Layer`,
+// The stream's bank contract (sdk.expert.assertBank; sdk.expert.stream): with the topology, `Component`, `Layer`,
 // `Records` and `Bank` above and below, a segment's MLX dtype and the slot arrays by projection.
 
 pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {

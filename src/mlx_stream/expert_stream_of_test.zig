@@ -4,7 +4,7 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = @import("mlx");
-const StreamOf = @import("expert_stream_of.zig").StreamOf;
+const StreamOf = sdk.expert.stream.StreamOf;
 
 const testing = std.testing;
 
@@ -65,7 +65,7 @@ const MxBank = struct {
     }
 };
 
-const MxStream = StreamOf(MxBank).Stream;
+const MxStream = StreamOf(MxBank, false).Stream;
 
 test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) streams through the same code, every slot its record" {
     // h 256, i 128: weights 16 KiB, scales 1 KiB per projection; record 52 KiB (MiMo: 13,369,344 B at h 4096, i 2048).

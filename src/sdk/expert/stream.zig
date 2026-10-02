@@ -1,17 +1,18 @@
-//! The expert stream over any bank module `B` (the bank contract, `sdk.expert.assertBank`): per-layer slot pools, routes,
+//! sdk.expert.stream: the expert stream over any bank module `B` (the bank contract, `sdk.expert.assertBank`): per-layer slot pools, routes,
 //! deferred release, growth, read-ahead, gates, the phase change. `B` fixes the record topology, the segments and the slot
 //! arrays at compile time, so an instance is the same code as a stream written for that bank.
 
 const std = @import("std");
-const sdk = @import("sdk");
-const bo = @import("build_options");
 const mlx = @import("mlx");
-const expert_io = sdk.expert.io;
-const expert_policy = sdk.expert.policy;
-const expert_lookahead = @import("expert_lookahead.zig");
+const expert = @import("../expert.zig");
+const expert_io = @import("io.zig");
+const expert_policy = @import("policy.zig");
+const expert_lookahead = @import("lookahead.zig");
 
-pub fn StreamOf(comptime B: type) type {
-    sdk.expert.assertBank(B);
+/// `probed`: the plugin's prefill-timers build (its read-ahead probes compiled in; every other build has no field, call or
+/// branch for them).
+pub fn StreamOf(comptime B: type, comptime probed: bool) type {
+    expert.assertBank(B);
     return struct {
         pub const n_components = B.n_components;
         pub const gu_components = B.gu_components;
@@ -259,14 +260,14 @@ pub fn StreamOf(comptime B: type) type {
 
         /// What the stream supports as an expert source (`sdk.expert.Caps`); an arm installs a subset at construction
         /// (`Options`).
-        pub const source_caps: sdk.expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
+        pub const source_caps: expert.Caps = .{ .two_phase = true, .transient_release = true, .prompt_seed = true, .read_ahead = true, .wide = true, .lookahead = true, .preread = true, .event_gates = true };
 
         /// It reads through the process's one reader: the host takes it at its arch's load claim (`sdk.expert.takeReader`).
         pub const uses_reader = true;
 
         /// The source contract's slot types (`sdk.expert`).
-        pub const BankKind = sdk.expert.BankKind;
-        pub const SlotRef = sdk.expert.SlotRef;
+        pub const BankKind = expert.BankKind;
+        pub const SlotRef = expert.SlotRef;
 
         // ── Stream: per-layer slot pools, routes, deferred release, growth ──
 
@@ -313,7 +314,7 @@ pub fn StreamOf(comptime B: type) type {
 
         /// G7: the prompt pass's read-ahead records, in the package's prefill-timers build only: the arch that builds the
         /// stream hands it these probes; every other build has no field, call or branch for them.
-        pub const read_ahead_probed: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;
+        pub const read_ahead_probed: bool = probed;
         pub const ReadAheadProbe = struct {
             /// At a layer's barrier: the records read ahead that its call routed, and its seed (the demand records).
             barrier: *const fn (layer: u32, hits: u32, seed: *const std.DynamicBitSetUnmanaged) void,
@@ -354,9 +355,9 @@ pub fn StreamOf(comptime B: type) type {
         };
 
         /// The contract's gates, counters and refusals (`sdk.expert`).
-        pub const Gates = sdk.expert.Gates;
-        pub const Stats = sdk.expert.Stats;
-        pub const Error = sdk.expert.Error;
+        pub const Gates = expert.Gates;
+        pub const Stats = expert.Stats;
+        pub const Error = expert.Error;
 
         pub const SlotState = enum(u8) { empty, loading, ready, failed };
 

@@ -29,6 +29,10 @@ pub const policy = @import("expert/policy.zig");
 /// A generic expert cache over per-expert tensors at known file offsets (the draft head's experts): the residency
 /// policy plans it, the read pool fills it.
 pub const slot_cache = @import("expert/slot_cache.zig");
+/// The expert stream over a bank module (`assertBank`): slot rows, routes, residency, reads, lookahead, gates, release.
+pub const stream = @import("expert/stream.zig");
+/// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
+pub const lookahead = @import("expert/lookahead.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model

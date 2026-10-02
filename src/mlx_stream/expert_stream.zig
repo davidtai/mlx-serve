@@ -16,7 +16,7 @@ const expert_policy = @import("sdk").expert.policy;
 const expert_lookahead = @import("expert_lookahead.zig");
 const exl3_quant = @import("exl3_quant.zig");
 
-const S = @import("expert_stream_of.zig").StreamOf(expert_bank);
+const S = sdk.expert.stream.StreamOf(expert_bank, if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false);
 const n_components = S.n_components;
 const gu_components = S.gu_components;
 const Component = S.Component;
