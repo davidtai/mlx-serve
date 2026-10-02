@@ -976,6 +976,8 @@ const CellReceipt = struct {
     draft_cache_stats: ?expert_stream.Stats = null,
     /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
     draft_cache_pool: ?[]const u8 = null,
+    /// DRAFTCACHE's residency policy as installed ("shipped" | "lru"; null: the route off).
+    draft_cache_policy: ?[]const u8 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1365,6 +1367,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .draft_cache_hot = md.installed.draft_cache_hot,
         .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
+        .draft_cache_policy = if (md.installed.draft_cache_policy) |p| @tagName(p) else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
@@ -1491,6 +1494,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
     // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
     if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
+    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("expert_slot_cache.zig").PolicyKind, v) orelse return error.CellDraftCachePolicy;
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
