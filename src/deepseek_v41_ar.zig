@@ -1267,6 +1267,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // The box's pages beside this footprint are marked by the Module's observer inside the phase change (start,
     // released, grown); the marks' own time is taken out of the phase change's, and they are judged after the receipt.
     const t1 = std.Io.Timestamp.now(io, .boot);
+    // The timeline's hook from the prompt's end: the phase change's commits prove it live before the first cycle.
+    if (comptime dt.enabled) if (ro.timeline) try timeline.install(md.g.s, max_tokens, md.model.c.n_layers);
     // Upstream's decode handover, as the server calls it: after the prompt, before the first round.
     try md.decodeHandover(.{ .prompt_tokens = @intCast(prompt.len), .reserved_tokens = prompt.len + max_tokens, .native_draft = true });
     const phase_s = @max(secondsSince(io, t1) - cx.marks.observerSeconds(), 0);
@@ -1290,7 +1292,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         // The read-outs' storage bounds are checked here, before the first cycle.
         const ds_c = md.model.c.dspark;
         if (ro.routes) try draft_routes.install(.{ .n_stages = ds_c.n_stages, .n_experts = ds_c.n_routed_experts, .top_k = ds_c.n_experts_per_tok, .block = ds_c.block_size }, max_tokens);
-        if (ro.timeline) try timeline.install(md.g.s, max_tokens, md.model.c.n_layers);
+        // the hook (installed at the prompt's end) saw the phase change's commits, or the cell stops here by name
+        if (ro.timeline) try timeline.checkLive();
         if (ro.any()) std.debug.print("NATIVE profile read-outs: draft_route_hist={s} ({d} B static), verify_gpu_timeline={s} ({d} B static), host_heap={s}\n", .{ if (ro.routes) "on" else "off", draft_routes.storage_bytes, if (ro.timeline) "on" else "off", timeline.storage_bytes, if (ro.heap) "on" else "off" });
     }
     const t2 = std.Io.Timestamp.now(io, .boot);

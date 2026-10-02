@@ -20,7 +20,8 @@ pub const max_layers = 64;
 pub const max_buffers = 1 << 18;
 
 /// One committed command buffer (the shim's `Dsv41tlRow`). Times: mach_absolute_time ns.
-pub const Row = extern struct { host_commit: u64 = 0, gpu_start: u64 = 0, gpu_end: u64 = 0, host_done: u64 = 0, tag: u64 = 0, status: u64 = 0 };
+/// `queue`: 1 for the queue of the buffer the install saw (MLX's stream), 0 for another queue.
+pub const Row = extern struct { host_commit: u64 = 0, gpu_start: u64 = 0, gpu_end: u64 = 0, host_done: u64 = 0, tag: u64 = 0, status: u64 = 0, queue: u64 = 0 };
 
 pub const Phase = enum(u8) { draft = 1, verify = 2, rest = 3 };
 
@@ -51,12 +52,18 @@ var cur: u32 = 0;
 var in_verify = false;
 pub var n_layers: u32 = 0;
 var t0: u64 = 0;
+/// The stream whose current buffer every cycle's begin re-checks (a buffer of an unhooked class is hooked).
+var stream: ?mlx.mlx_stream = null;
 
 const c = if (enabled) struct {
     extern fn dsv41tl_mlx_buffer(s: mlx.mlx_stream) ?*anyopaque;
     extern fn dsv41tl_install(buf: ?*anyopaque, rows: [*]Row, cap: u32) c_int;
     extern fn dsv41tl_tag(tag: u64) void;
     extern fn dsv41tl_counts(out: *[3]u32) void;
+    extern fn dsv41tl_rehook(buf: ?*anyopaque) c_int;
+    extern fn dsv41tl_hook_stats(out: *[4]u64) void;
+    extern fn dsv41tl_hooked_names(out: [*]u8, cap: usize) usize;
+    extern fn dsv41tl_selftest(rows: [*]Row, cap: u32) c_int;
     extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else struct {};
 
@@ -72,6 +79,7 @@ pub fn install(s: mlx.mlx_stream, max_tokens: u32, layer_count: u32) !void {
     try bound(max_tokens, layer_count);
     const rc = c.dsv41tl_install(c.dsv41tl_mlx_buffer(s), &rows, max_buffers);
     if (rc != 0) return error.TimelineNoCommandBuffer;
+    stream = s;
     _ = c.q3ld_test_ev_log(@ptrCast(&signals), max_signals);
     arm(layer_count);
 }
@@ -124,6 +132,9 @@ pub fn cycleBegin() void {
     cycles += 1;
     verifies[cur] = .{};
     layers[cur] = @splat(.{});
+    if (comptime @hasDecl(c, "dsv41tl_rehook")) if (stream) |s| {
+        _ = c.dsv41tl_rehook(c.dsv41tl_mlx_buffer(s));
+    };
     tag(.draft);
 }
 
@@ -171,6 +182,21 @@ pub fn gate(layer: u32, gu: u64, down_first: u64, n_parts: u32) void {
 pub fn disarm() void {
     if (comptime !enabled) return;
     if (comptime @hasDecl(c, "dsv41tl_tag")) c.dsv41tl_tag(0);
+}
+
+/// The hook's own counters: every override entry, the tagged ones, the tagged ones of another queue, the classes hooked.
+pub fn hookStats() [4]u64 {
+    var out: [4]u64 = @splat(0);
+    if (comptime @hasDecl(c, "dsv41tl_hook_stats")) c.dsv41tl_hook_stats(&out);
+    return out;
+}
+
+/// Before the first cycle (the phase change committed buffers after the install, at the prompt's end): refuses a hook
+/// that saw no commit, by name.
+pub fn checkLive() !void {
+    if (comptime !enabled) return;
+    if (!active) return;
+    if (hookStats()[0] == 0) return error.TimelineHookSawNoCommit;
 }
 
 pub fn uninstall() void {
@@ -463,7 +489,12 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
         n += 1;
     }
     const k = counts();
-    try w.print("VERIFY_GPU_TIMELINE {{\"cycles\": {d}, \"verifies\": {d}, \"layers\": {d}, \"buffers\": {d}, \"verify_buffers\": {d}, \"dropped\": {d}, \"pending\": {d}, \"truncated_cycles\": {d}, \"signals\": {d}, \"signals_full\": {}, \"clock\": \"mach_absolute ns; GPUStartTime / GPUEndTime per committed MTLCommandBuffer; bytes_wait to the read pool's host call of setSignaledValue\"", .{ cycles, n, n_layers, rs.len, verify_buffers, k[2], pending, truncated, sig.len, sig.len >= max_signals });
+    const hs = hookStats();
+    var other_rows: u64 = 0;
+    for (rs) |r| other_rows += @intFromBool(r.queue == 0);
+    var names: [512]u8 = undefined;
+    const nlen: usize = if (comptime @hasDecl(c, "dsv41tl_hooked_names")) c.dsv41tl_hooked_names(&names, names.len) else 0;
+    try w.print("VERIFY_GPU_TIMELINE {{\"cycles\": {d}, \"verifies\": {d}, \"layers\": {d}, \"buffers\": {d}, \"verify_buffers\": {d}, \"dropped\": {d}, \"pending\": {d}, \"truncated_cycles\": {d}, \"signals\": {d}, \"signals_full\": {}, \"hook\": {{\"calls\": {d}, \"tagged\": {d}, \"other_queue\": {d}, \"other_queue_rows\": {d}, \"classes\": {d}, \"names\": \"{s}\"}}, \"clock\": \"mach_absolute ns; GPUStartTime / GPUEndTime per committed MTLCommandBuffer; bytes_wait to the read pool's host call of setSignaledValue\"", .{ cycles, n, n_layers, rs.len, verify_buffers, k[2], pending, truncated, sig.len, sig.len >= max_signals, hs[0], hs[1], hs[2], other_rows, hs[3], names[0..nlen] });
     inline for (.{ "median", "mean" }) |kind| {
         try w.print(", \"{s}\": {{", .{kind});
         for (fields, 0..) |name, f| {
@@ -518,7 +549,7 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 18) * 48 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
     try std.testing.expectError(error.TimelineLayers, bound(1024, 65));
     try bound(1024, 40);
@@ -530,6 +561,14 @@ test "dsv41 verify timeline: a default build stamps nothing and links no shim; t
     gate(0, 1, 2, 1);
     try std.testing.expectEqual(@as(u32, 0), cycles);
     try std.testing.expect(!active);
+}
+
+var selftest_rows: [8]Row = undefined;
+
+test "dsv41 verify timeline (profile builds): the -commit hook on a fake buffer hierarchy: a subclass overriding -commit records once, a sibling through its base, an unrelated class after a rehook" {
+    if (comptime !enabled) return error.SkipZigTest;
+    // dsv41tl_selftest (lib/expert_io/dsv41_cb_timeline.mm): no Metal object; 0 or the failed check's number
+    try std.testing.expectEqual(@as(c_int, 0), c.dsv41tl_selftest(&selftest_rows, selftest_rows.len));
 }
 
 test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, idle split, hit spans, router gaps, the gated waits to the pool's signals" {
