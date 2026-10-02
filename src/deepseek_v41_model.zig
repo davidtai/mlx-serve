@@ -217,7 +217,7 @@ pub fn Model(comptime G: type) type {
                     self.head_rows = kr.HeadRows(G).init(g, reg, self.head.dense, null) catch |e| return if (e == error.RouteInput) error.HeadRowsGeometry else e;
                 }
                 if (tier.routes.rc_mxfp8_rows) if (self.engram) |en| {
-                    for (0..cp.engram.n_layers) |i| self.engram_m1[i] = if (tier.routes.dense_rc) try Tr.rcSite(g, reg, .engram_wkv, en.w[i].wkv) else try Tr.m1Site(g, reg, .engram_wkv, en.w[i].wkv);
+                    for (0..cp.engram.n_layers) |i| self.engram_m1[i] = try Tr.m1Site(g, reg, .engram_wkv, en.w[i].wkv);
                 };
                 if (tier.routes.rc_head_mxfp8) {
                     self.head_mx = kr.HeadMx(G).init(g, reg, self.head.mxfp8.w, self.head.mxfp8.s, null) catch |e| return if (e == error.RouteInput) error.HeadMxGeometry else e;

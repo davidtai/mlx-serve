@@ -202,9 +202,8 @@ pub const Routes = struct {
     /// (w1 / w3 / w2) and the Engram wkv in the M = 1 mxfp8 qmv order per row (RCPROJ keeps wq_a /
     /// wkv / wq_b / wo_b); bound per layer (the Engram's by the model).
     rc_mxfp8_rows: bool = false,
-    /// DENSE_RC (kbench v7, rounding-class): C29's sites on RCPROJ's FMA text instead of m1rows (needs
-    /// rc_mxfp8_rows): the shared expert's gate and up as ONE launch over their stacked weights (`LayerW.sh_w13`),
-    /// w2 at 8-wide lane steps, the indexer wq_b and the Engram wkv. Bound at construction.
+    /// DENSE_RC (kbench v7 / v7b, rounding-class; needs rc_mxfp8_rows): the shared expert's gate and up as ONE RCPROJ
+    /// launch over their stacked weights (`LayerW.sh_w13`); C29's other sites stay on m1rows. Bound at construction.
     dense_rc: bool = false,
     /// C27 INDEX_TOPK=metal at rows <= 8: an index source's select as one dispatch (the prefill
     /// route's kernel at the verify rows).
@@ -556,9 +555,9 @@ pub fn Trunk(comptime G: type) type {
                         }
                         if (rt.dense_rc) {
                             const w13 = w.sh_w13 orelse return error.DenseRcNeedsStack;
-                            if (w.idx_q) |iq| ms.idx_wq_b = try rcSite(g, reg, .indexer_wq_b, iq.wq_b);
+                            if (w.idx_q) |iq| ms.idx_wq_b = try m1Site(g, reg, .indexer_wq_b, iq.wq_b);
                             ms.sh_w13 = try rcSite(g, reg, .shared_w1_w3, w13);
-                            ms.sh_w2 = try rcSite(g, reg, .shared_w2, w.sh_w2);
+                            ms.sh_w2 = try m1Site(g, reg, .shared_w2, w.sh_w2);
                         } else if (rt.rc_mxfp8_rows) {
                             if (w.idx_q) |iq| ms.idx_wq_b = try m1Site(g, reg, .indexer_wq_b, iq.wq_b);
                             ms.sh_w1 = try m1Site(g, reg, .shared_w1_w3, w.sh_w1);
@@ -1621,7 +1620,7 @@ pub fn Trunk(comptime G: type) type {
                     out[n] = .{ .name = "shared_w13 rc", .ok = try checkClose(g, try s13.call(g, x), want, 2e-2) };
                     n += 1;
                     const h = try checkFill(g, r, scratch, &.{ M, @intCast(c.moe_intermediate_size) }, 1.0, .bfloat16);
-                    out[n] = .{ .name = "shared_w2 rc", .ok = try checkClose(g, try ms.sh_w2.?.call(g, h), try qlinear(g, h, w.sh_w2), 2e-2) };
+                    out[n] = .{ .name = "shared_w2", .ok = try checkClose(g, try ms.sh_w2.?.call(g, h), try qlinear(g, h, w.sh_w2), 2e-2) };
                     n += 1;
                 };
             }
@@ -3371,13 +3370,14 @@ test "dsv41 graph: DENSE_RC binds the mxfp8 rows sites on RCPROJ over the stacke
     const ms = &k.minv.items[l];
     try testing.expect(ms.sh_w13 != null and ms.sh_w1 == null and ms.sh_w3 == null and ms.sh_w2 != null and ms.idx_wq_b != null);
     try testing.expectEqual(xk.Kernel.q3rc_mxfp8_fma, ms.sh_w13.?.e.kernel);
-    // The shared expert at 5 rows: two RCPROJ launches (gate | up stacked, then w2), no m1rows, no qmm.
+    // The shared expert at 5 rows: one RCPROJ launch (gate | up stacked), w2 on m1rows, no qmm.
     const l0 = g.launched.items.len;
     const n0 = g.nodes.items.len;
     const y = try Tr.sharedExpertMinvFor(&g, &c, &rt, &ws[l], ms, try g.input(&.{ 5, 5120 }, .bfloat16));
     try expectShape(&g, y, &.{ 5, 5120 }, .bfloat16);
-    try testing.expectEqual(@as(usize, 2), g.launchesOf(l0, .q3rc_mxfp8_fma));
-    try testing.expectEqual(@as(usize, 0), g.launchesOf(l0, .dsv41_mxfp8_m1rows));
+    try testing.expectEqual(@as(usize, 1), g.launchesOf(l0, .q3rc_mxfp8_fma));
+    try testing.expectEqual(@as(usize, 1), g.launchesOf(l0, .dsv41_mxfp8_m1rows));
+    try testing.expectEqual(xk.Kernel.dsv41_mxfp8_m1rows, ms.idx_wq_b.?.e.kernel);
     for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .qmm);
 }
 
