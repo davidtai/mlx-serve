@@ -775,15 +775,20 @@ pub const Module = struct {
     /// The uniform route's counterpart of `logDecodeRows`, after the decode (off every clock; the prompt counts are
     /// unchanged by decode): the rows prompt_stats would have grown to and each layer's prompt tail.
     fn logUniformPromptRows(self: *Module) void {
-        if (self.installed.decode_rows_alloc != .uniform or !self.installed.wide.seed) return;
+        if (self.installed.decode_rows_alloc != .uniform) return;
+        self.logUniformPromptRowsOr() catch |e| log.info("NATIVE DSV41_DECODE_ROWS skipped: {s}", .{@errorName(e)});
+    }
+
+    fn logUniformPromptRowsOr(self: *Module) !void {
+        if (!self.installed.wide.seed) return error.NoPromptSeeds;
         switch (self.arm) {
             inline else => |t| {
-                var dr = arm_mod.DecodeRows.init(self.gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts) catch return;
+                if (t.arm.prefill_rows[0] >= t.arm.decode_rows[0]) return error.NoRoomAbovePromptRows;
+                var dr = try arm_mod.DecodeRows.init(self.gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
                 defer dr.deinit(self.gpa);
-                if (t.arm.prefill_rows[0] >= t.arm.decode_rows[0]) return;
-                const would = t.arm.promptRows(&dr) catch return;
+                const would = try t.arm.promptRows(&dr);
                 const s = rowsSummary(would);
-                const json = std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{}) catch return;
+                const json = try std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{});
                 defer self.gpa.free(json);
                 log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
             },
