@@ -203,8 +203,6 @@ test "dsv41 plugin: the term-wise bill bounds the process exactly as the load pr
     const ov: module.RouteOverrides = .{};
     const p = try sdk.ConfigPeek.parse(a, bank_dir, "{}");
     const req: sdk.BillRequest = .{ .peek = &p, .cfg = cfg, .routes = &ov, .prompt_tokens = bill_mod.fill_prompt_tokens, .max_tokens = bill_mod.fill_max_tokens, .ceiling = ceiling, .stop = module.ceiling_stop_bytes };
-    const mb = try bill(testing.allocator, testing.io, &req);
-    defer mb.free(testing.allocator);
     const floor: sdk.Rows = .{ .prompt = bill_mod.min_fill_rows, .decode = bill_mod.min_fill_rows };
-    try testing.expectEqual(try loadBytes(testing.allocator, testing.io, cfg, &host.loadFacts(), ceiling), mb.processBound(floor));
+    try sdk.testing.expectBillBoundsLoad(@This(), testing.allocator, testing.io, cfg, &host.loadFacts(), &req, floor);
 }

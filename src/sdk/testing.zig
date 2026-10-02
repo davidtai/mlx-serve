@@ -104,6 +104,14 @@ pub fn expectAdmission(b: bill.MemoryBill, n_experts: u32, min_rows: u32, cases:
     }
 }
 
+/// G4: an arch's itemized bill (`A.bill`) bounds the process exactly as its load preflight (`A.loadBytes`) bills it, at
+/// the fill's floor rows: the preflight and the admission read one bill.
+pub fn expectBillBoundsLoad(comptime A: type, gpa: std.mem.Allocator, io: std.Io, cfg: *const A.Config, facts: *const arch.LoadFacts, req: *const bill.BillRequest, floor: bill.Rows) !void {
+    const mb = try A.bill(gpa, io, req);
+    defer mb.free(gpa);
+    try std.testing.expectEqual(try A.loadBytes(gpa, io, cfg, facts, req.ceiling), mb.processBound(floor));
+}
+
 /// A route override changes exactly the terms its owner bills: `a` and `b` (one bill at two routes) differ in the
 /// `owned` terms only, and keep the same term names in the same order.
 pub fn expectRouteFollowing(a: bill.MemoryBill, b: bill.MemoryBill, owned: []const []const u8) !void {
