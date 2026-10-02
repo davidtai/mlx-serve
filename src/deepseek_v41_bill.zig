@@ -444,7 +444,9 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const em = try v41.WeightMap.build(a, try v41.engramSpec(a, &c), &eck, &vd);
     // JOINLESS (the served default): the routed group's joined input is the minimal copy's bound (`joinedBytes`).
     const joinless = ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
-    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
+    // P1d's resident-first route makes one more deferred base call per wide call (one more output).
+    const base_calls = v41.PrefillBill.wide_base_calls + @intFromBool(config.dsv41WideResidentFirst());
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
     const variant = try billVariant();
     const tight_streams = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
     const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4);

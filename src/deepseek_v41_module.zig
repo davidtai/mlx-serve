@@ -702,6 +702,8 @@ pub const Module = struct {
         if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)", .{});
         // P1c: exact by construction (groups change no expert's rows; the base call's place moves before the stream's).
         if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)", .{});
+        // P1d: exact by construction (the same base rows, slots and kernels; the resident ones drain first, in their own call).
+        if (arm.hook.wide_route.resident_first) log.info("NATIVE prefill base split: resident_first (the base rows resident at the barrier drain before the seed's reads land)", .{});
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -1301,7 +1303,7 @@ pub fn prefillIndexRoute(config: *const model_io.ModelConfig, ov: RouteOverrides
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const model_io.ModelConfig) xp.Wide {
-    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned() };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned(), .resident_first = config.dsv41WideResidentFirst() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
