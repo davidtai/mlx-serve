@@ -1363,7 +1363,7 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1601,7 +1601,7 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try model.parseConfig(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};

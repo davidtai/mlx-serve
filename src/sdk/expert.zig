@@ -15,6 +15,7 @@ pub const UncachedFd = io.UncachedFd;
 pub const openUncached = io.openUncached;
 /// The read pool threads' scheduling (`Options.sched`).
 pub const Sched = io.Sched;
+pub const openUncachedFollowing = io.openUncachedFollowing;
 pub const max_range_components = io.max_range_components;
 pub const checkTopology = io.checkTopology;
 
@@ -25,6 +26,9 @@ pub const Event = event.Event;
 
 /// The residency policy every source plans with (one admission and replacement policy for every source).
 pub const policy = @import("expert/policy.zig");
+/// A generic expert cache over per-expert tensors at known file offsets (the draft head's experts): the residency
+/// policy plans it, the read pool fills it.
+pub const slot_cache = @import("expert/slot_cache.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model

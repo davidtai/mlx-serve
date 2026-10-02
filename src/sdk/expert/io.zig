@@ -234,7 +234,17 @@ pub const OpenError = error{ NotFound, OpenFailed, StatFailed, NotRegularFile, N
 /// `path` for the reader: open(O_RDONLY | O_NOFOLLOW), a regular file, F_NOCACHE and read-ahead off. `errno`
 /// receives the open's errno when it fails.
 pub fn openUncached(path: [*:0]const u8, errno: ?*c_int) OpenError!UncachedFd {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    return openUncachedWith(path, errno, false);
+}
+
+/// `openUncached` through a symlink (a model directory's safetensors shard may be one): the target is opened, still
+/// a regular file, F_NOCACHE and read-ahead off.
+pub fn openUncachedFollowing(path: [*:0]const u8, errno: ?*c_int) OpenError!UncachedFd {
+    return openUncachedWith(path, errno, true);
+}
+
+fn openUncachedWith(path: [*:0]const u8, errno: ?*c_int, follow: bool) OpenError!UncachedFd {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = !follow, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     if (fd < 0) {
         const e = std.c._errno().*;
         if (errno) |p| p.* = e;

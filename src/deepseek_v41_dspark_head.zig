@@ -15,10 +15,11 @@ const mdl = @import("deepseek_v41_model.zig");
 const xk = @import("exl3_kernels.zig");
 const kr = @import("dsv41_kernel_routes.zig");
 const draft_routes = @import("dsv41_draft_routes.zig");
-const xsc = @import("expert_slot_cache.zig");
-const expert_io = @import("expert_io.zig");
+const sdk = @import("sdk");
+const xsc = sdk.expert.slot_cache;
+const expert_io = sdk.expert.io;
+const expert_policy = sdk.expert.policy;
 const expert_stream = @import("expert_stream.zig");
-const expert_policy = @import("expert_policy.zig");
 
 /// Bytes of one DSpark head expert (gate, up and down, mxfp4 with one e8m0
 /// scale per 32 weights): 18,800,640 on the bank of record, the stack of
@@ -1535,10 +1536,10 @@ test "dsv41 dspark head: DRAFTCACHE on the bank: every routed id's slot rows are
             if (fds[t.shard] < 0) {
                 const path = try ck.shardPath(a, t.shard);
                 defer a.free(path);
-                fds[t.shard] = try @import("io_util.zig").openNoCache(path.ptr, .{});
+                fds[t.shard] = try @import("io_util").openNoCache(path.ptr, .{});
             }
             const buf = want[0..@intCast(t.end - t.begin)];
-            try @import("nocache_reader.zig").readAligned(fds[t.shard], buf, t.begin);
+            try @import("io_util").readAligned(fds[t.shard], buf, t.begin);
             try testing.expectEqualSlices(u8, buf, cache.row(0, k, slot));
         };
     }
@@ -1557,8 +1558,8 @@ test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots 
         std.debug.print("\ndraft cache smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const mlx = @import("mlx.zig");
-    const model_io = @import("model.zig");
+    const mlx = @import("mlx");
+    const model_io = @import("deepseek_v41_host.zig").model;
     const G = ops.MlxOps;
     const T = G.T;
     const H = Head(G);
