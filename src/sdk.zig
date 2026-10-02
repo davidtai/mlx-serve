@@ -90,6 +90,8 @@ pub const profile = @import("sdk/profile.zig");
 pub const ops = @import("sdk/ops.zig");
 /// Process and box memory readings (the kernel's ledgers) that bills and construction checks compare against.
 pub const memory = @import("sdk/memory.zig");
+/// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
+pub const kv = @import("sdk/kv.zig");
 const weights = @import("sdk/weights.zig");
 pub const Weights = weights.Weights;
 pub const LoadOpts = weights.LoadOpts;
