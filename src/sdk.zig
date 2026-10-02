@@ -86,6 +86,8 @@ pub const kernels = @import("sdk/kernels.zig");
 pub const quant = @import("sdk/quant.zig");
 /// G7: a plugin's profile probes, injected by its arch's backend type (`of(Backend)`); off everywhere else.
 pub const profile = @import("sdk/profile.zig");
+/// Host-side helpers more than one plugin needs (a strided copy out of an evaluated array's buffer).
+pub const ops = @import("sdk/ops.zig");
 /// Process and box memory readings (the kernel's ledgers) that bills and construction checks compare against.
 pub const memory = @import("sdk/memory.zig");
 const weights = @import("sdk/weights.zig");
