@@ -37,7 +37,8 @@ static std::atomic<uint64_t> g_other_queue{0};
  * another object made from inside it starts at depth 0 (its own outermost call, recorded). */
 static thread_local int t_depth = 0;
 static thread_local id t_self = nil;
-/* install / rehook run on one thread (the inference thread): hook_chain is not reentrant. */
+/* install / rehook run on one thread (the inference thread): hook_chain is not reentrant. Plain statics: the first
+ * hook_chain (the install) sets them before any other call can reach hook_chain. */
 static pthread_t g_owner;
 static int g_owned = 0;
 
