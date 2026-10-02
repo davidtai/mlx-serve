@@ -448,6 +448,9 @@ pub const ModelConfig = struct {
     /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group
     /// (`expert_wide_seed_aligned`; null = on wherever P1b's base call at the seed and the hottest-first order are).
     expert_wide_seed_aligned: ?bool = null,
+    /// P1d: the base rows resident at the barrier drain first, in their own call (`expert_wide_resident_first`;
+    /// null = off: the one deferred base call at the seed).
+    expert_wide_resident_first: ?bool = null,
     /// Prefill rows per layer from the caller's native bill (with `expert_rows` the decode rows): the
     /// stream's rows, the envelope admission's rows unused (`deepseek_v41_module.fillRows`).
     expert_prefill_rows: ?u32 = null,
@@ -754,6 +757,11 @@ pub const ModelConfig = struct {
     /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
     pub fn dsv41WideSeedAligned(self: *const ModelConfig) bool {
         return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
+    }
+
+    /// P1d's resident-first base call: the setting, else off.
+    pub fn dsv41WideResidentFirst(self: *const ModelConfig) bool {
+        return self.expert_wide_resident_first orelse false;
     }
 
     fn dsv41ServedTier(self: *const ModelConfig) bool {
