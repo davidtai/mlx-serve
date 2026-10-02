@@ -191,12 +191,23 @@ pub fn hookStats() [4]u64 {
     return out;
 }
 
-/// Before the first cycle (the phase change committed buffers after the install, at the prompt's end): refuses a hook
-/// that saw no commit, by name.
-pub fn checkLive() !void {
-    if (comptime !enabled) return;
-    if (!active) return;
-    if (hookStats()[0] == 0) return error.TimelineHookSawNoCommit;
+/// Before the first cycle (the phase change committed buffers after the install, at the prompt's end): why the GPU
+/// timeline cannot run (the hook saw no commit), else null. The cell then does not install it for the decode.
+pub fn unavailableReason() ?[]const u8 {
+    if (comptime !enabled) return null;
+    if (!active) return null;
+    if (hookStats()[0] == 0) return "the hook saw no commit of the phase change";
+    return null;
+}
+
+/// `VERIFY_GPU_TIMELINE_UNAVAILABLE {...}`: the reason and what the hook saw (its counters and classes).
+pub fn unavailableLine(buf: []u8, reason: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const hs = hookStats();
+    var names: [512]u8 = undefined;
+    const nlen: usize = if (comptime @hasDecl(c, "dsv41tl_hooked_names")) c.dsv41tl_hooked_names(&names, names.len) else 0;
+    w.print("VERIFY_GPU_TIMELINE_UNAVAILABLE {{\"reason\": \"{s}\", \"calls\": {d}, \"tagged\": {d}, \"other_queue\": {d}, \"classes\": {d}, \"names\": \"{s}\"}}", .{ reason, hs[0], hs[1], hs[2], hs[3], names[0..nlen] }) catch return buf[0..0];
+    return w.buffered();
 }
 
 pub fn uninstall() void {
@@ -561,6 +572,38 @@ test "dsv41 verify timeline: a default build stamps nothing and links no shim; t
     gate(0, 1, 2, 1);
     try std.testing.expectEqual(@as(u32, 0), cycles);
     try std.testing.expect(!active);
+}
+
+// Profile builds, a device step (DSV41_PHASE0B_MLX=1; no model): MLX's own buffers on the GPU stream reach the hook.
+// Prints TIMELINE_HOOK_SMOKE {pass, calls, tagged, rows, classes, names}; fails when no commit was seen or recorded.
+test "dsv41 smoke 0b: the command-buffer hook sees MLX's own commits on the GPU stream (no model)" {
+    if (comptime !enabled) return error.SkipZigTest;
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const ops = @import("deepseek_v41_ops.zig");
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(std.testing.allocator, s);
+    defer g.deinit();
+    var vals: [1024]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = try g.hostArray(std.mem.sliceAsBytes(&vals), &.{1024}, .float32);
+    try g.evalAll(&.{try g.add(x, x)});
+    try install(s, 2, 1);
+    defer uninstall();
+    cycleBegin();
+    verifyBegin();
+    const y = try g.add(try g.mul(x, x), x);
+    try g.evalAll(&.{y});
+    _ = mlx.mlx_synchronize(s);
+    verifyEnd();
+    const pending = settle(s, 2000);
+    const hs = hookStats();
+    const k = counts();
+    var names: [512]u8 = undefined;
+    const nlen = c.dsv41tl_hooked_names(&names, names.len);
+    const pass = hs[0] > 0 and k[0] > 0 and pending == 0;
+    std.debug.print("NATIVE TIMELINE_HOOK_SMOKE {{\"pass\": {}, \"calls\": {d}, \"tagged\": {d}, \"other_queue\": {d}, \"rows\": {d}, \"pending\": {d}, \"classes\": {d}, \"names\": \"{s}\", \"first_row_gpu_us\": {d:.1}}}\n", .{ pass, hs[0], hs[1], hs[2], k[0], pending, hs[3], names[0..nlen], if (k[0] > 0) @as(f64, @floatFromInt(rows[0].gpu_end -| rows[0].gpu_start)) / 1e3 else 0 });
+    try std.testing.expect(pass);
 }
 
 var selftest_rows: [8]Row = undefined;
