@@ -136,7 +136,23 @@ pub const RouteOverrides = struct {
     /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
     /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
     host_relief: ?bool = null,
+    /// DRAFTCACHE: the DSpark experts behind an exact adaptive cache of this many hot slots (split over the stages),
+    /// plus one draft block's transient slots per stage; none resident. null: the default, all resident.
+    draft_cache_hot: ?u32 = null,
+    /// DRAFTCACHE's slot pool form (`dh.DraftPool`; null: per_stage). Only with `draft_cache_hot`.
+    draft_cache_pool: ?dh.DraftPool = null,
 };
+
+/// DRAFTCACHE's hot slots as the Module installs it and the bill charges it (one resolver; off by default).
+pub fn draftCacheHot(ov: RouteOverrides) ?u32 {
+    return ov.draft_cache_hot;
+}
+
+/// DRAFTCACHE's pool form as installed and billed (per_stage unless set); a form without a hot count is refused by name.
+pub fn draftCachePool(ov: RouteOverrides) error{DraftCachePoolWithoutHot}!dh.DraftPool {
+    if (ov.draft_cache_hot == null and ov.draft_cache_pool != null) return error.DraftCachePoolWithoutHot;
+    return ov.draft_cache_pool orelse .per_stage;
+}
 
 /// The host relief route the Module installs (off by default).
 pub fn hostRelief(ov: RouteOverrides) bool {
@@ -287,6 +303,8 @@ pub const Module = struct {
     embed_rows: qwen4.NgramTable,
     model: *M,
     head: *H,
+    /// DRAFTCACHE's slot banks and policy (`draftCacheHot`); the head routes its stages through it.
+    draft_cache: ?*dh.DraftCache = null,
     /// The request in flight (rebuilt at `cache.step == 0`).
     state: ?M.State = null,
     /// The DSpark strategy's settings (the served tier with a draft head); null: serial decode only.
@@ -510,7 +528,26 @@ pub const Module = struct {
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg });
+        if (draftCacheHot(ov)) |hot| {
+            var ck = try v41.Checkpoint.openIndexed(gpa, io, dir, &vd);
+            defer ck.deinit();
+            const pool = switch (self.arm) {
+                inline else => |t| t.arm.stream.pool,
+            };
+            self.draft_cache = dh.DraftCache.open(gpa, &ck, &c, hot, try draftCachePool(ov), .{ .mlx = s }, pool) catch |e| {
+                log.err("draft cache refused at hot {d}: {s}", .{ hot, @errorName(e) });
+                return e;
+            };
+        }
+        errdefer if (self.draft_cache) |dc| dc.deinit();
+        _ = try draftCachePool(ov);
+        self.installed.draft_cache_hot = draftCacheHot(ov);
+        self.installed.draft_cache_pool = if (self.draft_cache) |dc| dc.geom.pool else null;
+        if (self.draft_cache) |dc| {
+            const caps = dc.geom.caps[0..dc.geom.n_groups];
+            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.cache.geom.billBytes() });
+        } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache });
         errdefer self.head.deinit(&self.g);
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
@@ -565,6 +602,12 @@ pub const Module = struct {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
         log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared", .{forgotten});
+        // DRAFTCACHE: the warm-up's draft block belongs to no request either; each stage's first ids seed its hot slots.
+        if (self.draft_cache) |dc| {
+            const seeded = try dc.seedFirstIds();
+            log.info("NATIVE draft cache seeded: {d} records (each stage's first ids), {d} B read", .{ seeded, dc.cache.stats.expert_bytes_read });
+            dc.cache.stats = .{};
+        }
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
         try self.checkConstruction(io, &admitted, ceiling_bytes);
@@ -673,6 +716,7 @@ pub const Module = struct {
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
+        if (self.draft_cache) |dc| dc.deinit();
         self.model.deinit(&self.g);
         self.embed_rows.close();
         self.engram.deinit();
@@ -1175,6 +1219,10 @@ pub const Installed = struct {
     phase_change_settle: PhaseChangeSettle = .until_freed,
     /// The phase change's host relief, as installed (`hostRelief`).
     host_relief: bool = false,
+    /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
+    draft_cache_hot: ?u32 = null,
+    /// DRAFTCACHE's pool form, as installed (null: the route off).
+    draft_cache_pool: ?dh.DraftPool = null,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -2525,4 +2573,13 @@ test "dsv41 module: the installed-routes line reads the routes as built, on and 
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false", seed_only.line(&buf));
     const off: Installed = .{};
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
+}
+
+test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) and installs at the overrides' hot count" {
+    try std.testing.expectEqual(@as(?u32, null), draftCacheHot(.{}));
+    try std.testing.expectEqual(@as(?u32, null), (Installed{}).draft_cache_hot);
+    try std.testing.expectEqual(@as(?u32, 201), draftCacheHot(.{ .draft_cache_hot = 201 }));
+    try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
+    try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
+    try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
 }
