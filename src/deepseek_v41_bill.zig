@@ -795,6 +795,22 @@ test "dsv41 memory: verify_wave is the geometric bound of a decode forward's liv
     try testing.expect(verifyWaveBytes(&c, 7, p, 5) < vw and verifyWaveBytes(&c, 8, p - 1024, 5) < vw);
 }
 
+test "dsv41 memory: KV lanes at the request's declared bound against the fill's headroom bound (pricing read-out)" {
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    const pb = v41.PrefillBill.of(&c);
+    const seq = fill_prompt_tokens;
+    const headroom = billedPositions(seq, fill_max_tokens);
+    const declared = module.Module.maxPositions(@intCast(seq), seq + fill_max_tokens);
+    try testing.expect(declared < headroom);
+    const kp = [2]u64{ pb.kvPromptBytes(seq, headroom), pb.kvPromptBytes(seq, declared) };
+    const kd = [2]u64{ pb.kvDecodeBytes(seq, headroom), pb.kvDecodeBytes(seq, declared) };
+    const lanes = [2]u64{ pb.laneBytes(headroom), pb.laneBytes(declared) };
+    std.debug.print("\nKV_PRICE positions {d} -> {d}; lanes {d} -> {d} B; prompt kv {d} -> {d} B; decode kv {d} -> {d} B\n", .{ headroom, declared, lanes[0], lanes[1], kp[0], kp[1], kd[0], kd[1] });
+    try testing.expect(kd[1] <= kd[0] and kp[1] <= kp[0]);
+}
+
 test "dsv41 memory: wire_tables bills the page tables and wiring records of a phase's wired bytes, per 16 KiB page" {
     // 24 B a page, 16 B per 32 MiB, 16 B per 64 GiB; no per-buffer term.
     try testing.expectEqual(@as(u64, 24 + 16 + 16), wireTables(1));

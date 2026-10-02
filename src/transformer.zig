@@ -19432,6 +19432,18 @@ pub const Transformer = struct {
         }
     }
 
+    /// The request's end for the module-owned-state archs whose module takes one (dsv41: its reverse phase change, back
+    /// to the prompt configuration); a no-op elsewhere. From the scheduler's `finishSlot`, after the request's last
+    /// token went out.
+    pub fn requestEnd(self: *Transformer) !void {
+        inline for (module_owned_state_fields) |f| {
+            const Ptr = @typeInfo(@FieldType(Transformer, f)).optional.child;
+            if (comptime @hasDecl(@typeInfo(Ptr).pointer.child, "requestEnd")) {
+                if (@field(self, f)) |m| return m.requestEnd();
+            }
+        }
+    }
+
     /// Whether this model's arch takes the handover: read once, at a Generator's construction.
     pub fn decodeHandoverWanted(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {

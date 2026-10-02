@@ -100,6 +100,8 @@ pub const Options = struct {
     wide_depth: u8 = 1,
     /// The phase change's transient release (`expert_stream.Options.transient_release`; the Module's route).
     transient_release: bool = false,
+    /// The grow's new rows' allocation (`expert_stream.Options.grow_fill`; the Module's route).
+    grow_fill: expert_stream.GrowFill = .zeros,
     /// A0 (a): the first verify's warm reads (`expert_stream.Options.first_verify_warm`; the Module's route).
     first_verify_warm: ?expert_stream.FirstVerifyWarm = null,
     /// The draft head's resident bytes for the admission: null charges the
@@ -395,6 +397,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .wide_depth = opt.wide_depth,
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
+                .grow_fill = opt.grow_fill,
                 .first_verify_warm = opt.first_verify_warm,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
@@ -444,6 +447,19 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         pub fn promptRows(self: *Self, dr: *DecodeRows, extra: u32) ![]const u32 {
             for (0..self.config.n_layers) |l| @memcpy(dr.layerCounts(l), self.stream.promptCounts(@intCast(l)));
             return dr.planWith(self.prefill_rows, self.decode_rows[0], extra);
+        }
+
+        /// The reverse phase change's free, back to the admitted prompt rows (`Experts.shrink`). Returns the bytes freed.
+        pub fn shrink(self: *Self) !u64 {
+            const bytes = try self.hook.shrink(self.prefill_rows);
+            self.grown = false;
+            return bytes;
+        }
+
+        /// The reverse phase change's allocation, after its frees landed: the prompt's scratch, bound (`released`: the
+        /// release route freed it; else it stayed through decode). Returns the bytes allocated.
+        pub fn regrowTransient(self: *Self, g: *G, released: bool) !u64 {
+            return self.hook.regrowTransient(g, released);
         }
 
         /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
