@@ -1295,37 +1295,55 @@ test "dsv41 io: qos: a claimed speculative record's worker runs at the demand cl
     var f = try PatternFile.init(64 * page);
     defer f.deinit();
     // A record of three page chunks (the demand ranges inside its first page) whose second and third chunks each sleep
-    // 200 ms: claimed during the second.
+    // 800 ms: claimed during the second, so the worker promotes itself at the third chunk's boundary. Both checks poll
+    // for the state (a loaded box schedules the UTILITY worker late) and end on the chunk count, not on a sleep.
     const rec = 3 * page;
     var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .sched = .{ .qos = true }, .spec = .{ .threads = 1, .slots = 2, .record_bytes = rec, .chunk_bytes = page } });
     defer pool.stop();
     defer clearFaults();
     const base: u64 = 20 * page;
-    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 200 * std.time.ns_per_ms, 200 * std.time.ns_per_ms });
+    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 800 * std.time.ns_per_ms, 800 * std.time.ns_per_ms });
     try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, rec));
-    std.Io.sleep(testing.io, .fromMilliseconds(60), .awake) catch {};
-    const unclaimed = ThreadProbe.scan("spec unclaimed");
-    try testing.expectEqual(@as(u32, 1), unclaimed.spec_utility);
+    const SpecQos = struct {
+        fn of() ?c_uint {
+            var list: [*]ThreadProbe.mach_port_t = undefined;
+            var n: u32 = 0;
+            if (ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n) != 0) return null;
+            for (list[0..n]) |port| {
+                const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
+                var name: [64]u8 = @splat(0);
+                _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
+                if (std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) return ThreadProbe.qosOf(t);
+            }
+            return null;
+        }
+        fn is(want: c_uint) bool {
+            return of() == want;
+        }
+    };
+    // Unclaimed: the worker has named itself and set UTILITY (its first chunk is unclaimed; the claim is not yet made).
+    try waitFor(ThreadProbe.utility, SpecQos.is);
+    try testing.expectEqual(@as(i64, 0), pool.counter(.claimed));
     var d = try Dests.init(1, &spec_lens);
     defer testing.allocator.free(d.buf);
     const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
-    // Past the second chunk's end: the third chunk runs claimed.
-    std.Io.sleep(testing.io, .fromMilliseconds(250), .awake) catch {};
-    var list: [*]ThreadProbe.mach_port_t = undefined;
-    var n: u32 = 0;
-    try testing.expectEqual(@as(c_int, 0), ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n));
-    var found = false;
-    for (list[0..n]) |port| {
-        const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
-        var name: [64]u8 = @splat(0);
-        _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
-        if (!std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) continue;
-        const q = ThreadProbe.qosOf(t);
-        std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{q});
-        try testing.expectEqual(ThreadProbe.user_interactive, q);
-        found = true;
+    if (pool.counter(.spec_chunks) >= 2) {
+        // The claim landed after the second chunk ended (the test thread stalled > 800 ms): no boundary left to promote at.
+        std.debug.print("QOSPROBE skipped: the claim came after the second chunk (box loaded)\n", .{});
+        try pool.wait(first, 2, 10 * std.time.ns_per_s);
+        return error.SkipZigTest;
     }
-    try testing.expect(found);
+    // Claimed: the worker reaches USER_INTERACTIVE before its third (claimed) chunk ends.
+    var seen: ?c_uint = null;
+    var t: u32 = 0;
+    while (pool.counter(.spec_chunks) < 3) : (t += 1) {
+        if (t > 10_000) return error.Timeout;
+        seen = SpecQos.of();
+        if (seen == ThreadProbe.user_interactive) break;
+        std.Io.sleep(testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{seen orelse 0});
+    try testing.expectEqual(@as(?c_uint, ThreadProbe.user_interactive), seen);
     try pool.wait(first, 2, 10 * std.time.ns_per_s);
     try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
     try testing.expectEqual(@as(i64, 1), pool.counter(.claimed));
