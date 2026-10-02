@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
-const qwen4 = @import("qwen4_exp.zig");
+const ngram = @import("ngram");
 const io_util = @import("io_util");
 
 pub const max_ngram = 8;
@@ -196,7 +196,7 @@ pub fn readRows(fd: std.c.fd_t, bank: *const Bank, rows: []const i64, codes: []u
 pub const row_cache_bytes_per_bank: u64 = 64 << 20;
 
 /// The row caches' host bytes (a memory bill's term): two banks of 264-byte records.
-pub const row_cache_host_bytes: u64 = 2 * qwen4.RowCache.hostBytes(264, row_cache_bytes_per_bank);
+pub const row_cache_host_bytes: u64 = 2 * ngram.RowCache.hostBytes(264, row_cache_bytes_per_bank);
 
 /// Construction-time refusals of the row source (one named error each; the
 /// message says which field or file).
@@ -285,7 +285,7 @@ pub const RowSource = struct {
     hashing: Hashing,
     bank: Bank,
     map: TokenMap,
-    tables: [max_layers]?*qwen4.NgramTable = @splat(null),
+    tables: [max_layers]?*ngram.NgramTable = @splat(null),
     /// The tables' descriptors (they own them).
     fds: [max_layers]std.c.fd_t = @splat(-1),
     /// A gather's records before the codes / scales split (heap: `read` takes a const source).
@@ -309,8 +309,8 @@ pub const RowSource = struct {
         self.recs = recs;
         for (0..self.hashing.n_layers) |i| {
             const path = try std.fmt.allocPrintSentinel(a, "{s}/engram/{s}", .{ bank_dir, self.bank.files[i] }, 0);
-            const t = try gpa.create(qwen4.NgramTable);
-            t.* = qwen4.NgramTable.openRecords(path, self.bank.record_bytes, self.bank.rows[i], 0) catch |e| {
+            const t = try gpa.create(ngram.NgramTable);
+            t.* = ngram.NgramTable.openRecords(path, self.bank.record_bytes, self.bank.rows[i], 0) catch |e| {
                 gpa.destroy(t);
                 return refuse(diag, error.EngramBankFile, "{s}: {s} (the manifest's {d} rows x {d} B)", .{ path, @errorName(e), self.bank.rows[i], self.bank.record_bytes });
             };
@@ -338,7 +338,7 @@ pub const RowSource = struct {
     }
 
     /// Layer slot `li`'s row-cache statistics (Python's `cache.stats`).
-    pub fn cacheStats(self: *const RowSource, li: usize) qwen4.RowCache.Stats {
+    pub fn cacheStats(self: *const RowSource, li: usize) ngram.RowCache.Stats {
         return self.tables[li].?.cache.?.stats;
     }
 
@@ -369,7 +369,7 @@ pub const RowSource = struct {
 
     /// Layer slot `li`'s gather for the `n` positions of `rows`, posted: `read`'s ids now, its records
     /// when `take` returns (the table's poster runs `read`'s gather, cache included, in post order).
-    pub const Posted = struct { job: qwen4.NgramTable.Posted, li: usize };
+    pub const Posted = struct { job: ngram.NgramTable.Posted, li: usize };
 
     /// Post layer slot `li`'s gather for `n` positions of `rows` (`advance`'s output); `a` holds the ids and
     /// records until `take` (and every later wave that reads them) is done.
@@ -861,7 +861,7 @@ test "dsv41 engram: the lane's gather sequence replays through the row source wi
     var diag: v41.Diag = .{};
     errdefer std.debug.print("refused: {s}\n", .{diag.message()});
     const c = try v41.Config.load(gpa, testing.io, bank_dir, &diag);
-    const Py = struct { stats: []const qwen4.RowCache.Stats, bytes_read: u64, sha256: []const u8 };
+    const Py = struct { stats: []const ngram.RowCache.Stats, bytes_read: u64, sha256: []const u8 };
     const Seq = struct { name: []const u8, bin: []const u8, forwards: u32, gathers: u32, lookups: u64, python: Py };
     const doc = try std.json.parseFromSliceLeaky(struct { format: []const u8, schedule: []const u8, sequences: []const Seq }, a, try std.Io.Dir.cwd().readFileAlloc(testing.io, replay, a, .limited(64 << 20)), .{ .ignore_unknown_fields = true });
     try testing.expectEqualStrings("unsplit", doc.schedule);

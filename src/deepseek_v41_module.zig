@@ -35,7 +35,7 @@ const eng = @import("deepseek_v41_engram.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
-const qwen4 = @import("qwen4_exp.zig");
+const ngram = @import("ngram");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
@@ -484,7 +484,7 @@ pub const Module = struct {
     weights: *sdk.Weights,
     engram: eng.RowSource,
     /// The input embedding's rows in its shard, read past the page cache once the prompt fence ran.
-    embed_rows: qwen4.NgramTable,
+    embed_rows: ngram.NgramTable,
     model: *M,
     head: *H,
     /// DRAFTCACHE's slot banks and policy (`draftCacheHot`); the head routes its stages through it.

@@ -857,12 +857,14 @@ const Shared = struct {
     log: *std.Build.Module,
     io_util: *std.Build.Module,
     sdk: *std.Build.Module,
+    ngram: *std.Build.Module,
 
     fn importInto(s: Shared, m: *std.Build.Module) void {
         m.addImport("mlx", s.mlx);
         m.addImport("log", s.log);
         m.addImport("io_util", s.io_util);
         m.addImport("sdk", s.sdk);
+        m.addImport("ngram", s.ngram);
     }
 };
 
@@ -883,7 +885,15 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
         .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
     });
-    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk };
+    // The hashed n-gram tables qwen4_exp's PLE and mlx-stream's Engram share.
+    const ngram = b.createModule(.{
+        .root_source_file = b.path("src/ngram.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
+    });
+    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk, .ngram = ngram };
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

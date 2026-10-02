@@ -14,7 +14,7 @@ const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const mlx = @import("mlx");
-const qwen4 = @import("qwen4_exp.zig");
+const ngram = @import("ngram");
 const dh = @import("deepseek_v41_dspark_head.zig");
 
 /// How the residents load: past the page cache (`nocache_reader`), so a load
@@ -56,7 +56,7 @@ pub fn Resources(comptime G: type) type {
         /// The input embedding's rows in its checkpoint shard, opened with the
         /// residents (past the page cache); the model's lookups read them from
         /// the first prompt pass's fence on.
-        embed_rows: qwen4.NgramTable,
+        embed_rows: ngram.NgramTable,
         model: *L.M,
         head: *L.H,
 
@@ -108,7 +108,7 @@ pub fn Resources(comptime G: type) type {
 /// handlers release its buffer into MLX's cache; cleared ahead of them, the
 /// table stays cached whenever the cache limit holds it, as SERVED9's 2 GiB
 /// prefill cache held the 1.32 GB table while active dropped).
-pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *qwen4.NgramTable, owner: anytype) !void {
+pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *ngram.NgramTable, owner: anytype) !void {
     const before = activeBytes(G, g);
     _ = try model.retireEmbedding(g, rows);
     owner.drop("embed.weight");
@@ -134,7 +134,7 @@ fn refuse(diag: *v41.Diag, err: anytype, comptime fmt: []const u8, args: anytype
 
 /// The input embedding's rows in its checkpoint shard (`embed.weight`, bf16
 /// `[vocab, dim]`), read past the page cache (`NgramTable.openTensor`).
-pub fn openEmbeddingRows(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, c: *const v41.Config, diag: *v41.Diag) !qwen4.NgramTable {
+pub fn openEmbeddingRows(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, c: *const v41.Config, diag: *v41.Diag) !ngram.NgramTable {
     var ck = try v41.Checkpoint.openIndexed(a, io, model_dir, diag);
     defer ck.deinit();
     const t = ck.tensors.get("embed.weight") orelse return refuse(diag, error.MissingWeight, "embed.weight: not in the checkpoint", .{});
@@ -142,7 +142,7 @@ pub fn openEmbeddingRows(a: std.mem.Allocator, io: std.Io, model_dir: []const u8
         return refuse(diag, error.EmbeddingRowsMismatch, "embed.weight: {t} rank {d} [{d}, {d}], the host rows need bf16 [{d}, {d}]", .{ t.dtype, t.rank, t.shape[0], t.shape[1], c.vocab_size, c.hidden_size });
     const path = try ck.shardPath(a, t.shard);
     defer a.free(path);
-    return qwen4.NgramTable.openTensor(path, "embed.weight") catch |e|
+    return ngram.NgramTable.openTensor(path, "embed.weight") catch |e|
         refuse(diag, e, "{s}: the embedding rows cannot be read past the page cache", .{path});
 }
 
@@ -339,7 +339,7 @@ fn writeEmbedShard(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const
 /// The fence as `Resources` runs it, over a recording owner of the table.
 const FenceProbe = struct {
     model: *Loop.M,
-    rows: *qwen4.NgramTable,
+    rows: *ngram.NgramTable,
     dropped: std.ArrayList([]const u8) = .empty,
     runs: u32 = 0,
     /// The node count when the fence ran: later nodes belong to the cycles.
@@ -496,7 +496,7 @@ test "dsv41 dspark serve: the first prompt pass's fence moves every later lookup
     var pbuf: [700]u8 = undefined;
     var root: [512]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/shard.safetensors", .{root[0..try rig.mini.tmp.dir.realPath(testing.io, &root)]}, 0);
-    var rows = try qwen4.NgramTable.openTensor(path, "embed.weight");
+    var rows = try ngram.NgramTable.openTensor(path, "embed.weight");
     defer rows.close();
     var probe: FenceProbe = .{ .model = rig.model, .rows = &rows };
     defer probe.dropped.deinit(a);

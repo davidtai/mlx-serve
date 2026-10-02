@@ -22,7 +22,7 @@ const expert_policy = @import("sdk").expert.policy;
 /// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
 const prof = @import("dsv41_prefill_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
-const qwen4 = @import("qwen4_exp.zig");
+const ngram = @import("ngram");
 
 /// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
 /// not hold the layer's input stream (hc x the tap's bytes) to the forward's end. The bill reads this declaration
@@ -94,7 +94,7 @@ pub fn Model(comptime G: type) type {
         /// (`qwen4_exp.NgramTable.openTensor`, past the page cache).
         pub const Embed = union(enum) {
             table: T,
-            rows: *qwen4.NgramTable,
+            rows: *ngram.NgramTable,
 
             /// `ids` embedded `[1, n, dim]`; host buffers come from `a`.
             pub fn of(self: Embed, g: *G, a: std.mem.Allocator, ids: []const u32, dim: u32) !T {
@@ -494,7 +494,7 @@ pub fn Model(comptime G: type) type {
         /// read `rows` (the table's rows on the host) and the table is handed
         /// back for its owner to free. Once per model; `rows` must be the
         /// table's layout (bf16 `[vocab, dim]`) and outlive the model.
-        pub fn retireEmbedding(self: *Self, g: *G, rows: *qwen4.NgramTable) !T {
+        pub fn retireEmbedding(self: *Self, g: *G, rows: *ngram.NgramTable) !T {
             const w = switch (self.embed) {
                 .table => |w| w,
                 .rows => return error.EmbeddingRetired,
