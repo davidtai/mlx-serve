@@ -1565,6 +1565,9 @@ pub const Stream = struct {
                 m.* = .{};
             }
             ls.policy.shrink(rows) catch unreachable;
+            // decode_first16: no pool slot below the prompt rows (the grow re-arms it).
+            ls.pool_lo = rows;
+            ls.pool = &.{};
             // The one place that decides which residents a later prompt finds: none, as at construction (its
             // schedule then equals the first prompt's; slot bytes stay, a load of the same record skips its read).
             _ = ls.policy.forgetAll();
@@ -1583,6 +1586,13 @@ pub const Stream = struct {
             w.pending_layers = 0;
         }
         self.warm_live = false;
+        // decode_first16: the next request's clock and miss counts start over (the grow re-arms its pool).
+        if (self.dpool) |*d| {
+            d.cycle = 0;
+            d.done = false;
+            @memset(d.base, 0);
+            @memset(d.first, 0);
+        }
         self.phase = .prefill;
         self.route_lookahead = false;
         self.route_preread = false;
@@ -1631,6 +1641,8 @@ pub const Stream = struct {
         var bytes: u64 = 0;
         for (t.row_bytes) |n| bytes += n * t.rows;
         return bytes;
+    }
+
     /// The end of a decode cycle (after its flush): option (b)'s clock. At the end of cycle from_cycle - 1 it marks
     /// each layer's misses; at the end of cycle at_cycle it re-owns the pool rows once (`replanPool`). No pool: a no-op.
     pub fn cycleEnd(self: *Stream) Error!void {
@@ -4078,4 +4090,44 @@ test "dsv41 stream: decode_first16's re-plan relabels a donor's surviving pool r
     try expectServed(s, &sb, r1, &.{ 20, 21, 22, 23, 24 });
     s.release(r1);
     try s.flush();
+}
+
+// decode_first16 across requests: the reverse phase change frees the pool with window 0 and resets its clock, so the
+// second request's grow re-arms 20 (here 2) pool rows per layer, re-plans once more at its own cycle, and serves every
+// id its record.
+test "dsv41 stream: decode_first16 re-arms its pool and its clock for the next request" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 3 } });
+    defer s.deinit();
+    var rng = std.Random.DefaultPrng.init(5);
+    const rand = rng.random();
+    var ids: [12]u16 = undefined;
+    for (0..2) |_| {
+        s.release(try serve(s, 0, &.{ 1, 2, 3 }));
+        _ = try s.releaseTransient();
+        try s.grow(&.{ 8, 8 });
+        for (s.layers) |ls| try testing.expectEqual(@as(u32, 6), ls.pool_lo);
+        for (1..6) |cycle| {
+            for (0..2) |l| {
+                const n = rand.intRangeAtMost(usize, 2, 8);
+                for (ids[0..n]) |*e| e.* = if (l == 0) rand.intRangeLessThan(u16, 0, 5) else rand.intRangeLessThan(u16, 8, 30);
+                const r = try serve(s, @intCast(l), ids[0..n]);
+                try expectServed(s, &sb, r, ids[0..n]);
+                s.release(r);
+            }
+            try s.flush();
+            try s.cycleEnd();
+            try testing.expectEqual(cycle >= 3, s.poolReplan() != null);
+        }
+        const rp = s.poolReplan().?;
+        try testing.expectEqual(@as(u32, 16), rp.rows[0] + rp.rows[1]);
+        _ = try s.shrink(&.{ 4, 4 });
+        for (s.layers) |ls| {
+            try testing.expectEqual(@as(u32, 4), ls.pool_lo);
+            try testing.expectEqual(@as(usize, 0), ls.pool.len);
+        }
+        try testing.expect(s.poolReplan() == null);
+        _ = try s.regrowTransient();
+    }
 }
