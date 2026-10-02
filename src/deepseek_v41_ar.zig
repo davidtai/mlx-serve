@@ -970,6 +970,10 @@ const CellReceipt = struct {
     /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
     /// returned ride in `phase_change.host_relief_bytes`.
     host_relief: ?bool = null,
+    /// DRAFTCACHE's hot slots as installed (`module.draftCacheHot`; null: every draft expert resident), and its stream
+    /// statistics over the request (route calls, hits, misses, loads, bytes read), read after the timed decode.
+    draft_cache_hot: ?u32 = null,
+    draft_cache_stats: ?expert_stream.Stats = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1356,6 +1360,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .phase_change_settle = md.installed.phase_change_settle,
         .host_relief = md.installed.host_relief,
+        .draft_cache_hot = md.installed.draft_cache_hot,
+        .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
@@ -1480,6 +1486,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     // The phase change's settle condition (interval | until_freed; anything else refused here).
     if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
+    // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
+    if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
@@ -2112,6 +2120,7 @@ fn printBill(b: CellBill) void {
         }
     }.f;
     std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
+    if (b.draft_cache > 0) std.debug.print("  (DRAFTCACHE: the residents carry the draft cache's slot banks, {d} B, in place of the DSpark experts)\n", .{b.draft_cache});
     const T = struct { name: []const u8, p: u64, d: u64 };
     for ([_]T{
         .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },

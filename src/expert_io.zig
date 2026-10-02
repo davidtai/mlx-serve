@@ -302,8 +302,14 @@ pub const Pool = struct {
     /// `lens[c]` bytes into `rows[i][c]`. Returns the first of its 2n tickets:
     /// gate/up of record i = first + i, down = first + n + i.
     pub fn submit(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) !u32 {
+        return self.submitSplit(fd, file_size, gu_offsets, down_offsets, rows, lens, gu_components, n_components - gu_components);
+    }
+
+    /// `submit` for records of another part geometry: each gate/up span `ngu` parts, each down span `ndown`
+    /// (`lens[0..ngu]`, then `lens[ngu..][0..ndown]`; the rest of `rows[i]` and `lens` unused).
+    pub fn submitSplit(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
         const n = rows.len;
-        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n) return error.InvalidJob;
+        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or ngu == 0 or ndown == 0 or ngu + ndown > n_components) return error.InvalidJob;
         const count: u32 = @intCast(2 * n);
         self.drain();
         if (self.next_ticket + count > self.demand_tickets) self.next_ticket = 0;
@@ -317,7 +323,7 @@ pub const Pool = struct {
         }
         var lens_i: [n_components]i64 = undefined;
         for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
-        switch (c.q3ld_submit(fd, @intCast(file_size), no_deadline, @intCast(n), gu_components, n_components - gu_components, &offsets, &row_ptrs, &lens_i, first)) {
+        switch (c.q3ld_submit(fd, @intCast(file_size), no_deadline, @intCast(n), @intCast(ngu), @intCast(ndown), &offsets, &row_ptrs, &lens_i, first)) {
             0 => {},
             -2 => return error.TicketsBusy,
             -3 => return error.QueueFull,
