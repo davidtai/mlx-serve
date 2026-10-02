@@ -314,6 +314,11 @@ pub const StreamSource = struct {
         return self.stream.gate(call.route.?);
     }
 
+    /// The end of a decode cycle (option (b)'s clock; `Stream.cycleEnd`).
+    pub fn cycleEnd(self: *StreamSource) !void {
+        return self.stream.cycleEnd();
+    }
+
     pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {
         const ls = &self.stream.layers[layer];
         return switch (kind) {
@@ -1302,6 +1307,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// After the forward's last eval: settles and unpins released calls.
         pub fn flush(self: *Self) !void {
             try self.source.flush();
+        }
+
+        /// The end of a decode cycle, after its flush (a source without a cycle clock: nothing).
+        pub fn cycleEnd(self: *Self) !void {
+            if (comptime @hasDecl(S, "cycleEnd")) try self.source.cycleEnd();
         }
 
         pub const Hook = struct {
