@@ -597,6 +597,38 @@ fn readState(a: std.mem.Allocator, lines: *std.ArrayList(LayerStateLine), m: *mo
     }
 }
 
+/// DSV41_CELL_ROUTED_FORMS: "stock" or a comma list of down_pair / gu_one (each at most once), refused by name.
+pub fn parseForms(v: []const u8) !xq.Forms {
+    var f: xq.Forms = .{};
+    if (std.mem.eql(u8, v, "stock")) return f;
+    var it = std.mem.splitScalar(u8, v, ',');
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "down_pair") and !f.down_pair) {
+            f.down_pair = true;
+        } else if (std.mem.eql(u8, tok, "gu_one") and !f.gu_one) {
+            f.gu_one = true;
+        } else return error.CellRoutedForms;
+    }
+    return f;
+}
+
+pub fn formsName(f: xq.Forms) []const u8 {
+    if (f.down_pair and f.gu_one) return "down_pair,gu_one";
+    if (f.down_pair) return "down_pair";
+    if (f.gu_one) return "gu_one";
+    return "stock";
+}
+
+test "dsv41 ar: DSV41_CELL_ROUTED_FORMS parses each form once, stock, and refuses the rest by name" {
+    try std.testing.expectEqual(xq.Forms{}, try parseForms("stock"));
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, try parseForms("down_pair"));
+    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, try parseForms("gu_one"));
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, try parseForms("gu_one,down_pair"));
+    for ([_][]const u8{ "", "pair", "down_pair,down_pair", "down_pair,", "stock,gu_one" }) |bad| try std.testing.expectError(error.CellRoutedForms, parseForms(bad));
+    try std.testing.expectEqualStrings("down_pair,gu_one", formsName(.{ .down_pair = true, .gu_one = true }));
+    try std.testing.expectEqualStrings("stock", formsName(.{}));
+}
+
 fn envStr(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
@@ -1092,6 +1124,8 @@ const CellReceipt = struct {
     head_mode: ?[]const u8 = null,
     /// The mxfp8 head's apply route (installed): RCPROJ (true) or MLX's quantized matmul; null on a bf16 head.
     head_mxfp8_rc: ?bool = null,
+    /// ROUTED_FORMS as installed: "stock", "down_pair", "gu_one" or "down_pair,gu_one".
+    routed_forms: []const u8 = "stock",
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1566,6 +1600,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
+        .routed_forms = formsName(md.installed.routed_forms),
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1699,6 +1734,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
+    if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_HEAD_MXFP8_RC")) |v| ov.head_mxfp8_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellHeadMxfp8Rc;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;

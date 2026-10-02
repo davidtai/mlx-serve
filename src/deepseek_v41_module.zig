@@ -131,6 +131,9 @@ pub const RouteOverrides = struct {
     /// HEAD_MODE mxfp8's head on RCPROJ at <= 8 rows (the verify rows and the draft block) instead of MLX's quantized
     /// matmul; needs head_mode mxfp8. Rounding-class like the codec itself. null: the default, off.
     head_mxfp8_rc: ?bool = null,
+    /// ROUTED_FORMS (kbench v9, exact): the routed decode GEMVs' forms, each independently: down_pair (the down
+    /// projection's pair text) and gu_one (gate and up in one launch). null: stock.
+    routed_forms: ?xq.Forms = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -581,6 +584,8 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
+        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
+        if (ov.routed_forms) |f| if (f.down_pair or f.gu_one) try self.exl3.routeForms(&self.g, f);
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
         // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
@@ -707,6 +712,8 @@ pub const Module = struct {
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
+        self.installed.routed_forms = self.exl3.forms;
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
@@ -1730,6 +1737,8 @@ pub const Installed = struct {
     head_mode: graph.Routes.Head = .f32,
     /// The mxfp8 head's apply route as installed: RCPROJ (true) or MLX's quantized matmul.
     head_mxfp8_rc: bool = false,
+    /// ROUTED_FORMS as installed.
+    routed_forms: xq.Forms = .{},
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.

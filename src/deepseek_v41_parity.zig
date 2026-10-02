@@ -1198,7 +1198,7 @@ test "dsv41 host: the host-only tests created no Metal device" {
     }
 }
 
-// Host, bank mode (MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
+// Guarded window only (_GPU_WINDOW_LOCKED; MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
 // p*.head.logits over the head's first `head_rows` rows>. HEAD_MODE mxfp8 is LOSSY: this reports, against the dump's
 // own logits (the f32 head of the stock levers), the max / rms error and the top-1 agreement of the bf16 head, (a) MLX's mxfp8 quantized matmul (today's path) and (b)
 // the RCPROJ route's numerics on the host (the dequantized codes, x cast to bf16, an f32 product, the bf16 output); the
@@ -1206,6 +1206,8 @@ test "dsv41 host: the host-only tests created no Metal device" {
 test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits (max, rms, top-1)" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const dump_path = std.mem.span(std.c.getenv("DSV41_HEAD_FIXTURE_DUMP") orelse return error.SkipZigTest);
+    // Any MLX array constructs the Metal device, the CPU stream's too: never outside the lock.
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GuardedWindowRequired;
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
