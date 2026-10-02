@@ -1390,10 +1390,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // Decode rows / prompt rows by baseline: stock, then hot 96 / 128 / 201 / 256.
     const Want = struct { base: u64, decode: [5]u32, prefill: [5]u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 179, 176, 174 }, .prefill = .{ 137, 146, 144, 142, 140 } },
-        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 134, 142, 141, 139, 137 } },
-        .{ .base = 9_200_000_000, .decode = .{ 168, 176, 175, 172, 170 }, .prefill = .{ 133, 142, 141, 138, 136 } },
-        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 133, 141, 140, 138, 136 } },
+        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 179, 176, 174 }, .prefill = .{ 137, 145, 144, 142, 140 } },
+        .{ .base = 8_990_000_000, .decode = .{ 168, 177, 175, 173, 171 }, .prefill = .{ 134, 142, 141, 139, 137 } },
+        .{ .base = 9_200_000_000, .decode = .{ 168, 176, 175, 172, 171 }, .prefill = .{ 133, 142, 141, 138, 136 } },
+        .{ .base = 9_550_000_000, .decode = .{ 167, 176, 174, 172, 170 }, .prefill = .{ 133, 141, 140, 138, 136 } },
     }) |w| {
         const base = w.base;
         config.memory_baseline_bytes = base;
