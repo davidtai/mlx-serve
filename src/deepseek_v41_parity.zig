@@ -1197,3 +1197,103 @@ test "dsv41 host: the host-only tests created no Metal device" {
         try testing.expect(std.mem.indexOf(u8, std.mem.span(name), "AGXMetal") == null);
     }
 }
+
+// Host, bank mode (MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
+// p*.head.logits over the head's first `head_rows` rows>. HEAD_MODE mxfp8 is LOSSY: this reports, against the dump's
+// own logits (the f32 head of the stock levers), the max / rms error and the top-1 agreement of the bf16 head, (a) MLX's mxfp8 quantized matmul (today's path) and (b)
+// the RCPROJ route's numerics on the host (the dequantized codes, x cast to bf16, an f32 product, the bf16 output); the
+// bar is the harness (the bf16 head reproduces the dump) and finite values, not identity.
+test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits (max, rms, top-1)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const dump_path = std.mem.span(std.c.getenv("DSV41_HEAD_FIXTURE_DUMP") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 parity head: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(gpa, testing.io, bank, &diag);
+    var ck = try v41.Checkpoint.openIndexed(gpa, testing.io, bank, &diag);
+    defer ck.deinit();
+    var dump = try v41.Checkpoint.openFile(gpa, dump_path, &diag);
+    defer dump.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var g = try ops.MlxOps.init(gpa, cpu);
+    defer g.deinit();
+    const Tr = graph.Trunk(ops.MlxOps);
+    // The head's first `rows` rows, read past the page cache.
+    const lt0 = dump.tensors.get("p0.head.logits") orelse return error.TensorMissing;
+    const rows: u64 = lt0.shape[lt0.rank - 1];
+    const head_t = ck.tensors.get("head.weight") orelse return error.TensorMissing;
+    var sub = head_t;
+    sub.shape[0] = rows;
+    sub.end = sub.begin + rows * @as(u64, c.hidden_size) * 2;
+    const buf = try a.alloc(u8, @intCast(sub.end - sub.begin));
+    const hfd = std.c.open((try ck.shardPath(a, head_t.shard)).ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    if (hfd < 0) return error.ShardMissing;
+    defer _ = std.c.close(hfd);
+    _ = std.c.fcntl(hfd, 48, @as(c_int, 1)); // F_NOCACHE
+    if (std.c.pread(hfd, buf.ptr, buf.len, @intCast(sub.begin)) != @as(isize, @intCast(buf.len))) return error.ShortRead;
+    const dense = try g.adopt(try arrayFrom(buf, sub));
+    const q = try Tr.quantizeHead(&g, dense);
+    const deq = try g.dequantize(q.w, q.s, .mxfp8);
+    const deq_t = try g.transpose(try g.astype(deq, .float32));
+    try g.evalAll(&.{ q.w, q.s, deq_t });
+    const r32: graph.Routes = .{ .head = .f32 };
+    const r16: graph.Routes = .{ .head = .bf16 };
+    const r8: graph.Routes = .{ .head = .mxfp8 };
+    const Acc = struct {
+        max_abs: f64 = 0,
+        se: f64 = 0,
+        sr: f64 = 0,
+        top1: u64 = 0,
+        fn add(s: *@This(), want: []const f32, got: []const f32, n_cols: usize) void {
+            var r: usize = 0;
+            while (r * n_cols < want.len) : (r += 1) {
+                const w = want[r * n_cols ..][0..n_cols];
+                const o = got[r * n_cols ..][0..n_cols];
+                for (w, o) |x, y| {
+                    s.max_abs = @max(s.max_abs, @abs(@as(f64, x) - y));
+                    s.se += (@as(f64, x) - y) * (@as(f64, x) - y);
+                    s.sr += @as(f64, x) * x;
+                }
+                s.top1 += @intFromBool(std.mem.indexOfMax(f32, w) == std.mem.indexOfMax(f32, o));
+            }
+        }
+    };
+    var acc: [4]Acc = .{ .{}, .{}, .{}, .{} };
+    var n_rows: u64 = 0;
+    var p: usize = 0;
+    while (true) : (p += 1) {
+        const fk = try std.fmt.allocPrint(a, "p{d}.final.h", .{p});
+        const lk = try std.fmt.allocPrint(a, "p{d}.head.logits", .{p});
+        const ft = dump.tensors.get(fk) orelse break;
+        if (dump.tensors.get(lk) == null) return error.TensorMissing;
+        const m = g.mark();
+        defer g.resetTo(m);
+        const fin = try g.adopt(try arrayFrom(try v41.readTensor(a, &dump, fk), ft));
+        const want_bytes = try v41.readTensor(a, &dump, lk);
+        const want = try a.alloc(f32, want_bytes.len / 4);
+        @memcpy(std.mem.sliceAsBytes(want), want_bytes);
+        const outs = [4]ops.MlxOps.T{
+            try Tr.head(&g, &r32, fin, .{ .dense = dense }),
+            try Tr.head(&g, &r16, fin, .{ .dense = dense }),
+            try Tr.head(&g, &r8, fin, .{ .mxfp8 = q }),
+            try g.astype(try g.astype(try g.matmul(try g.astype(try g.astype(fin, .bfloat16), .float32), deq_t), .bfloat16), .float32),
+        };
+        for (outs, &acc) |o, *s| {
+            const got = try a.alloc(f32, want.len);
+            _ = try g.hostF32(o, got);
+            for (got) |v| try testing.expect(std.math.isFinite(v));
+            s.add(want, got, @intCast(rows));
+        }
+        n_rows += want.len / rows;
+    }
+    try testing.expect(n_rows > 0);
+    const names = [_][]const u8{ "f32_head", "bf16_head", "mxfp8_mlx_qmm", "mxfp8_rcproj_host" };
+    for (names, acc) |nm, s| std.debug.print("NATIVE HEAD_MXFP8_FIXTURE {{\"path\": \"{s}\", \"rows\": {d}, \"cols\": {d}, \"max_abs\": {e:.4}, \"rms_rel\": {e:.4}, \"top1_agree\": {d}}}\n", .{ nm, n_rows, rows, s.max_abs, @sqrt(s.se / s.sr), s.top1 });
+    // The harness: the dump's own head (levers none: f32 x over the bf16 weight) reproduced on the same rows.
+    try testing.expectEqual(n_rows, acc[0].top1);
+    try testing.expect(@sqrt(acc[0].se / acc[0].sr) < 1e-4);
+}

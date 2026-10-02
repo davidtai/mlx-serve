@@ -68,6 +68,9 @@ pub fn Head(comptime G: type) type {
             registry: ?*const xk.Registry = null,
             /// DRAFTCACHE: the stages' experts served from this cache's slot banks (`DraftCache`), none resident.
             cache: ?*DraftCache = null,
+            /// HEAD_MODE mxfp8 on RCPROJ (the model's, over the quantized head the draft shares): required when the routes
+            /// carry `rc_head_mxfp8`, and then the block's head pass runs on it (block_size <= 8 rows).
+            head_mx: ?*const kr.HeadMx(G) = null,
         };
 
         const DP = kr.DraftProj(G);
@@ -295,6 +298,8 @@ pub fn Head(comptime G: type) type {
         pruned_bytes: u64 = 0,
         /// C16's routes (`rt.rc_draft`), built at `initWith`.
         rc: ?*DraftRc = null,
+        /// `Options.head_mx`, bound when the routes carry `rc_head_mxfp8`.
+        head_mx: ?*const kr.HeadMx(G) = null,
         /// DRAFTCACHE (`Options.cache`; borrowed): the stages route through its slots.
         cache: ?*DraftCache = null,
 
@@ -383,6 +388,10 @@ pub fn Head(comptime G: type) type {
             self.inv_swa = try self.own(g, try Tr.swaInvFreq(g, &self.c));
             self.block_scratch = try gpa.alloc(u8, @max(ds.block_size * @sizeOf(i32), @as(usize, ds.block_size) * c.hidden_size * 2) + 16);
             errdefer gpa.free(self.block_scratch);
+            if (rt.rc_head_mxfp8) {
+                self.head_mx = opts.head_mx orelse return error.DraftNeedsHeadMx;
+                if (ds.block_size > kr.HeadMx(G).max_rows) return error.DraftHeadMxRows;
+            }
             if (rt.rc_draft) {
                 const reg = opts.registry orelse return error.DraftNeedsKernels;
                 self.rc = DraftRc.init(gpa, g, reg, self) catch |e| return if (e == error.RouteInput) error.DraftRcGeometry else e;
@@ -729,7 +738,7 @@ pub fn Head(comptime G: type) type {
             const x = try Tr.hcPre(g, cur.h, cur.pre_mix);
             carry.release(g);
             const hn = try Tr.rmsnorm(g, x, self.norm, c.rms_norm_eps);
-            const base = try Tr.head(g, &self.rt, hn, head_w);
+            const base = if (self.head_mx) |hm| try Tr.headMx(g, hm, hn) else try Tr.head(g, &self.rt, hn, head_w);
             const vocab = g.shapeOf(base).dim(-1);
             var prev = try g.hostArray(std.mem.sliceAsBytes(ids[0..1]), &.{1}, .int32);
             var outs: [64]T = undefined;
@@ -1709,4 +1718,42 @@ test "dsv41 dspark head: DRAFTCACHE replay of recorded draft routes (misses per 
             std.debug.print("DSV41_DRAFT_REPLAY {{\"pool\": \"{t}\", \"hot\": {d}, \"misses\": {d}, \"compulsory\": {d}, \"capacity\": {d}, \"misses_per_cycle\": {d:.3}, \"compulsory_per_cycle\": {d:.3}, \"capacity_per_cycle\": {d:.3}, \"max_misses_cycle\": {d}, \"rows_gained\": {d}, \"net_ms_per_cycle\": {d:.3}}}\n", .{ form, rw.hot, misses, compulsory, misses - compulsory, mpc, @as(f64, @floatFromInt(compulsory)) / cyc, @as(f64, @floatFromInt(misses - compulsory)) / cyc, max_cycle, gained, net });
         };
     }
+}
+
+test "dsv41 dspark head: HEAD_MODE mxfp8 on RCPROJ runs the block's head pass on the model's head route, refused unbound" {
+    const a = testing.allocator;
+    const TraceOps = ops.TraceOps;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const json = try v41.testConfigJson(a, .real);
+    defer a.free(json);
+    const c = try v41.Config.parse(a, json, null);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = try v41.residentSpec(arena.allocator(), &c) };
+    const H = Head(TraceOps);
+    const rt: graph.Routes = .{ .rc_draft = true, .head = .mxfp8, .rc_head_mxfp8 = true, .draft_rows = graph.draft_compile_max_rows };
+    try testing.expectError(error.DraftNeedsHeadMx, H.initWith(a, &g, c, rt, &lookup, .{ .registry = &reg }));
+    const vocab: c_int = @intCast(c.vocab_size);
+    const qw = try g.input(&.{ vocab, 5120 / 4 }, .uint32);
+    const qs = try g.input(&.{ vocab, 5120 / 32 }, .uint8);
+    var hm = try kr.HeadMx(TraceOps).init(&g, &reg, qw, qs, null);
+    defer hm.deinit(&g);
+    const h = try H.initWith(a, &g, c, rt, &lookup, .{ .registry = &reg, .head_mx = &hm });
+    defer h.deinit(&g);
+    const caches = try arena.allocator().alloc(H.Cache, h.nStages());
+    for (caches) |*x| x.* = .{};
+    defer for (caches) |*x| x.deinit(&g);
+    const table = try g.input(&.{ vocab, 5120 }, .bfloat16);
+    try h.seedMain(&g, try g.input(&.{ 1, 3, 15360 }, .float32), caches);
+    const l0 = g.launched.items.len;
+    const n0 = g.nodes.items.len;
+    const out = try h.draftBlock(&g, try g.input(&.{ 1, 1, 15360 }, .bfloat16), 7, caches, .{ .table = table }, .{ .mxfp8 = .{ .w = qw, .s = qs, .mode = .mxfp8 } });
+    try testing.expect(g.shapeOf(out.logits).eql(ops.Shape.of(&.{ 1, 5, vocab })));
+    // The head pass is the one extra RCPROJ launch (DRAFTRC's 3 + 3 bf16 calls, then the head at 5 rows); no MLX qmm.
+    for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .qmm);
+    try testing.expectEqual(@as(usize, 3 + 3 + 1), g.launchesOf(l0, .q3rc_mxfp8_fma));
 }
