@@ -1,4 +1,4 @@
-//! HC post emulation probe (kbench, device only; DSV41_PHASE0B_MLX=1 and DSV41_HCPOST_EMUL_BENCH=1): can one pass
+//! HC post emulation probe (kbench, device only; DSV41_PHASE0B_MLX=1 and DSV41_HCPOST_EMUL_BENCH_V1=1): can one pass
 //! reproduce the compiled HcPost region (`_hc_post_impl`: the einsum's NAX f32 GEMM, MLX_ENABLE_TF32 default, then the
 //! fused `post * x + mixed` tail) word for word? Both prompt-width sites (hc1.h, out.h) run that region.
 //! Per shape: the stock-vs-stock control (the region twice, the eager einsum twice), then each emulation variant's
@@ -485,7 +485,7 @@ const testing = std.testing;
 
 test "dsv41 hcpost emul bench 0b: one-pass emulations of the compiled HC post against the region, word for word, and its time (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    _ = std.c.getenv("DSV41_HCPOST_EMUL_BENCH") orelse return error.SkipZigTest;
+    _ = std.c.getenv("DSV41_HCPOST_EMUL_BENCH_V1") orelse return error.SkipZigTest;
     const G = ops.MlxOps;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
