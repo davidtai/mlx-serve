@@ -65,9 +65,13 @@ pub const kernels = [_]Kernel{
     .q3_exl3_dig_decmat_5120x2304_mul1hk3,
     .q3_exl3_dig_decmat_2304x5120_mul1hk3,
     .q3_exl3_dig_decmat_5120x2304_mul1k3,
-    .q3_exl3_dig_decmat_2304x5120_mul1k3
-,
+    .q3_exl3_dig_decmat_2304x5120_mul1k3,
+    .dsv41_exl3_pair_k3_5120,
+    .dsv41_exl3_guone_k3_2304,
 };
+
+/// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
+pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
 
 /// One projection's per-slot arrays: the streamer's `ProjArrays` {code, rout, rin}.
 pub fn Arrays(comptime T: type) type {
@@ -194,6 +198,8 @@ pub fn Accepted(comptime G: type) type {
         waves: []DigXPrefill(G) = &.{},
         /// the waves' down stage is the fused down GEMM (`routeFusedDown`)
         fused_down: bool = false,
+        /// the decode GEMVs' routed forms (`routeForms`); all false: the stock mul1h texts
+        forms: Forms = .{},
 
         /// Once per bank bind and per grow: the three projections' arrays are the kernels' (cap
         /// within the kernels' bound, shapes, dtypes).
@@ -209,9 +215,8 @@ pub fn Accepted(comptime G: type) type {
             const rows = rowsOf(G, g, x, 0);
             if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
             const xs = try self.prep.inRin(g, x, self.tok[rows - 1], gate.rin, up.rin, slot_ids);
-            const zg = try self.gemv.project(g, .gate, xs[0], slot_ids, gate.code);
-            const zu = try self.gemv.project(g, .up, xs[1], slot_ids, up.code);
-            return self.prep.guEpi(g, zg, zu, gate.rout, up.rout, slot_ids);
+            const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code);
+            return self.prep.guEpi(g, z[0], z[1], gate.rout, up.rout, slot_ids);
         }
 
         /// h [rows, 2304] f32 (gateUp's), slot_ids u32 [rows] -> [rows, 5120] f32: din_rin ->
@@ -249,6 +254,16 @@ pub fn Accepted(comptime G: type) type {
             self.fused_down = true;
         }
 
+        /// The routed decode forms, at construction (before any decode): the GEMVs rebuilt on the forms' texts. Exact by
+        /// the registry's twin checks (every word == mul1h's) and kbench v9; no device check here.
+        pub fn routeForms(self: *Self, g: *G, forms: Forms) !void {
+            var next = try Gemv(G).initForms(g, self.reg, forms);
+            errdefer next.deinit(g);
+            self.gemv.deinit(g);
+            self.gemv = next;
+            self.forms = forms;
+        }
+
         /// Releases the routes (statics, prepared configs, the row maps, the wave states) and
         /// the plan's results. The kernel set stays the load context's.
         pub fn deinit(self: *Self, g: *G) void {
@@ -276,10 +291,13 @@ const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128
 const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
 /// The table-codebook gate|up GEMM: registered, not routed (its 0b smoke checks it by name).
 const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut};
+/// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
+/// a check window and by kbench v9); the stock accept neither routes nor checks them.
+pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304 };
 const checked_at_accept = blk: {
-    var out: [kernels.len - w1_texts.len - lut_texts.len]Kernel = undefined;
+    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len]Kernel = undefined;
     var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts), k) == null) {
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts), k) == null) {
         out[n] = k;
         n += 1;
     };
@@ -364,24 +382,43 @@ pub fn Gemv(comptime G: type) type {
         dn_statics: Statics(G),
         gu_p: RowPlans(G, 48),
         dn_p: RowPlans(G, 48),
+        /// gu_one: gate and up in one launch (`dsv41_exl3_guone_k3_2304`), bound by `initForms`.
+        gu1_p: ?RowPlans(G, 48) = null,
 
         pub fn init(g: *G, reg: *const xk.Registry) !Self {
+            return initForms(g, reg, .{});
+        }
+
+        /// The GEMVs under the routed forms (stock when none): down_pair's text for the down projection, gu_one's one
+        /// launch for gate and up. Every form computes the stock words (registry twin checks; kbench v9).
+        pub fn initForms(g: *G, reg: *const xk.Registry, forms: Forms) !Self {
             const gu = reg.get(.dsv41_exl3_mul1h_k3_2304);
-            const dn = reg.get(.dsv41_exl3_mul1h_k3_5120);
+            const dn = reg.get(if (forms.down_pair) .dsv41_exl3_pair_k3_5120 else .dsv41_exl3_mul1h_k3_5120);
             var gu_p: RowPlans(G, 48) = try .init(g, gu, null, null);
             errdefer gu_p.deinit(g);
             var dn_p: RowPlans(G, 48) = try .init(g, dn, null, null);
             errdefer dn_p.deinit(g);
+            var gu1_p: ?RowPlans(G, 48) = if (forms.gu_one) try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_guone_k3_2304), null, null) else null;
+            errdefer if (gu1_p) |*x| x.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p };
+            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
+            if (self.gu1_p) |*x| x.deinit(g);
             self.gu_statics.deinit(g);
             self.dn_statics.deinit(g);
+        }
+
+        /// Gate and up: one launch under gu_one, else the two stock launches (a construction-time route).
+        pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) ![2]G.T {
+            const p = if (self.gu1_p) |*x| x else return .{ try self.project(g, .gate, xg, ids, code_g), try self.project(g, .up, xu, ids, code_u) };
+            var out: [2]G.T = undefined;
+            try p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
+            return out;
         }
 
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's

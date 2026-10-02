@@ -751,6 +751,50 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
 }
 
+test "dsv41 kernels ops: the routed forms launch their texts with the stock arguments (down pair; gate + up in one launch)" {
+    const xq = @import("exl3_quant.zig");
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    const ge = reg.get(.dsv41_exl3_mul1h_k3_2304);
+    const de = reg.get(.dsv41_exl3_mul1h_k3_5120);
+    const s = &ge.samples[0];
+    const code_g = try t.arg(ge, "code", &s.vars);
+    const code_u = try t.arg(ge, "code", &s.vars);
+    const code_d = try t.arg(de, "code", &s.vars);
+    for ([_]xq.Forms{ .{}, .{ .down_pair = true }, .{ .gu_one = true }, .{ .down_pair = true, .gu_one = true } }) |f| {
+        var gv = try xq.Gemv(Trace).initForms(&t, &reg, f);
+        defer gv.deinit(&t);
+        for ([_]c_int{ 1, 6, 8 }) |m| {
+            const xg = try t.node(&.{ m, 5120 }, .float32, &.{});
+            const xu = try t.node(&.{ m, 5120 }, .float32, &.{});
+            const ids = try t.node(&.{m}, .uint32, &.{});
+            const n0 = t.launches.items.len;
+            const z = try gv.projectGu(&t, xg, xu, ids, code_g, code_u);
+            if (f.gu_one) {
+                try testing.expectEqual(n0 + 1, t.launches.items.len);
+                const l = t.back(1);
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_guone_k3_2304, l.k);
+                try testing.expectEqualSlices(Trace.T, &.{ xg, xu, ids, code_g, code_u }, l.inputs[0..l.n_in]);
+                try testing.expectEqual([3]u32{ 4608, @intCast(2 * m), 1 }, l.cfg.grid);
+                try testing.expectEqual(@as(usize, 2), l.cfg.n_out);
+            } else {
+                try testing.expectEqual(n0 + 2, t.launches.items.len);
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_mul1h_k3_2304, t.back(1).k);
+            }
+            try testing.expect(t.shapeOf(z[0]).eql(t.shapeOf(z[1])));
+            const xd = try t.node(&.{ m, 2304 }, .float32, &.{});
+            _ = try gv.project(&t, .down, xd, ids, code_d);
+            const ld = t.back(1);
+            try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_pair_k3_5120 else xk.Kernel.dsv41_exl3_mul1h_k3_5120, ld.k);
+            // the pair text takes mul1h's signature and grid
+            try testing.expectEqual([3]u32{ 10240, @intCast(m), 1 }, ld.cfg.grid);
+        }
+    }
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
 test "dsv41 kernels ops: the routes launch the same through the profiling backend (dsv41_profile.Profiled over the host trace)" {
     const prof = @import("dsv41_profile.zig");
     const P = prof.Profiled(Trace);

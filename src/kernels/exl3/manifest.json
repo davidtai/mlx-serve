@@ -49618,6 +49618,642 @@
      "name": "experts"
     }
    ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 10240
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "ints": [
+       3417055213,
+       0,
+       2415890431,
+       996162400
+      ],
+      "kind": "values"
+     },
+     "dtype": "uint32",
+     "name": "cb",
+     "role": "static",
+     "shape": [
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_a",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_b",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_p",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_r",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_c",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_mul1h_k3_5120",
+    "native": "mlx-serve dsv41-model (2026-10-02): the Python EXL3 forms module's pair form (q3_exl3_decode_forms.form_source('pair', 5120)), byte for byte; kbench v9 v93c99671: every output word == mul1h on 19 of 19 census shapes"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "269288967642c1d84298948dfc0c1ac809366ced04aca0267bb9e7dbb768489e",
+     "symbol": "q3_exl3_decode_forms.PINS['pair_5120'] (R/q3_exl3_decode_forms.py): rows of one slot pair up in row order, the leader decodes each weight once for both rows (mul1q codebook, bit-identical to mul1h's), a row without a partner runs the single-row loop"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      10240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      6,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_pair_k3_5120",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (every output word == the stock mul1h text on grouped slot runs) and kbench v9's bit-identity",
+    "rows_max": 8,
+    "twin": "every output word == dsv41_exl3_mul1h_k3_5120 on the same xh, codes and grouped ids (runs of 1..6 rows)"
+   },
+   "source": {
+    "bytes": 7592,
+    "file": "dsv41_exl3_pair_k3_5120.metal",
+    "sha256": "269288967642c1d84298948dfc0c1ac809366ced04aca0267bb9e7dbb768489e"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "routedforms"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 4608
+    },
+    {
+     "m": 2,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh_g",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh_u",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_g",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_u",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_mul1h_k3_2304",
+    "native": "mlx-serve dsv41-model (2026-10-02): mul1h_k3_2304's statements per row; threadgroups [0, R) are gate's rows, [R, 2R) up's (R = half the grid's rows), each half on its own code, input and output; kbench v9 v93c99671: every word == the two stock launches on 19 of 19 census shapes"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "6af722fb4d53f2d6493d764b7e70532317d595b9bdf5bfd819adf340a8d46cd4",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): dsv41_exl3_mul1h_k3_2304 with a threadgroup-uniform half selecting gate's or up's code / xh / out"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      4608,
+      2,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2304
+      ],
+      [
+       1,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      12,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       2304
+      ],
+      [
+       6,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      96,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2304
+      ],
+      [
+       48,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_guone_k3_2304",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out_g",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "out_u",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (out_g / out_u == the stock mul1h text on xh_g / code_g and xh_u / code_u) and kbench v9's bit-identity",
+    "rows_max": 8,
+    "twin": "out_g == dsv41_exl3_mul1h_k3_2304(xh_g, ids, code_g), out_u == (xh_u, ids, code_u), every word"
+   },
+   "source": {
+    "bytes": 3435,
+    "file": "dsv41_exl3_guone_k3_2304.metal",
+    "sha256": "6af722fb4d53f2d6493d764b7e70532317d595b9bdf5bfd819adf340a8d46cd4"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "routedforms"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -50348,6 +50984,108 @@
     "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1"
    ],
    "manifest_sha256": "833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71"
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3",
+    "joinless",
+    "dig_mul1h_k3_lut"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine",
+    "q3jl_combine",
+    "dsv41_prefill_dig_take2v_5120",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1"
+   ],
+   "manifest_sha256": "4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"
   }
  ],
  "sources": {

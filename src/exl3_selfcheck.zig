@@ -92,7 +92,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
     return switch (c) {
         .compile, .row_invariance => true,
         .join_equiv => k == .q3jl_combine,
-        .twin => twinOf(k) != null,
+        .twin => twinOf(k) != null or formTwinOf(k) != null,
         .fused => fusedOf(k) != null,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
@@ -129,6 +129,80 @@ fn twinOf(k: Kernel) ?Kernel {
         .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut => .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
         else => null,
     };
+}
+
+/// A routed decode form's `twin` reference: the stock mul1h text of its projection; null for every other kernel.
+fn formTwinOf(k: Kernel) ?Kernel {
+    return switch (k) {
+        .dsv41_exl3_pair_k3_5120 => .dsv41_exl3_mul1h_k3_5120,
+        .dsv41_exl3_guone_k3_2304 => .dsv41_exl3_mul1h_k3_2304,
+        else => null,
+    };
+}
+
+/// A wave's slot runs for the form twins: single rows, pairs, odd and even runs.
+const form_twin_runs = [_]u32{ 1, 2, 3, 6, 1, 4, 1, 5 };
+
+/// A routed form against the stock mul1h text on the same inputs with ids grouped in runs: every output word (the
+/// pair text: its one output; gate + up in one launch: each half against its own stock launch).
+fn checkFormTwin(h: *H, k: Kernel) !void {
+    var sc: Scope = .{ .a = h.a };
+    defer sc.deinit();
+    const e = h.reg.get(k);
+    const stock = formTwinOf(k).?;
+    const es = h.reg.get(stock);
+    var vars = defaultVars(e);
+    var rows: u64 = 0;
+    for (form_twin_runs) |r| rows += r;
+    vars.set(.rows, rows);
+    vars.set(.cap, 16);
+    var svars = defaultVars(es);
+    svars.set(.rows, rows);
+    svars.set(.cap, 16);
+    const wave = Wave.even(1, rows, 16);
+    var ins = try genAll(h, &sc, e, &vars, null, &wave);
+    var sins = try genAll(h, &sc, es, &svars, null, &wave);
+    var ids: [64]u32 = undefined;
+    var n: usize = 0;
+    for (form_twin_runs, 0..) |r, j| for (0..r) |_| {
+        ids[n] = @intCast((j * 5 + 3) % 16);
+        n += 1;
+    };
+    const shape = [_]c_int{@intCast(rows)};
+    const id_arr = try fromHost(&sc, std.mem.sliceAsBytes(ids[0..n]), &shape, .uint32);
+    var bad: u64 = 0;
+    var words: u64 = 0;
+    if (k == .dsv41_exl3_pair_k3_5120) {
+        ins[1] = id_arr;
+        sins[0] = ins[0];
+        sins[1] = id_arr;
+        sins[2] = ins[2];
+        const got = try launch(h, &sc, k, ins[0..e.inputs.len], &vars, null);
+        const want = try launch(h, &sc, stock, sins[0..es.inputs.len], &svars, null);
+        const g_ = try hostCopy(h, got[0]);
+        defer h.a.free(g_);
+        const w_ = try hostCopy(h, want[0]);
+        defer h.a.free(w_);
+        words += g_.len / 4;
+        bad += if (g_.len == w_.len) countDiff(w_, g_, 4) else g_.len / 4;
+    } else {
+        // inputs xh_g, xh_u, ids, code_g, code_u
+        ins[2] = id_arr;
+        const got = try launch(h, &sc, k, ins[0..e.inputs.len], &vars, null);
+        for ([_]usize{ 0, 1 }, [_]usize{ 3, 4 }, 0..) |xi, ci, o| {
+            sins[0] = ins[xi];
+            sins[1] = id_arr;
+            sins[2] = ins[ci];
+            const want = try launch(h, &sc, stock, sins[0..es.inputs.len], &svars, null);
+            const g_ = try hostCopy(h, got[o]);
+            defer h.a.free(g_);
+            const w_ = try hostCopy(h, want[0]);
+            defer h.a.free(w_);
+            words += g_.len / 4;
+            bad += if (g_.len == w_.len) countDiff(w_, g_, 4) else g_.len / 4;
+        }
+    }
+    try h.record(.{ .kernel = k, .check = .twin, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
 }
 
 /// Runs every check of every kernel's plan; a failing check is recorded (with the latched MLX
@@ -215,7 +289,7 @@ const H = struct {
             .layout_guard => try checkLayoutGuard(h, k),
             .composition => try checkComposition(h, k),
             .join_equiv => try checkJoinEquiv(h, k),
-            .twin => try checkTwin(h, k),
+            .twin => if (formTwinOf(k) != null) try checkFormTwin(h, k) else try checkTwin(h, k),
             .fused => try checkFused(h, k),
         }
     }
