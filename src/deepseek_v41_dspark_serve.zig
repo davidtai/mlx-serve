@@ -8,7 +8,7 @@ const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const routes = @import("deepseek_v41_routes.zig");
 const eng = @import("deepseek_v41_engram.zig");
-const model_io = @import("model.zig");
+const sdk = @import("sdk");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -20,7 +20,7 @@ const dh = @import("deepseek_v41_dspark_head.zig");
 /// How the residents load: past the page cache (`nocache_reader`), so a load
 /// keeps no file pages next to the array buffers (the guard counts cached
 /// pages as used).
-pub const resident_load_opts: model_io.LoadOpts = .{ .nocache = true };
+pub const resident_load_opts: sdk.LoadOpts = .{ .nocache = true };
 
 /// The Engram residents' sidecar (`wkv`, `q_weight`, `k_weight` of every
 /// Engram layer), beside the model's shards; the index names none of them.
@@ -29,16 +29,16 @@ pub const engram_residents_file = "engram/engram-residents.safetensors";
 /// Every resident the model and the draft head bind, for the served arm and
 /// both window harnesses: the shards the index names (`loadWeightsOpt`)
 /// and, when the config has Engram layers, the Engram sidecar, all past the
-/// page cache.
-pub fn loadResidents(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, c: *const v41.Config) !model_io.Weights {
-    var w = try model_io.loadWeightsOpt(io, a, model_dir, resident_load_opts);
+/// page cache, through the host's loaders.
+pub fn loadResidents(io: std.Io, a: std.mem.Allocator, loader: *const sdk.WeightLoader, model_dir: []const u8, c: *const v41.Config) !sdk.Weights {
+    var w = try loader.dir(io, a, model_dir, resident_load_opts);
     errdefer w.deinit();
     if (c.engram.n_layers > 0) {
         const path = try std.fmt.allocPrintSentinel(a, "{s}/" ++ engram_residents_file, .{model_dir}, 0);
         defer a.free(path);
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try model_io.loadSafetensorsFile(a, &w, path.ptr, s, resident_load_opts);
+        try loader.file(a, &w, path.ptr, s, resident_load_opts);
     }
     return w;
 }
@@ -51,7 +51,7 @@ pub fn Resources(comptime G: type) type {
     return struct {
         const Self = @This();
         a: std.mem.Allocator,
-        weights: model_io.Weights,
+        weights: sdk.Weights,
         engram: eng.RowSource,
         /// The input embedding's rows in its checkpoint shard, opened with the
         /// residents (past the page cache); the model's lookups read them from
@@ -64,11 +64,11 @@ pub fn Resources(comptime G: type) type {
         /// parity harness), the draft head's stages at its routes (every expert,
         /// or only a pinned subset's) and the Engram row source over `token_map`
         /// (the tokenizer's exported map).
-        pub fn open(a: std.mem.Allocator, io: std.Io, g: *G, model_dir: []const u8, c: v41.Config, tier: routes.Tier, token_map: []const u8, subset: ?*const dh.Subset, diag: *v41.Diag) !*Self {
+        pub fn open(a: std.mem.Allocator, io: std.Io, loader: *const sdk.WeightLoader, g: *G, model_dir: []const u8, c: v41.Config, tier: routes.Tier, token_map: []const u8, subset: ?*const dh.Subset, diag: *v41.Diag) !*Self {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.a = a;
-            self.weights = try loadResidents(io, a, model_dir, &c);
+            self.weights = try loadResidents(io, a, loader, model_dir, &c);
             errdefer self.weights.deinit();
             self.engram = try eng.RowSource.open(a, io, model_dir, token_map, &c, diag);
             errdefer self.engram.deinit();

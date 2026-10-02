@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
-const model = @import("model.zig");
+const model = @import("deepseek_v41_host.zig").model;
 /// Bank shards open past the page cache (F_NOCACHE): a test's reads leave no credited cache behind
 /// for the next window (SERVED3 found 4.2 GB).
 const bank_load: model.LoadOpts = .{ .nocache = true };

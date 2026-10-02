@@ -329,7 +329,7 @@ test "sdk testing: the fake arch's table counts every call, and its optional hoo
     vt.apply_settings(cfg, .null);
     try testing.expectEqual(@as(u32, 2), vt.shell(cfg).num_layers);
     try testing.expectEqual(@as(u64, 7), vt.prompt_bytes.?(cfg, 16384, 1024));
-    const load: arch.LoadCtx = .{ .gpa = testing.allocator, .io = testing.io, .stream = .{}, .weights = undefined, .facts = .{ .wired_margin_bytes = 0 }, .ceiling = 0 };
+    const load: arch.LoadCtx = .{ .gpa = testing.allocator, .io = testing.io, .stream = .{}, .weights = undefined, .loader = undefined, .facts = .{ .wired_margin_bytes = 0 }, .ceiling = 0 };
     const m = try vt.init(&load, cfg);
     _ = try vt.prefill(m, &.{ 1, 2, 3 }, .{ .prompt_tokens = 3, .max_tokens = 8, .host_context = 4096 });
     try vt.handover.?(m, .{ .prompt_tokens = 3, .reserved_tokens = 0, .native_draft = true });

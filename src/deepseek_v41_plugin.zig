@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
-const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 const settings = @import("deepseek_v41_settings.zig");
 const module = @import("deepseek_v41_module.zig");
@@ -89,7 +88,7 @@ pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
 
 pub fn init(load: *const sdk.LoadCtx, c: *const Config) !*Module {
     const built = c.withFacts(&load.facts);
-    return Module.init(load.gpa, load.io, &built, @ptrCast(@alignCast(load.weights)), load.stream, .{ .ceiling = load.ceiling, .wired_margin = load.facts.wired_margin_bytes });
+    return Module.init(load.gpa, load.io, &built, load.weights, load.stream, .{ .ceiling = load.ceiling, .wired_margin = load.facts.wired_margin_bytes, .loader = load.loader });
 }
 
 pub fn deinit(m: *Module) void {
@@ -198,7 +197,7 @@ test "dsv41 plugin: the term-wise bill bounds the process exactly as the load pr
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const host = try model.parseConfig(testing.io, a, bank_dir);
+    const host = try @import("deepseek_v41_host.zig").model.parseConfig(testing.io, a, bank_dir);
     const cfg: *const Config = @ptrCast(@alignCast(host.arch_cfg.?));
     const ceiling: u64 = 120_259_084_288;
     const ov: module.RouteOverrides = .{};

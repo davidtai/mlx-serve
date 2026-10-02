@@ -88,6 +88,10 @@ pub const quant = @import("sdk/quant.zig");
 pub const profile = @import("sdk/profile.zig");
 /// Process and box memory readings (the kernel's ledgers) that bills and construction checks compare against.
 pub const memory = @import("sdk/memory.zig");
+const weights = @import("sdk/weights.zig");
+pub const Weights = weights.Weights;
+pub const LoadOpts = weights.LoadOpts;
+pub const WeightLoader = weights.WeightLoader;
 pub const BuildOption = @import("sdk/build_option.zig").BuildOption;
 pub const QuantMode = @import("sdk/quant_mode.zig").QuantMode;
 

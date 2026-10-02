@@ -42509,7 +42509,7 @@ test "dsv41 plugin: the load claim takes the one expert reader; a second load cl
 /// A registered arch: its module over the loaded residents; the shell is dsv4's (a 0-layer KVCache, empty
 /// standard fields).
 fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream, vt: *const sdk.Arch) !Transformer {
-    const load: sdk.LoadCtx = .{ .gpa = allocator, .io = io, .stream = s, .weights = weights, .facts = config.loadFacts(), .ceiling = gpu_ceiling.staticGpuMemoryCeiling() };
+    const load: sdk.LoadCtx = .{ .gpa = allocator, .io = io, .stream = s, .weights = weights, .loader = &model_mod.weight_loader, .facts = config.loadFacts(), .ceiling = gpu_ceiling.staticGpuMemoryCeiling() };
     const m = try vt.init(&load, config.arch_cfg.?);
     errdefer vt.deinit(m);
     var t = try initDsv4Shell(allocator, config, s);

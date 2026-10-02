@@ -8,7 +8,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx");
-const model = @import("model.zig");
+const host_bridge = @import("deepseek_v41_host.zig");
+const model = host_bridge.model;
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -27,7 +28,7 @@ const sdk = @import("sdk");
 const kernel_set = sdk.kernels.KernelSet(xk);
 const xq = @import("exl3_quant.zig");
 const module = @import("deepseek_v41_module.zig");
-const gpu_ceiling = @import("gpu_ceiling.zig");
+const gpu_ceiling = host_bridge.gpu_ceiling;
 const cell = @import("deepseek_v41_cell.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
@@ -189,7 +190,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     defer kernels.deinit(&g);
     memProbe("dsv41 ar", "kernels accepted (the startup self-check)");
 
-    var weights = try dss.loadResidents(io, gpa, bank_dir, &c);
+    var weights = try dss.loadResidents(io, gpa, host_bridge.loader, bank_dir, &c);
     defer weights.deinit();
     var src = try engram.RowSource.open(gpa, io, bank_dir, map_path, &c, &diag);
     defer src.deinit();
@@ -402,7 +403,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const run = try parseServedRun(n, envStr("DSV41_AR_SPLIT"), envStr("DSV41_AR_PHASE"), envStr("DSV41_AR_TIER"));
     const calls = try promptCalls(a, n, run);
     const forwards = try forwardRows(a, calls, ref.new_tokens);
-    var config = try settings.Config.load(io, a, bank_dir);
+    var config = try host_bridge.loadConfig(io, a, bank_dir);
     if (std.c.getenv("DSV41_AR_BASELINE_GB")) |v| config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(v)) * 1e9));
     // The box the module's admission fills: the guard's ceiling (unset: the GPU's working set), with its stop, for
     // the test's span (`WindowStop`).
@@ -801,7 +802,7 @@ test "dsv41 ar: the served schedule's host preconditions: the top-2 rule and, on
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // What Module.init reads from the shell's config: the bank dir and the Engram token map beside it.
-    const config = try settings.Config.load(testing.io, arena.allocator(), bank_dir);
+    const config = try host_bridge.loadConfig(testing.io, arena.allocator(), bank_dir);
     try testing.expect(config.expert_bank_dir != null and config.engram_token_map_path != null);
     if (std.c.getenv("DSV41_AR_REF")) |rp| {
         const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std.mem.span(rp), arena.allocator(), .limited(16 << 20));
@@ -1879,10 +1880,10 @@ const WindowStop = struct {
     }
 };
 
-/// The Module's box as the host's load states it: the static ceiling and the wired margin (a window's, once
-/// `WindowStop.set` has put them there).
-fn hostBox() module.Box {
-    return .{ .ceiling = gpu_ceiling.staticGpuMemoryCeiling(), .wired_margin = gpu_ceiling.wired_limit_margin_bytes };
+/// The Module's host facts as the host's load states them: the static ceiling and the wired margin (a window's, once
+/// `WindowStop.set` has put them there), and the host's loaders.
+fn hostBox() module.Host {
+    return .{ .ceiling = gpu_ceiling.staticGpuMemoryCeiling(), .wired_margin = gpu_ceiling.wired_limit_margin_bytes, .loader = host_bridge.loader };
 }
 
 fn cellBool(comptime name: []const u8, v: []const u8) !bool {
@@ -2828,7 +2829,7 @@ test "dsv41 memory: the harness's filled rows pass the Module's admission under 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 9_730_000_000;
     const ceiling: u64 = 120_259_084_288;
     const nr = try bill_mod.fill(a, testing.io, config, bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens, null, ceiling, ceiling - module.ceiling_stop_bytes, .{});
@@ -2873,7 +2874,7 @@ test "dsv41 memory: cell fill == server fill at 9.20, 9.73, 12.90 (bank)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
     const ceiling: u64 = 120_259_084_288;
     // The runner's stop: the harness's default when DSV41_CELL_STOP_BYTES is unset, and --wired-margin's parse of it.
     const stop = try windowStopBytes("DSV41_CELL_STOP_BYTES");
@@ -2910,7 +2911,7 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
     const args = try cellConfig(&config);
     const stop = WindowStop.set(args.stop, args.ceiling);
     defer stop.restore();
@@ -3365,7 +3366,7 @@ fn secondsSince(io: std.Io, t: std.Io.Timestamp) f64 {
 fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id: ?[]const u8, bank_dir: []const u8) !struct { prompt: []const u32, config: settings.Config, eos: []const u32 } {
     const prompt = try cellPrompt(a, io, prompt_path, case_id);
     const host = try model.parseConfig(io, a, bank_dir);
-    const config = try settings.Config.ofHost(&host);
+    const config = try host_bridge.configOf(&host);
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
     if (host.num_eos_tokens == 0) return error.NoEosIds;
     return .{ .prompt = prompt, .config = config, .eos = try a.dupe(u32, host.eos_token_ids[0..host.num_eos_tokens]) };
@@ -3594,7 +3595,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
     const L = dsl.Loop(ops.MlxOps);
     // The Python reference ran the stock path (every lever unset).
-    const res = try dss.Resources(ops.MlxOps).open(gpa, io, &g, bank_dir, c, routes.stock, map_path, null, &diag);
+    const res = try dss.Resources(ops.MlxOps).open(gpa, io, host_bridge.loader, &g, bank_dir, c, routes.stock, map_path, null, &diag);
     defer res.deinit(&g);
     const m = res.model;
     const head = res.head;

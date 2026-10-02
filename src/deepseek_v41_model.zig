@@ -2033,7 +2033,7 @@ test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {
 /// The model over MLX with the checkpoint's weights map and the routed
 /// stand-in: referenced (never called) by the test below so the MLX
 /// instantiation is analysed on the host.
-fn mlxSmoke(gpa: std.mem.Allocator, g: *ops.MlxOps, c: v41.Config, tier: routes.Tier, w: *const @import("model.zig").Weights, src: ?*const eng.RowSource, routed: graph.StandIn(ops.MlxOps)) !void {
+fn mlxSmoke(gpa: std.mem.Allocator, g: *ops.MlxOps, c: v41.Config, tier: routes.Tier, w: *const @import("sdk").Weights, src: ?*const eng.RowSource, routed: graph.StandIn(ops.MlxOps)) !void {
     const M = Model(ops.MlxOps);
     const m = try M.init(gpa, g, c, tier, w, src);
     defer m.deinit(g);

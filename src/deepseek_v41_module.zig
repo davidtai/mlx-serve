@@ -16,7 +16,6 @@
 
 const std = @import("std");
 const mlx = @import("mlx");
-const model_io = @import("model.zig");
 const sdk = @import("sdk");
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -482,7 +481,7 @@ pub const Module = struct {
     /// block's): the bill's transient terms (C4, P4).
     warm_peaks: []u64 = &.{},
     arm: Arm,
-    weights: *model_io.Weights,
+    weights: *sdk.Weights,
     engram: eng.RowSource,
     /// The input embedding's rows in its shard, read past the page cache once the prompt fence ran.
     embed_rows: qwen4.NgramTable,
@@ -543,12 +542,12 @@ pub const Module = struct {
 
     /// `config` is the shell's (its bank and token-map paths, the memory baseline); `weights`
     /// the loaded residents (the Engram sidecar joins them here).
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, box: Box) !*Module {
-        return initWith(gpa, io, config, weights, s, box, .{});
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host) !*Module {
+        return initWith(gpa, io, config, weights, s, host, .{});
     }
 
     /// `init` with a harness's route overrides (the served path passes none).
-    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *model_io.Weights, s: mlx.mlx_stream, box: Box, ov: RouteOverrides) !*Module {
+    pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -578,13 +577,13 @@ pub const Module = struct {
         };
         claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
         try self.acceptKernels(gpa, &c0, s, &diag);
-        // The box the admission fits (`box`, read once by the host at load): its static GPU ceiling (Metal's working
+        // The box the admission fits (`host`, read once by the host at load): its static GPU ceiling (Metal's working
         // set, or `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling the same
         // way); the fill's target lands the wired margin (`--wired-margin-gib`) under it, and the bill (which reads
         // the same ceiling) carries the baseline (the preflight's sample of the memory in use before the load, or
         // `--memory-baseline-gb`). Passed to the bill explicitly.
-        const ceiling_bytes = box.ceiling;
-        const target = ceiling_bytes -| box.wired_margin;
+        const ceiling_bytes = host.ceiling;
+        const target = ceiling_bytes -| host.wired_margin;
         const ceiling = boxCeiling(ceiling_bytes, c0.n_routed_experts);
         // The served admission, one kind only (the native bill; the Python envelope planner never runs here):
         // rows filled up to the stop's target, or `--expert-rows R` as the decode rows with the prompt rows
@@ -651,7 +650,7 @@ pub const Module = struct {
         const c = switch (self.arm) {
             inline else => |t| t.arm.config,
         };
-        if (c.engram.n_layers > 0) try loadEngramResidents(gpa, weights, dir, config);
+        if (c.engram.n_layers > 0) try loadEngramResidents(gpa, host.loader, weights, dir, config);
         self.engram = try eng.RowSource.open(gpa, io, dir, map, &c, &vd);
         errdefer self.engram.deinit();
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
@@ -965,7 +964,7 @@ pub const Module = struct {
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
-    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const settings.Config, weights: *const model_io.Weights, s: mlx.mlx_stream, ceiling: expert_admission.Ceiling, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
+    fn buildArm(self: *Module, comptime AT: type, io: std.Io, config: *const settings.Config, weights: *const sdk.Weights, s: mlx.mlx_stream, ceiling: expert_admission.Ceiling, event: ?expert_event.Event, diag: *arm_mod.Diag) !Tiered(AT) {
         const gpa = self.gpa;
         const gates = try routerGates(AT.Hook.Gate, gpa, weights, config.num_hidden_layers);
         errdefer gpa.free(gates);
@@ -1543,7 +1542,7 @@ pub const Module = struct {
     /// before the first decode forward or round. Refused by name without a prompt (`prefill` never ran) or,
     /// when the shell drives native draft rounds, without the strategy the prompt seeded. The only entry to
     /// the phase change: no forward width or round triggers it.
-    pub fn decodeHandover(self: *Module, h: model_io.DecodeHandover) !void {
+    pub fn decodeHandover(self: *Module, h: sdk.DecodeHandover) !void {
         try self.gate.begin(.{ .handover = .{ .native_draft = h.native_draft } });
         // The prompt pass is complete (a split prompt's continuations included): its reads, once.
         self.reportPrompt();
@@ -2104,9 +2103,10 @@ pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 pub const fill_max_tokens = bill_mod.fill_max_tokens;
 pub const min_fill_rows = bill_mod.min_fill_rows;
 
-/// The box a Module admits in, stated by its builder once: the GPU memory ceiling and the wired margin the fill's
-/// target stays under (the served load passes the host's `sdk.LoadCtx.ceiling` and `LoadFacts.wired_margin_bytes`).
-pub const Box = struct { ceiling: u64, wired_margin: u64 };
+/// What a Module's builder states once from the host's load: the GPU memory ceiling and the wired margin the fill's
+/// target stays under, and the host's loaders (the Engram sidecar). The served load passes `sdk.LoadCtx.ceiling`,
+/// `LoadFacts.wired_margin_bytes` and `LoadCtx.loader`.
+pub const Host = struct { ceiling: u64, wired_margin: u64, loader: *const sdk.WeightLoader };
 
 pub fn boxCeiling(ceiling_bytes: u64, n_experts: u32) expert_admission.Ceiling {
     return .ofWorkingSet(ceiling_bytes, ceiling_stop_bytes, n_experts);
@@ -2143,14 +2143,14 @@ fn setCacheLimit(limit: usize) void {
 
 /// The Engram residents' sidecar joins the loaded shards (the index names none of them), read as the residents
 /// are: past the page cache (the aligned uncached reader) under the model's `nocache_weights` setting.
-fn loadEngramResidents(gpa: std.mem.Allocator, weights: *model_io.Weights, dir: []const u8, config: *const settings.Config) !void {
+fn loadEngramResidents(gpa: std.mem.Allocator, loader: *const sdk.WeightLoader, weights: *sdk.Weights, dir: []const u8, config: *const settings.Config) !void {
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/" ++ dsp.engram_residents_file, .{dir}, 0);
     defer gpa.free(path);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     var opts = dsp.resident_load_opts;
     opts.nocache = config.nocache_weights orelse opts.nocache;
-    try model_io.loadSafetensorsFile(gpa, weights, path.ptr, cpu, opts);
+    try loader.file(gpa, weights, path.ptr, cpu, opts);
 }
 
 /// The quant kind at load, before its accept: the EXL3 quant this arch binds claims the bank's description
@@ -2200,7 +2200,7 @@ fn GrownBanks(comptime AT: type) type {
 }
 
 /// `layers.<l>.ffn.gate.{weight,bias}` of every routed layer, refused by name when one is missing.
-fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const model_io.Weights, n_layers: u32) ![]Gate {
+fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const sdk.Weights, n_layers: u32) ![]Gate {
     const gates = try gpa.alloc(Gate, n_layers);
     errdefer gpa.free(gates);
     var buf: [64]u8 = undefined;
@@ -2240,7 +2240,7 @@ test "dsv41 module: each tier's prefill allocator cache is inside what the admis
 }
 
 test "dsv41 module: a request's bounded lanes hold its reservation, else the prompt plus the shell's headroom, plus a verify block" {
-    try std.testing.expectEqual(@import("transformer.zig").KVCache.RESERVE_GEN_HEADROOM, generation_headroom);
+    try std.testing.expectEqual(@import("deepseek_v41_host.zig").transformer.KVCache.RESERVE_GEN_HEADROOM, generation_headroom);
     // 16K prompt, no declared budget: 16384 + 8192 + 8.
     try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), Module.maxPositions(16384, 0));
     // A reservation (prompt + budget + chunk) is the bound.

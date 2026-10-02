@@ -6,7 +6,6 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = @import("mlx");
-const model = @import("model.zig");
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -1059,7 +1058,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     config.memory_baseline_bytes = 8_548_761_600;
     const ceiling_bytes: u64 = 119_259_000_000;
     const wired: u64 = 3_380_379_648;
@@ -1108,7 +1107,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1190,7 +1189,7 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310 + 3 * 2 * 2048 * 184;
     try testing.expectEqual(@as(u64, 184_758_272), at_change);
     // The bill carries them per phase.
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     // Option B: the ceiling is the bill's argument, not a config field.
     config.memory_baseline_bytes = 9_200_000_000;
     const b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, 120_259_084_288, .{});
@@ -1207,7 +1206,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     // Option B: the ceiling is the harness's argument, not a config field.
     const ceiling: u64 = 120_259_084_288;
     config.memory_baseline_bytes = 9_200_000_000;
@@ -1263,7 +1262,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1319,7 +1318,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1399,7 +1398,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1448,7 +1447,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1495,7 +1494,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var config = try settings.Config.load(testing.io, a, bank_dir);
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
@@ -1581,7 +1580,7 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const config = try settings.Config.load(testing.io, a, bank_dir);
+    const config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     const ceiling_bytes: u64 = 120_259_084_288;
     const need = try loadRequirementBytes(a, testing.io, config, ceiling_bytes);
     var floor = config;

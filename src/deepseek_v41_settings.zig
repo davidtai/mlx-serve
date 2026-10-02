@@ -5,7 +5,6 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const log = @import("log");
-const model = @import("model.zig");
 const v41 = @import("deepseek_v41.zig");
 
 /// The arch's numerics, chosen at construction (`numeric_tier`): "stock" (the exact reference math, the prompt in
@@ -67,20 +66,6 @@ pub const Config = struct {
         out.expert_prefill_rows = facts.expert_prefill_rows;
         out.nocache_weights = facts.nocache_weights;
         return out;
-    }
-
-    /// The host's parsed config of this arch's model (its registry entry's config), with the host's load facts.
-    pub fn ofHost(host: *const model.ModelConfig) error{NotDeepseekV41}!Config {
-        const vt = host.arch orelse return error.NotDeepseekV41;
-        if (!std.mem.eql(u8, vt.name, "deepseek_v41")) return error.NotDeepseekV41;
-        const c: *const Config = @ptrCast(@alignCast(host.arch_cfg.?));
-        return c.withFacts(&host.loadFacts());
-    }
-
-    /// A model directory's config as the host parses it (config.json through the registry), as this arch's config;
-    /// its strings live in `a`.
-    pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !Config {
-        return ofHost(&try model.parseConfig(io, a, model_dir));
     }
 
     /// This model's model-settings.json object: each key this arch takes, set when present and valid (anything

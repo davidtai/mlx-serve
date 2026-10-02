@@ -9,7 +9,6 @@
 const std = @import("std");
 const mlx = @import("mlx");
 const sdk = @import("sdk");
-const model = @import("model.zig");
 const expert_admission = @import("expert_admission.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 
@@ -1321,7 +1320,7 @@ pub const WeightMap = struct {
 /// every spec parameter is a handle with the dtype and shape the headers
 /// declared. Reads array metadata only, but the arrays exist, so this runs
 /// where MLX may run.
-pub fn checkLoaded(w: *const model.Weights, spec: []const Param, diag: ?*Diag) Error!void {
+pub fn checkLoaded(w: *const sdk.Weights, spec: []const Param, diag: ?*Diag) Error!void {
     var nb: [256]u8 = undefined;
     for (spec) |p| switch (p.kind) {
         .dense => |d| try expectLoaded(w, p.name, stToMlx(d.dtype), d.shape[0..d.rank], diag),
@@ -1351,7 +1350,7 @@ fn stToMlx(d: StDtype) mlx.mlx_dtype {
     };
 }
 
-fn expectLoaded(w: *const model.Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const u64, diag: ?*Diag) Refusal!void {
+fn expectLoaded(w: *const sdk.Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const u64, diag: ?*Diag) Refusal!void {
     const a = w.get(name) orelse return refuse(diag, error.TensorMissing, "{s}: not in the loaded weights", .{name});
     if (mlx.mlx_array_dtype(a) != dtype) return refuse(diag, error.TensorDtype, "{s}: loaded as {s}, want {s}", .{ name, @tagName(mlx.mlx_array_dtype(a)), @tagName(dtype) });
     const got = mlx.getShape(a);

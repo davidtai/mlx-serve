@@ -10,6 +10,9 @@ const peek = @import("peek.zig");
 const spec = @import("spec.zig");
 const bill = @import("memory_bill.zig");
 const check = @import("check.zig");
+const weights_mod = @import("weights.zig");
+const Weights = weights_mod.Weights;
+const WeightLoader = weights_mod.WeightLoader;
 
 const Allocator = std.mem.Allocator;
 
@@ -55,8 +58,10 @@ pub const LoadCtx = struct {
     gpa: Allocator,
     io: std.Io,
     stream: mlx.mlx_stream,
-    /// The loaded residents (the host's weight map: opaque until the weights module is shared).
-    weights: *anyopaque,
+    /// The loaded residents (the host's weight map).
+    weights: *Weights,
+    /// The host's loaders, for a sidecar the model directory's index does not name.
+    loader: *const WeightLoader,
     facts: LoadFacts,
     /// The GPU memory ceiling every plan fits under (an argument, never a global).
     ceiling: u64,
