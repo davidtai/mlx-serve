@@ -20,6 +20,7 @@ const arm_mod = @import("deepseek_v41_arm.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const expert_bank = @import("expert_bank.zig");
+const kvc = @import("deepseek_v41_cache.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -446,8 +447,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     const bill = v41.PrefillBill.of(&c).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4);
     const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
-    // A verify forward: the fixed wave at 8 rows plus its index chain over every position (two arrays live).
-    const decode_wave = bill.waveBytes(rows, rows, .served) + v41.PrefillBill.chain_copies * rows * bill.index_heads * positions * 4;
+    // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).
+    const decode_wave = verifyWaveBytes(&c, rows, positions, c.dspark.block_size);
     // The phases' buffers (printed): the checkpoint's tensors as the Module keeps them, what it builds, the state, the slot banks.
     const persistent_arrays = m.totalTensors() - droppedResidentArrays(headRoute(ov)) + builtResidentArrays(&c, headRoute(ov)) + em.totalTensors() + wire_arrays_state + (@as(u64, c.n_layers) + 1) * expert_bank.n_components;
     return .{
@@ -490,6 +491,40 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .wire_arrays_decode = persistent_arrays + 2 * wire_arrays_decode_wave,
     };
 }
+
+/// verify_wave (G3, the memory lane's ledger sec. 76): a decode forward's live set, by geometry. forwardSpan resets the
+/// handles once per layer, so a decode forward holds at most one layer's allocating outputs plus what crosses layers.
+/// The widest layer is an index source over the ratio-1 lane (P' = the bounded compressed rows at `positions`):
+/// - index chain: the f32 index keys, the [M, Hi, P'] einsum / relu / weighted products (3), six [M, P'] reductions
+///   and masks, the candidate blocks (two [M, P'] f32);
+/// - attention core: the window and compressed gathers, their join and f32 cast (3 x [M, W+k, hd]), q / pv / div
+///   (3 x [M, H, hd]), qk and the softmax (2 x [M, H, W+k]);
+/// - MLX's operand copies inside the two einsums (not trace nodes): the index keys again and 2 x [M, W+k, hd];
+/// - the ratio-1 lane's append (a new array unless MLX donates; nothing pins donation): P' x (hd + Di) f32;
+/// - the projections, rope, the HC tail, the router, the shared and routed chains, Engram: `verify_glue_bytes`;
+/// - across layers: the comp-row memos (2 x [M, k, hd]), two [M, P'] masks, the h and pre-mix streams (2 x [M, hc, d]),
+///   the previous layer's pending combine inputs ([M, 8, d] f32), the draft's per-row distribution ([B, V] f32).
+pub fn verifyWaveBytes(c: *const v41.Config, rows: u64, positions: u64, block: u64) u64 {
+    const m = rows;
+    const p: u64 = kvc.boundedCompCap(@intCast(positions), 1).?;
+    const di: u64 = c.index_head_dim;
+    const hi: u64 = c.index_n_heads;
+    const hd: u64 = c.head_dim;
+    const h: u64 = c.n_heads;
+    const keys: u64 = @as(u64, c.window) + c.index_topk;
+    const d: u64 = c.hidden_size;
+    const index = p * di * 4 + 3 * m * hi * p * 4 + 6 * m * p * 4 + 2 * m * p * 4;
+    const attn = 3 * m * keys * hd * 4 + 3 * m * h * hd * 4 + 2 * m * h * keys * 4;
+    const prim = p * di * 4 + 2 * m * keys * hd * 4;
+    const lane = p * (hd + di) * 4;
+    const carry = 2 * m * @as(u64, c.index_topk) * hd * 4 + 2 * m * p + 2 * m * c.hc_mult * d * 4;
+    const pending = m * 8 * d * 4 + block * @as(u64, c.vocab_size) * 4;
+    return index + attn + prim + lane + verify_glue_bytes + carry + pending;
+}
+
+/// verify_wave's allowance for a layer's projections, rope, HC tail, router, shared and routed chains and Engram at
+/// decode rows (the memory lane's 20 MB; the bank trace test holds the whole layer under the form).
+pub const verify_glue_bytes: u64 = 20 << 20;
 
 /// The prompt pass's billed transient: K16's layer-major wave (JOINLESS: the wave alone; else with the wide lane's
 /// routed-output copy), or the chunk-major widest wave x 5 / 4.
@@ -703,6 +738,21 @@ pub fn cell4Bill() Bill {
     };
 }
 
+test "dsv41 memory: verify_wave is the geometric bound of a decode forward's live set (ledger sec. 76)" {
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    // M 8, the fill's positions (16,384 + 8,192 + 8 = 24,584), the DSpark block 5: 0.272 GB, under today's 0.365.
+    const p = billedPositions(fill_prompt_tokens, fill_max_tokens);
+    try testing.expectEqual(@as(u64, 24_584), p);
+    const vw = verifyWaveBytes(&c, 8, p, c.dspark.block_size);
+    try testing.expectEqual(@as(u32, 5), c.dspark.block_size);
+    try testing.expectEqual(@as(u64, 271_525_120), vw);
+    try testing.expect(vw < 365_449_216);
+    // Monotone in rows and positions.
+    try testing.expect(verifyWaveBytes(&c, 7, p, 5) < vw and verifyWaveBytes(&c, 8, p - 1024, 5) < vw);
+}
+
 test "dsv41 memory: wire_tables bills the page tables and wiring records of a phase's wired bytes, per 16 KiB page" {
     // 24 B a page, 16 B per 32 MiB, 16 B per 64 GiB; no per-buffer term.
     try testing.expectEqual(@as(u64, 24 + 16 + 16), wireTables(1));
@@ -837,6 +887,9 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(@as(u64, 1_250_000_000), b.decodeTerms().host_reserve);
     try testing.expectEqual(@as(u64, 900_000_000), b.constructionTerms().host_reserve);
     try testing.expectEqual(@as(u64, 0), b.lookahead_staging + b.wide_window + b.unbilled_overhead);
+    // The verify and draft waves bill verify_wave (G3) at M 8, the fill's positions and the DSpark block.
+    try testing.expectEqual(@as(u64, 271_525_120), b.decode_wave);
+    try testing.expectEqual(b.decode_wave, b.draft_wave);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // v6's failure mode is gone by construction: without the envelope planner the native bill does not read
     // the wired bytes at all (the constructed module's own +85 GB changes nothing).
@@ -875,6 +928,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // 1.115-1.120 GB): before it 8.99 GB 135 / 164, 9.20 GB 135 / 164 off and 134 / 164 on, 9.55 GB 134 / 163.
     // SERVED19E: wire_tables (~0.16 GB a phase) and decode's buffer allowance: 9.20 GB posted on 134 -> 133 prompt rows.
     // SERVED19F: the re-frozen buffer allowances (decode 40.4 MB, prompt 17 MB): 9.20 GB decode 168 -> 167 (release on).
+    // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
@@ -884,7 +938,7 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 133, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     };
     // The release route as the Module resolves it: the default (on), then each override.
@@ -1025,7 +1079,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
         // 5 prompt rows.
         .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 133, .decode = 168 }, .tight = .{ .prefill = 138, .decode = 168 } },
         .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1075,7 +1129,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 168 }, .one = .{ .prefill = 141, .decode = 168 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 140, .decode = 167 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 138, .decode = 168 }, .one = .{ .prefill = 140, .decode = 168 } },
         .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 140, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1125,7 +1179,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 133, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
         .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1164,7 +1218,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 168 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 168 } },
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 133, .decode = 162 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 162 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1209,7 +1263,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 133, .decode = 168 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
