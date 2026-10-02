@@ -71,7 +71,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 23), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 25), eq.kernels.len);
     try testing.expectEqual(@as(usize, 56), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
@@ -127,6 +127,15 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try acc.routeFusedDown(set, &diag);
     try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
     for (acc.waves) |*w| try testing.expectEqual(@as(u32, 4), w.wave_launches);
+    // the routed forms: the GEMVs rebuilt on their texts at construction (no check joins the report: the registry's
+    // twins run in a check window), the prepared tables swap (gate|up's one-launch table joins: + 48)
+    try acc.routeForms(&t, .{ .down_pair = true, .gu_one = true });
+    try testing.expectEqual(Kernel.dsv41_exl3_pair_k3_5120, acc.gemv.dn.kernel);
+    try testing.expect(acc.gemv.gu1_p != null);
+    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
+    try acc.routeForms(&t, .{});
+    try testing.expectEqual(@as(isize, 288), t.prepared_live);
     // the trunk: the rest of the plan less the table-codebook text's 3 (the EXL3 subset's, registered, not checked at
     // accept), none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
@@ -134,7 +143,10 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try tr.accept(a, set, &rep, &diag);
     const lut_checks = set.reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut).checks.count();
     try testing.expectEqual(@as(usize, 3), lut_checks);
-    try testing.expectEqual(plan - 60 - fused_checks - lut_checks, rep.results.items.len);
+    var form_checks: usize = 0;
+    for (eq.form_texts) |k| form_checks += set.reg.get(k).checks.count();
+    try testing.expectEqual(@as(usize, 6), form_checks);
+    try testing.expectEqual(plan - 60 - fused_checks - lut_checks - form_checks, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
@@ -595,7 +607,9 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     // launch them; the route launches the 128-row texts)
     for (reg.entries) |e| {
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
-            e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3;
+            e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or
+            // the routed forms: their own test launches them (`Gemv.initForms`)
+            e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304;
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
@@ -729,11 +743,11 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
             },
         }
     }
-    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2, PREP 4; index top-k 1, softmax 2
-    try testing.expectEqual(@as(usize, 27), rule);
+    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2, PREP 4; index top-k 1, softmax 2
+    try testing.expectEqual(@as(usize, 29), rule);
     // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
     // sinkhorn16 (32 n), the head (8 M)
-    try testing.expectEqual(@as(usize, 6 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
+    try testing.expectEqual(@as(usize, 8 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
     // a route refuses M outside its table before any launch; its prepared configs are released
     const n_launch = t.launches.items.len;
@@ -783,7 +797,7 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
                 try testing.expectEqual(n0 + 2, t.launches.items.len);
                 try testing.expectEqual(xk.Kernel.dsv41_exl3_mul1h_k3_2304, t.back(1).k);
             }
-            try testing.expect(t.shapeOf(z[0]).eql(t.shapeOf(z[1])));
+            try testing.expectEqualSlices(c_int, t.shapeOf(z[0]).slice(), t.shapeOf(z[1]).slice());
             const xd = try t.node(&.{ m, 2304 }, .float32, &.{});
             _ = try gv.project(&t, .down, xd, ids, code_d);
             const ld = t.back(1);
