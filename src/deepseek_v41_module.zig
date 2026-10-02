@@ -141,6 +141,9 @@ pub const RouteOverrides = struct {
     draft_cache_hot: ?u32 = null,
     /// DRAFTCACHE's slot pool form (`dh.DraftPool`; null: per_stage). Only with `draft_cache_hot`.
     draft_cache_pool: ?dh.DraftPool = null,
+    /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
+    /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
+    decode_cache_bytes: ?u64 = null,
 };
 
 /// DRAFTCACHE's hot slots as the Module installs it and the bill charges it (one resolver; off by default).
@@ -152,6 +155,13 @@ pub fn draftCacheHot(ov: RouteOverrides) ?u32 {
 pub fn draftCachePool(ov: RouteOverrides) error{DraftCachePoolWithoutHot}!dh.DraftPool {
     if (ov.draft_cache_hot == null and ov.draft_cache_pool != null) return error.DraftCachePoolWithoutHot;
     return ov.draft_cache_pool orelse .per_stage;
+}
+
+/// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
+pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
+    const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
+    if (v > envelope.decode_cache_bytes) return error.DecodeCacheLimit;
+    return v;
 }
 
 /// The host relief route the Module installs (off by default).
@@ -354,6 +364,10 @@ pub const Module = struct {
             log.err("prefill routes refused: {s}", .{@errorName(e)});
             return e;
         };
+        _ = decodeCacheLimit(ov) catch |e| {
+            log.err("decode cache limit refused: {d} B (at most the envelope's {d} B)", .{ ov.decode_cache_bytes.?, envelope.decode_cache_bytes });
+            return e;
+        };
         const poll_ms = phaseChangePollMs(ov) catch |e| {
             log.err("phase change poll refused: {d} ms (1..{d})", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
             return e;
@@ -519,6 +533,8 @@ pub const Module = struct {
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
         self.installed.host_relief = hostRelief(ov);
+        self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
+        log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
         log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
@@ -1080,7 +1096,7 @@ pub const Module = struct {
             marks[2] = VmMark.now();
         }
         self.g.clearCache();
-        setCacheLimit(envelope.decode_cache_bytes);
+        setCacheLimit(self.installed.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
         // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
         const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
@@ -1223,6 +1239,8 @@ pub const Installed = struct {
     draft_cache_hot: ?u32 = null,
     /// DRAFTCACHE's pool form, as installed (null: the route off).
     draft_cache_pool: ?dh.DraftPool = null,
+    /// MLX's buffer cache limit through decode, as installed (`decodeCacheLimit`).
+    decode_cache_bytes: u64 = envelope.decode_cache_bytes,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -2300,6 +2318,14 @@ test "dsv41 memory: the settle waits for the footprint to show the frees, then t
         try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
         try checkFreed(before, st.after, 0);
     }
+}
+
+test "dsv41 module: the decode cache limit is a construction-time route; the envelope's by default, never above it" {
+    try std.testing.expectEqual(@as(u64, 268_435_456), try decodeCacheLimit(.{}));
+    try std.testing.expectEqual(@as(u64, 268_435_456), (Installed{}).decode_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 0), try decodeCacheLimit(.{ .decode_cache_bytes = 0 }));
+    try std.testing.expectEqual(@as(u64, 67_108_864), try decodeCacheLimit(.{ .decode_cache_bytes = 67_108_864 }));
+    try std.testing.expectError(error.DecodeCacheLimit, decodeCacheLimit(.{ .decode_cache_bytes = 268_435_457 }));
 }
 
 test "dsv41 memory: the phase change's settle poll as a route (poll5): the same reads and check, its own wait steps" {
