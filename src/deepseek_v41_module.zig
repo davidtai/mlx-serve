@@ -679,6 +679,11 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
+        // DRAFTCACHE reads on its own tickets of the stream's pool (more tickets, the demand ring unchanged).
+        if (draftCacheHot(self.overrides) != null) {
+            opts.pool.tickets += dh.draft_aux_tickets;
+            opts.pool.aux_tickets = dh.draft_aux_tickets;
+        }
         const warm = firstVerifyWarm(self.overrides);
         opts.first_verify_warm = if (warm) .{} else null;
         var wide = wideRoute(config);

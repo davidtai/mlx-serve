@@ -784,6 +784,9 @@ pub fn Head(comptime G: type) type {
 /// A record's parts in read order: (w1, w3, w2) x (weight, scales), each projection one pool job.
 pub const draft_parts = [_][]const u8{ "w1.weight", "w1.scales", "w3.weight", "w3.scales", "w2.weight", "w2.scales" };
 pub const max_draft_stages = 8;
+/// The aux ring the served route reserves on the stream's pool (`expert_io.Options.aux_tickets`): two tickets per pool
+/// job; a read runs in batches of the ring's size, one batch waited before the next.
+pub const draft_aux_tickets: u32 = 192;
 
 /// The hot set's persistent slots per stage: `hot` split as evenly as possible, the first stages taking the remainder.
 pub fn hotSplit(hot: u32, n_stages: u32, out: []u32) void {
@@ -926,6 +929,8 @@ pub const DraftCache = struct {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
         self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, form), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        // The served route reads on its own tickets (the pool's aux ring): no ticket of the stream's demand ring is reused.
+        if (memory == .mlx and (pool == null or pool.?.auxTickets() < draft_aux_tickets)) return error.DraftCacheTickets;
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), memory, pool);
         errdefer self.cache.deinit();
         try placeParts(self.cache, a, ck, &self.geom, self.n_stages, self.n_experts);
@@ -1556,7 +1561,8 @@ test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots 
         defer pool.stop();
         const cache = try xsc.Cache.init(a, geom, .{ .mlx = s }, pool);
         defer cache.deinit();
-        try placeParts(cache, a, &ck, &dg, if (form == .shared) 2 else 1, c.dspark.n_routed_experts);
+        // Shared: every stage's ids sit in the one group, so every stage is placed (checkLocs walks them all).
+        try placeParts(cache, a, &ck, &dg, if (form == .shared) c.dspark.n_stages else 1, c.dspark.n_routed_experts);
         try cache.checkLocs();
         _ = try cache.seed(0, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
         const cached: H.Experts = .{ .w1 = .{ .w = cache.arrays[0][0], .s = cache.arrays[0][1], .mode = .mxfp4 }, .w3 = .{ .w = cache.arrays[0][2], .s = cache.arrays[0][3], .mode = .mxfp4 }, .w2 = .{ .w = cache.arrays[0][4], .s = cache.arrays[0][5], .mode = .mxfp4 } };
@@ -1595,5 +1601,112 @@ test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots 
         }
         std.debug.print("\ndraft cache smoke ({t}): 16 blocks bit for bit (f32 and bf16 inputs); {d} hits, {d} misses, {d} evictions, {d} B read\n", .{ form, cache.stats.expert_cache_hits, cache.stats.expert_cache_misses, cache.stats.expert_cache_evictions, cache.stats.expert_bytes_read });
         try testing.expect(cache.stats.expert_cache_evictions > 0);
+    }
+}
+
+// DSV41_BANK=<bank> (host): the served DraftCache.open over the real checkpoint for both pools at H 128, no slot memory
+// (placement and the construction check only: nothing read or allocated): every stage's every expert is placed, each
+// pair in its own shard, stage 2's last expert where its pool keys it.
+test "dsv41 dspark head: DRAFTCACHE on the bank: both pools place every stage's experts in their shards at construction" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var vd: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 draft cache placement: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, testing.io, bank, &vd);
+    var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank, &vd);
+    defer ck.deinit();
+    const last_name = "mtp.2.ffn.experts.127.w2.scales";
+    const last = ck.tensors.get(last_name).?;
+    for ([_]DraftPool{ .per_stage, .shared }) |form| {
+        const dc = try DraftCache.open(a, &ck, &c, 128, form, .none, null);
+        defer dc.deinit();
+        // Three shards (stages 0 / 1 / 2), each opened once.
+        try testing.expectEqual(@as(usize, 3), dc.cache.files.items.len);
+        const grp = dc.geom.group_of[2];
+        const id = dc.geom.offset_of[2] + 127;
+        try testing.expectEqual(@as(u32, if (form == .shared) 383 else 127), id);
+        const loc = dc.cache.locs[(grp * dc.cache.geom.n_experts + id) * draft_parts.len + 5];
+        try testing.expectEqual(last.begin, loc.offset);
+        // Stage 0's expert 0 and stage 2's expert 127 read from different files.
+        const first = dc.cache.locs[(@as(usize, dc.geom.group_of[0]) * dc.cache.geom.n_experts + dc.geom.offset_of[0]) * draft_parts.len];
+        try testing.expect(first.file != loc.file);
+    }
+}
+
+// DSV41_DRAFT_REPLAY=<receipt.json>[,<receipt.json>...] (host, CPU only): each receipt's draft route stream (per cycle,
+// per stage, the block's routed ids) replayed through the served policy (planOnly, first-ids seed) for both pools at
+// H 96 / 128 / 201 / 256. Misses split into compulsory (an id neither seeded nor routed before) and capacity; the cycle
+// price at the decode lane's figures: 1.41 ms per miss + 0.55 ms of routing barriers per cycle against 0.65 ms per
+// decode row gained (the 7.29 GB bill rows).
+test "dsv41 dspark head: DRAFTCACHE replay of recorded draft routes (misses per cycle per pool and H)" {
+    const list = std.mem.span(std.c.getenv("DSV41_DRAFT_REPLAY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const json = try v41.testConfigJson(a, .real);
+    defer a.free(json);
+    const c = try v41.Config.parse(a, json, null);
+    const Rec = struct { draft_route_stream: struct { stages: u32, experts_per_stage: u32, cycles: []const []const []const u16 } };
+    const stock_rows: f64 = 171;
+    const Rows = struct { hot: u32, per_stage: f64, shared: f64 };
+    const rows = [_]Rows{ .{ .hot = 96, .per_stage = 180, .shared = 181 }, .{ .hot = 128, .per_stage = 179, .shared = 180 }, .{ .hot = 201, .per_stage = 176, .shared = 177 }, .{ .hot = 256, .per_stage = 174, .shared = 175 } };
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(256 << 20));
+        defer a.free(text);
+        const parsed = try std.json.parseFromSlice(Rec, a, text, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const ds = parsed.value.draft_route_stream;
+        const n_cycles = ds.cycles.len;
+        var distinct: [max_draft_stages]u32 = @splat(0);
+        {
+            var used: [max_draft_stages * 512]bool = @splat(false);
+            for (ds.cycles) |cy| for (cy, 0..) |ids, s| for (ids) |e| {
+                const g = s * ds.experts_per_stage + e;
+                if (!used[g]) distinct[s] += 1;
+                used[g] = true;
+            };
+        }
+        std.debug.print("\nDSV41_DRAFT_REPLAY {{\"receipt\": \"{s}\", \"cycles\": {d}, \"distinct\": [{d}, {d}, {d}]}}\n", .{ std.fs.path.basename(path), n_cycles, distinct[0], distinct[1], distinct[2] });
+        for (rows) |rw| for ([_]DraftPool{ .per_stage, .shared }) |form| {
+            const dc = try DraftCache.planOnly(a, &c, rw.hot, form);
+            defer dc.deinit();
+            _ = try dc.seedFirstIds();
+            var seen: [max_draft_stages * 512]bool = @splat(false);
+            for (0..dc.geom.n_groups) |grp| for (dc.cache.policies[grp].slot_to_expert[0..dc.geom.caps[grp]]) |e| {
+                if (e == expert_policy.no_expert) continue;
+                // A group's ids are its stage's (per stage) or global (shared): back to a global id.
+                const g: usize = if (form == .shared) e else grp * ds.experts_per_stage + e;
+                seen[g] = true;
+            };
+            dc.cache.stats = .{};
+            var compulsory: u64 = 0;
+            var max_cycle: u64 = 0;
+            for (ds.cycles) |cy| {
+                const m0 = dc.cache.stats.expert_cache_misses;
+                for (cy, 0..) |ids, s| {
+                    var buf: [expert_policy.max_route_ids]u16 = undefined;
+                    var first: [expert_policy.max_route_ids]bool = undefined;
+                    for (ids, 0..) |e, i| {
+                        buf[i] = @intCast(dc.geom.offset_of[s] + e);
+                        const g = s * ds.experts_per_stage + e;
+                        first[i] = !seen[g];
+                    }
+                    // Unique first uses in this route: each a compulsory miss.
+                    for (ids, 0..) |e, i| if (first[i]) {
+                        const g = s * ds.experts_per_stage + e;
+                        if (!seen[g]) compulsory += 1;
+                        seen[g] = true;
+                    };
+                    var slots: [expert_policy.max_route_ids]u32 = undefined;
+                    try dc.cache.route(dc.geom.group_of[s], buf[0..ids.len], slots[0..ids.len]);
+                }
+                max_cycle = @max(max_cycle, dc.cache.stats.expert_cache_misses - m0);
+            }
+            const misses = dc.cache.stats.expert_cache_misses;
+            const cyc: f64 = @floatFromInt(n_cycles);
+            const mpc = @as(f64, @floatFromInt(misses)) / cyc;
+            const gained = (if (form == .shared) rw.shared else rw.per_stage) - stock_rows;
+            const net = 1.41 * mpc + 0.55 - 0.65 * gained;
+            std.debug.print("DSV41_DRAFT_REPLAY {{\"pool\": \"{t}\", \"hot\": {d}, \"misses\": {d}, \"compulsory\": {d}, \"capacity\": {d}, \"misses_per_cycle\": {d:.3}, \"compulsory_per_cycle\": {d:.3}, \"capacity_per_cycle\": {d:.3}, \"max_misses_cycle\": {d}, \"rows_gained\": {d}, \"net_ms_per_cycle\": {d:.3}}}\n", .{ form, rw.hot, misses, compulsory, misses - compulsory, mpc, @as(f64, @floatFromInt(compulsory)) / cyc, @as(f64, @floatFromInt(misses - compulsory)) / cyc, max_cycle, gained, net });
+        };
     }
 }
