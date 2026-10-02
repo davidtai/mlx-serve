@@ -46,6 +46,7 @@ const expert_stream = @import("expert_stream.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_event = @import("expert_event.zig");
 const expert_io = @import("expert_io.zig");
+const xsc = @import("expert_slot_cache.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
 comptime {
@@ -161,6 +162,8 @@ pub const RouteOverrides = struct {
     decode_extra_records: ?u32 = null,
     /// The grow's new rows without the zero fill (`expert_stream.GrowFill`). null: the default, zeros.
     grow_fill: ?expert_stream.GrowFill = null,
+    /// DRAFTCACHE's residency policy (shipped: the streamer's decode policy; lru). Only with `draft_cache_hot`.
+    draft_cache_policy: ?xsc.PolicyKind = null,
 };
 
 /// The grow fill route the Module installs in the stream (zeros by default).
@@ -254,6 +257,12 @@ pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
 /// setting on the shell's config; off by default): handed to the pool at its start.
 pub fn readerSched(config: *const model_io.ModelConfig) expert_io.Sched {
     return config.expert_reader_sched orelse .{};
+}
+
+/// DRAFTCACHE's residency policy as installed (shipped unless set); a policy without a hot count is refused by name.
+pub fn draftCachePolicy(ov: RouteOverrides) error{DraftCachePolicyWithoutHot}!xsc.PolicyKind {
+    if (ov.draft_cache_hot == null and ov.draft_cache_policy != null) return error.DraftCachePolicyWithoutHot;
+    return ov.draft_cache_policy orelse .shipped;
 }
 
 /// The host relief route the Module installs (off by default).
@@ -733,13 +742,14 @@ pub const Module = struct {
             const pool = switch (self.arm) {
                 inline else => |t| t.arm.stream.pool,
             };
-            self.draft_cache = dh.DraftCache.open(gpa, &ck, &c, hot, try draftCachePool(ov), .{ .mlx = s }, pool) catch |e| {
+            self.draft_cache = dh.DraftCache.openWith(gpa, &ck, &c, hot, try draftCachePool(ov), try draftCachePolicy(ov), .{ .mlx = s }, pool) catch |e| {
                 log.err("draft cache refused at hot {d}: {s}", .{ hot, @errorName(e) });
                 return e;
             };
         }
         errdefer if (self.draft_cache) |dc| dc.deinit();
         _ = try draftCachePool(ov);
+        _ = try draftCachePolicy(ov);
         self.installed.draft_cache_hot = draftCacheHot(ov);
         const rows_alloc = decodeRowsAlloc(ov);
         switch (self.arm) {
@@ -767,9 +777,10 @@ pub const Module = struct {
             .prompt_stats => std.fmt.comptimePrint("prompt_stats (shift cap {d}; floor max(prompt rows, U - {d}); total U x layers)", .{ arm_mod.decode_rows_shift_cap, arm_mod.decode_rows_shift_cap }),
         }});
         self.installed.draft_cache_pool = if (self.draft_cache) |dc| dc.geom.pool else null;
+        self.installed.draft_cache_policy = if (self.draft_cache) |dc| dc.geom.policy else null;
         if (self.draft_cache) |dc| {
             const caps = dc.geom.caps[0..dc.geom.n_groups];
-            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.cache.geom.billBytes() });
+            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, policy {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.geom.policy, dc.cache.geom.billBytes() });
         } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
         self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache, .head_mx = if (self.model.head_mx) |*hm| hm else null });
         errdefer self.head.deinit(&self.g);
@@ -1676,6 +1687,8 @@ pub const Installed = struct {
     decode_rows_alloc: arm_mod.DecodeRowsAlloc = .uniform,
     /// The fill's decode granule, as installed (`decodeFillGranule`).
     decode_fill_granule: arm_mod.DecodeFillGranule = .row,
+    /// DRAFTCACHE's residency policy, as installed (null: the route off).
+    draft_cache_policy: ?xsc.PolicyKind = null,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -3183,6 +3196,9 @@ test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) a
     try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
     try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
     try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
+    try std.testing.expectEqual(xsc.PolicyKind.shipped, try draftCachePolicy(.{ .draft_cache_hot = 128 }));
+    try std.testing.expectEqual(xsc.PolicyKind.lru, try draftCachePolicy(.{ .draft_cache_hot = 128, .draft_cache_policy = .lru }));
+    try std.testing.expectError(error.DraftCachePolicyWithoutHot, draftCachePolicy(.{ .draft_cache_policy = .lru }));
 }
 
 test "dsv41 module: the reader scheduling is off by default and follows the shell's model setting" {

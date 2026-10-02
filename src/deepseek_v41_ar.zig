@@ -1066,6 +1066,8 @@ const CellReceipt = struct {
     /// The fill's decode granule as installed ("row" | "record") and the single records past the rows it admitted.
     decode_fill_granule: ?[]const u8 = null,
     decode_extra_records: ?u32 = null,
+    /// DRAFTCACHE's residency policy as installed ("shipped" | "lru"; null: the route off).
+    draft_cache_policy: ?[]const u8 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1450,6 +1452,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
     var reader_sched_buf: [24]u8 = undefined;
+    // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
+    const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
+    if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
@@ -1531,7 +1536,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .draft_cache_hot = md.installed.draft_cache_hot,
-        .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
+        .draft_cache_stats = dcs,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
         .reader_sched = md.installed.reader_sched.name(&reader_sched_buf),
         .reader_demand_first = md.installed.reader_sched.demand_first,
@@ -1544,6 +1549,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
             const s = module.rowsSummary(gr);
             break :blk .{ .layers = gr, .total = s.total, .min = s.min, .max = s.max };
         },
+        .draft_cache_policy = if (md.installed.draft_cache_policy) |p| @tagName(p) else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
@@ -1679,6 +1685,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
     if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
+    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("expert_slot_cache.zig").PolicyKind, v) orelse return error.CellDraftCachePolicy;
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;

@@ -22,8 +22,177 @@ pub const alloc_page_bytes: u64 = 16_384;
 /// One part of every record of a group: its bytes, and the per-row shape and dtype of its bank array.
 pub const Component = struct { bytes: u64, shape: []const c_int, dtype: mlx.mlx_dtype };
 
+/// Which residency policy plans a group's slots. `shipped`: the streamer's decode policy (`expert_policy.LayerPolicy`:
+/// persistent rows [0, capacity) by transition-window admission, the transient rows a per-route scratch). `lru`: every
+/// row of the group holds residency (capacity + transient), a miss takes an empty row or the least recently routed
+/// one not in the route. Either way only which correct record sits in which row changes.
+pub const PolicyKind = enum { shipped, lru };
+
+/// The LRU planner (`PolicyKind.lru`), in `expert_policy.Plan` terms: every load persistent.
+pub const LruPolicy = struct {
+    n_experts: u32,
+    rows: u32,
+    slot_to_expert: []u16,
+    expert_to_slot: []u32,
+    last_used: []u64,
+    clock: u64 = 0,
+    occupancy: u32 = 0,
+
+    pub fn init(a: std.mem.Allocator, n_experts: u32, rows: u32) !LruPolicy {
+        if (n_experts == 0 or n_experts >= expert_policy.no_expert or rows > n_experts) return error.InvalidCapacity;
+        const p: LruPolicy = .{ .n_experts = n_experts, .rows = rows, .slot_to_expert = try a.alloc(u16, rows), .expert_to_slot = try a.alloc(u32, n_experts), .last_used = try a.alloc(u64, rows) };
+        @memset(p.slot_to_expert, expert_policy.no_expert);
+        @memset(p.expert_to_slot, expert_policy.no_slot);
+        @memset(p.last_used, 0);
+        return p;
+    }
+
+    pub fn deinit(p: *LruPolicy, a: std.mem.Allocator) void {
+        a.free(p.slot_to_expert);
+        a.free(p.expert_to_slot);
+        a.free(p.last_used);
+    }
+
+    pub fn slotOf(p: *const LruPolicy, e: u16) ?u32 {
+        const s = p.expert_to_slot[e];
+        return if (s == expert_policy.no_slot) null else s;
+    }
+
+    pub fn invalidate(p: *LruPolicy, e: u16) void {
+        const s = p.expert_to_slot[e];
+        if (s == expert_policy.no_slot) return;
+        p.slot_to_expert[s] = expert_policy.no_expert;
+        p.expert_to_slot[e] = expert_policy.no_slot;
+        p.occupancy -= 1;
+    }
+
+    fn take(p: *LruPolicy, e: u16, s: u32, out: ?*expert_policy.Plan) void {
+        const prev = p.slot_to_expert[s];
+        if (prev != expert_policy.no_expert) {
+            p.expert_to_slot[prev] = expert_policy.no_slot;
+            if (out) |o| {
+                o.evictions[o.n_evictions] = .{ .slot = s, .previous = prev, .next = e };
+                o.n_evictions += 1;
+            }
+        } else p.occupancy += 1;
+        p.slot_to_expert[s] = e;
+        p.expert_to_slot[e] = s;
+    }
+
+    /// The route's unique ids in first-occurrence order, one at a time: a hit becomes the most recent; a miss takes an
+    /// empty row, else the least recently used row whose expert is not in this route, and becomes the most recent.
+    pub fn plan(p: *LruPolicy, ids: []const u16, out: *expert_policy.Plan) void {
+        out.* = .{ .phase = .decode, .n_ids = @intCast(ids.len) };
+        var uniq: [expert_policy.max_route_ids]u16 = undefined;
+        var n: usize = 0;
+        for (ids) |e| {
+            if (std.mem.indexOfScalar(u16, uniq[0..n], e) != null) continue;
+            uniq[n] = e;
+            n += 1;
+        }
+        const route = uniq[0..n];
+        for (route) |e| {
+            p.clock += 1;
+            if (p.expert_to_slot[e] != expert_policy.no_slot) {
+                out.hits[out.n_hits] = e;
+                out.n_hits += 1;
+                p.last_used[p.expert_to_slot[e]] = p.clock;
+                continue;
+            }
+            out.misses[out.n_misses] = e;
+            out.n_misses += 1;
+            var best: ?u32 = null;
+            for (p.slot_to_expert, 0..) |x, slot| {
+                if (x == expert_policy.no_expert) {
+                    best = @intCast(slot);
+                    break;
+                }
+                if (std.mem.indexOfScalar(u16, route, x) != null) continue;
+                if (best == null or p.last_used[slot] < p.last_used[best.?]) best = @intCast(slot);
+            }
+            const slot = best.?; // rows >= the route's unique ids (the geometry's transient bound)
+            p.take(e, slot, out);
+            p.last_used[slot] = p.clock;
+            out.loads[out.n_loads] = .{ .expert = e, .slot = slot, .persistent = true };
+            out.n_loads += 1;
+        }
+        out.n_persistent = out.n_loads;
+        for (ids, 0..) |e, i| out.slots[i] = p.expert_to_slot[e];
+    }
+
+    /// The seed: `experts` into empty rows, in order (no eviction).
+    pub fn admitReadAhead(p: *LruPolicy, experts: []const u16, out: []expert_policy.LayerPolicy.ReadAhead) []expert_policy.LayerPolicy.ReadAhead {
+        var n: usize = 0;
+        for (experts) |e| {
+            if (n == out.len) break;
+            if (e >= p.n_experts or p.expert_to_slot[e] != expert_policy.no_slot) continue;
+            const s = for (p.slot_to_expert, 0..) |x, i| {
+                if (x == expert_policy.no_expert) break @as(u32, @intCast(i));
+            } else break;
+            p.take(e, s, null);
+            out[n] = .{ .expert = e, .slot = s };
+            n += 1;
+        }
+        return out[0..n];
+    }
+};
+
+/// A group's planner, chosen at construction (`Geometry.policy`).
+pub const Planner = union(PolicyKind) {
+    shipped: expert_policy.LayerPolicy,
+    lru: LruPolicy,
+
+    fn init(a: std.mem.Allocator, kind: PolicyKind, n_experts: u32, cap: u32, transient: u32) !Planner {
+        return switch (kind) {
+            .shipped => .{ .shipped = try expert_policy.LayerPolicy.init(a, n_experts, cap) },
+            .lru => .{ .lru = try LruPolicy.init(a, n_experts, cap + transient) },
+        };
+    }
+
+    pub fn deinit(p: *Planner, a: std.mem.Allocator) void {
+        switch (p.*) {
+            inline else => |*x| x.deinit(a),
+        }
+    }
+
+    pub fn slotOf(p: *const Planner, e: u16) ?u32 {
+        return switch (p.*) {
+            inline else => |*x| x.slotOf(e),
+        };
+    }
+
+    pub fn invalidate(p: *Planner, e: u16) void {
+        switch (p.*) {
+            inline else => |*x| x.invalidate(e),
+        }
+    }
+
+    pub fn plan(p: *Planner, ids: []const u16, out: *expert_policy.Plan) void {
+        switch (p.*) {
+            .shipped => |*x| x.plan(ids, .decode, out),
+            .lru => |*x| x.plan(ids, out),
+        }
+    }
+
+    pub fn admitReadAhead(p: *Planner, experts: []const u16, out: []expert_policy.LayerPolicy.ReadAhead) []expert_policy.LayerPolicy.ReadAhead {
+        return switch (p.*) {
+            inline else => |*x| x.admitReadAhead(experts, out),
+        };
+    }
+
+    /// The experts resident in the group's persistent rows (seeded or admitted; `no_expert` for an empty row).
+    pub fn residents(p: *const Planner) []const u16 {
+        return switch (p.*) {
+            .shipped => |*x| x.slot_to_expert[0..x.capacity],
+            .lru => |*x| x.slot_to_expert,
+        };
+    }
+};
+
 pub const Geometry = struct {
     n_experts: u32,
+    /// The residency policy of every group (construction-time route).
+    policy: PolicyKind = .shipped,
     components: []const Component,
     /// Persistent rows per group (the hot set's slots).
     capacity: []const u32,
@@ -56,7 +225,7 @@ pub const Cache = struct {
     geom: Geometry,
     memory: Memory,
     pool: ?*expert_io.Pool,
-    policies: []expert_policy.LayerPolicy,
+    policies: []Planner,
     /// [group][expert][component].
     locs: []Loc,
     files: std.ArrayList(File) = .empty,
@@ -86,14 +255,14 @@ pub const Cache = struct {
         errdefer a.destroy(self);
         self.* = .{ .a = a, .geom = geom, .memory = memory, .pool = pool, .policies = &.{}, .locs = &.{}, .base = &.{}, .host = &.{}, .arrays = &.{} };
         {
-            const pols = try a.alloc(expert_policy.LayerPolicy, n_groups);
+            const pols = try a.alloc(Planner, n_groups);
             var n_pol: usize = 0;
             errdefer {
                 for (pols[0..n_pol]) |*p| p.deinit(a);
                 a.free(pols);
             }
             for (pols, geom.capacity) |*p, cap| {
-                p.* = expert_policy.LayerPolicy.init(a, geom.n_experts, cap) catch return error.CacheGeometry;
+                p.* = Planner.init(a, geom.policy, geom.n_experts, cap, geom.transient) catch return error.CacheGeometry;
                 n_pol += 1;
             }
             self.policies = pols;
@@ -203,7 +372,7 @@ pub const Cache = struct {
     pub fn route(self: *Cache, group: usize, ids: []const u16, slots: []u32) Error!void {
         if (self.failed) return error.CacheFailed;
         var plan: expert_policy.Plan = undefined;
-        self.policies[group].plan(ids, .decode, &plan);
+        self.policies[group].plan(ids, &plan);
         const st = &self.stats;
         st.route_calls += 1;
         st.expert_cache_hits += plan.n_hits;
@@ -245,7 +414,7 @@ pub const Cache = struct {
     /// their bytes but no plan serves from them until read again.
     pub fn forgetAll(self: *Cache) Error!void {
         for (self.policies, self.geom.capacity) |*p, cap| {
-            const fresh = expert_policy.LayerPolicy.init(self.a, self.geom.n_experts, cap) catch return error.CacheGeometry;
+            const fresh = Planner.init(self.a, self.geom.policy, self.geom.n_experts, cap, self.geom.transient) catch return error.CacheGeometry;
             p.deinit(self.a);
             p.* = fresh;
         }
@@ -569,4 +738,33 @@ test "dsv41 slot cache: on a pool with an aux ring every read takes the aux tick
         try testing.expect(t + 2 <= pool.demand_tickets);
         try pool.wait(t, 2, 5 * std.time.ns_per_s);
     }
+}
+
+test "dsv41 slot cache: the LRU policy keeps every routed id's rows its record's bytes through evictions, every row residency" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a, 1, 12, &test_comps, 29);
+    defer fx.deinit(a);
+    var pool = try expert_io.Pool.start(a, .{ .workers = 3, .staging_bytes = 4 * std.heap.pageSize(), .tickets = 256 });
+    defer pool.stop();
+    const cache = try Cache.init(a, .{ .n_experts = 12, .policy = .lru, .components = &test_comps, .capacity = &.{2}, .transient = 6 }, .host, pool);
+    defer cache.deinit();
+    const f = try cache.openFile(fx.path);
+    for (0..12) |e| for (0..test_comps.len) |k| cache.setLoc(0, e, k, .{ .file = f, .offset = fx.offsets[e * test_comps.len + k] });
+    try cache.checkLocs();
+    var prng = std.Random.DefaultPrng.init(31);
+    const rnd = prng.random();
+    for (0..40) |_| {
+        var ids: [6]u16 = undefined;
+        for (&ids, 0..) |*d, i| while (true) {
+            d.* = rnd.uintLessThan(u16, 12);
+            if (std.mem.indexOfScalar(u16, ids[i - i % 3 .. i], d.*) == null) break;
+        };
+        var slots: [6]u32 = undefined;
+        try cache.route(0, &ids, &slots);
+        for (ids, slots) |e, slot| for (0..test_comps.len) |k| try testing.expectEqualSlices(u8, fx.part(&test_comps, 12, 0, e, k), cache.row(0, k, slot));
+    }
+    try testing.expect(cache.stats.expert_cache_evictions > 0);
+    // Every load is persistent: the 8 rows (2 + 6) all hold residency.
+    try testing.expectEqual(@as(u64, 0), cache.stats.transient_loads);
+    try testing.expectEqual(@as(usize, 8), cache.policies[0].residents().len);
 }

@@ -17,6 +17,7 @@ const kr = @import("dsv41_kernel_routes.zig");
 const draft_routes = @import("dsv41_draft_routes.zig");
 const xsc = @import("expert_slot_cache.zig");
 const expert_io = @import("expert_io.zig");
+const expert_stream = @import("expert_stream.zig");
 const expert_policy = @import("expert_policy.zig");
 
 /// Bytes of one DSpark head expert (gate, up and down, mxfp4 with one e8m0
@@ -827,6 +828,8 @@ pub const DraftGeometry = struct {
     shapes: [draft_parts.len][2]c_int = undefined,
     caps: [max_draft_stages]u32 = undefined,
     pool: DraftPool = .per_stage,
+    /// The residency policy (construction-time route; shipped by default).
+    policy: xsc.PolicyKind = .shipped,
     n_stages: u32 = 0,
     /// The cache's groups: one per stage, or one shared.
     n_groups: u32 = 0,
@@ -874,7 +877,7 @@ pub const DraftGeometry = struct {
             .shape = sh,
             .dtype = if (k % 2 == 0) .uint32 else .uint8,
         };
-        return .{ .n_experts = d.n_experts, .components = &d.comps, .capacity = d.caps[0..d.n_groups], .transient = d.transient };
+        return .{ .n_experts = d.n_experts, .policy = d.policy, .components = &d.comps, .capacity = d.caps[0..d.n_groups], .transient = d.transient };
     }
 
     /// The bill's term: every group's slot arrays, each rounded to the allocator's page.
@@ -922,12 +925,30 @@ pub const DraftCache = struct {
     n_experts: u32,
     hot: u32,
     cache: *xsc.Cache,
+    /// `cache.stats` at the previous `takeRequestStats` (zero: construction).
+    request_base: expert_stream.Stats = .{},
+
+    /// The statistics since the previous call (the first: since `cache.stats` was last zeroed; the Module zeroes it
+    /// after the seed), for one request's receipt; the cache itself carries over to the next request.
+    pub fn takeRequestStats(self: *DraftCache) expert_stream.Stats {
+        const now = self.cache.stats;
+        var d: expert_stream.Stats = .{};
+        inline for (@typeInfo(expert_stream.Stats).@"struct".field_names) |n| @field(d, n) = @field(now, n) - @field(self.request_base, n);
+        self.request_base = now;
+        return d;
+    }
 
     /// The policy alone, no slot memory and no file (the trace backend's stand-in).
     pub fn planOnly(a: std.mem.Allocator, c: *const v41.Config, hot: u32, pool: DraftPool) !*DraftCache {
+        return planOnlyWith(a, c, hot, pool, .shipped);
+    }
+
+    pub fn planOnlyWith(a: std.mem.Allocator, c: *const v41.Config, hot: u32, pool: DraftPool, policy: xsc.PolicyKind) !*DraftCache {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, pool), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        var geom = try DraftGeometry.of(c, hot, pool);
+        geom.policy = policy;
+        self.* = .{ .a = a, .geom = geom, .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), .none, null);
         return self;
     }
@@ -935,9 +956,15 @@ pub const DraftCache = struct {
     /// The cache at `hot` over `ck`'s shards (each opened past the page cache), every part's place checked against the
     /// header (dtype, shape, inside the file) by name before any read.
     pub fn open(a: std.mem.Allocator, ck: *const v41.Checkpoint, c: *const v41.Config, hot: u32, form: DraftPool, memory: xsc.Memory, pool: ?*expert_io.Pool) !*DraftCache {
+        return openWith(a, ck, c, hot, form, .shipped, memory, pool);
+    }
+
+    pub fn openWith(a: std.mem.Allocator, ck: *const v41.Checkpoint, c: *const v41.Config, hot: u32, form: DraftPool, policy: xsc.PolicyKind, memory: xsc.Memory, pool: ?*expert_io.Pool) !*DraftCache {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, form), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        var geom = try DraftGeometry.of(c, hot, form);
+        geom.policy = policy;
+        self.* = .{ .a = a, .geom = geom, .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
         // The served route reads on its own tickets (the pool's aux ring): no ticket of the stream's demand ring is reused.
         if (memory == .mlx and (pool == null or pool.?.auxTickets() < draft_aux_tickets)) return error.DraftCacheTickets;
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), memory, pool);
@@ -1455,6 +1482,18 @@ test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, 
     try dc.cache.route(0, &.{@intCast(dc.geom.offset_of[1] + 2)}, &slots);
     try testing.expectEqual(miss0 + 1, dc.cache.stats.expert_cache_misses);
     for ([_]u32{ 0, 1, 2 }) |st| try testing.expectEqual(@as(u32, 0), dc.geom.group_of[st]);
+    // Per request: the first take counts from construction (the seed and the route above), the next only its own
+    // routes; the residents carry over (expert 130 hits in request 2).
+    const r1 = dc.takeRequestStats();
+    try testing.expectEqual(dc.cache.stats.expert_cache_misses, r1.expert_cache_misses);
+    try testing.expectEqual(@as(u64, 1), r1.route_calls);
+    var slots2: [2]u32 = undefined;
+    try dc.cache.route(0, &.{ 130, 3 }, &slots2);
+    const r2 = dc.takeRequestStats();
+    try testing.expectEqual(@as(u64, 1), r2.route_calls);
+    try testing.expectEqual(@as(u64, 1), r2.expert_cache_hits);
+    try testing.expectEqual(@as(u64, 1), r2.expert_cache_misses);
+    try testing.expectEqual(r1.expert_cache_misses + 1, dc.cache.stats.expert_cache_misses);
 }
 
 // DSV41_BANK=<bank> (host): stage 0's real records through the cache at 2 hot + 3 transient slots (94 MB of host rows),
@@ -1680,7 +1719,7 @@ test "dsv41 dspark head: DRAFTCACHE replay of recorded draft routes (misses per 
             defer dc.deinit();
             _ = try dc.seedFirstIds();
             var seen: [max_draft_stages * 512]bool = @splat(false);
-            for (0..dc.geom.n_groups) |grp| for (dc.cache.policies[grp].slot_to_expert[0..dc.geom.caps[grp]]) |e| {
+            for (0..dc.geom.n_groups) |grp| for (dc.cache.policies[grp].residents()) |e| {
                 if (e == expert_policy.no_expert) continue;
                 // A group's ids are its stage's (per stage) or global (shared): back to a global id.
                 const g: usize = if (form == .shared) e else grp * ds.experts_per_stage + e;
@@ -1756,4 +1795,45 @@ test "dsv41 dspark head: HEAD_MODE mxfp8 on RCPROJ runs the block's head pass on
     // The head pass is the one extra RCPROJ launch (DRAFTRC's 3 + 3 bf16 calls, then the head at 5 rows); no MLX qmm.
     for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .qmm);
     try testing.expectEqual(@as(usize, 3 + 3 + 1), g.launchesOf(l0, .q3rc_mxfp8_fma));
+}
+
+/// One recorded draft route stream (pass3bz's receipts, `draft_route_stream`): per cycle, per stage, the block's ids.
+const RouteStream = struct { stages: u32, experts_per_stage: u32, cycles: []const []const []const u16 };
+
+/// Total draft misses of `stream` through a shared pool at `hot` under `policy`, from an empty cache (no seed).
+fn replayMisses(a: std.mem.Allocator, c: *const v41.Config, stream: RouteStream, hot: u32, policy: xsc.PolicyKind) !u64 {
+    const dc = try DraftCache.planOnlyWith(a, c, hot, .shared, policy);
+    defer dc.deinit();
+    for (stream.cycles) |cy| for (cy, 0..) |ids, s| {
+        var buf: [expert_policy.max_route_ids]u16 = undefined;
+        for (ids, 0..) |e, i| buf[i] = @intCast(dc.geom.offset_of[s] + e);
+        var slots: [expert_policy.max_route_ids]u32 = undefined;
+        try dc.cache.route(0, buf[0..ids.len], slots[0..ids.len]);
+    };
+    return dc.cache.stats.expert_cache_misses;
+}
+
+test "dsv41 dspark head: DRAFTCACHE policies on the recorded draft routes reproduce the decode lane's replay (shipped and LRU, shared, from empty)" {
+    const a = testing.allocator;
+    const json = try v41.testConfigJson(a, .real);
+    defer a.free(json);
+    const c = try v41.Config.parse(a, json, null);
+    const Want = struct { text: []const u8, hot: u32, shipped: u64, lru: u64 };
+    const fastest = @embedFile("fixtures/dsv41_draft_routes_fastest_20261001.json");
+    const standard = @embedFile("fixtures/dsv41_draft_routes_standard_20261001.json");
+    // The decode lane's replay (decode note sec. 35): the Python oracle of the streamer's policy, LRU at H + 15.
+    for ([_]Want{
+        .{ .text = fastest, .hot = 96, .shipped = 246, .lru = 195 },
+        .{ .text = fastest, .hot = 128, .shipped = 167, .lru = 156 },
+        .{ .text = standard, .hot = 96, .shipped = 424, .lru = 334 },
+        .{ .text = standard, .hot = 128, .shipped = 259, .lru = 229 },
+    }) |w| {
+        const parsed = try std.json.parseFromSlice(RouteStream, a, w.text, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const shipped = try replayMisses(a, &c, parsed.value, w.hot, .shipped);
+        const lru = try replayMisses(a, &c, parsed.value, w.hot, .lru);
+        std.debug.print("DSV41_DRAFT_POLICY_REPLAY {{\"cycles\": {d}, \"hot\": {d}, \"shipped\": {d}, \"lru\": {d}}}\n", .{ parsed.value.cycles.len, w.hot, shipped, lru });
+        try testing.expectEqual(w.shipped, shipped);
+        try testing.expectEqual(w.lru, lru);
+    }
 }
