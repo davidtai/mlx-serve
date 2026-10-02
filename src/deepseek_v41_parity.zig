@@ -1200,7 +1200,7 @@ test "dsv41 host: the host-only tests created no Metal device" {
 
 // Host, bank mode (MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
 // p*.head.logits over the head's first `head_rows` rows>. HEAD_MODE mxfp8 is LOSSY: this reports, against the dump's
-// bf16 logits, the max / rms error and the top-1 agreement of (a) MLX's mxfp8 quantized matmul (today's path) and (b)
+// own logits (the f32 head of the stock levers), the max / rms error and the top-1 agreement of the bf16 head, (a) MLX's mxfp8 quantized matmul (today's path) and (b)
 // the RCPROJ route's numerics on the host (the dequantized codes, x cast to bf16, an f32 product, the bf16 output); the
 // bar is the harness (the bf16 head reproduces the dump) and finite values, not identity.
 test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits (max, rms, top-1)" {
@@ -1240,6 +1240,7 @@ test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits
     const deq = try g.dequantize(q.w, q.s, .mxfp8);
     const deq_t = try g.transpose(try g.astype(deq, .float32));
     try g.evalAll(&.{ q.w, q.s, deq_t });
+    const r32: graph.Routes = .{ .head = .f32 };
     const r16: graph.Routes = .{ .head = .bf16 };
     const r8: graph.Routes = .{ .head = .mxfp8 };
     const Acc = struct {
@@ -1261,7 +1262,7 @@ test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits
             }
         }
     };
-    var acc: [3]Acc = .{ .{}, .{}, .{} };
+    var acc: [4]Acc = .{ .{}, .{}, .{}, .{} };
     var n_rows: u64 = 0;
     var p: usize = 0;
     while (true) : (p += 1) {
@@ -1272,8 +1273,11 @@ test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits
         const m = g.mark();
         defer g.resetTo(m);
         const fin = try g.adopt(try arrayFrom(try v41.readTensor(a, &dump, fk), ft));
-        const want = std.mem.bytesAsSlice(f32, try v41.readTensor(a, &dump, lk));
-        const outs = [3]ops.MlxOps.T{
+        const want_bytes = try v41.readTensor(a, &dump, lk);
+        const want = try a.alloc(f32, want_bytes.len / 4);
+        @memcpy(std.mem.sliceAsBytes(want), want_bytes);
+        const outs = [4]ops.MlxOps.T{
+            try Tr.head(&g, &r32, fin, .{ .dense = dense }),
             try Tr.head(&g, &r16, fin, .{ .dense = dense }),
             try Tr.head(&g, &r8, fin, .{ .mxfp8 = q }),
             try g.astype(try g.astype(try g.matmul(try g.astype(try g.astype(fin, .bfloat16), .float32), deq_t), .bfloat16), .float32),
@@ -1282,14 +1286,14 @@ test "dsv41 parity: the mxfp8 head against the bf16 head on the fixture's logits
             const got = try a.alloc(f32, want.len);
             _ = try g.hostF32(o, got);
             for (got) |v| try testing.expect(std.math.isFinite(v));
-            s.add(@alignCast(want), got, @intCast(rows));
+            s.add(want, got, @intCast(rows));
         }
         n_rows += want.len / rows;
     }
     try testing.expect(n_rows > 0);
-    const names = [_][]const u8{ "bf16_head", "mxfp8_mlx_qmm", "mxfp8_rcproj_host" };
+    const names = [_][]const u8{ "f32_head", "bf16_head", "mxfp8_mlx_qmm", "mxfp8_rcproj_host" };
     for (names, acc) |nm, s| std.debug.print("NATIVE HEAD_MXFP8_FIXTURE {{\"path\": \"{s}\", \"rows\": {d}, \"cols\": {d}, \"max_abs\": {e:.4}, \"rms_rel\": {e:.4}, \"top1_agree\": {d}}}\n", .{ nm, n_rows, rows, s.max_abs, @sqrt(s.se / s.sr), s.top1 });
-    // The harness: the bf16 head reproduces the dump's own logits (same codec, same rows).
+    // The harness: the dump's own head (levers none: f32 x over the bf16 weight) reproduced on the same rows.
     try testing.expectEqual(n_rows, acc[0].top1);
-    try testing.expect(@sqrt(acc[0].se / acc[0].sr) < 1e-3);
+    try testing.expect(@sqrt(acc[0].se / acc[0].sr) < 1e-4);
 }
