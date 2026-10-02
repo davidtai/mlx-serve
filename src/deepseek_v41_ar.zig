@@ -1146,11 +1146,14 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // request k > 1 writes its receipt beside the first (`<out>.req<k>.json`).
     const n_req: u32 = if (envStr("DSV41_CELL_REQUESTS")) |v| std.fmt.parseInt(u32, v, 10) catch return error.CellRequests else 1;
     if (n_req < 1 or n_req > 3) return error.CellRequests;
+    // DSV41_CELL_REQUEST_END=prefill: the shell's end is skipped (an errored request that never reached finishSlot), so
+    // the next request's prefill runs the pending reverse change on its own clock.
+    const end_at_prefill = if (envStr("DSV41_CELL_REQUEST_END")) |v| (if (std.mem.eql(u8, v, "prefill")) true else if (std.mem.eql(u8, v, "end")) false else return error.CellRequestEnd) else false;
     for (0..n_req) |k| {
         if (k > 0) {
             const t_end = std.Io.Timestamp.now(io, .boot);
-            try md.requestEnd();
-            const end_ms = @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
+            if (!end_at_prefill) try md.requestEnd();
+            const end_ms: ?f64 = if (end_at_prefill) null else @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
             const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k, .request_end_ms = end_ms, .reverse = md.reverse_change }, .{});
             std.debug.print("NATIVE DSV41_REQUEST_END {s}\n", .{rj});
             marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
