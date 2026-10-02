@@ -1118,6 +1118,8 @@ const CellReceipt = struct {
     prefill_input_release: ?bool = null,
     /// The shared expert's middle at prompt widths as installed: "compiled" or "eager".
     prefill_shared_mid: ?[]const u8 = null,
+    /// The prompt-width HC combines as installed: "fused" (one pass) or "region" (the compiled HcPost).
+    prefill_hcpost: ?[]const u8 = null,
     /// P1's predictor GEMM in bf16 (installed): the gate as stored, not its f32 copy.
     predict_bf16: ?bool = null,
     /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
@@ -1597,6 +1599,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .input_stream_early_release = md.installed.input_stream_early_release,
         .prefill_input_release = md.installed.prefill_input_release,
         .prefill_shared_mid = if (md.installed.prefill_shared_mid) "compiled" else "eager",
+        .prefill_hcpost = if (md.installed.prefill_hcpost) "fused" else "region",
         .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
@@ -1712,6 +1715,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_MEMOS")) |v| ov.decode_memos = try cellBool("DSV41_CELL_DECODE_MEMOS", v);
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
     if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
+    if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);

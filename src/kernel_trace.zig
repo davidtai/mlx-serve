@@ -274,7 +274,7 @@ pub fn isDecode2(e: *const Entry) bool {
 
 /// The prefill batch 2 families (their routes' own test covers them).
 pub fn isPrefill2(e: *const Entry) bool {
-    inline for (.{ "pf_idxscore", "pf_attn_core", "pf_hcnorm", "pf_smallk", "pf_joinless" }) |f| {
+    inline for (.{ "pf_idxscore", "pf_attn_core", "pf_hcnorm", "pf_smallk", "pf_joinless", "pf_hcpost" }) |f| {
         if (std.mem.eql(u8, e.family, f)) return true;
     }
     return false;

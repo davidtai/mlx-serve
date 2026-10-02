@@ -122,6 +122,8 @@ pub const RouteOverrides = struct {
     prefill_input_release: ?bool = null,
     /// The shared expert's middle compiled (C22's region) at prompt widths. null: the default, off.
     prefill_shared_mid: ?bool = null,
+    /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
+    prefill_hcpost: ?bool = null,
     /// P1's predictor GEMM on the gate as stored (bf16) instead of an f32 copy; exact outputs (it only chooses reads).
     predict_bf16: ?bool = null,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
@@ -653,6 +655,7 @@ pub const Module = struct {
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
+        if (ov.prefill_hcpost) |v| tier.routes.prefill_hcpost = v;
         // The release frees the inputs the combine would read without the host shared experts and JOINLESS.
         if (tier.routes.prefill_input_release and (!tier.routes.prefill_host_shared or !tier.routes.prefill_joinless))
             return refused(refuse(&diag, error.InputReleaseRoute, "prefill input release needs the host shared experts and JOINLESS", .{}), &diag);
@@ -679,7 +682,7 @@ pub const Module = struct {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
         }
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
             // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
@@ -709,6 +712,7 @@ pub const Module = struct {
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
+        self.installed.prefill_hcpost = self.model.tier.routes.prefill_hcpost;
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
@@ -719,6 +723,7 @@ pub const Module = struct {
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
+        if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)", .{});
         if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)", .{});
         if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)", .{});
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
@@ -1731,6 +1736,8 @@ pub const Installed = struct {
     prefill_input_release: bool = false,
     /// The shared expert's middle compiled at prompt widths, as installed.
     prefill_shared_mid: bool = false,
+    /// PREFILL_HCPOST's one-pass combine, as installed (past its construction check).
+    prefill_hcpost: bool = false,
     /// P1's predictor GEMM in bf16, as installed.
     predict_bf16: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).

@@ -193,6 +193,10 @@ pub const Routes = struct {
     /// above rc_max_rows); decode widths keep their own route (`shared_mid`). The device probe found the region equal
     /// to the op chain word for word at 953 and 183 f32 rows (kbench hcpostx1ff57a9e, SHAREDMIDX).
     prefill_shared_mid: bool = false,
+    /// PREFILL_HCPOST: both HC combines at prompt widths (rows above rc_max_rows) in one pass (`kr.HcPostTf32`) instead
+    /// of the compiled HcPost region, its words by construction on the region's numerics (needs prefill_hc_post: the
+    /// region is the reference, checked at construction); decode widths keep their routes.
+    prefill_hcpost: bool = false,
     /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
     /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
     predict_bf16: bool = false,
@@ -380,6 +384,8 @@ pub fn LayerKernels(comptime G: type) type {
         hc_norm: [2]?*const kr.HcNorm(G) = .{ null, null },
         combine: ?*const kr.SmallKCombine(G) = null,
         joinless: ?*const kr.JoinlessCombine(G) = null,
+        /// PREFILL_HCPOST's one-pass combine (both sites, prompt widths).
+        hcpost: ?*const kr.HcPostTf32(G) = null,
         /// C27-C29 / C23 at rows <= 8: this layer's M-invariant sites, the select, the softmax.
         minv: ?*const MinvSites(G) = null,
         decode_topk: ?*const kr.IndexTopk(G) = null,
@@ -434,13 +440,14 @@ pub fn Trunk(comptime G: type) type {
             hc_norm: [2]?kr.HcNorm(G) = .{ null, null },
             combine: ?kr.SmallKCombine(G) = null,
             joinless: ?kr.JoinlessCombine(G) = null,
+            hcpost: ?kr.HcPostTf32(G) = null,
             /// C28 / C29, per layer: the M-invariant sites; C27 the verify select; C23 the softmax.
             minv: std.ArrayList(MinvSites(G)) = .empty,
             decode_topk: ?kr.IndexTopk(G) = null,
             attn_softmax: ?kr.AttnSoftmax(G) = null,
 
             pub fn needed(rt: *const Routes) bool {
-                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index or rt.prefill_hc or rt.prefill_combine or rt.prefill_joinless or rt.rc_smallm or rt.rc_mxfp8_rows or rt.rc_index_topk or rt.rc_attn_softmax;
+                return rt.rc_sinkhorn or rt.rc_router or rt.rc_premix or rt.rc_proj or rt.rc_tape or rt.rc_fused_proj or rt.rc_head or rt.prefill_attn or rt.prefill_index or rt.prefill_hc or rt.prefill_combine or rt.prefill_joinless or rt.prefill_hcpost or rt.rc_smallm or rt.rc_mxfp8_rows or rt.rc_index_topk or rt.rc_attn_softmax;
             }
 
             /// `layers`: the model's bound layer weights (the router and premix routes keep
@@ -528,6 +535,11 @@ pub fn Trunk(comptime G: type) type {
                     const geo = prefillGeometry(c);
                     k.joinless = try kr.JoinlessCombine(G).init(reg, &geo, null);
                 }
+                if (rt.prefill_hcpost) {
+                    if (!rt.prefill_hc_post) return error.HcPostNeedsRegion;
+                    const geo = prefillGeometry(c);
+                    k.hcpost = try kr.HcPostTf32(G).init(reg, &geo, null);
+                }
                 if (rt.rc_smallm or rt.rc_mxfp8_rows) {
                     // The sites' x is the bf16 stream at these rows (C14 keeps it bf16).
                     if (!rt.rc_proj) return error.MinvNeedsProj;
@@ -605,6 +617,7 @@ pub fn Trunk(comptime G: type) type {
                     .hc_norm = .{ if (self.hc_norm[0]) |*x| x else null, if (self.hc_norm[1]) |*x| x else null },
                     .combine = if (self.combine) |*x| x else null,
                     .joinless = if (self.joinless) |*x| x else null,
+                    .hcpost = if (self.hcpost) |*x| x else null,
                     .minv = if (self.minv.items.len > 0) &self.minv.items[l] else null,
                     .decode_topk = if (self.decode_topk) |*x| x else null,
                     .attn_softmax = if (self.attn_softmax) |*x| x else null,
@@ -1549,6 +1562,19 @@ pub fn Trunk(comptime G: type) type {
                 out[n] = .{ .name = "MoE combine", .ok = try checkClose(g, try cb.call(g, ro, wt, sh), try moeCombine(g, ro, wt, sh), 1e-3) };
                 n += 1;
             }
+            if (kx.hcpost) |*hp| {
+                // PREFILL_HCPOST: the one-pass combine == the compiled region, every element, on both residual dtypes.
+                for ([_]Dtype{ .float32, .bfloat16 }) |rdt| {
+                    const x = try checkFill(g, r, scratch, &.{ 1, S, dim }, 4.0, .float32);
+                    const res = try checkFill(g, r, scratch, &.{ 1, S, hc, dim }, 4.0, rdt);
+                    const post = try g.add(try checkFill(g, r, scratch, &.{ 1, S, hc }, 1.0, .float32), try g.scalar(1.0, .float32));
+                    const comb = try g.add(try checkFill(g, r, scratch, &.{ 1, S, hc, hc }, 0.5, .float32), try g.scalar(0.5, .float32));
+                    var want: [1]T = undefined;
+                    try g.tape(HcPost, c, &.{ x, res, post, comb }, &want);
+                    out[n] = .{ .name = if (rdt == .float32) "HC post, f32 residual" else "HC post, bf16 residual", .ok = try checkEqual(g, try hcPostFused(g, hp, x, res, post, comb), want[0]) };
+                    n += 1;
+                }
+            }
             return n;
         }
 
@@ -2173,6 +2199,7 @@ pub fn Trunk(comptime G: type) type {
         /// `hcFfnPrep` at prompt widths with the attention HC post compiled (HCPOST: HcPost's region, prepared at
         /// construction): the eager chain's ops in one region; the ffn mixes and pre-norm follow as there.
         pub fn hcFfnPrepCompiledPost(g: *G, c: *const v41.Config, lk: LK, attn_out: T, residual: T, attn_pre: T, attn_post: T, attn_comb: T, fnw: T, base: T, scale: T, norm_w: T) ![5]T {
+            if (lk.hcpost) |hp| return hcFfnFrom(g, c, lk, try hcPostFused(g, hp, attn_out, residual, attn_post, attn_comb), attn_pre, fnw, base, scale, norm_w);
             var o: [1]T = undefined;
             try g.tape(HcPost, c, &.{ attn_out, residual, attn_post, attn_comb }, &o);
             return hcFfnFrom(g, c, lk, o[0], attn_pre, fnw, base, scale, norm_w);
@@ -2213,6 +2240,7 @@ pub fn Trunk(comptime G: type) type {
                 return g.reshape(h, &.{ d.b, d.s, d.hc, d.dim });
             };
             const rows = rowsOf(g, residual, 2);
+            if (lk.hcpost) |hp| if (rows > rc_max_rows) return hcPostFused(g, hp, x, residual, post, comb);
             if (rows <= rt.hc_rows or (rt.prefill_hc_post and rows > rc_max_rows)) {
                 var o: [1]T = undefined;
                 try g.tape(HcPost, c, &.{ x, residual, post, comb }, &o);
@@ -2379,8 +2407,19 @@ pub fn Trunk(comptime G: type) type {
             return combineWide(g, lk, ro, weights, shared);
         }
 
-        /// `_PREFILL_HC_POST`: K16's ffn combine, always the compiled `_hc_post_impl`.
-        pub fn prefillHcPost(g: *G, c: *const v41.Config, mo: T, half: Half) !T {
+        /// PREFILL_HCPOST: x [b, s, dim], residual [b, s, hc, dim], post [b, s, hc], comb [b, s, hc, hc] through the
+        /// one-pass combine (rows flattened) -> [b, s, hc, dim] f32.
+        fn hcPostFused(g: *G, hp: *const kr.HcPostTf32(G), x: T, residual: T, post: T, comb: T) !T {
+            const rs = g.shapeOf(residual);
+            const m = rs.d[0] * rs.d[1];
+            const h = try hp.call(g, try g.reshape(x, &.{ m, rs.d[3] }), try g.reshape(residual, &.{ m, rs.d[2], rs.d[3] }), try g.reshape(post, &.{ m, rs.d[2] }), try g.reshape(comb, &.{ m, rs.d[2] * rs.d[2] }));
+            return g.reshape(h, rs.slice());
+        }
+
+        /// `_PREFILL_HC_POST`: K16's ffn combine, always the compiled `_hc_post_impl` (PREFILL_HCPOST's one pass above
+        /// rc_max_rows when bound).
+        pub fn prefillHcPost(g: *G, c: *const v41.Config, lk: LK, mo: T, half: Half) !T {
+            if (lk.hcpost) |hp| if (rowsOf(g, half.h1, 2) > rc_max_rows) return hcPostFused(g, hp, mo, half.h1, half.post, half.comb);
             var o: [1]T = undefined;
             try g.tape(HcPost, c, &.{ mo, half.h1, half.post, half.comb }, &o);
             return o[0];
@@ -3799,7 +3838,7 @@ fn k16HcPostTraces(rt: *const Routes, widths: []const c_int) !usize {
             const half = try Tr.attnAndMoeInput(&g, NoProbe{}, &c, rt, .{}, li, w, inv, h, pm, try g.arange(0, @floatFromInt(s), 1, .int32), &cache, &shared);
             // The combine's x at the MoE input's dtype (f32: the stream dtype of h1), as forwardLayerMajor casts it.
             try testing.expectEqual(Dtype.float32, g.dtypeOf(half.moe_in));
-            h = try Tr.prefillHcPost(&g, &c, try g.input(g.shapeOf(half.moe_in).slice(), g.dtypeOf(half.moe_in)), half);
+            h = try Tr.prefillHcPost(&g, &c, .{}, try g.input(g.shapeOf(half.moe_in).slice(), g.dtypeOf(half.moe_in)), half);
             try testing.expectEqual(Dtype.float32, g.dtypeOf(h));
             pm = half.ffn_pre;
         }
@@ -3866,6 +3905,64 @@ test "dsv41 graph: HCPOST compiles both HC posts above 8 rows over the eager ops
     const span = [_]c_int{ 16, 16, 12 };
     try testing.expectEqual(@as(usize, 0), try spanHcPostTraces(&.{}, &span));
     try testing.expectEqual(@as(usize, 4), try spanHcPostTraces(&.{ .prefill_hc_post = true }, &span));
+}
+
+test "dsv41 graph: PREFILL_HCPOST runs both HC combines above 8 rows as one launch (the f32 or bf16 residual text), checked against the region; 8 rows and below keep their routes" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    var ws: [v41.max_layers]LayerW(u32) = undefined;
+    for (0..c.n_layers) |l| ws[l] = try traceLayerW(&g, &c, c.layers[l]);
+    // The region is the reference: refused without it.
+    try testing.expectError(error.HcPostNeedsRegion, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &.{ .prefill_hcpost = true }, ws[0..c.n_layers]));
+    const rt: Routes = .{ .prefill_hc_post = true, .prefill_hcpost = true };
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, ws[0..c.n_layers]);
+    defer k.deinit(&g);
+    try Tr.prepareRegions(&g, &c, &rt, true);
+    const lk = k.at(1);
+    try testing.expect(lk.hcpost != null);
+    const hc: c_int = @intCast(c.hc_mult);
+    const dim: c_int = @intCast(c.hidden_size);
+    for ([_]c_int{ 953, 183, 9 }) |S| for ([_]ops.Dtype{ .float32, .bfloat16 }) |rdt| {
+        const x = try g.input(&.{ 1, S, dim }, .float32);
+        const res = try g.input(&.{ 1, S, hc, dim }, rdt);
+        const post = try g.input(&.{ 1, S, hc }, .float32);
+        const comb = try g.input(&.{ 1, S, hc, hc }, .float32);
+        const l0 = g.launched.items.len;
+        const n0 = g.nodes.items.len;
+        const half: Tr.Half = .{ .moe_in = x, .h1 = res, .post = post, .comb = comb, .ffn_pre = post };
+        const a = try Tr.prefillHcPost(&g, &c, lk, x, half);
+        const b = try Tr.hcPostRoute(&g, &c, &rt, lk, x, res, post, comb);
+        for ([_]u32{ a, b }) |h| {
+            try testing.expect(g.shapeOf(h).eql(ops.Shape.of(&.{ 1, S, hc, dim })));
+            try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(h));
+        }
+        _ = l0;
+        var kernels: usize = 0;
+        for (g.nodes.items[n0..]) |nd| kernels += @intFromBool(nd.op == .kernel);
+        try testing.expectEqual(@as(usize, 2), kernels);
+        try testing.expect(noneOf(&g, n0, .tape_begin));
+    };
+    // 8 rows and below: no launch (the region or the decode tape / chain, as before).
+    {
+        const S: c_int = 8;
+        const res = try g.input(&.{ 1, S, hc, dim }, .float32);
+        const x = try g.input(&.{ 1, S, dim }, .float32);
+        const n0 = g.nodes.items.len;
+        _ = try Tr.prefillHcPost(&g, &c, lk, x, .{ .moe_in = x, .h1 = res, .post = try g.input(&.{ 1, S, hc }, .float32), .comb = try g.input(&.{ 1, S, hc, hc }, .float32), .ffn_pre = x });
+        try testing.expect(noneOf(&g, n0, .kernel));
+    }
+    // The construction check: the one-pass combine against the region on both residual dtypes.
+    const scratch = try testing.allocator.alloc(f32, 64 * 64 * 512);
+    defer testing.allocator.free(scratch);
+    var checks: [16]Tr.RouteCheck = undefined;
+    const n = try Tr.prefillRoutesCheck(&g, &c, &rt, &k, ws[0..c.n_layers], scratch, &checks);
+    var found: usize = 0;
+    for (checks[0..n]) |ck| found += @intFromBool(std.mem.endsWith(u8, ck.name, "residual") and std.mem.startsWith(u8, ck.name, "HC post"));
+    try testing.expectEqual(@as(usize, 2), found);
 }
 
 test "dsv41 graph: PREFILL_SHAREDMID compiles the shared middle above 8 rows over the eager ops; 8 rows and below keep their chain" {

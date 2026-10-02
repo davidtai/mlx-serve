@@ -206,6 +206,12 @@
    "file": "header_dig_mul1h_k3_lut.metal",
    "id": "dig_mul1h_k3_lut",
    "sha256": "4f3e5c1c8a87a467a056d45c7ca692f8064ed493dee953bb199fdb2bb8cc4fac"
+  },
+  {
+   "bytes": 415,
+   "file": "header_hcpost_tf32.metal",
+   "id": "hcpost_tf32",
+   "sha256": "587e93efb8bc549ae326f7cf713fc5ee93f60d228df513f1ee2e798780113485"
   }
  ],
  "kernels": [
@@ -50254,6 +50260,571 @@
      "name": "cap"
     }
    ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "pf_hcpost",
+   "grid": [
+    {
+     "m": 1280,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": {
+    "bytes": 415,
+    "file": "header_hcpost_tf32.metal",
+    "id": "hcpost_tf32",
+    "sha256": "587e93efb8bc549ae326f7cf713fc5ee93f60d228df513f1ee2e798780113485"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "res",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "post",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "comb",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 16
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "the compiled HcPost region (graph.zig Trunk.HcPost: the einsum on MLX NAX f32 (TF32) + the fused tail)",
+    "native": "mlx-serve dsv41-model prefill lane (2026-10-02): kbench hcpostx2553b18r2: trunc_pair_ftzp == the region word for word on f32 953 / 183 rows, the bf16 layer-0 residual, a +-2^40 exponent range and a 2 % denormal-edge mix; an input whose products are ALL below 2^-126 is not covered"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "8928485690d142f3c8e022c6527040d19dfd550fd4c95ee7e940fece9f917946",
+     "symbol": "mlx-serve native text (dsv41-model prefill lane, 2026-10-02): the HC combine in one pass on the NAX GEMM numerics (TF32 truncation, products flushed below 2^-126, pairwise sum, mul-then-add tail)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1280,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      42240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       33,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 33
+      }
+     ]
+    },
+    {
+     "grid": [
+      1219840,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       953,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 953
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_hcpost_tf32",
+   "notes": "x f32 [n, 5120], res [n, 4, 5120] (f32, or bf16 on layer 0), post f32 [n, 4], comb f32 [n, 16] (comb[j, k] at j * 4 + k) -> h f32 [n, 4, 5120] = post[k] x + sum_j comb[j, k] res[j]; one thread per 4 columns of a row",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "h",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "the model construction check (Trunk.prefillRoutesCheck): the kernel == the compiled HcPost region word for word at prompt rows, both residual dtypes, refused on any mismatch",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1183,
+    "file": "dsv41_hcpost_tf32.metal",
+    "sha256": "8928485690d142f3c8e022c6527040d19dfd550fd4c95ee7e940fece9f917946"
+   },
+   "template": [
+    {
+     "int": 5120,
+     "name": "D"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "hcpost"
+   ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "pf_hcpost",
+   "grid": [
+    {
+     "m": 1280,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": {
+    "bytes": 415,
+    "file": "header_hcpost_tf32.metal",
+    "id": "hcpost_tf32",
+    "sha256": "587e93efb8bc549ae326f7cf713fc5ee93f60d228df513f1ee2e798780113485"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "x",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "res",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "post",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "comb",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 16
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "the compiled HcPost region (graph.zig Trunk.HcPost: the einsum on MLX NAX f32 (TF32) + the fused tail)",
+    "native": "mlx-serve dsv41-model prefill lane (2026-10-02): kbench hcpostx2553b18r2: trunc_pair_ftzp == the region word for word on f32 953 / 183 rows, the bf16 layer-0 residual, a +-2^40 exponent range and a 2 % denormal-edge mix; an input whose products are ALL below 2^-126 is not covered"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "8928485690d142f3c8e022c6527040d19dfd550fd4c95ee7e940fece9f917946",
+     "symbol": "mlx-serve native text (dsv41-model prefill lane, 2026-10-02): the HC combine in one pass on the NAX GEMM numerics (TF32 truncation, products flushed below 2^-126, pairwise sum, mul-then-add tail)"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1280,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      42240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       33,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 33
+      }
+     ]
+    },
+    {
+     "grid": [
+      1219840,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       953,
+       4,
+       5120
+      ]
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "rows",
+       "value": 953
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_hcpost_tf32__rbf16",
+   "notes": "x f32 [n, 5120], res [n, 4, 5120] (f32, or bf16 on layer 0), post f32 [n, 4], comb f32 [n, 16] (comb[j, k] at j * 4 + k) -> h f32 [n, 4, 5120] = post[k] x + sum_j comb[j, k] res[j]; one thread per 4 columns of a row",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "h",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "the model construction check (Trunk.prefillRoutesCheck): the kernel == the compiled HcPost region word for word at prompt rows, both residual dtypes, refused on any mismatch",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 1183,
+    "file": "dsv41_hcpost_tf32.metal",
+    "sha256": "8928485690d142f3c8e022c6527040d19dfd550fd4c95ee7e940fece9f917946"
+   },
+   "template": [
+    {
+     "int": 5120,
+     "name": "D"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "hcpost"
+   ],
+   "variant": {
+    "key": {
+     "input_dtypes": [
+      "float32",
+      "bfloat16",
+      "float32",
+      "float32"
+     ],
+     "template": [
+      {
+       "int": 5120,
+       "name": "D"
+      }
+     ],
+     "text_sha256": "8928485690d142f3c8e022c6527040d19dfd550fd4c95ee7e940fece9f917946"
+    },
+    "mlx_name": "dsv41_hcpost_tf32",
+    "of": "dsv41_hcpost_tf32"
+   },
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -51086,6 +51657,111 @@
     "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1"
    ],
    "manifest_sha256": "4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3",
+    "joinless",
+    "dig_mul1h_k3_lut"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine",
+    "q3jl_combine",
+    "dsv41_prefill_dig_take2v_5120",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1",
+    "dsv41_exl3_pair_k3_5120",
+    "dsv41_exl3_guone_k3_2304"
+   ],
+   "manifest_sha256": "97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15",
+   "widened": []
   }
  ],
  "sources": {

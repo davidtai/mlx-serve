@@ -90,6 +90,8 @@ pub const kernels = [_]Kernel{
     .q3pf_hc_pre_norm__f32,
     .q3sk_combine,
     .q3jl_combine,
+    .dsv41_hcpost_tf32,
+    .dsv41_hcpost_tf32__rbf16,
 };
 
 /// The arch's kernel acceptance, once per backend before its routes are built: this subset's
@@ -1190,6 +1192,34 @@ pub fn SmallKCombine(comptime G: type) type {
     };
 }
 
+/// PREFILL_HCPOST: the Hyper-Connection combine (`_hc_post_impl`) at prompt widths in one pass, on the compiled HcPost
+/// region's words: the einsum's NAX f32 GEMM numerics (TF32-truncated operands, each product flushed to a signed zero
+/// below 2^-126, the K = 4 terms summed in pairs) and the region's tail (post x, then + mixed). Exactness domain
+/// (kbench hcpostx2553b18r2): word for word on every normal-range and mixed-edge input tested; an input whose products
+/// all fall below 2^-126 is not covered (not seen: comb >= ~1e-7). The model checks it against the region at
+/// construction.
+pub fn HcPostTf32(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        f32_res: *const Entry,
+        bf16_res: *const Entry,
+
+        pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
+            try geo.admit("dsv41_hcpost_tf32", diag);
+            return .{ .f32_res = reg.get(.dsv41_hcpost_tf32), .bf16_res = reg.get(.dsv41_hcpost_tf32__rbf16) };
+        }
+
+        /// x f32 [n, 5120], res [n, 4, 5120] (f32; bf16 on layer 0's stream), post f32 [n, 4], comb f32 [n, 16]
+        /// (`...jk` flattened) -> f32 [n, 4, 5120].
+        pub fn call(self: *const Self, g: *G, x: G.T, res: G.T, post: G.T, comb: G.T) !G.T {
+            const e = if (g.dtypeOf(res) == .bfloat16) self.bf16_res else self.f32_res;
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, e, &rowsVars(rowsOf(G, g, x, 0)), &.{ x, res, post, comb }, &out);
+            return out[0];
+        }
+    };
+}
+
 /// JOINLESS (`q3_prefill_joinless_candidate.JoinlessKernel`): SMALLK's combine reading each routed row
 /// from the fused call output that computed it, through a per-assignment (source, row) table, so the
 /// joined [n, 6, 5120] routed array is never built. Exact (the same f32 words, SMALLK's fold order).
@@ -1653,6 +1683,17 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             const routed, const w, const sh = .{ try t.node(&.{ n, 6, 5120 }, .float32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
             _ = try r.call(&t, routed, w, sh);
             try expectLaunch(t.back(1), e, s, &.{ routed, w, sh });
+        }
+    }
+    // PREFILL_HCPOST: x, res, post, comb at each sample's rows; the residual's dtype picks the text
+    for ([_]xk.Kernel{ .dsv41_hcpost_tf32, .dsv41_hcpost_tf32__rbf16 }) |k| {
+        const e = reg.get(k);
+        const r = try HcPostTf32(Trace).init(&reg, &.derived, null);
+        for (e.samples) |*s| {
+            const n: c_int = @intCast(s.vars.get(.rows));
+            const x, const res, const post, const comb = .{ try t.node(&.{ n, 5120 }, .float32, &.{}), try t.node(&.{ n, 4, 5120 }, if (k == .dsv41_hcpost_tf32) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 4 }, .float32, &.{}), try t.node(&.{ n, 16 }, .float32, &.{}) };
+            _ = try r.call(&t, x, res, post, comb);
+            try expectLaunch(t.back(1), e, s, &.{ x, res, post, comb });
         }
     }
     // INDEX_TOPK's select at a prefill chunk's rows (the same entry, per call)

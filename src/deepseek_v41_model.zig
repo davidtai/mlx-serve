@@ -915,7 +915,7 @@ pub fn Model(comptime G: type) type {
                         pos += nk;
                         const mo = try g.reshape(try g.astype(y, mo_dt[k - i]), mo_shape[k - i].slice());
                         try probe.put("moe.y", mo);
-                        const next = try Tr.prefillHcPost(g, c, mo, halves[k]);
+                        const next = try Tr.prefillHcPost(g, c, self.kx.at(l), mo, halves[k]);
                         try probe.put("out.h", next);
                         if (!rt.input_stream_early_release) g.release(hs[k]);
                         hs[k] = g.keep(next);
