@@ -423,6 +423,8 @@ pub const ModelConfig = struct {
     /// A streamed-expert model's routed waves wait on the reads' events instead of the host (the
     /// `expert_event_gates` model setting; null = the arch's default).
     expert_event_gates: ?bool = null,
+    /// deepseek_v41: the read pool threads' scheduling (`expert_reader_sched` model setting; null = off).
+    expert_reader_sched: ?@import("model_settings.zig").ReaderSched = null,
     /// A module-owned arch's numerics, chosen at construction (the `numeric_tier` model setting; null = served).
     numeric_tier: ?@import("model_settings.zig").NumericTier = null,
     /// A module-owned arch's prompt pass layer by layer (the `layer_major_prefill` model setting; null = off).

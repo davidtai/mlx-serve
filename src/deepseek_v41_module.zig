@@ -45,6 +45,7 @@ const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_bank = @import("expert_bank.zig");
 const expert_event = @import("expert_event.zig");
+const expert_io = @import("expert_io.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
 comptime {
@@ -162,6 +163,12 @@ pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
     if (v > envelope.decode_cache_bytes) return error.DecodeCacheLimit;
     return v;
+}
+
+/// The read pool's scheduling the Module installs, the server's and a harness's alike (the `expert_reader_sched` model
+/// setting on the shell's config; off by default): handed to the pool at its start.
+pub fn readerSched(config: *const model_io.ModelConfig) expert_io.Sched {
+    return config.expert_reader_sched orelse .{};
 }
 
 /// The host relief route the Module installs (off by default).
@@ -536,6 +543,12 @@ pub const Module = struct {
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
         log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
         log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
+        self.installed.reader_sched = readerSched(config);
+        {
+            const rs = self.installed.reader_sched;
+            var nb: [24]u8 = undefined;
+            log.info("NATIVE reader scheduling: {s} (threads {s}; spin {s}; speculative chunks {s})", .{ rs.name(&nb), if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)" });
+        }
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
@@ -679,6 +692,7 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
+        opts.pool.sched = readerSched(config);
         const warm = firstVerifyWarm(self.overrides);
         opts.first_verify_warm = if (warm) .{} else null;
         var wide = wideRoute(config);
@@ -1235,6 +1249,8 @@ pub const Installed = struct {
     phase_change_settle: PhaseChangeSettle = .until_freed,
     /// The phase change's host relief, as installed (`hostRelief`).
     host_relief: bool = false,
+    /// The read pool's scheduling, as installed at its start (`readerSched`).
+    reader_sched: expert_io.Sched = .{},
     /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
     draft_cache_hot: ?u32 = null,
     /// DRAFTCACHE's pool form, as installed (null: the route off).
@@ -2608,4 +2624,13 @@ test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) a
     try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
     try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
     try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
+}
+
+test "dsv41 module: the reader scheduling is off by default and follows the shell's model setting" {
+    var c: model_io.ModelConfig = undefined;
+    c.expert_reader_sched = null;
+    try std.testing.expectEqual(expert_io.Sched{}, readerSched(&c));
+    try std.testing.expectEqual(expert_io.Sched{}, (Installed{}).reader_sched);
+    c.expert_reader_sched = .{ .qos = true, .demand_first = true };
+    try std.testing.expectEqual(expert_io.Sched{ .qos = true, .demand_first = true }, readerSched(&c));
 }

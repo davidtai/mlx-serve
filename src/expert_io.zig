@@ -41,6 +41,7 @@ const c = if (@import("build_options").macos_engines) struct {
     extern fn q3ld_warm_cancel(first: i64, count: i64) i64;
     extern fn q3ld_monotonic_ns() i64;
     extern fn q3ld_abi() i32;
+    extern fn q3ld_sched_config(mode: i32) c_int;
     extern fn q3ld_counters_n() i32;
     extern fn q3ld_max_spec() i32;
     extern fn q3ld_max_pre() i32;
@@ -52,7 +53,7 @@ const c = if (@import("build_options").macos_engines) struct {
     extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else @import("expert_io_stub.zig").q3ld;
 
-pub const abi_version = 2026100101;
+pub const abi_version = 2026100201;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -165,8 +166,12 @@ pub const Spec = struct {
 /// `busy_max` jobs run, on `tickets` tickets of their own at the top of the ring (demand wraps below them).
 pub const Warm = struct { tickets: u32, busy_max: u32 };
 
+/// The pool's scheduling, fixed at start (`reader_sched.zig`).
+pub const Sched = @import("reader_sched.zig").Sched;
+
 pub const Options = struct {
     workers: u32 = 4,
+    sched: Sched = .{},
     /// One page-aligned staging buffer per worker; 9 MiB holds a whole
     /// 8,877,056-byte gate/up span plus its page alignment.
     staging_bytes: u64 = 9 << 20,
@@ -256,6 +261,7 @@ pub const Pool = struct {
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
+        if (c.q3ld_sched_config(testSched(opt.sched).bits()) != 0) return error.PoolUnavailable;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
@@ -459,6 +465,14 @@ pub const Pool = struct {
         }
     }
 };
+
+/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts at that value, so the
+/// stream's bank tests prove each value reads the same bytes into the same rows.
+fn testSched(s: Sched) Sched {
+    if (comptime !@import("builtin").is_test) return s;
+    const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
+    return Sched.parse(std.mem.span(v)) orelse s;
+}
 
 /// The reader's monotonic clock (ns), the one its result words use.
 pub fn monotonicNs() i64 {
@@ -1154,4 +1168,121 @@ test "dsv41 io: the event class refuses a pool without it and bad arguments" {
     try testing.expectError(error.EventRefused, pool.armEvent(.host, 0, std.time.ns_per_s, 0));
     // The pre-read class needs the speculative class.
     try testing.expectError(error.PreReadRefused, pool.armPreRead(&spec_lens));
+}
+
+/// The pool threads as the kernel sees them (tests): each thread's QoS class and name.
+const ThreadProbe = struct {
+    const mach_port_t = u32;
+    extern "c" var mach_task_self_: mach_port_t;
+    extern "c" fn task_threads(task: mach_port_t, list: *[*]mach_port_t, count: *u32) c_int;
+    extern "c" fn pthread_from_mach_thread_np(port: mach_port_t) ?std.c.pthread_t;
+    extern "c" fn pthread_get_qos_class_np(t: std.c.pthread_t, qos: *c_uint, rel: *c_int) c_int;
+    extern "c" fn pthread_getname_np(t: std.c.pthread_t, name: [*]u8, len: usize) c_int;
+    extern "c" fn pthread_self() std.c.pthread_t;
+
+    const user_interactive: c_uint = 0x21;
+    const utility: c_uint = 0x11;
+
+    const Seen = struct { demand: u32 = 0, demand_ui: u32 = 0, spec: u32 = 0, spec_utility: u32 = 0, watchdog: u32 = 0, watchdog_ui: u32 = 0, named: u32 = 0 };
+
+    fn qosOf(t: std.c.pthread_t) c_uint {
+        var q: c_uint = 0;
+        var rel: c_int = 0;
+        _ = pthread_get_qos_class_np(t, &q, &rel);
+        return q;
+    }
+
+    /// Every thread named q3ld-* with its QoS; printed one line each (QOSPROBE).
+    fn scan(label: []const u8) Seen {
+        var list: [*]mach_port_t = undefined;
+        var n: u32 = 0;
+        var s: Seen = .{};
+        if (task_threads(mach_task_self_, &list, &n) != 0) return s;
+        for (list[0..n]) |port| {
+            const t = pthread_from_mach_thread_np(port) orelse continue;
+            var name: [64]u8 = @splat(0);
+            _ = pthread_getname_np(t, &name, name.len);
+            const nm = std.mem.sliceTo(&name, 0);
+            if (!std.mem.startsWith(u8, nm, "q3ld-")) continue;
+            const q = qosOf(t);
+            std.debug.print("QOSPROBE {s}: \"{s}\" qos 0x{x}\n", .{ label, nm, q });
+            s.named += 1;
+            if (std.mem.startsWith(u8, nm, "q3ld-demand-")) {
+                s.demand += 1;
+                s.demand_ui += @intFromBool(q == user_interactive);
+            } else if (std.mem.startsWith(u8, nm, "q3ld-spec-")) {
+                s.spec += 1;
+                s.spec_utility += @intFromBool(q == utility);
+            } else if (std.mem.eql(u8, nm, "q3ld-watchdog")) {
+                s.watchdog += 1;
+                s.watchdog_ui += @intFromBool(q == user_interactive);
+            }
+        }
+        return s;
+    }
+};
+
+test "dsv41 io: the reader scheduling sets each pool thread's QoS and name at start; off leaves them unnamed, inherited" {
+    // The bank sweep (DSV41_TEST_READER_SCHED) runs every pool at one value: this test reads all three itself.
+    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    for ([_]Sched{ .{}, .{ .qos = true }, .{ .qos = true, .spin = true }, .{ .demand_first = true }, .{ .qos = true, .spin = true, .demand_first = true } }) |sched| {
+        var nb: [24]u8 = undefined;
+        const label = sched.name(&nb);
+        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .sched = sched, .spec = .{ .threads = 1, .slots = 1, .record_bytes = page, .chunk_bytes = page } });
+        defer pool.stop();
+        var word: i64 align(8) = 0;
+        try pool.armEvent(.host, @intFromPtr(&word), std.time.ns_per_s, 0);
+        // Each thread sets its class and name as its first act: poll until all four show (at most 1 s).
+        var seen: ThreadProbe.Seen = .{};
+        var tries: u32 = 0;
+        while (tries < 200) : (tries += 1) {
+            seen = ThreadProbe.scan(label);
+            if (!sched.qos or seen.named == 4) break;
+            std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+        }
+        std.debug.print("QOSPROBE {s}: self qos 0x{x}; demand {d} (UI {d}), spec {d} (UTILITY {d}), watchdog {d} (UI {d})\n", .{ label, ThreadProbe.qosOf(ThreadProbe.pthread_self()), seen.demand, seen.demand_ui, seen.spec, seen.spec_utility, seen.watchdog, seen.watchdog_ui });
+        if (!sched.qos) {
+            try testing.expectEqual(@as(u32, 0), seen.named);
+        } else {
+            try testing.expectEqual(@as(u32, 2), seen.demand_ui);
+            try testing.expectEqual(@as(u32, 1), seen.spec_utility);
+            try testing.expectEqual(@as(u32, 1), seen.watchdog_ui);
+            try testing.expectEqual(@as(u32, 4), seen.named);
+        }
+    }
+}
+
+test "dsv41 io: the reader scheduling list: off or qos, spin, demandfirst (spin only with qos), and the pool refuses spin alone" {
+    var nb: [24]u8 = undefined;
+    try testing.expectEqualStrings("off", (Sched.parse("off").?).name(&nb));
+    try testing.expectEqualStrings("qos,spin,demandfirst", (Sched.parse("demandfirst,spin,qos").?).name(&nb));
+    try testing.expectEqual(@as(i32, 5), (Sched.parse("qos,demandfirst").?).bits());
+    for ([_][]const u8{ "spin", "qos,qos", "qos,fast", "", "QOS" }) |bad| try testing.expect(Sched.parse(bad) == null);
+    try testing.expectError(error.PoolUnavailable, Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = .{ .spin = true } }));
+}
+
+test "dsv41 io: demand first: no unclaimed speculative chunk starts while a demand job executes; the record lands after it" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .sched = .{ .demand_first = true }, .spec = .{ .threads = 1, .slots = 2, .record_bytes = spec_rec_len, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    // The demand job's first read sleeps 80 ms (a demand job executing), during which a record is queued for speculation.
+    const base: u64 = 2 * page;
+    injectFault(base / page * page, 5, 80 * std.time.ns_per_ms);
+    var d = try Dests.init(1, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
+    const spec_base: u64 = 30 * page + 7;
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(spec_base)}, spec_rec_len));
+    std.Io.sleep(testing.io, .fromMilliseconds(30), .awake) catch {};
+    // Still executing: nothing speculative started.
+    try testing.expectEqual(@as(i64, 0), pool.counter(.spec_chunks));
+    try pool.wait(first, 2, 10 * std.time.ns_per_s);
+    try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
+    try waitFor(@as(i64, @intCast(spec_base)), landedAt);
+    try testing.expectEqual(@as(i64, 0), pool.counter(.max_busy_at_start));
 }
