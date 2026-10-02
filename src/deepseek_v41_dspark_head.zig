@@ -757,6 +757,9 @@ pub fn Head(comptime G: type) type {
 /// A record's parts in read order: (w1, w3, w2) x (weight, scales), each projection one pool job.
 pub const draft_parts = [_][]const u8{ "w1.weight", "w1.scales", "w3.weight", "w3.scales", "w2.weight", "w2.scales" };
 pub const max_draft_stages = 8;
+/// The aux ring the served route reserves on the stream's pool (`expert_io.Options.aux_tickets`): two tickets per pool
+/// job; a read runs in batches of the ring's size, one batch waited before the next.
+pub const draft_aux_tickets: u32 = 192;
 
 /// The hot set's persistent slots per stage: `hot` split as evenly as possible, the first stages taking the remainder.
 pub fn hotSplit(hot: u32, n_stages: u32, out: []u32) void {
@@ -899,6 +902,8 @@ pub const DraftCache = struct {
         const self = try a.create(DraftCache);
         errdefer a.destroy(self);
         self.* = .{ .a = a, .geom = try DraftGeometry.of(c, hot, form), .n_stages = c.dspark.n_stages, .n_experts = c.dspark.n_routed_experts, .hot = hot, .cache = undefined };
+        // The served route reads on its own tickets (the pool's aux ring): no ticket of the stream's demand ring is reused.
+        if (memory == .mlx and (pool == null or pool.?.auxTickets() < draft_aux_tickets)) return error.DraftCacheTickets;
         self.cache = try xsc.Cache.init(a, self.geom.geometry(), memory, pool);
         errdefer self.cache.deinit();
         try placeParts(self.cache, a, ck, &self.geom, self.n_stages, self.n_experts);

@@ -173,6 +173,9 @@ pub const Options = struct {
     tickets: u32 = 256,
     spec: ?Spec = null,
     warm: ?Warm = null,
+    /// Tickets of their own for a second demand client (the draft-expert cache), between demand's ring and the warm
+    /// class's: its submits (`submitAux`) never reuse a ticket the stream's demand ring holds. 0: none.
+    aux_tickets: u32 = 0,
 };
 
 /// A speculative staging slot: the page-rounded record plus two pages.
@@ -206,6 +209,10 @@ pub const Pool = struct {
     /// Demand's tickets end here; the warm class's (`Options.warm`) run from here to the end of the ring.
     demand_tickets: u32 = 0,
     next_warm: u32 = 0,
+    /// The aux ring [aux_first, aux_end) (`Options.aux_tickets`) and its next ticket.
+    aux_first: u32 = 0,
+    aux_end: u32 = 0,
+    next_aux: u32 = 0,
     record_bytes: u64 = 0,
 
     /// Starts the process's pool (the speculative class, when given, is
@@ -219,6 +226,8 @@ pub const Pool = struct {
             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
         if (opt.warm) |w| if (w.tickets == 0 or w.tickets % 2 != 0 or w.tickets > opt.tickets -| 2 * max_items or w.busy_max == 0 or
             w.busy_max > opt.workers) return error.InvalidOptions;
+        const warm_n: u32 = if (opt.warm) |w| w.tickets else 0;
+        if (opt.aux_tickets % 2 != 0 or (opt.aux_tickets > 0 and opt.aux_tickets < 2 * max_items) or opt.aux_tickets + warm_n > opt.tickets -| 2 * max_items) return error.InvalidOptions;
         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
             c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
         const self = try allocator.create(Pool);
@@ -234,8 +243,8 @@ pub const Pool = struct {
         @memset(res, 0);
         @memset(log_arr, 0);
         @memset(published, false);
-        const demand: u32 = if (opt.warm) |w| opt.tickets - w.tickets else opt.tickets;
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .next_warm = demand };
+        const demand: u32 = opt.tickets - warm_n - opt.aux_tickets;
+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .next_warm = demand + opt.aux_tickets, .aux_first = demand, .aux_end = demand + opt.aux_tickets, .next_aux = demand };
         var bufs: [max_spec]u64 = undefined;
         var threads: i32 = 0;
         var slot_bytes: u64 = 0;
@@ -308,12 +317,27 @@ pub const Pool = struct {
     /// `submit` for records of another part geometry: each gate/up span `ngu` parts, each down span `ndown`
     /// (`lens[0..ngu]`, then `lens[ngu..][0..ndown]`; the rest of `rows[i]` and `lens` unused).
     pub fn submitSplit(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
+        return self.submitOn(0, self.demand_tickets, &self.next_ticket, fd, file_size, gu_offsets, down_offsets, rows, lens, ngu, ndown);
+    }
+
+    /// `submitSplit` on the aux ring (`Options.aux_tickets`): a second client's jobs, on tickets the demand ring never uses.
+    pub fn submitAux(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
+        if (self.aux_end == self.aux_first) return error.InvalidJob;
+        return self.submitOn(self.aux_first, self.aux_end, &self.next_aux, fd, file_size, gu_offsets, down_offsets, rows, lens, ngu, ndown);
+    }
+
+    /// Tickets of the aux ring (0: none).
+    pub fn auxTickets(self: *const Pool) u32 {
+        return self.aux_end - self.aux_first;
+    }
+
+    fn submitOn(self: *Pool, lo: u32, hi: u32, next: *u32, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64, ngu: u32, ndown: u32) !u32 {
         const n = rows.len;
         if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or ngu == 0 or ndown == 0 or ngu + ndown > n_components) return error.InvalidJob;
         const count: u32 = @intCast(2 * n);
         self.drain();
-        if (self.next_ticket + count > self.demand_tickets) self.next_ticket = 0;
-        const first = self.next_ticket;
+        if (next.* + count > hi) next.* = lo;
+        const first = next.*;
         var offsets: [2 * max_items]i64 = undefined;
         var row_ptrs: [max_items][*]const u64 = undefined;
         for (0..n) |i| {
@@ -330,7 +354,7 @@ pub const Pool = struct {
             else => return error.SubmitRefused,
         }
         @memset(self.published[first..][0..count], false);
-        self.next_ticket = first + count;
+        next.* = first + count;
         return first;
     }
 
@@ -338,10 +362,10 @@ pub const Pool = struct {
     /// (gate/up of record i = first + i, down = first + n + i). Returns its first ticket.
     pub fn submitWarm(self: *Pool, fd: std.c.fd_t, file_size: u64, gu_offsets: []const u64, down_offsets: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) !u32 {
         const n = rows.len;
-        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or self.demand_tickets == self.published.len) return error.InvalidJob;
+        if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or self.aux_end == self.published.len) return error.InvalidJob;
         const count: u32 = @intCast(2 * n);
         self.drain();
-        if (self.next_warm + count > self.published.len) self.next_warm = self.demand_tickets;
+        if (self.next_warm + count > self.published.len) self.next_warm = self.aux_end;
         const first = self.next_warm;
         var offsets: [2 * max_items]i64 = undefined;
         var row_ptrs: [max_items][*]const u64 = undefined;

@@ -46,7 +46,7 @@ pub const Geometry = struct {
 
 pub const Memory = union(enum) { none, host, mlx: mlx.mlx_stream };
 
-pub const Error = error{ CacheGeometry, CacheLocation, ReadFailed, Timeout, TicketsBusy, QueueFull, SubmitRefused, InvalidJob, OutOfMemory, MlxError, MlxNoData };
+pub const Error = error{ CacheGeometry, CacheLocation, CacheFailed, ReadFailed, Timeout, TicketsBusy, QueueFull, SubmitRefused, InvalidJob, OutOfMemory, MlxError, MlxNoData };
 
 /// Where a record's part sits: a file the cache opened and the byte offset in it.
 pub const Loc = struct { file: u16 = std.math.maxInt(u16), offset: u64 = 0 };
@@ -65,6 +65,12 @@ pub const Cache = struct {
     host: [][max_components][]u8,
     arrays: [][max_components]mlx.mlx_array,
     stats: expert_stream.Stats = .{},
+    /// A read the cache could not see land (a ticket's wait timed out, or a submit refused after earlier jobs of the
+    /// call were queued): a worker may still write into that call's rows, so no row may ever be planned again. Latched;
+    /// every later route and seed refuses by name (CacheFailed).
+    failed: bool = false,
+    /// One ticket's wait bound (tests shorten it).
+    wait_ns: i64 = wait_timeout_ns,
 
     pub const File = struct { fd: std.c.fd_t, size: u64 };
 
@@ -195,6 +201,7 @@ pub const Cache = struct {
 
     /// One route of group `group`: each id's slot into `slots` (`ids.len`), every load read and landed first.
     pub fn route(self: *Cache, group: usize, ids: []const u16, slots: []u32) Error!void {
+        if (self.failed) return error.CacheFailed;
         var plan: expert_policy.Plan = undefined;
         self.policies[group].plan(ids, .decode, &plan);
         const st = &self.stats;
@@ -214,6 +221,7 @@ pub const Cache = struct {
     /// The hot set's seed (construction): `experts` into empty persistent slots, in order, read and landed.
     /// Returns how many were admitted.
     pub fn seed(self: *Cache, group: usize, experts: []const u16) Error!u32 {
+        if (self.failed) return error.CacheFailed;
         var buf: [512]expert_policy.LayerPolicy.ReadAhead = undefined;
         var done: u32 = 0;
         var rest = experts;
@@ -243,14 +251,30 @@ pub const Cache = struct {
         }
     }
 
-    /// One pool job per (load, component pair), then every job waited and its status words checked.
+    /// One pool job per (load, component pair) on the pool's aux ring when it has one (the cache's own tickets), in
+    /// batches the ring holds; every job of a batch waited and its status words checked before the next. A job the
+    /// cache cannot see land latches `failed` (its rows may still be written), so a failed call never frees a row
+    /// that can be planned again.
     fn read(self: *Cache, group: usize, loads: []const expert_policy.Load) Error!void {
         if (self.memory == .none or loads.len == 0) return;
         const pool = self.pool.?;
         const n_pairs = self.geom.components.len / 2;
+        const ring: usize = if (pool.auxTickets() > 0) pool.auxTickets() else pool.demand_tickets;
+        const batch_loads = @max(1, @min(ring / 2, max_jobs) / n_pairs);
+        var rest = loads;
+        while (rest.len > 0) {
+            const now = rest[0..@min(rest.len, batch_loads)];
+            rest = rest[now.len..];
+            try self.readBatch(pool, group, now);
+        }
+    }
+
+    fn readBatch(self: *Cache, pool: *expert_io.Pool, group: usize, loads: []const expert_policy.Load) Error!void {
+        const n_pairs = self.geom.components.len / 2;
         var tickets: [max_jobs]u32 = undefined;
         var n_jobs: usize = 0;
-        for (loads) |l| for (0..n_pairs) |p| {
+        var submit_err: ?Error = null;
+        submit: for (loads) |l| for (0..n_pairs) |p| {
             const k = 2 * p;
             const gu = self.locs[self.locIndex(group, l.expert, k)];
             const down = self.locs[self.locIndex(group, l.expert, k + 1)];
@@ -261,12 +285,21 @@ pub const Cache = struct {
             dest[1] = self.base[group][k + 1] + @as(u64, l.slot) * self.geom.components[k + 1].bytes;
             lens[0] = self.geom.components[k].bytes;
             lens[1] = self.geom.components[k + 1].bytes;
-            tickets[n_jobs] = try pool.submitSplit(f.fd, f.size, &.{gu.offset}, &.{down.offset}, &.{dest}, &lens, 1, 1);
+            const sub = if (pool.auxTickets() > 0) pool.submitAux(f.fd, f.size, &.{gu.offset}, &.{down.offset}, &.{dest}, &lens, 1, 1) else pool.submitSplit(f.fd, f.size, &.{gu.offset}, &.{down.offset}, &.{dest}, &lens, 1, 1);
+            tickets[n_jobs] = sub catch |e| {
+                submit_err = e;
+                break :submit;
+            };
             n_jobs += 1;
         };
         var failed = false;
+        // Every submitted job is waited, whatever an earlier one did: no row of this call is released while a worker
+        // can still write it.
         for (tickets[0..n_jobs]) |t| {
-            try pool.wait(t, 2, wait_timeout_ns);
+            pool.wait(t, 2, self.wait_ns) catch |e| {
+                self.failed = true;
+                return e;
+            };
             for (0..2) |i| {
                 const r = pool.result(t + @as(u32, @intCast(i)));
                 if (r.status != .ok) failed = true;
@@ -274,6 +307,7 @@ pub const Cache = struct {
                 self.stats.preadv_calls += @intCast(@max(r.preadv_calls, 0));
             }
         }
+        if (submit_err) |e| return e;
         if (failed) return error.ReadFailed;
     }
 };
@@ -471,4 +505,68 @@ test "dsv41 slot cache: one group shared by consecutive routes reuses a row the 
         have_prev = true;
     };
     try testing.expect(reuse_in_block > 0 and reuse_across > 0);
+}
+
+test "dsv41 slot cache: a read it cannot see land latches the cache: no row of that call is planned again, even after the late write" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a, 1, 8, &test_comps, 19);
+    defer fx.deinit(a);
+    var pool = try expert_io.Pool.start(a, .{ .workers = 2, .staging_bytes = 4 * std.heap.pageSize(), .tickets = 64, .aux_tickets = 32 });
+    defer pool.stop();
+    defer expert_io.clearFaults();
+    const cache = try Cache.init(a, .{ .n_experts = 8, .components = &test_comps, .capacity = &.{2}, .transient = 3 }, .host, pool);
+    defer cache.deinit();
+    const f = try cache.openFile(fx.path);
+    for (0..8) |e| for (0..test_comps.len) |k| cache.setLoc(0, e, k, .{ .file = f, .offset = fx.offsets[e * test_comps.len + k] });
+    try cache.checkLocs();
+    cache.wait_ns = 30 * std.time.ns_per_ms;
+    // Expert 5's second pair (its down span) sleeps 300 ms before its read: one ticket of a multi-ticket call is late.
+    const page = std.heap.pageSize();
+    const late = fx.offsets[5 * test_comps.len + 3];
+    expert_io.injectFault(late / page * page, 5, 300 * std.time.ns_per_ms);
+    var slots: [3]u32 = undefined;
+    try testing.expectError(error.Timeout, cache.route(0, &.{ 4, 5, 6 }, &slots));
+    try testing.expect(cache.failed);
+    // Refused by name from here on, before and after the late ticket publishes.
+    try testing.expectError(error.CacheFailed, cache.route(0, &.{ 4, 5, 6 }, &slots));
+    try testing.expectError(error.CacheFailed, cache.seed(0, &.{1}));
+    std.Io.sleep(testing.io, .fromMilliseconds(400), .awake) catch {};
+    try testing.expectError(error.CacheFailed, cache.route(0, &.{1}, slots[0..1]));
+}
+
+test "dsv41 slot cache: on a pool with an aux ring every read takes the aux tickets; the demand ring is untouched" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a, 1, 8, &test_comps, 23);
+    defer fx.deinit(a);
+    var pool = try expert_io.Pool.start(a, .{ .workers = 2, .staging_bytes = 4 * std.heap.pageSize(), .tickets = 96, .aux_tickets = 32 });
+    defer pool.stop();
+    try testing.expectEqual(@as(u32, 64), pool.demand_tickets);
+    try testing.expectEqual(@as(u32, 64), pool.aux_first);
+    const cache = try Cache.init(a, .{ .n_experts = 8, .components = &test_comps, .capacity = &.{2}, .transient = 6 }, .host, pool);
+    defer cache.deinit();
+    const f = try cache.openFile(fx.path);
+    for (0..8) |e| for (0..test_comps.len) |k| cache.setLoc(0, e, k, .{ .file = f, .offset = fx.offsets[e * test_comps.len + k] });
+    try cache.checkLocs();
+    var slots: [6]u32 = undefined;
+    // 6 loads x 2 pairs = 24 tickets per route, the aux ring 32: the ring wraps inside [64, 96) across routes.
+    for (0..5) |r| {
+        const ids = [_]u16{ @intCast(r % 8), @intCast((r + 1) % 8), @intCast((r + 2) % 8), @intCast((r + 3) % 8), @intCast((r + 4) % 8), @intCast((r + 5) % 8) };
+        try cache.route(0, &ids, &slots);
+        for (ids, slots) |e, slot| for (0..test_comps.len) |k| try testing.expectEqualSlices(u8, fx.part(&test_comps, 8, 0, e, k), cache.row(0, k, slot));
+        try testing.expect(pool.next_aux >= pool.aux_first and pool.next_aux <= pool.aux_end);
+    }
+    try testing.expectEqual(@as(u32, 0), pool.next_ticket);
+    // The stream's demand submits stay below the aux ring.
+    var dests: [expert_bank.n_components]u64 = @splat(0);
+    var buf: [8192]u8 = undefined;
+    dests[0] = @intFromPtr(&buf);
+    dests[1] = @intFromPtr(&buf) + 4096;
+    var lens: [expert_bank.n_components]u64 = @splat(0);
+    lens[0] = 100;
+    lens[1] = 100;
+    for (0..40) |_| {
+        const t = try pool.submitSplit(cache.files.items[0].fd, cache.files.items[0].size, &.{0}, &.{200}, &.{dests}, &lens, 1, 1);
+        try testing.expect(t + 2 <= pool.demand_tickets);
+        try pool.wait(t, 2, 5 * std.time.ns_per_s);
+    }
 }
