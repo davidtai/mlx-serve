@@ -326,6 +326,19 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             self.grown = true;
         }
 
+        /// The reverse phase change's free, back to the admitted prompt rows (`Experts.shrink`). Returns the bytes freed.
+        pub fn shrink(self: *Self) !u64 {
+            const bytes = try self.hook.shrink(self.prefill_rows);
+            self.grown = false;
+            return bytes;
+        }
+
+        /// The reverse phase change's allocation, after its frees landed: the prompt's scratch, bound (`released`: the
+        /// release route freed it; else it stayed through decode). Returns the bytes allocated.
+        pub fn regrowTransient(self: *Self, g: *G, released: bool) !u64 {
+            return self.hook.regrowTransient(g, released);
+        }
+
         /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
         /// demand into its empty rows, layer-major (`Stream.warmIssue`). Returns the records issued.
         pub fn warmIssue(self: *Self) !u32 {

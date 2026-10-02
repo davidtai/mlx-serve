@@ -1141,9 +1141,25 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
     md.phase_observer = marks.observer();
 
-    // Either arm the configuration builds: host waits (the served default) or event gates (C6).
-    switch (md.arm) {
-        inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_path, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
+    // DSV41_CELL_REQUESTS (1..3, default 1): the same prompt again through the same Module, each after the previous
+    // request's end (`Module.requestEnd`, the reverse phase change, as the server's finishSlot runs it: off both clocks);
+    // request k > 1 writes its receipt beside the first (`<out>.req<k>.json`).
+    const n_req: u32 = if (envStr("DSV41_CELL_REQUESTS")) |v| std.fmt.parseInt(u32, v, 10) catch return error.CellRequests else 1;
+    if (n_req < 1 or n_req > 3) return error.CellRequests;
+    for (0..n_req) |k| {
+        if (k > 0) {
+            const t_end = std.Io.Timestamp.now(io, .boot);
+            try md.requestEnd();
+            const end_ms = @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
+            const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k, .request_end_ms = end_ms, .reverse = md.reverse_change }, .{});
+            std.debug.print("NATIVE DSV41_REQUEST_END {s}\n", .{rj});
+            marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
+        }
+        const out_k = if (k == 0) out_path else try std.fmt.allocPrint(a, "{s}.req{d}.json", .{ out_path, k + 1 });
+        // Either arm the configuration builds: host waits (the served default) or event gates (C6).
+        switch (md.arm) {
+            inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_k, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
+        }
     }
 }
 

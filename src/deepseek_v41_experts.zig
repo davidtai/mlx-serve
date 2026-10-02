@@ -230,6 +230,16 @@ pub const StreamSource = struct {
         return self.stream.releaseTransient();
     }
 
+    /// The reverse phase change's free (`Stream.shrink`): the bytes freed.
+    pub fn shrink(self: *StreamSource, prompt_rows: []const u32) !u64 {
+        return self.stream.shrink(prompt_rows);
+    }
+
+    /// The reverse phase change's allocation (`Stream.regrowTransient`): the bytes allocated.
+    pub fn regrowTransient(self: *StreamSource) !u64 {
+        return self.stream.regrowTransient();
+    }
+
     pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
         return self.stream.seedPrefill(layer, ids);
     }
@@ -1227,6 +1237,26 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (self.transient_released) b[@backingInt(BankKind.transient)] = try bind(g, self.source, @intCast(l), .transient);
             }
             self.transient_released = false;
+        }
+
+        /// The reverse phase change's free: the grown rows' and window 0's bindings nulled (a stray use fails on null),
+        /// then the source frees them. Returns the bytes freed.
+        pub fn shrink(self: *Self, prompt_rows: []const u32) !u64 {
+            for (self.banks) |*b| {
+                b[@backingInt(BankKind.ext)] = null;
+                b[@backingInt(BankKind.transient)] = null;
+            }
+            self.transient_released = true;
+            return self.source.shrink(prompt_rows);
+        }
+
+        /// The reverse phase change's allocation: the prompt's scratch re-created and bound. Returns its bytes (0 when
+        /// the scratch stayed through decode: the release route off).
+        pub fn regrowTransient(self: *Self, g: *G, released: bool) !u64 {
+            const bytes: u64 = if (released) try self.source.regrowTransient() else 0;
+            for (self.banks, 0..) |*b, l| b[@backingInt(BankKind.transient)] = try bind(g, self.source, @intCast(l), .transient);
+            self.transient_released = false;
+            return bytes;
         }
 
         /// After the forward's last eval: settles and unpins released calls.

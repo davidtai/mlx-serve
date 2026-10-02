@@ -24,6 +24,9 @@ pub const Module = struct {
     pub fn decodeHandover(_: *Module, _: model_io.DecodeHandover) !void {
         return error.Dsv41NotBuiltForThisTarget;
     }
+    pub fn requestEnd(_: *Module) !void {
+        return error.Dsv41NotBuiltForThisTarget;
+    }
     pub const DsparkRound = struct {
         tokens: []u32,
         accepted: u32,

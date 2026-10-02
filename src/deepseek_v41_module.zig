@@ -263,6 +263,47 @@ pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decod
     return .{ .bound = billed_decode_process -| grow, .grow = grow };
 }
 
+/// The reverse phase change's bound on the footprint before the prompt's scratch comes back: the prompt phase's billed
+/// process terms less the ones not live then (the scratch it re-creates, when absent; the prompt wave, KV, cache and the
+/// posted Engram gathers, which the next prompt allocates later), so every later allocation lands within the prompt bill.
+pub fn reverseBound(prompt: bill_mod.PhaseTerms, scratch_bytes: u64) u64 {
+    return prompt.sum() -| (scratch_bytes + prompt.waves + prompt.kv + prompt.mlx_cache + prompt.engram_posted);
+}
+
+/// The reverse phase change in the bill's order (ledger 101), on any `x` with `free() !u64` (the request's state and the
+/// decode-only rows; the bytes), `clear()` (MLX's cache), `settle(freed) !void` (until the frees landed and the footprint
+/// is at most `reverseBound`, then the one check) and `allocate() !void` (the prompt's scratch and cache limit): nothing
+/// is allocated before the settle passed, and a refused settle allocates nothing.
+/// `settle` under another name, for the reverse change's adapter (whose own step is named `settle`).
+const settleReadings = settle;
+
+pub fn reverseSteps(x: anytype) !void {
+    const freed = try x.free();
+    x.clear();
+    try x.settle(freed);
+    try x.allocate();
+}
+
+/// The reverse phase change's record (`NATIVE DSV41_REVERSE_PHASE_CHANGE`): the readings before the frees and settled,
+/// the bytes freed (the cache clear and the decode-only rows), the bound and its margin at the last reading, the scratch
+/// re-created, the reading after it, and the whole change's time.
+pub const ReverseRecord = struct {
+    before: BoundaryMemory,
+    after: BoundaryMemory,
+    prompt_ready: ?BoundaryMemory = null,
+    /// The box's pages beside this footprint at the same three points (`VmMark`, for the release proof's check:
+    /// outside-the-footprint rise from before to settled).
+    vm_before: ?VmMark = null,
+    vm_after: ?VmMark = null,
+    vm_prompt_ready: ?VmMark = null,
+    freed_bytes: u64,
+    regrown_bytes: u64 = 0,
+    settle_ms: u32,
+    bound_bytes: u64,
+    margin_bytes: i64,
+    ms: f64,
+};
+
 /// One grow allocation's rounding bound: MLX's Metal allocator rounds a buffer up to the 16 KiB page.
 pub const grow_alloc_round_bytes: u64 = 16_384;
 
@@ -364,12 +405,19 @@ pub const Module = struct {
     bill: bill_mod.Bill = undefined,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
+    /// The prompt phase's MLX cache limit (set at construction; the reverse phase change restores it).
+    prompt_cache_bytes: usize = 0,
     /// The fill's target (the ceiling less upstream's wired margin): each phase's billed total stays under it.
     fill_target: u64 = 0,
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
     /// The request's tail release (`tailRelease`; reset at each prefill).
     tail_release: ?TailReleaseRecord = null,
+    /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
+    /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
+    prompt_ready: bool = true,
+    /// The last reverse phase change's record.
+    reverse_change: ?ReverseRecord = null,
     /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
     phase_observer: ?PhaseObserver = null,
     /// The request's decode host side (`DecodeHost`; reset at each phase change).
@@ -474,7 +522,8 @@ pub const Module = struct {
         }
         self.g.clearCache();
         // The allocator cache holds no more than the admission charges for the phase (prefill here).
-        _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, prefillCacheLimit(config.numeric_tier orelse .served));
+        self.prompt_cache_bytes = prefillCacheLimit(config.numeric_tier orelse .served);
+        _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.prompt_cache_bytes);
         errdefer setCacheLimit(self.prev_cache_limit);
         self.arm = if (eventGates(config))
             .{ .event_gates = try self.buildArm(AGated, io, &admitted, weights, s, ceiling, try expert_event.createMetal(), &diag) }
@@ -881,6 +930,9 @@ pub const Module = struct {
     pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
+        // The previous request's end, when the shell did not run it (an errored request): its routes settled and, if it
+        // left the prompt configuration, the reverse phase change, on this request's clock before anything of it allocates.
+        try self.requestEnd();
         try self.gate.begin(.prefill);
         self.tail_release = null;
         self.dropDspark();
@@ -973,6 +1025,7 @@ pub const Module = struct {
         try self.gate.request();
         _ = mlx.mlx_synchronize(self.g.s);
         try self.observe(.tail);
+        self.prompt_ready = false;
         const t0 = std.Io.Timestamp.now(self.io, .boot);
         const before = BoundaryMemory.now();
         const freed = switch (self.arm) {
@@ -1138,6 +1191,96 @@ pub const Module = struct {
         self.logPhaseChange();
     }
 
+    /// The reverse phase change (decode -> prompt), once per finished request: the served shell calls it at the request's
+    /// end, after its last token went out (off both clocks); the next prefill runs it when an errored request's end did
+    /// not. The order is the bill's (ledger 101): the request's state and the decode-only rows freed first (the grown
+    /// rows and window 0; a cancelled request's routes settled and unpinned before), the MLX cache cleared, then the
+    /// settle until the footprint is at most the prompt bill less the terms not yet live (`reverseBound`), and ONLY
+    /// then the prompt's scratch and cache limit back. Residents, Engram and the draft cache persist. A no-op when the
+    /// Module already holds its prompt configuration; a refusal is the boundary's (every later request refused).
+    pub fn requestEnd(self: *Module) !void {
+        try self.gate.request();
+        const t0 = std.Io.Timestamp.now(self.io, .boot);
+        _ = mlx.mlx_synchronize(self.g.s);
+        // A request cancelled or disconnected mid-forward (prompt or decode) leaves routes live: settled first, always.
+        switch (self.arm) {
+            inline else => |t| t.arm.stream.settleRoutes() catch |e| return self.refuseBoundary(e),
+        }
+        // A request that ended in its prompt phase with nothing released needs nothing more.
+        if (self.prompt_ready) return;
+        self.recordDecodeEnd();
+        const vm0 = VmMark.now();
+        var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now() };
+        reverseSteps(&x) catch |e| {
+            self.logReverse();
+            return self.refuseBoundary(e);
+        };
+        self.prompt_ready = true;
+        const r = &self.reverse_change.?;
+        r.prompt_ready = BoundaryMemory.now();
+        r.vm_before = vm0;
+        r.vm_prompt_ready = VmMark.now();
+        r.ms = @as(f64, @floatFromInt(@max(t0.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
+        self.logReverse();
+    }
+
+    /// `reverseSteps` on the live Module.
+    const ReverseLive = struct {
+        m: *Module,
+        before: BoundaryMemory,
+        scratch_absent: bool = false,
+
+        /// The finished request's state (its KV lanes, the strategy's caches; a new prompt rebuilds both), then the
+        /// decode-only rows. Returns the rows' bytes.
+        pub fn free(x: *ReverseLive) !u64 {
+            const m = x.m;
+            m.dropDspark();
+            if (m.state) |*st| st.deinit(&m.g, m.gpa);
+            m.state = null;
+            const freed = if (m.grown()) switch (m.arm) {
+                inline else => |t| try t.arm.shrink(),
+            } else 0;
+            x.scratch_absent = switch (m.arm) {
+                inline else => |t| t.arm.stream.transient_released,
+            };
+            return freed;
+        }
+
+        /// MLX's cache cleared after every command retired (the decode limit stays until `allocate`).
+        pub fn clear(x: *ReverseLive) void {
+            x.m.g.clearCache();
+            _ = mlx.mlx_synchronize(x.m.g.s);
+        }
+
+        /// Until the footprint shows the frees and sits at most `reverseBound`, then the one check (by name).
+        pub fn settle(x: *ReverseLive, freed: u64) !void {
+            const m = x.m;
+            const scratch = if (x.scratch_absent) switch (m.arm) {
+                inline else => |t| t.arm.stream.promptTransientBytes(),
+            } else 0;
+            const bound = reverseBound(m.bill.prefillTerms(), scratch);
+            const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
+            m.reverse_change = .{ .vm_after = VmMark.now(), .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
+            try checkSettled(x.before, st.after, freed, bound);
+        }
+
+        /// The prompt's scratch (when the decode freed it) and the prompt cache limit.
+        pub fn allocate(x: *ReverseLive) !void {
+            const m = x.m;
+            m.reverse_change.?.regrown_bytes = switch (m.arm) {
+                inline else => |t| try t.arm.regrowTransient(&m.g, x.scratch_absent),
+            };
+            setCacheLimit(m.prompt_cache_bytes);
+        }
+    };
+
+    fn logReverse(self: *Module) void {
+        const r = self.reverse_change orelse return;
+        const json = std.json.Stringify.valueAlloc(self.gpa, r, .{}) catch return;
+        defer self.gpa.free(json);
+        log.info("NATIVE DSV41_REVERSE_PHASE_CHANGE {s}", .{json});
+    }
+
     /// Upstream's prefill-to-decode handover (`model.DecodeHandover`; `Transformer.decodeHandover` dispatches
     /// it over the module-owned-state archs): the phase change below, once per request, after the prompt and
     /// before the first decode forward or round. Refused by name without a prompt (`prefill` never ran) or,
@@ -1167,6 +1310,7 @@ pub const Module = struct {
     fn phaseChange(self: *Module) !void {
         try self.gate.request();
         if (self.grown()) return;
+        self.prompt_ready = false;
         var marks: [5]?VmMark = @splat(null);
         marks[0] = VmMark.now();
         _ = mlx.mlx_synchronize(self.g.s);
@@ -2606,6 +2750,66 @@ test "dsv41 memory: the tail release route: off by default; the grow's bound and
     try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
     try checkSettled(before, st.after, tail.boundary, ut.bound);
     try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkSettled(before, st.after, stock.boundary, us.bound));
+}
+
+test "dsv41 memory: the reverse phase change frees, settles, and only then allocates; a refused settle allocates nothing" {
+    const Rec = struct {
+        log: [8]u8 = undefined,
+        n: usize = 0,
+        settle_fails: bool = false,
+        fn put(x: *@This(), c: u8) void {
+            x.log[x.n] = c;
+            x.n += 1;
+        }
+        pub fn free(x: *@This()) !u64 {
+            x.put('f');
+            return 18_754_387_968;
+        }
+        pub fn clear(x: *@This()) void {
+            x.put('c');
+        }
+        pub fn settle(x: *@This(), freed: u64) !void {
+            x.put('s');
+            try std.testing.expectEqual(@as(u64, 18_754_387_968), freed);
+            if (x.settle_fails) return error.PhaseChangeFootprintOverBill;
+        }
+        pub fn allocate(x: *@This()) !void {
+            x.put('a');
+        }
+    };
+    var ok: Rec = .{};
+    try reverseSteps(&ok);
+    try std.testing.expectEqualStrings("fcsa", ok.log[0..ok.n]);
+    var rejected: Rec = .{ .settle_fails = true };
+    try std.testing.expectError(error.PhaseChangeFootprintOverBill, reverseSteps(&rejected));
+    try std.testing.expectEqualStrings("fcs", rejected.log[0..rejected.n]);
+}
+
+test "dsv41 memory: the reverse bound is the prompt bill less the terms the next prompt allocates later; the settle holds the scratch until the frees landed" {
+    // Prompt terms at 134 / 168 (served19f): slot banks (40 x 134 + 240) records, the K16 wave 13.869 GB, KV 0.356, cache
+    // 2 GiB, posted Engram 0.107; the rest as billed.
+    const rec: u64 = 13_315_584;
+    const scratch: u64 = 240 * rec;
+    const t: bill_mod.PhaseTerms = .{ .slot_banks = (40 * 134 + 240) * rec, .residents = 16_355_231_048, .engram = 324_730_880, .waves = 13_868_806_049, .kv = 355_600_384, .mlx_cache = 2_147_483_648, .host_reserve = 1_250_000_000, .engram_posted = 107_000_000, .wire_tables = 157_696_560, .prompt_buffer_allowance = 17_000_000 };
+    const b = reverseBound(t, scratch);
+    // Every later allocation of the next prompt (the scratch, then its wave, KV, cache and posted gathers) lands in the bill.
+    try std.testing.expectEqual(t.sum(), b + scratch + t.waves + t.kv + t.mlx_cache + t.engram_posted);
+    // The release route off: the scratch stayed through decode, so it is in the footprint, not in the bound's credit.
+    try std.testing.expectEqual(b + scratch, reverseBound(t, 0));
+    // Decode's end (grown rows and window 0 live, footprint 108.4 GB); the frees trail: the first reading is above the bound,
+    // the settle keeps polling (the drop test alone would pass it), and the check passes only on the landed reading.
+    const freed: u64 = (40 * 34 + 48) * rec;
+    const before: BoundaryMemory = .{ .active = 106_945_662_972, .cache = 268_000_000, .footprint = 108_400_000_000 };
+    const early: BoundaryMemory = .{ .active = before.active - freed, .cache = 0, .footprint = b + 100_000_000 };
+    const landed: BoundaryMemory = .{ .active = before.active - freed, .cache = 0, .footprint = b - 600_000_000 };
+    var i: usize = 0;
+    var slept: u32 = 0;
+    const st = settle(FakeReader{ .readings = &.{ early, early, landed }, .i = &i, .slept_ms = &slept }, before, freed, 5, b);
+    try std.testing.expectEqual(@as(usize, 3), i);
+    try std.testing.expectEqual(landed, st.after);
+    try checkSettled(before, st.after, freed, b);
+    try std.testing.expectError(error.PhaseChangeFootprintOverBill, checkSettled(before, early, freed, b));
+    try checkFreed(before, early, freed);
 }
 
 test "dsv41 memory: the host relief route calls malloc's relief once at the boundary, never when off; the decode host side reads" {
