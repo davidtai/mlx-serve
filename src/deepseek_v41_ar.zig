@@ -1049,6 +1049,10 @@ const CellReceipt = struct {
     draft_cache_stats: ?expert_stream.Stats = null,
     /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
     draft_cache_pool: ?[]const u8 = null,
+    /// The read pool's scheduling as installed ("off" or the list of qos, spin, demandfirst; `module.readerSched`), and its
+    /// demand-first knob on its own.
+    reader_sched: ?[]const u8 = null,
+    reader_demand_first: ?bool = null,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
@@ -1411,6 +1415,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
+    var reader_sched_buf: [24]u8 = undefined;
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
@@ -1492,6 +1497,8 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .draft_cache_hot = md.installed.draft_cache_hot,
         .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
+        .reader_sched = md.installed.reader_sched.name(&reader_sched_buf),
+        .reader_demand_first = md.installed.reader_sched.demand_first,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
@@ -1579,6 +1586,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_LAYER_MAJOR")) |v| config.layer_major_prefill = try cellBool("DSV41_CELL_LAYER_MAJOR", v);
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
+    // The read pool's scheduling, through the same config field the server's model setting sets.
+    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("model_settings.zig").ReaderSched.parse(v) orelse return error.CellReaderSched;
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The feed's halves on their own (each overrides the feed's value for its half).
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);

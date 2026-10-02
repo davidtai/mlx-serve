@@ -11,6 +11,10 @@ const mtp_acceptance = @import("mtp_acceptance.zig");
 /// A module-owned arch's construction-time numerics (`numeric_tier`).
 pub const NumericTier = enum { stock, served };
 
+/// A streamed-expert model's read pool scheduling (`expert_reader_sched`): "off" or a comma list of qos, spin,
+/// demandfirst (`reader_sched.Sched.parse`).
+pub const ReaderSched = @import("reader_sched.zig").Sched;
+
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,
@@ -21,6 +25,8 @@ pub const Override = struct {
     nocache_weights: ?bool = null,
     /// A streamed-expert model's routed waves wait on the reads' events, not the host (null: the arch's default).
     expert_event_gates: ?bool = null,
+    /// A streamed-expert model's read pool scheduling (null: off).
+    expert_reader_sched: ?ReaderSched = null,
     /// A module-owned arch's numerics, chosen at construction: "stock" (the exact reference math, the prompt in
     /// decode-width forwards) or "served" (the tier of record, its rounding-class prefill). Null: served.
     numeric_tier: ?NumericTier = null,
@@ -51,7 +57,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and o.numeric_tier == null and
+            o.mtp_greedy_tail == null and o.nocache_weights == null and o.expert_event_gates == null and o.expert_reader_sched == null and o.numeric_tier == null and
             o.layer_major_prefill == null and o.expert_wide_feed == null and o.expert_wide_depth == null and o.expert_wide_seed == null and o.expert_wide_hot_first == null and o.embedding_host_rows == null and o.expert_wide_cold_rows == null and
             o.chat_template_kwargs == null and o.drafter == null;
     }
@@ -129,6 +135,9 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     if (obj.get("expert_event_gates")) |n| switch (n) {
         .bool => |b| o.expert_event_gates = b,
         else => {},
+    };
+    if (obj.get("expert_reader_sched")) |n| if (n == .string) {
+        o.expert_reader_sched = ReaderSched.parse(n.string);
     };
     if (obj.get("numeric_tier")) |n| if (n == .string) {
         o.numeric_tier = std.meta.stringToEnum(NumericTier, n.string);
