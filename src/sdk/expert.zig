@@ -131,6 +131,7 @@ pub const Stats = struct {
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.
 pub const Error = error{
     StreamFailed,
+    RoutesLive,
     RoutesExhausted,
     SlotStillPinned,
     ReadFailed,

@@ -360,7 +360,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         /// The hook's construction inputs the arm's routes need beyond `Options`: every routed layer's gate
         /// (`.lookahead`: the predictor reads the next layer's) and the stream's event (`.gated`).
-        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("sdk").expert.Event = null, wide: xp.Wide = .{} };
+        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("sdk").expert.Event = null, wide: xp.Wide = .{}, banked: bool = false };
 
         pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
             // The hook's predictor feeds the stream's read-ahead: the route needs the stream's class.
@@ -402,6 +402,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_release = opt.transient_release,
                 .grow_fill = opt.grow_fill,
                 .first_verify_warm = opt.first_verify_warm,
+                .decode_pool = opt.decode_pool,
                 .read_ahead_probe = if (comptime expert_stream.read_ahead_probed) .{ .barrier = prefill_timers.readAheadBarrier, .admission = prefill_timers.readAheadAdmission, .posted = prefill_timers.readAheadPosted } else {},
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();

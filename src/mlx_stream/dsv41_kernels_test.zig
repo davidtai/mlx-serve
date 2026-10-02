@@ -845,7 +845,7 @@ test "dsv41 kernels ops: the banked route launches its texts with every bank's a
     const ne = reg.get(.q3_exl3_prep_din_rin);
     const s = &ge.samples[0];
     const P = xq.ProjArrays(Trace.T);
-    var banks: [3]@import("quant.zig").BankArrays(P) = undefined;
+    var banks: [3]@import("sdk").quant.BankArrays(P) = undefined;
     for (&banks) |*b| b.* = .{
         .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars) },
         .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars) },

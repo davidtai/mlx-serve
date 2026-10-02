@@ -3502,3 +3502,12 @@ test "dsv41 module: the states and the bill read one ring geometry: the numeric 
     const dec1 = b1.ringDecodeBytes(seq) + b1.frontierDecodeBytes(seq);
     try std.testing.expectEqual(dec1 - dec0, b1.kvDecodeBytes(seq, positions) - b0.kvDecodeBytes(seq, positions));
 }
+
+test "dsv41 module: decode_first16 needs its pool's rows above the prompt rows and the transient release, and refuses single records" {
+    try checkDecodeRowsAlloc(.decode_first16, false, 136, 168);
+    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.decode_first16, true, 150, 168));
+    try checkDecodePoolRoutes(.decode_first16, .row, true);
+    try std.testing.expectError(error.DecodePoolWithRecords, checkDecodePoolRoutes(.decode_first16, .record, true));
+    try std.testing.expectError(error.DecodePoolNeedsRelease, checkDecodePoolRoutes(.decode_first16, .row, false));
+    try checkDecodePoolRoutes(.uniform, .record, false);
+}

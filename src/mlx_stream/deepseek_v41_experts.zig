@@ -4331,3 +4331,112 @@ test "dsv41 lookahead 0b: the predictor graph scores like its host reference" {
     std.debug.print("predictor graph: worst |mlx - host| {d:.6}\n", .{worst});
     try testing.expect(worst < 2e-2);
 }
+
+/// A decode math whose outputs carry, per row, its slot row and the arrays it read (host arrays the trace records):
+/// the per-bank calls and the banked calls (packed ids) must hand every routed position the same words.
+const BankEnc = struct {
+    pub const has_banked = true;
+    const w = 4;
+
+    fn rowsOf(g: *TraceOps, x: u32) ![]const u32 {
+        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
+        return std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(b)));
+    }
+
+    fn floatsOf(g: *TraceOps, x: u32) ![]const f32 {
+        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
+        return std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(b)));
+    }
+
+    fn emit(g: *TraceOps, v: []const f32) !u32 {
+        return g.hostArray(std.mem.sliceAsBytes(v), &.{ @intCast(v.len / w), w }, .float32);
+    }
+
+    pub fn gateUp(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const r = try rowsOf(g, ids);
+        for (r, 0..) |row, i| v[i * w ..][0..w].* = .{ @floatFromInt(row), @floatFromInt(gate.code), @floatFromInt(up.rin), 0 };
+        return emit(g, v[0 .. r.len * w]);
+    }
+
+    pub fn down(_: *const BankEnc, g: *TraceOps, h: u32, _: u32, d: ProjOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const hv = try floatsOf(g, h);
+        @memcpy(v[0..hv.len], hv);
+        for (0..hv.len / w) |i| v[i * w + 3] = @floatFromInt(d.rout);
+        return emit(g, v[0..hv.len]);
+    }
+
+    pub fn gateUpBanked(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const r = try rowsOf(g, ids);
+        for (r, 0..) |p, i| {
+            const b = &banks[p >> 24];
+            v[i * w ..][0..w].* = .{ @floatFromInt(p & 0xFFFFFF), @floatFromInt(b.gate.code), @floatFromInt(b.up.rin), 0 };
+        }
+        return emit(g, v[0 .. r.len * w]);
+    }
+
+    pub fn downBanked(_: *const BankEnc, g: *TraceOps, h: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const hv = try floatsOf(g, h);
+        const r = try rowsOf(g, ids);
+        @memcpy(v[0..hv.len], hv);
+        for (r, 0..) |p, i| v[i * w + 3] = @floatFromInt(banks[p >> 24].down.rout);
+        return emit(g, v[0..hv.len]);
+    }
+};
+
+test "dsv41 experts: the banked waves (ROUTED_BANKED) hand every routed position the per-bank route's words, one group per wave" {
+    const a = testing.allocator;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 30;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 30, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.record_host = true;
+    const Ex = ExpertsWith(TraceOps, FakeSource, BankEnc, .{});
+    // One hook, both bindings (the arrays bound once): the option binds the banked stages at construction.
+    var banked = try Ex.initWith(a, &g, &src, .{}, &c, .{ .banked = true });
+    defer banked.deinit();
+    try testing.expect(banked.gate_up_wave == &Ex.gateUpWaveBanked and banked.down_wave == &Ex.downWaveBanked);
+    var grouped = banked;
+    grouped.gate_up_wave = Ex.gateUpWaveGrouped;
+    grouped.down_wave = Ex.downWaveGrouped;
+    // The ext bank is unbound: the banked arrays fill it with another bank's (never indexed).
+    try testing.expect(banked.banks[0][@backingInt(BankKind.ext)] == null);
+    try testing.expect(banked.banks[0][@backingInt(BankKind.base)].?.gate.code != banked.banks[0][@backingInt(BankKind.transient)].?.gate.code);
+    // One token, top-6, both banks in each wave.
+    const refs = [_]SlotRef{ .{ .bank = .base, .row = 3 }, .{ .bank = .transient, .row = 5 }, .{ .bank = .base, .row = 7 }, .{ .bank = .transient, .row = 0 }, .{ .bank = .base, .row = 1 }, .{ .bank = .transient, .row = 2 } };
+    const waves = [_]u8{ 0, 0, 1, 1, 0, 1 };
+    const sv: Served = .{ .refs = &refs, .waves = &waves, .n_parts = 1 };
+    const xf = try g.input(&.{ 1, 64 }, .bfloat16);
+    var words: [2][6][BankEnc.w]f32 = undefined;
+    for ([_]*Ex{ &grouped, &banked }, 0..) |ex, arm| {
+        var acc: Ex.Acc = .{};
+        for (0..2) |wv| {
+            const wave = try ex.gate_up_wave(ex, &g, 0, xf, 6, sv, @intCast(wv), null);
+            try testing.expectEqual(@as(usize, if (arm == 0) 2 else 1), wave.n);
+            _ = try ex.down_wave(ex, &g, 0, &wave, &acc, null);
+        }
+        try testing.expectEqual(@as(usize, if (arm == 0) 4 else 2), acc.n_outs);
+        var j: usize = 0;
+        for (acc.outs[0..acc.n_outs]) |o| {
+            const v = try BankEnc.floatsOf(&g, o);
+            for (0..v.len / BankEnc.w) |r| {
+                words[arm][acc.pos[j]] = v[r * BankEnc.w ..][0..BankEnc.w].*;
+                j += 1;
+            }
+        }
+        try testing.expectEqual(@as(usize, 6), j);
+    }
+    for (words[0], words[1], refs) |x, y, ref| {
+        try testing.expectEqual(x, y);
+        try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), x[0]);
+        try testing.expectEqual(@as(f32, @floatFromInt(grouped.banks[0][@backingInt(ref.bank)].?.gate.code)), x[1]);
+    }
+    // A math without the banked route refuses the option at construction.
+    const Plain = ExpertsWith(TraceOps, FakeSource, TraceMath, .{});
+    try testing.expectError(error.BankedNotInMath, Plain.initWith(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c, .{ .banked = true }));
+}

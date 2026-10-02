@@ -40,6 +40,9 @@ pub const Options = S.Options;
 pub const read_ahead_probed = S.read_ahead_probed;
 pub const ReadAheadProbe = S.ReadAheadProbe;
 pub const GrowFill = S.GrowFill;
+pub const DecodePool = S.DecodePool;
+pub const PoolCand = S.PoolCand;
+pub const poolRows = S.poolRows;
 const ProbeSlot = S.ProbeSlot;
 const no_probe = S.no_probe;
 pub const FirstVerifyWarm = S.FirstVerifyWarm;
@@ -264,6 +267,11 @@ pub const StreamSource = struct {
     /// Event gates of the call's reads (a stream built with `event`).
     pub fn gate(self: *StreamSource, call: *Call) Error!?Gates {
         return self.stream.gate(call.route.?);
+    }
+
+    /// The end of a decode cycle (option (b)'s clock; `Stream.cycleEnd`).
+    pub fn cycleEnd(self: *StreamSource) !void {
+        return self.stream.cycleEnd();
     }
 
     pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {

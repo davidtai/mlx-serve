@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15";
+pub const manifest_sha256 = "21521ce4d44e18a8ad828f1e14447053903b6e5c0df4e25f84b175d265d1858f";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -1205,7 +1205,12 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     // the LUT gate|up text's manifest lists the fused down GEMM's (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71"));
     // the routed forms' manifest lists the LUT gate|up text's (every kernel and header unchanged)
+    try testing.expect(reg.acceptsManifest("4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"));
+    // the HC post texts' manifest and the banked texts' manifest each list the routed forms' (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15"));
+    // served19j's union manifest lists both (every kernel and header of each unchanged)
+    try testing.expect(reg.acceptsManifest("9033520a3565e84d0d3ece55ba5f9e0db096b7e27f7c955f6ed8de9acf26cdf9"));
+    try testing.expect(reg.acceptsManifest("1aee687704d0009f85155621acdfb8917c7ba1446f652f5209b19028204beac4"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each
