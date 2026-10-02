@@ -136,6 +136,9 @@ pub const RouteOverrides = struct {
     /// ROUTED_FORMS (kbench v9, exact): the routed decode GEMVs' forms, each independently: down_pair (the down
     /// projection's pair text) and gu_one (gate and up in one launch). null: stock.
     routed_forms: ?xq.Forms = null,
+    /// DENSE_RC (kbench v7 / v7b): the shared gate | up stacked on RCPROJ, one launch (C29's other sites stay on
+    /// m1rows). Rounding-class (the head keeps C11's m1rows). null: off.
+    dense_rc: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -664,6 +667,10 @@ pub const Module = struct {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
         }
+        if (ov.dense_rc) |v| if (v) {
+            if (!tier.routes.rc_mxfp8_rows) return error.DenseRcNeedsRows;
+            tier.routes.dense_rc = true;
+        };
         if (ov.head_mxfp8_rc) |v| {
             if (v and tier.routes.head != .mxfp8) return error.HeadMxfp8RcNeedsMxfp8;
             tier.routes.rc_head_mxfp8 = v;
@@ -678,6 +685,13 @@ pub const Module = struct {
         errdefer self.model.deinit(&self.g);
         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
         // dense one (the draft head takes the model's), so the checkpoint's bf16 head leaves the device here.
+        if (tier.routes.dense_rc) {
+            // DENSE_RC: the model rebound the shared gate and up as views of its stack; the originals leave here.
+            var b: [96]u8 = undefined;
+            for (0..c.n_layers) |l| inline for (.{ "w1", "w3" }) |nm| inline for (.{ "weight", "scales" }) |part| {
+                weights.drop(try std.fmt.bufPrint(&b, "layers.{d}.ffn.shared_experts." ++ nm ++ "." ++ part, .{l}));
+            };
+        }
         if (tier.routes.head == .mxfp8) {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
@@ -718,6 +732,8 @@ pub const Module = struct {
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         log.info("NATIVE routed forms installed: down_pair {}, gu_one {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
+        self.installed.dense_rc = self.model.tier.routes.dense_rc;
+        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
@@ -1746,6 +1762,8 @@ pub const Installed = struct {
     head_mxfp8_rc: bool = false,
     /// ROUTED_FORMS as installed.
     routed_forms: xq.Forms = .{},
+    /// DENSE_RC as installed.
+    dense_rc: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.

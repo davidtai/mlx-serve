@@ -209,6 +209,20 @@ pub fn RowPlans(comptime G: type, comptime n: usize) type {
             return initAt(g, e, site, &no_vars, diag);
         }
 
+        /// A table of explicit launches (`cfgs[m - 1]` at M = m; the template slices must outlive the plans).
+        pub fn initCfgs(g: *G, e: *const Entry, cfgs: *const [n]LaunchConfig) !Self {
+            var p: Self = .{ .e = e, .cfg = cfgs.*, .prep = undefined };
+            if (prepared) {
+                var built: usize = 0;
+                errdefer for (p.prep[0..built]) |*x| g.releasePrepared(x);
+                for (&p.prep, &p.cfg) |*x, *c| {
+                    x.* = try g.prepareLaunch(e.kernel, c);
+                    built += 1;
+                }
+            }
+            return p;
+        }
+
         /// As `init` at the fixed values `base` of the kernel's other vars (the attention's key
         /// count): the table varies M only. The kernel's rows bound covers the table (a kernel the
         /// prefill routes also launch, at more rows per call, has a wider bound).
