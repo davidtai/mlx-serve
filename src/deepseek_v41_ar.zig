@@ -1611,6 +1611,12 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
+    // The decode cache limit in MiB (decodecache32 ...): 0 refused by name (decodecache0 is dead: a fresh buffer per
+    // allocation); exclusive with the byte form.
+    if (envStr("DSV41_CELL_DECODE_CACHE_LIMIT_MB")) |v| {
+        if (ov.decode_cache_bytes != null) return error.CellDecodeCacheTwoForms;
+        ov.decode_cache_bytes = try cellCacheLimitMb(v);
+    }
     // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
     if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
@@ -1668,6 +1674,22 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: 
     });
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
+}
+
+/// DSV41_CELL_DECODE_CACHE_LIMIT_MB's value in bytes: 1..256 MiB (the Module refuses above the envelope's).
+pub fn cellCacheLimitMb(v: []const u8) error{ CellDecodeCacheLimitMb, CellDecodeCacheLimitZeroIsDead }!u64 {
+    const mb = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheLimitMb;
+    if (mb == 0) return error.CellDecodeCacheLimitZeroIsDead;
+    if (mb > 256) return error.CellDecodeCacheLimitMb;
+    return mb << 20;
+}
+
+test "dsv41 served cell: the decode cache limit in MiB: 1..256, 0 refused by name" {
+    try testing.expectEqual(@as(u64, 33_554_432), try cellCacheLimitMb("32"));
+    try testing.expectEqual(@as(u64, 268_435_456), try cellCacheLimitMb("256"));
+    try testing.expectError(error.CellDecodeCacheLimitZeroIsDead, cellCacheLimitMb("0"));
+    try testing.expectError(error.CellDecodeCacheLimitMb, cellCacheLimitMb("257"));
+    try testing.expectError(error.CellDecodeCacheLimitMb, cellCacheLimitMb("32m"));
 }
 
 fn gbOf(x: u64) f64 {

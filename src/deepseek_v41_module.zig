@@ -2196,11 +2196,35 @@ test "dsv41 memory: verify_wave covers a served decode forward's layer waves, it
     _ = try head.draftBlock(&g, lp.main_h.?, 1, caches[0..n_st], model_.embed, model_.head);
     const dh_ = LayerHeld.of(&g, d0, g.nodes.items.len, g.freed.items[dw0..]);
     g.reset();
+    if (std.c.getenv("DSV41_CACHE_SIM") != null) printCacheSim(&g, &.{ .{ v0, d0 }, .{ d0, g.nodes.items.len } });
     const form = bill_mod.verifyWaveBytes(&c, verify_rows, positions, c.dspark.block_size);
     std.debug.print("\nDSV41_VERIFY_WAVE {{\"positions\": {d}, \"rows\": {d}, \"verify_layer\": {d}, \"verify_outside\": {d}, \"draft_layer\": {d}, \"draft_outside\": {d}, \"form\": {d}, \"decode_wave_today\": 365449216}}\n", .{ positions, verify_rows, vh.layer, vh.outside, dh_.layer, dh_.outside, form });
     try std.testing.expect(vh.layer + vh.outside <= form);
     try std.testing.expect(dh_.layer + dh_.outside <= form);
     try std.testing.expect(form <= 365_449_216);
+}
+
+/// DSV41_CACHE_SIM=1 with the verify_wave test (bank, trace backend): one decode cycle's traced buffers (the verify
+/// forward and the draft block; views, inputs and host values excluded) and the largest one. MLX's cache recycles a
+/// freed buffer while it holds less than its limit (metal/allocator.cpp `free`), so it can end one buffer over: the
+/// decode cache's geometric bound is the limit plus the largest buffer a decode cycle frees.
+fn printCacheSim(g: *const ops.TraceOps, parts: []const [2]usize) void {
+    const sim = @import("dsv41_cache_sim.zig");
+    var count: u64 = 0;
+    var largest: u64 = 0;
+    var largest_op: ops.Op = .input;
+    for (parts) |p| for (g.nodes.items[p[0]..p[1]]) |node| switch (node.op) {
+        .input, .host, .scalar, .reshape, .transpose, .transpose_axes, .broadcast_to, .expand_dims, .slice, .tape_begin, .tape_end => {},
+        else => {
+            count += 1;
+            const b = sim.rounded(@as(u64, @intCast(node.shape.numel())) * ops.dtypeSize(node.dtype));
+            if (b > largest) {
+                largest = b;
+                largest_op = node.op;
+            }
+        },
+    };
+    std.debug.print("\nDSV41_CACHE_SIM {{\"traced_buffers_per_cycle\": {d}, \"largest_buffer_bytes\": {d}, \"largest_op\": \"{t}\"}}\n", .{ count, largest, largest_op });
 }
 
 /// The routed hook with a record of each forward's rows (layer 0's routed call), the order the model feeds it.
