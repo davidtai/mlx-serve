@@ -185,6 +185,10 @@ pub const Routes = struct {
     /// residual, the tap is settled), not at its routed group's HC post; the routed groups then hold one hc-width
     /// stream. Lifetime only: the same ops.
     input_stream_early_release: bool = false,
+    /// K16: each routed group's MoE inputs (the chunks' moe_in, their row views and concat) freed once the wide call's
+    /// waves drained and the host-shared experts were issued from them, before the group's final evaluation. Lifetime
+    /// only: the same ops. Needs JOINLESS and the host shared experts (the combine then reads neither input).
+    prefill_input_release: bool = false,
     /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
     /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
     predict_bf16: bool = false,

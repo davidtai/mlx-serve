@@ -352,6 +352,26 @@ pub const MlxOps = struct {
         _ = mlx.mlx_array_free(x);
     }
 
+    /// Free a wave-tracked array before its wave's reset (its slot in the scope holds an empty handle after).
+    pub fn drop(g: *MlxOps, x: T) void {
+        var i = g.live.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (g.live.items[i].ctx == x.ctx) {
+                _ = mlx.mlx_array_free(x);
+                g.live.items[i] = mlx.mlx_array_new();
+                return;
+            }
+        }
+        unreachable;
+    }
+
+    /// Free a kept array now; returns the empty handle its holder keeps until its own release.
+    pub fn dropKept(_: *MlxOps, x: T) T {
+        _ = mlx.mlx_array_free(x);
+        return mlx.mlx_array_new();
+    }
+
     /// Take ownership of an array built outside the backend (freed by `reset`).
     pub fn adopt(g: *MlxOps, x: T) !T {
         return g.track(x);
@@ -1121,6 +1141,9 @@ pub const TraceOps = struct {
     /// dtypes) it has not seen is what `mx.compile` traces anew.
     compiles: usize = 0,
     tape_sigs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Arrays dropped before their scope ended (`drop`), and the reads of them after (a use after release).
+    dropped: std.ArrayList(T) = .empty,
+    use_after_drop: u32 = 0,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1134,6 +1157,7 @@ pub const TraceOps = struct {
         g.evals.deinit(g.gpa);
         g.evaluated.deinit(g.gpa);
         g.released.deinit(g.gpa);
+        g.dropped.deinit(g.gpa);
         var it = g.host_data.valueIterator();
         while (it.next()) |v| g.gpa.free(v.*);
         g.host_data.deinit(g.gpa);
@@ -1175,6 +1199,7 @@ pub const TraceOps = struct {
     }
 
     pub fn evalAll(g: *TraceOps, xs: []const T) !void {
+        for (xs) |x| g.touch(x);
         try g.evals.append(g.gpa, g.nodes.items.len);
         try g.evaluated.appendSlice(g.gpa, xs);
     }
@@ -1183,6 +1208,17 @@ pub const TraceOps = struct {
     }
     pub fn release(g: *TraceOps, x: T) void {
         g.released.append(g.gpa, x) catch @panic("trace: out of memory");
+    }
+    /// An array freed before its scope ends; any later shape, dtype or evaluation of it counts in `use_after_drop`.
+    pub fn drop(g: *TraceOps, x: T) void {
+        g.dropped.append(g.gpa, x) catch @panic("trace: out of memory");
+    }
+    pub fn dropKept(g: *TraceOps, x: T) T {
+        g.drop(x);
+        return x;
+    }
+    fn touch(g: *TraceOps, x: T) void {
+        if (std.mem.indexOfScalar(T, g.dropped.items, x) != null) g.use_after_drop += 1;
     }
     pub fn adopt(_: *TraceOps, x: T) !T {
         return x;
@@ -1223,10 +1259,12 @@ pub const TraceOps = struct {
     }
 
     pub fn dtypeOf(g: *TraceOps, x: T) Dtype {
+        g.touch(x);
         return g.nodes.items[x].dtype;
     }
 
     pub fn shapeOf(g: *TraceOps, x: T) Shape {
+        g.touch(x);
         return g.nodes.items[x].shape;
     }
 

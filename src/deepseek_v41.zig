@@ -65,6 +65,9 @@ pub const PrefillBill = struct {
     /// two with it (ee80e40; SERVED16 measured the fence's drop at 2.787 GB: two streams freed, 2.684 GB, so one more than
     /// the mixed stream stays live), one once the model declares that holder released.
     group_streams: u64 = 4,
+    /// K16's MoE-input release (`Routes.prefill_input_release`): the group's final evaluation no longer holds the
+    /// chunks' moe_in (seq x hidden f32, in `halves`) nor their concat (g_rows x hidden f32, in the final evaluation).
+    input_release: bool = false,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
@@ -91,6 +94,12 @@ pub const PrefillBill = struct {
     pub fn withIndexLaunch(b: PrefillBill, on: bool) PrefillBill {
         var x = b;
         x.index_launch = on;
+        return x;
+    }
+
+    pub fn withInputRelease(b: PrefillBill, on: bool) PrefillBill {
+        var x = b;
+        x.input_release = on;
         return x;
     }
 
@@ -248,7 +257,10 @@ pub const PrefillBill = struct {
         // the taps and the selection are the kept terms above. It binds where the group's streams no longer do (the
         // tight bill with the early release).
         const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * 4 + b.top_k * 20);
-        return kept_stream + halves + selection + @max(attn, @max(group, final_eval));
+        // With the input release the final evaluation runs without the moe_in rows and their concat (the attention
+        // side and the routed call still hold both).
+        const released: u64 = if (b.input_release) seq * d * 4 + g_rows * d * 4 else 0;
+        return kept_stream + selection + @max(halves + @max(attn, group), halves + final_eval - released);
     }
 
     /// The K16 wide lane's own transient beside the layer-major wave: one more copy of the routed
@@ -413,6 +425,13 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     const group4: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 4 * 5120 * 4);
     const final_eval: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 5120 * 4 + 5120 * 4 + 6 * 20);
     try std.testing.expectEqual(final_eval, j.withGroupStreams(1).layerMajorWaveBytes(16384, .served) - (j.layerMajorWaveBytes(16384, .served) - group4));
+    // The input release lowers only the final evaluation's branch: where the group term binds (conservative, two
+    // streams) nothing; with one stream the final evaluation (5.84 GB) gives way to the attention side (5.58 GB).
+    try std.testing.expectEqual(j.layerMajorWaveBytes(16384, .served), j.withInputRelease(true).layerMajorWaveBytes(16384, .served));
+    try std.testing.expectEqual(j.withGroupStreams(2).layerMajorWaveBytes(16384, .served), j.withGroupStreams(2).withInputRelease(true).layerMajorWaveBytes(16384, .served));
+    const one = j.withGroupStreams(1);
+    const saved = one.layerMajorWaveBytes(16384, .served) - one.withInputRelease(true).layerMajorWaveBytes(16384, .served);
+    try std.testing.expect(saved > 0 and saved < 2 * 16384 * 5120 * 4);
     // Longer prompts make more row-closed waves: at a 65,104-row group (the chunk target's cap) the bound is 167.
     try std.testing.expectEqual(@as(u64, 48 + 108 + 9 + 2), j.joinlessOutputsMax(shape, 65_104 * 6));
     // P1d's resident-first base call: one more call's last wave, 87 outputs; the copy bound rises by routed x 23 / (86 x 87).
