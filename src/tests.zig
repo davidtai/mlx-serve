@@ -67,6 +67,8 @@ test {
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("dsv41_decode_timers.zig");
     _ = @import("dsv41_decode_first.zig");
+    _ = @import("dsv41_cache_sim.zig");
+    _ = @import("dsv41_policy_replay.zig");
     _ = @import("dsv41_draft_routes.zig");
     _ = @import("dsv41_verify_timeline.zig");
     _ = @import("dsv41_host_heap.zig");

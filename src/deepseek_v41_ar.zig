@@ -1728,6 +1728,12 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
+    // The decode cache limit in MiB (decodecache32 ...): 0 refused by name (decodecache0 is dead: a fresh buffer per
+    // allocation); exclusive with the byte form.
+    if (envStr("DSV41_CELL_DECODE_CACHE_LIMIT_MB")) |v| {
+        if (ov.decode_cache_bytes != null) return error.CellDecodeCacheTwoForms;
+        ov.decode_cache_bytes = try cellCacheLimitMb(v);
+    }
     // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
     if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
@@ -1787,6 +1793,22 @@ fn cellFill(a: std.mem.Allocator, io: std.Io, config: *model.ModelConfig, args: 
     });
     config.expert_rows = nr.decode;
     config.expert_prefill_rows = nr.prefill;
+}
+
+/// DSV41_CELL_DECODE_CACHE_LIMIT_MB's value in bytes: 1..256 MiB (the Module refuses above the envelope's).
+pub fn cellCacheLimitMb(v: []const u8) error{ CellDecodeCacheLimitMb, CellDecodeCacheLimitZeroIsDead }!u64 {
+    const mb = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheLimitMb;
+    if (mb == 0) return error.CellDecodeCacheLimitZeroIsDead;
+    if (mb > 256) return error.CellDecodeCacheLimitMb;
+    return mb << 20;
+}
+
+test "dsv41 served cell: the decode cache limit in MiB: 1..256, 0 refused by name" {
+    try testing.expectEqual(@as(u64, 33_554_432), try cellCacheLimitMb("32"));
+    try testing.expectEqual(@as(u64, 268_435_456), try cellCacheLimitMb("256"));
+    try testing.expectError(error.CellDecodeCacheLimitZeroIsDead, cellCacheLimitMb("0"));
+    try testing.expectError(error.CellDecodeCacheLimitMb, cellCacheLimitMb("257"));
+    try testing.expectError(error.CellDecodeCacheLimitMb, cellCacheLimitMb("32m"));
 }
 
 fn gbOf(x: u64) f64 {
@@ -2386,16 +2408,11 @@ fn sleepMs(ms: u32) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-fn printBill(b: CellBill) void {
-    const gb = struct {
-        fn f(x: u64) f64 {
-            return @as(f64, @floatFromInt(x)) / 1e9;
-        }
-    }.f;
-    std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
-    if (b.draft_cache > 0) std.debug.print("  (DRAFTCACHE: the residents carry the draft cache's slot banks, {d} B, in place of the DSpark experts)\n", .{b.draft_cache});
-    const T = struct { name: []const u8, p: u64, d: u64 };
-    for ([_]T{
+/// The bill's printed lines (prompt / decode bytes): every term of both phases' totals.
+pub const BillLine = struct { name: []const u8, p: u64, d: u64 };
+
+pub fn billLines(b: CellBill) [17]BillLine {
+    return .{
         .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
         .{ .name = "slot banks (layers x rows + transient) x record", .p = b.slot_prefill, .d = b.slot_decode },
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
@@ -2405,6 +2422,7 @@ fn printBill(b: CellBill) void {
         .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify or draft (in sequence)", .p = b.prefill_wave, .d = @max(b.decode_wave, b.draft_wave) },
         .{ .name = "KV (every bounded lane at its cap; the ring at its widest)", .p = b.kv, .d = b.kv_decode },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
+        .{ .name = "MLX cache overshoot (one freed buffer above the limit)", .p = b.cache_overshoot_prompt, .d = b.cache_overshoot_decode },
         .{ .name = "host side, measured (pools, staging, caches, process)", .p = b.host_reserve, .d = b.host_reserve },
         .{ .name = "wide read windows past the first", .p = b.wide_window, .d = b.wide_window },
         .{ .name = "retained prompt state (seed views; decode)", .p = 0, .d = b.prompt_state },
@@ -2412,9 +2430,34 @@ fn printBill(b: CellBill) void {
         .{ .name = "unbilled process overhead (prompt phase; decode's is prompt_state)", .p = b.unbilled_overhead, .d = 0 },
         .{ .name = "wire_tables (page tables + wiring records for the wired bytes)", .p = b.prefillTerms().wire_tables, .d = b.decodeTerms().wire_tables },
         .{ .name = "buffer allowances (provisional; pass3br's mark readings)", .p = b.prefillTerms().prompt_buffer_allowance, .d = b.decodeTerms().decode_buffer_allowance },
-    }) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
+    };
+}
+
+test "dsv41 served cell: the printed bill's lines sum to both phases' totals, the cache overshoot's included" {
+    var b = bill_mod.cell4Bill();
+    b.cache_overshoot_prompt = 1_474_834_337;
+    b.cache_overshoot_decode = bill_mod.cache_overshoot_decode_traced;
+    var p: u64 = 0;
+    var d: u64 = 0;
+    for (billLines(b)) |l| {
+        p += l.p;
+        d += l.d;
+    }
+    try testing.expectEqual(b.prefillTotal(), p);
+    try testing.expectEqual(b.decodeTotal(), d);
+}
+
+fn printBill(b: CellBill) void {
+    const gb = struct {
+        fn f(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e9;
+        }
+    }.f;
+    std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
+    if (b.draft_cache > 0) std.debug.print("  (DRAFTCACHE: the residents carry the draft cache's slot banks, {d} B, in place of the DSpark experts)\n", .{b.draft_cache});
+    for (billLines(b)) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
-    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"decode_extra_records\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, b.decode_extra_records, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes });
+    std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"decode_extra_records\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}, \"mlx_cache_overshoot_bytes\": [{d}, {d}]}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, b.decode_extra_records, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes, b.cache_overshoot_prompt, b.cache_overshoot_decode });
 }
 
 test "dsv41 memory: the harness's window proofs: page cache left by the load, the box's pages at the phase change" {
