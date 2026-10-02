@@ -455,7 +455,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
     // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).
     const decode_wave = verifyWaveBytes(&c, rows, positions, c.dspark.block_size);
     // The phases' buffers (printed): the checkpoint's tensors as the Module keeps them, what it builds, the state, the slot banks.
-    const persistent_arrays = m.totalTensors() - droppedResidentArrays(headRoute(ov)) + builtResidentArrays(&c, headRoute(ov)) + em.totalTensors() + wire_arrays_state + (@as(u64, c.n_layers) + 1) * expert_bank.n_components;
+    const persistent_arrays = m.totalTensors() - droppedResidentArrays(&c, headRoute(ov), denseRc(ov)) + builtResidentArrays(&c, headRoute(ov), denseRc(ov)) + em.totalTensors() + wire_arrays_state + (@as(u64, c.n_layers) + 1) * expert_bank.n_components;
     return .{
         // Unset (a shell without a box baseline): the process terms alone.
         .baseline = config.memory_baseline_bytes orelse 0,
@@ -469,7 +469,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient_decode) * rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
-        .residents = m.totalBytes() - droppedResidentBytes(&m, headRoute(ov)) + builtResidentBytes(&c, headRoute(ov)) - draftResidentBytes(&m, ov) + try draftCacheBytes(&c, ov),
+        .residents = m.totalBytes() - droppedResidentBytes(&m, &c, headRoute(ov), denseRc(ov)) + builtResidentBytes(&c, headRoute(ov), denseRc(ov)) - draftResidentBytes(&m, ov) + try draftCacheBytes(&c, ov),
         .draft_cache = try draftCacheBytes(&c, ov),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes(),
@@ -557,33 +557,42 @@ fn headRoute(ov: module.RouteOverrides) graph.Routes.Head {
     return ov.head_mode orelse module.numericTier(.served).routes.head;
 }
 
+/// DENSE_RC (`RouteOverrides.dense_rc`, default off).
+fn denseRc(ov: module.RouteOverrides) bool {
+    return ov.dense_rc orelse false;
+}
+
 /// Device bytes the model builds at construction beyond the checkpoint's residents (`Model.builtBytes`, computed before
 /// construction from the same formulas): HEAD_MODE mxfp8's codes and scales (vocab x hidden x 33 / 32), and W97's dense
 /// f32 wo_a per layer when the served tier routes it (off today).
-pub fn builtResidentBytes(c: *const v41.Config, head: graph.Routes.Head) u64 {
+pub fn builtResidentBytes(c: *const v41.Config, head: graph.Routes.Head, dense_rc: bool) u64 {
     var n: u64 = 0;
     if (module.numericTier(.served).routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
     if (head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
+    if (dense_rc) n += graph.sharedGateUpBytes(c);
     return n;
 }
 
 /// `builtResidentBytes`' arrays: HEAD_MODE mxfp8's codes and scales, W97's dense wo_a per layer.
-pub fn builtResidentArrays(c: *const v41.Config, head: graph.Routes.Head) u64 {
+pub fn builtResidentArrays(c: *const v41.Config, head: graph.Routes.Head, dense_rc: bool) u64 {
     var n: u64 = 0;
     if (module.numericTier(.served).routes.wo_a_f32) n += c.n_layers;
     if (head == .mxfp8) n += 2;
+    // DENSE_RC: the stacked codes and scales per layer (the halves are views of them: no buffers).
+    if (dense_rc) n += 2 * @as(u64, c.n_layers);
     return n;
 }
 
 /// `droppedResidentBytes`' arrays: the dense head's one tensor under HEAD_MODE mxfp8.
-pub fn droppedResidentArrays(head: graph.Routes.Head) u64 {
-    return @intFromBool(head == .mxfp8);
+pub fn droppedResidentArrays(c: *const v41.Config, head: graph.Routes.Head, dense_rc: bool) u64 {
+    return @as(u64, @intFromBool(head == .mxfp8)) + if (dense_rc) 4 * @as(u64, c.n_layers) else 0;
 }
 
 /// Checkpoint residents the Module drops once the model is built (`Model.droppedBytes`): the dense bf16 head under
 /// HEAD_MODE mxfp8, its bytes as the resident map holds them (`head.weight`).
-pub fn droppedResidentBytes(m: *const v41.WeightMap, head: graph.Routes.Head) u64 {
-    return if (head == .mxfp8) m.bytes_by_module[@backingInt(v41.Module.head)] else 0;
+pub fn droppedResidentBytes(m: *const v41.WeightMap, c: *const v41.Config, head: graph.Routes.Head, dense_rc: bool) u64 {
+    const h: u64 = if (head == .mxfp8) m.bytes_by_module[@backingInt(v41.Module.head)] else 0;
+    return h + if (dense_rc) graph.sharedGateUpBytes(c) else 0;
 }
 
 /// ENGRAM=prefetch (the served tier's `engram_posted` route, dsv41-engram-prefetch b198dbd): the K16 prompt pass
@@ -1227,10 +1236,14 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank_dir, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
-    try testing.expectEqual(@as(u64, 1_323_827_200), droppedResidentBytes(&m, .mxfp8));
-    try testing.expectEqual(@as(u64, c.vocab_size) * c.hidden_size * 2, droppedResidentBytes(&m, .mxfp8));
-    try testing.expectEqual(@as(u64, 0), droppedResidentBytes(&m, .bf16));
-    try testing.expectEqual(@as(u64, 682_598_400), builtResidentBytes(&c, .mxfp8) - builtResidentBytes(&c, .bf16));
+    try testing.expectEqual(@as(u64, 1_323_827_200), droppedResidentBytes(&m, &c, .mxfp8, false));
+    try testing.expectEqual(@as(u64, c.vocab_size) * c.hidden_size * 2, droppedResidentBytes(&m, &c, .mxfp8, false));
+    try testing.expectEqual(@as(u64, 0), droppedResidentBytes(&m, &c, .bf16, false));
+    try testing.expectEqual(@as(u64, 682_598_400), builtResidentBytes(&c, .mxfp8, false) - builtResidentBytes(&c, .bf16, false));
+    // DENSE_RC builds the stacked shared gate | up and drops the originals: the same bytes (40 x 2 x 2304 x 5120 x
+    // 33 / 32), the residents unchanged.
+    try testing.expectEqual(@as(u64, 973_209_600), graph.sharedGateUpBytes(&c));
+    try testing.expectEqual(builtResidentBytes(&c, .bf16, true) - builtResidentBytes(&c, .bf16, false), droppedResidentBytes(&m, &c, .bf16, true));
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{

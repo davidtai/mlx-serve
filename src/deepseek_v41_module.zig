@@ -125,6 +125,9 @@ pub const RouteOverrides = struct {
     /// HEAD_MODE mxfp8's head on RCPROJ at <= 8 rows (the verify rows and the draft block) instead of MLX's quantized
     /// matmul; needs head_mode mxfp8. Rounding-class like the codec itself. null: the default, off.
     head_mxfp8_rc: ?bool = null,
+    /// DENSE_RC (kbench v7): C29's mxfp8 sites on RCPROJ (shared gate | up stacked in one launch, w2 at 8-wide steps,
+    /// the indexer wq_b, the Engram wkv) and the verify head on MLX's matmul. Rounding-class. null: the default, off.
+    dense_rc: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -521,6 +524,11 @@ pub const Module = struct {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
         }
+        if (ov.dense_rc) |v| if (v) {
+            if (!tier.routes.rc_mxfp8_rows) return error.DenseRcNeedsRows;
+            tier.routes.dense_rc = true;
+            tier.routes.rc_head = false;
+        };
         if (ov.head_mxfp8_rc) |v| {
             if (v and tier.routes.head != .mxfp8) return error.HeadMxfp8RcNeedsMxfp8;
             tier.routes.rc_head_mxfp8 = v;
@@ -535,6 +543,13 @@ pub const Module = struct {
         errdefer self.model.deinit(&self.g);
         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
         // dense one (the draft head takes the model's), so the checkpoint's bf16 head leaves the device here.
+        if (tier.routes.dense_rc) {
+            // DENSE_RC: the model rebound the shared gate and up as views of its stack; the originals leave here.
+            var b: [96]u8 = undefined;
+            for (0..c.n_layers) |l| inline for (.{ "w1", "w3" }) |nm| inline for (.{ "weight", "scales" }) |part| {
+                weights.drop(try std.fmt.bufPrint(&b, "layers.{d}.ffn.shared_experts." ++ nm ++ "." ++ part, .{l}));
+            };
+        }
         if (tier.routes.head == .mxfp8) {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
@@ -570,6 +585,8 @@ pub const Module = struct {
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
+        self.installed.dense_rc = self.model.tier.routes.dense_rc;
+        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch), shared w2 kv8, indexer wq_b and Engram wkv on RCPROJ, verify head on MLX matmul; stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
@@ -1388,6 +1405,8 @@ pub const Installed = struct {
     head_mode: graph.Routes.Head = .f32,
     /// The mxfp8 head's apply route as installed: RCPROJ (true) or MLX's quantized matmul.
     head_mxfp8_rc: bool = false,
+    /// DENSE_RC as installed.
+    dense_rc: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.

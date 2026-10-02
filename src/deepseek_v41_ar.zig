@@ -1071,6 +1071,8 @@ const CellReceipt = struct {
     head_mode: ?[]const u8 = null,
     /// The mxfp8 head's apply route (installed): RCPROJ (true) or MLX's quantized matmul; null on a bf16 head.
     head_mxfp8_rc: ?bool = null,
+    /// DENSE_RC as installed.
+    dense_rc: ?bool = null,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1505,6 +1507,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
+        .dense_rc = md.installed.dense_rc,
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1628,6 +1631,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
+    if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_HEAD_MXFP8_RC")) |v| ov.head_mxfp8_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellHeadMxfp8Rc;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;
