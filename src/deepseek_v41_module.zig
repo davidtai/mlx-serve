@@ -142,6 +142,10 @@ pub const RouteOverrides = struct {
     /// ROUTED_BANKED (kbench v6d / v9b, exact): the routed decode stages on the banked texts, one launch per stage
     /// over a wave's rows of every bank (packed slot ids), the forms above taken. null: the default, off (per bank).
     routed_banked: ?bool = null,
+    /// GEMV_REBUILD (the stock-route leak's discriminator; info): the accept-time decode GEMVs freed and rebuilt at
+    /// construction on the forms above even when they are the stock texts (`formsRoute`). Exact: the same texts,
+    /// statics and launch configs. null: the default, off (the accept-time GEMVs kept unless a form is set).
+    gemv_rebuild: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -203,6 +207,27 @@ pub fn phaseGrowDelayMs(ov: RouteOverrides) error{ PhaseGrowDelayOutOfRange, Pha
     if (d == 0 or d > phase_grow_delay_max_ms) return error.PhaseGrowDelayOutOfRange;
     if (phaseTailRelease(ov)) return error.PhaseGrowDelayWithTailRelease;
     return d;
+}
+
+/// The forms `routeForms` rebuilds the decode GEMVs on at construction, or null (the accept-time GEMVs kept): any
+/// form set, or GEMV_REBUILD (then the stock texts are rebuilt too). Unset, exactly the routing before GEMV_REBUILD.
+pub fn formsRoute(ov: RouteOverrides) ?xq.Forms {
+    const f = ov.routed_forms orelse xq.Forms{};
+    return if (f.down_pair or f.gu_one or (ov.gemv_rebuild orelse false)) f else null;
+}
+
+test "dsv41 module: GEMV_REBUILD routes the stock forms through routeForms; unset, the forms route exactly as before" {
+    // unset or 0: the accept-time GEMVs stay unless a form is set (the routing before GEMV_REBUILD)
+    try std.testing.expect(formsRoute(.{}) == null);
+    try std.testing.expect(formsRoute(.{ .routed_forms = .{} }) == null);
+    try std.testing.expect(formsRoute(.{ .gemv_rebuild = false }) == null);
+    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }).?);
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true }, .gemv_rebuild = false }).?);
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }).?);
+    // set: the stock texts rebuilt (with or without an explicit stock ROUTED_FORMS); a form set is unchanged by it
+    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .gemv_rebuild = true }).?);
+    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .routed_forms = .{}, .gemv_rebuild = true }).?);
+    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true }, .gemv_rebuild = true }).?);
 }
 
 test "dsv41 module: STOCKDELAY is off by default, 1..2000 ms, and refused with the tail release" {
@@ -633,8 +658,9 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
-        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
-        if (ov.routed_forms) |f| if (f.down_pair or f.gu_one) try self.exl3.routeForms(&self.g, f);
+        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins);
+        // GEMV_REBUILD: rebuilt on the stock texts too (the accept-time GEMVs freed; the stock-route leak's discriminator).
+        if (formsRoute(ov)) |f| try self.exl3.routeForms(&self.g, f);
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
         if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
@@ -779,6 +805,8 @@ pub const Module = struct {
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
         log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
+        self.installed.gemv_rebuild = self.overrides.gemv_rebuild orelse false;
+        if (self.installed.gemv_rebuild) log.info("NATIVE gemv rebuild: installed (the accept-time decode GEMVs freed and rebuilt at construction; forms down_pair {}, gu_one {})", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
@@ -1857,6 +1885,8 @@ pub const Installed = struct {
     dense_rc: bool = false,
     /// ROUTED_BANKED as installed (the quant's banked route and the hook's banked waves).
     routed_banked: bool = false,
+    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction.
+    gemv_rebuild: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.
