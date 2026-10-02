@@ -177,6 +177,47 @@ reaches a plugin only through the registry.
    does for mlx-stream).
 4. `zig build conformance` and `zig build check -Dslim=true`.
 
+## A second arch, step by step
+
+What an arch like MiMo (a module-owned decode state, its routed experts repacked into one record file of six MXFP4
+components with gate/up = 4, eight experts routed per token, MLX's own `gather_qmm` for the expert math) writes, and what
+it gets from the SDK as it stands.
+
+It writes:
+
+1. **A directory** `src/<plugin>/` with a root file declaring `pub const plugin = sdk.Plugin{ .name, .api, .mlx,
+   .macos_only, .provides = .{ .arch = <its arch file> } }`, and one line in `src/plugins.zig`. Its files import `sdk`,
+   the shared modules and each other; the import probe holds it to that.
+2. **The arch file**, checked by `sdk.Arch.of`: `name`, `caps` (`owns_decode_state`, `prefill_whole_prompt`, ...),
+   `claims(ConfigPeek)` (its `model_type` at `native`), `Config` + `parse` / `freeConfig` / `shell` / `applySettings`,
+   `loadBytes` (its load preflight), `Module` + `init(LoadCtx, Config)` / `deinit` / `prefill` / `step` / `position`, and
+   optionally `promptBytes`, `handover` (its phase change), `bill` (its itemized `sdk.MemoryBill`) and `spec.draft_lane`.
+   `init` reads its residents from `LoadCtx.weights` (`sdk.Weights`), any sidecar through `LoadCtx.loader`, the GPU
+   ceiling from `LoadCtx.ceiling` and the wired margin from `LoadCtx.facts.wired_margin_bytes`.
+3. **A bank module** for its expert file: `n_components = 6`, `gu_components = 4`, `Records`, a `Component` enum, a
+   `Layer` (six segments: weight U32 / scales U8 per projection), `mlxDtype`, `Bank` (`layers`, `n_experts`, an
+   `UncachedFd` from `sdk.expert.openUncached`, `recordOffset`, `spans`), `BankArrays` / `bankArraysOf` (the six slot
+   arrays as its quant binds them) and `routed_top_k = 8`.
+4. **The MoE math** over the slot arrays the stream serves: `sdk.quant.FromGatherMatmul(sdk.quant.GatherQmm)` (mode
+   mxfp4, 4 bits, group 32) needs no kernels of its own; strided host reads of evaluated arrays use `sdk.ops.copyStrided`.
+
+It gets:
+
+- **The stream**: `sdk.expert.stream.StreamOf(Bank, false)`: slot rows per layer (host pages or MLX arrays), routes with
+  the residency policy, reads through the process's one reader past the page cache, and, as options it installs or not,
+  the lookahead selector at its own top-8, pre-reads, event gates, the transient release and the phase change's growth.
+  The same code serves mlx-stream's EXL3 bank.
+- **Memory**: `sdk.MemoryBill` with the fill and the admission (`sdk.fill`, `sdk.admit`), row-following terms for costs
+  not linear in the slot rows, the construction check, `sdk.memory` for the process and box ledgers, and
+  `sdk.testing.expectBillBoundsLoad` to prove its bill and its preflight agree.
+- **The host's side**: registry routing by claim, the load preflight and prompt admission from its own numbers,
+  single-flight admission and no prefix cache or batched decode (from `owns_decode_state`), the handover called once per
+  request, the reader taken at its load claim, and `-Dslim` / `-D<plugin>=false` builds.
+- **Conformance**: the CPU lane (claims decline what is not theirs, no Metal device, the import probe) by registering.
+
+What it does not get yet: an `sdk.KVCache` for an arch over the host's cache, and a host load path that asks the `quant`
+and `expert_source` lists (an arch binds its quant and source at compile time).
+
 ## Behavior changes
 
 The migration changes these behaviors; each fails with a named error:
