@@ -892,8 +892,8 @@ pub const DraftCache = struct {
     /// `cache.stats` at the previous `takeRequestStats` (zero: construction).
     request_base: expert_stream.Stats = .{},
 
-    /// The statistics since the previous call (the first: since construction, its seed included), for one request's
-    /// receipt; the cache itself carries over to the next request.
+    /// The statistics since the previous call (the first: since `cache.stats` was last zeroed; the Module zeroes it
+    /// after the seed), for one request's receipt; the cache itself carries over to the next request.
     pub fn takeRequestStats(self: *DraftCache) expert_stream.Stats {
         const now = self.cache.stats;
         var d: expert_stream.Stats = .{};
