@@ -1998,6 +1998,12 @@ const LiveReader = struct {
     fn sleep(self: LiveReader, ms: u32) void {
         std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
     }
+
+    /// A buffer that reached MLX's cache after the boundary's clear (a late release: a command buffer's temporaries
+    /// dropped at its completion) is returned to the system before the next reading.
+    fn clearCache(_: LiveReader) void {
+        _ = mlx.mlx_clear_cache();
+    }
 };
 
 /// The footprint may sit this far above its expected drop at the boundary (the ledger's page rounding
@@ -2013,10 +2019,10 @@ fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
 }
 
-/// The settle's condition on one reading: the footprint down by the freed bytes and, with `until_freed`'s bound,
-/// at most the bound.
+/// The settle's condition on one reading: MLX's cache empty (the one check requires it), the footprint down by the
+/// freed bytes and, with `until_freed`'s bound, at most the bound.
 fn settled(before: BoundaryMemory, m: BoundaryMemory, freed_device: u64, bound: ?u64) bool {
-    return footprintFreed(before, m, freed_device) and (if (bound) |b| m.footprint <= b else true);
+    return m.cache == 0 and footprintFreed(before, m, freed_device) and (if (bound) |b| m.footprint <= b else true);
 }
 
 /// After the frees: `reader` read every `poll_ms` (the phase change's installed poll; `phase_change_poll_ms` elsewhere)
@@ -2027,6 +2033,9 @@ pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64, poll_m
     var m = reader.now();
     var waited: u32 = 0;
     while (!settled(before, m, freed_device, bound) and waited < phase_change_settle_ms) {
+        // A buffer released into the cache after the boundary's clear: cleared again, so the settle cannot end on a
+        // reading the one check refuses (PhaseChangeCacheNotEmpty, a sticky boundary refusal).
+        if (m.cache != 0) reader.clearCache();
         reader.sleep(poll_ms);
         waited += poll_ms;
         m = reader.now();
@@ -2864,6 +2873,8 @@ const FakeReader = struct {
     readings: []const BoundaryMemory,
     i: *usize,
     slept_ms: *u32,
+    /// The settle's cache clears (null: not counted).
+    clears: ?*u32 = null,
 
     fn now(self: FakeReader) BoundaryMemory {
         const r = self.readings[@min(self.i.*, self.readings.len - 1)];
@@ -2874,7 +2885,49 @@ const FakeReader = struct {
     fn sleep(self: FakeReader, ms: u32) void {
         self.slept_ms.* += ms;
     }
+
+    fn clearCache(self: FakeReader) void {
+        if (self.clears) |c| c.* += 1;
+    }
 };
+
+test "dsv41 memory: a buffer reaching MLX's cache after the boundary's clear is cleared in the settle, never a sticky PhaseChangeCacheNotEmpty" {
+    const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
+    const freed_fp = before.footprint - before.cache;
+    // The frees landed, but a late release parked 48 MB in the cache after the single clear.
+    const late: BoundaryMemory = .{ .active = before.active, .cache = 48_000_000, .footprint = freed_fp };
+    const clean: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = freed_fp };
+    // Before the fix the settle ended on `late` (footprint freed) and the one check refused the boundary.
+    try std.testing.expectError(error.PhaseChangeCacheNotEmpty, checkSettled(before, late, 0, null));
+    // The settle clears the cache and reads again: the one check passes.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        var clears: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{ late, clean }, .i = &i, .slept_ms = &slept, .clears = &clears }, before, 0, 5, null);
+        try std.testing.expectEqual(@as(u32, 1), clears);
+        try std.testing.expectEqual(@as(u32, 5), st.waited_ms);
+        try checkSettled(before, st.after, 0, null);
+    }
+    // Under the reverse bound too (`until_freed` form).
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        var clears: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{ late, late, clean }, .i = &i, .slept_ms = &slept, .clears = &clears }, before, 0, 5, freed_fp);
+        try std.testing.expectEqual(@as(u32, 2), clears);
+        try checkSettled(before, st.after, 0, freed_fp);
+    }
+    // A clean reading needs no clear.
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        var clears: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{clean}, .i = &i, .slept_ms = &slept, .clears = &clears }, before, 0, 5, null);
+        try std.testing.expectEqual(@as(u32, 0), clears);
+        try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
+    }
+}
 
 test "dsv41 memory: the settle waits for the footprint to show the frees, then the one check judges the last reading" {
     const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };
