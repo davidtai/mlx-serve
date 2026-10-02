@@ -336,7 +336,7 @@ pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decod
 /// process terms less the ones not live then (the scratch it re-creates, when absent; the prompt wave, KV, cache and the
 /// posted Engram gathers, which the next prompt allocates later), so every later allocation lands within the prompt bill.
 pub fn reverseBound(prompt: bill_mod.PhaseTerms, scratch_bytes: u64) u64 {
-    return prompt.sum() -| (scratch_bytes + prompt.waves + prompt.kv + prompt.mlx_cache + prompt.engram_posted);
+    return prompt.sum() -| (scratch_bytes + prompt.waves + prompt.kv + prompt.mlx_cache + prompt.mlx_cache_overshoot + prompt.engram_posted);
 }
 
 /// The reverse phase change in the bill's order (ledger 101), on any `x` with `free() !u64` (the request's state and the
@@ -3063,10 +3063,10 @@ test "dsv41 memory: the reverse bound is the prompt bill less the terms the next
     // 2 GiB, posted Engram 0.107; the rest as billed.
     const rec: u64 = 13_315_584;
     const scratch: u64 = 240 * rec;
-    const t: bill_mod.PhaseTerms = .{ .slot_banks = (40 * 134 + 240) * rec, .residents = 16_355_231_048, .engram = 324_730_880, .waves = 13_868_806_049, .kv = 355_600_384, .mlx_cache = 2_147_483_648, .host_reserve = 1_250_000_000, .engram_posted = 107_000_000, .wire_tables = 157_696_560, .prompt_buffer_allowance = 17_000_000 };
+    const t: bill_mod.PhaseTerms = .{ .slot_banks = (40 * 134 + 240) * rec, .residents = 16_355_231_048, .engram = 324_730_880, .waves = 13_868_806_049, .kv = 355_600_384, .mlx_cache = 2_147_483_648, .mlx_cache_overshoot = 1_474_834_337, .host_reserve = 1_250_000_000, .engram_posted = 107_000_000, .wire_tables = 157_696_560, .prompt_buffer_allowance = 17_000_000 };
     const b = reverseBound(t, scratch);
     // Every later allocation of the next prompt (the scratch, then its wave, KV, cache and posted gathers) lands in the bill.
-    try std.testing.expectEqual(t.sum(), b + scratch + t.waves + t.kv + t.mlx_cache + t.engram_posted);
+    try std.testing.expectEqual(t.sum(), b + scratch + t.waves + t.kv + t.mlx_cache + t.mlx_cache_overshoot + t.engram_posted);
     // The release route off: the scratch stayed through decode, so it is in the footprint, not in the bound's credit.
     try std.testing.expectEqual(b + scratch, reverseBound(t, 0));
     // Decode's end (grown rows and window 0 live, footprint 108.4 GB); the frees trail: the first reading is above the bound,
