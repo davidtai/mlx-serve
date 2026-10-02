@@ -50254,6 +50254,2797 @@
      "name": "cap"
     }
    ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 4608
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "ints": [
+       3417055213,
+       0,
+       2415890431,
+       996162400
+      ],
+      "kind": "values"
+     },
+     "dtype": "uint32",
+     "name": "cb",
+     "role": "static",
+     "shape": [
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_a",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_b",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_p",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_r",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_c",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_mul1h_k3_2304",
+    "native": "mlx-serve dsv41-model (2026-10-02): dsv41_exl3_mul1h_k3_2304's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "cf7553b1fa1207b67f8e6d51068a824afdc39285977b21fd572108143727d172",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): dsv41_exl3_mul1h_k3_2304 with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      4608,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      6,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_mul1h_k3_2304",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == dsv41_exl3_mul1h_k3_2304 on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 3313,
+    "file": "dsv41_exl3_b3_mul1h_k3_2304.metal",
+    "sha256": "cf7553b1fa1207b67f8e6d51068a824afdc39285977b21fd572108143727d172"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 10240
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "ints": [
+       3417055213,
+       0,
+       2415890431,
+       996162400
+      ],
+      "kind": "values"
+     },
+     "dtype": "uint32",
+     "name": "cb",
+     "role": "static",
+     "shape": [
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_a",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_b",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_p",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_r",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_c",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_mul1h_k3_5120",
+    "native": "mlx-serve dsv41-model (2026-10-02): dsv41_exl3_mul1h_k3_5120's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "b0a5c17352fbfddbced9af0c0c6ad5206ebb5349b8827bfffce6e2373ddbf6c3",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): dsv41_exl3_mul1h_k3_5120 with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      10240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      6,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_mul1h_k3_5120",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == dsv41_exl3_mul1h_k3_5120 on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 3313,
+    "file": "dsv41_exl3_b3_mul1h_k3_5120.metal",
+    "sha256": "b0a5c17352fbfddbced9af0c0c6ad5206ebb5349b8827bfffce6e2373ddbf6c3"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": false,
+   "family": "exl3_rin_stage",
+   "grid": [
+    {
+     "m": 2560
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 4.0
+     },
+     "dtype": "bfloat16",
+     "name": "x",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1,
+       "v": "m_tokens"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "m_tokens"
+     },
+     "dtype": "int32",
+     "name": "tok",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rg0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rg1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rg2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "ru0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "ru1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "ru2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "q3_exl3_prep_in_rin",
+    "native": "mlx-serve dsv41-model (2026-10-02): q3_exl3_prep_in_rin's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "057904fc4814f1b920d55618d62c127dd2d65cb04c295a1c355edd078f6e70a5",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): q3_exl3_prep_in_rin with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      2560,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       5120
+      ],
+      [
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "m_tokens",
+       "value": 8
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      2560,
+      7,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       7,
+       5120
+      ],
+      [
+       7,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "m_tokens",
+       "value": 8
+      },
+      {
+       "name": "rows",
+       "value": 7
+      }
+     ]
+    },
+    {
+     "grid": [
+      2560,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       5120
+      ],
+      [
+       48,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "m_tokens",
+       "value": 8
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_prep_in_rin",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "xg",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "xu",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == q3_exl3_prep_in_rin on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 2024,
+    "file": "dsv41_exl3_b3_prep_in_rin.metal",
+    "sha256": "057904fc4814f1b920d55618d62c127dd2d65cb04c295a1c355edd078f6e70a5"
+   },
+   "template": [],
+   "threadgroup": [
+    64,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    },
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "m_tokens"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": false,
+   "family": "exl3_rin_stage",
+   "grid": [
+    {
+     "m": 1152
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 3.0
+     },
+     "dtype": "float32",
+     "name": "zg",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 3.0
+     },
+     "dtype": "float32",
+     "name": "zu",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "rg0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "rg1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "rg2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "ru0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "ru1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float16",
+     "name": "ru2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "q3_exl3_prep_gu_epi",
+    "native": "mlx-serve dsv41-model (2026-10-02): q3_exl3_prep_gu_epi's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "b7000d9aaf8364cfd109c400ddd036e96b0c60af0c0d30642ce46743b1e5ea78",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): q3_exl3_prep_gu_epi with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1152,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      1152,
+      7,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       7,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 7
+      }
+     ]
+    },
+    {
+     "grid": [
+      1152,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_prep_gu_epi",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == q3_exl3_prep_gu_epi on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 3071,
+    "file": "dsv41_exl3_b3_prep_gu_epi.metal",
+    "sha256": "b7000d9aaf8364cfd109c400ddd036e96b0c60af0c0d30642ce46743b1e5ea78"
+   },
+   "template": [],
+   "threadgroup": [
+    64,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": false,
+   "family": "exl3_rin_stage",
+   "grid": [
+    {
+     "m": 1152
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "hid",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rn0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rn1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rn2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "q3_exl3_prep_din_rin",
+    "native": "mlx-serve dsv41-model (2026-10-02): q3_exl3_prep_din_rin's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "969eaac41868453428331918f61f5a88e0debc3771bf822978d62ebcbebb7138",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): q3_exl3_prep_din_rin with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1152,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      1152,
+      7,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       7,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 7
+      }
+     ]
+    },
+    {
+     "grid": [
+      1152,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_prep_din_rin",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == q3_exl3_prep_din_rin on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 1173,
+    "file": "dsv41_exl3_b3_prep_din_rin.metal",
+    "sha256": "969eaac41868453428331918f61f5a88e0debc3771bf822978d62ebcbebb7138"
+   },
+   "template": [],
+   "threadgroup": [
+    64,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": false,
+   "family": "exl3_rin_stage",
+   "grid": [
+    {
+     "m": 2560
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "zd",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rd0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rd1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 0.05
+     },
+     "dtype": "float16",
+     "name": "rd2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "q3_moeprep_dpost",
+    "native": "mlx-serve dsv41-model (2026-10-02): q3_moeprep_dpost's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "8d5165978e63d64d4de9a84f27c2e2e63d21b3a23c533e2c3e3cbe457bb0fd5d",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): q3_moeprep_dpost with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      2560,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      2560,
+      7,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       7,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 7
+      }
+     ]
+    },
+    {
+     "grid": [
+      2560,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      64,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_moeprep_dpost",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == q3_moeprep_dpost on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 1171,
+    "file": "dsv41_exl3_b3_moeprep_dpost.metal",
+    "sha256": "8d5165978e63d64d4de9a84f27c2e2e63d21b3a23c533e2c3e3cbe457bb0fd5d"
+   },
+   "template": [],
+   "threadgroup": [
+    64,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 10240
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "ints": [
+       3417055213,
+       0,
+       2415890431,
+       996162400
+      ],
+      "kind": "values"
+     },
+     "dtype": "uint32",
+     "name": "cb",
+     "role": "static",
+     "shape": [
+      {
+       "m": 4
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_a",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_b",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "lane_p",
+     "role": "static",
+     "shape": [
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_r",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "zeros"
+     },
+     "dtype": "int32",
+     "name": "pos_c",
+     "role": "static",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_pair_k3_5120",
+    "native": "mlx-serve dsv41-model (2026-10-02): dsv41_exl3_pair_k3_5120's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "ccf2d51b1600569e2eeb0f994a2c0e910b58f7ce98affa4fe3ee4f925785fc9c",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): dsv41_exl3_pair_k3_5120 with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      10240,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      6,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      10240,
+      48,
+      1
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       5120
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_pair_k3_5120",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == dsv41_exl3_pair_k3_5120 on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 7678,
+    "file": "dsv41_exl3_b3_pair_k3_5120.metal",
+    "sha256": "ccf2d51b1600569e2eeb0f994a2c0e910b58f7ce98affa4fe3ee4f925785fc9c"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": null,
+   "ensure_row_contiguous": true,
+   "family": "exl3_decode_gemv",
+   "grid": [
+    {
+     "m": 4608
+    },
+    {
+     "m": 2,
+     "v": "rows"
+    },
+    {
+     "m": 1
+    }
+   ],
+   "header": null,
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh_g",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "xh_u",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 5120
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "cap"
+     },
+     "dtype": "uint32",
+     "name": "ids",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_g0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_g1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_g2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_u0",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_u1",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "bits"
+     },
+     "dtype": "int16",
+     "name": "code_u2",
+     "role": "bank",
+     "shape": [
+      {
+       "m": 1,
+       "v": "cap"
+      },
+      {
+       "m": 320
+      },
+      {
+       "m": 144
+      },
+      {
+       "m": 48
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "exact_vs": "dsv41_exl3_guone_k3_2304",
+    "native": "mlx-serve dsv41-model (2026-10-02): dsv41_exl3_guone_k3_2304's statements per row with every bank array read through the row's packed slot (bank << 24 | row) from three banks (base, ext, transient): one launch over a wave's rows in all three banks; kbench v6d / v9b: every word == the per-bank stock waves"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "source",
+     "sha256": "74cc6a76e7947542ba9082ee3f6352ba80c7d7074ca479cc65c70128c9992d3d",
+     "symbol": "mlx-serve native text (dsv41-model, 2026-10-02): dsv41_exl3_guone_k3_2304 with each bank read a three-way select on the packed slot's bank"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      4608,
+      2,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2304
+      ],
+      [
+       1,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      12,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       6,
+       2304
+      ],
+      [
+       6,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 6
+      }
+     ]
+    },
+    {
+     "grid": [
+      4608,
+      96,
+      1
+     ],
+     "output_dtypes": [
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2304
+      ],
+      [
+       48,
+       2304
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      32,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "cap",
+       "value": 4
+      },
+      {
+       "name": "rows",
+       "value": 48
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "dsv41_exl3_b3_guone_k3_2304",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "out_g",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "out_u",
+     "row_axis": 0,
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 2304
+      }
+     ]
+    }
+   ],
+   "phase": "decode",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance",
+     "twin"
+    ],
+    "lane_install_check": "none (mlx-serve native): the registry twin check (per bank b: every word == the stock text on bank b's arrays) and kbench v6d / v9b's bit-identity across banks",
+    "rows_max": 8,
+    "twin": "per bank b of 0..2: every output word == dsv41_exl3_guone_k3_2304 on bank b's arrays (packed ids with bank b)"
+   },
+   "source": {
+    "bytes": 3587,
+    "file": "dsv41_exl3_b3_guone_k3_2304.metal",
+    "sha256": "74cc6a76e7947542ba9082ee3f6352ba80c7d7074ca479cc65c70128c9992d3d"
+   },
+   "template": [],
+   "threadgroup": [
+    32,
+    1,
+    1
+   ],
+   "tiers": [
+    "banked"
+   ],
+   "vars": [
+    {
+     "hi": 48,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 4096,
+     "lo": 1,
+     "name": "cap"
+    }
+   ]
   }
  ],
  "mlx": {
@@ -51086,6 +53877,110 @@
     "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1"
    ],
    "manifest_sha256": "4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3",
+    "joinless",
+    "dig_mul1h_k3_lut"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine",
+    "q3jl_combine",
+    "dsv41_prefill_dig_take2v_5120",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1",
+    "dsv41_exl3_pair_k3_5120",
+    "dsv41_exl3_guone_k3_2304"
+   ],
+   "manifest_sha256": "97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15"
   }
  ],
  "sources": {

@@ -92,7 +92,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
     return switch (c) {
         .compile, .row_invariance => true,
         .join_equiv => k == .q3jl_combine,
-        .twin => twinOf(k) != null or formTwinOf(k) != null,
+        .twin => twinOf(k) != null or formTwinOf(k) != null or bankedTwinOf(k) != null,
         .fused => fusedOf(k) != null,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
@@ -129,6 +129,76 @@ fn twinOf(k: Kernel) ?Kernel {
         .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut => .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
         else => null,
     };
+}
+
+/// A banked text's `twin` reference: the stock text it reads three banks for; null for every other kernel.
+fn bankedTwinOf(k: Kernel) ?Kernel {
+    return switch (k) {
+        .dsv41_exl3_b3_mul1h_k3_2304 => .dsv41_exl3_mul1h_k3_2304,
+        .dsv41_exl3_b3_mul1h_k3_5120 => .dsv41_exl3_mul1h_k3_5120,
+        .dsv41_exl3_b3_prep_in_rin => .q3_exl3_prep_in_rin,
+        .dsv41_exl3_b3_prep_gu_epi => .q3_exl3_prep_gu_epi,
+        .dsv41_exl3_b3_prep_din_rin => .q3_exl3_prep_din_rin,
+        .dsv41_exl3_b3_moeprep_dpost => .q3_moeprep_dpost,
+        .dsv41_exl3_b3_pair_k3_5120 => .dsv41_exl3_pair_k3_5120,
+        .dsv41_exl3_b3_guone_k3_2304 => .dsv41_exl3_guone_k3_2304,
+        else => null,
+    };
+}
+
+/// A banked text against its stock text, once per bank: the generated slot ids are packed with bank b (b<<24 | row),
+/// and the stock call takes bank b's arrays plus the shared inputs; every output word of every bank pass.
+fn checkBankedTwin(h: *H, k: Kernel) !void {
+    var sc: Scope = .{ .a = h.a };
+    defer sc.deinit();
+    const e = h.reg.get(k);
+    const stock = bankedTwinOf(k).?;
+    const es = h.reg.get(stock);
+    var vars = defaultVars(e);
+    vars.set(.rows, 6);
+    vars.set(.cap, 16);
+    var svars = defaultVars(es);
+    svars.set(.rows, 6);
+    svars.set(.cap, 16);
+    const wave = Wave.even(1, 6, 16);
+    var ins = try genAll(h, &sc, e, &vars, null, &wave);
+    const ids_at = for (e.inputs, 0..) |ea, jj| {
+        if (std.mem.eql(u8, ea.name, "ids")) break jj;
+    } else return error.BankedTwinInput;
+    const ids_bytes = try hostCopy(h, ins[ids_at]);
+    defer h.a.free(ids_bytes);
+    const n_ids = ids_bytes.len / 4;
+    if (n_ids == 0 or n_ids > 64) return error.BankedTwinInput;
+    var plain: [64]u32 = undefined;
+    @memcpy(std.mem.sliceAsBytes(plain[0..n_ids]), ids_bytes[0 .. n_ids * 4]);
+    const shape = [_]c_int{@intCast(n_ids)};
+    var bad: u64 = 0;
+    var words: u64 = 0;
+    for (0..3) |b| {
+        var packed_ids: [64]u32 = undefined;
+        for (0..n_ids) |r| packed_ids[r] = (@as(u32, @intCast(b)) << 24) | plain[r];
+        ins[ids_at] = try fromHost(&sc, std.mem.sliceAsBytes(packed_ids[0..n_ids]), &shape, .uint32);
+        var sins: [inputs_max]mlx.mlx_array = @splat(.{});
+        for (es.inputs, 0..) |arg, i| {
+            var nb: [64]u8 = undefined;
+            const bank_name = std.fmt.bufPrint(&nb, "{s}{d}", .{ arg.name, b }) catch unreachable;
+            const j = for (e.inputs, 0..) |ea, jj| {
+                if (std.mem.eql(u8, ea.name, arg.name) or (ea.role == .bank and std.mem.eql(u8, ea.name, bank_name))) break jj;
+            } else return error.BankedTwinInput;
+            sins[i] = if (j == ids_at) try fromHost(&sc, std.mem.sliceAsBytes(plain[0..n_ids]), &shape, .uint32) else ins[j];
+        }
+        const got = try launch(h, &sc, k, ins[0..e.inputs.len], &vars, null);
+        const want = try launch(h, &sc, stock, sins[0..es.inputs.len], &svars, null);
+        for (0..e.outputs.len) |o| {
+            const g_ = try hostCopy(h, got[o]);
+            defer h.a.free(g_);
+            const w_ = try hostCopy(h, want[o]);
+            defer h.a.free(w_);
+            words += g_.len / 4;
+            bad += if (g_.len == w_.len) countDiff(w_, g_, 4) else g_.len / 4;
+        }
+    }
+    try h.record(.{ .kernel = k, .check = .twin, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
 }
 
 /// A routed decode form's `twin` reference: the stock mul1h text of its projection; null for every other kernel.
@@ -289,7 +359,7 @@ const H = struct {
             .layout_guard => try checkLayoutGuard(h, k),
             .composition => try checkComposition(h, k),
             .join_equiv => try checkJoinEquiv(h, k),
-            .twin => if (formTwinOf(k) != null) try checkFormTwin(h, k) else try checkTwin(h, k),
+            .twin => if (bankedTwinOf(k) != null) try checkBankedTwin(h, k) else if (formTwinOf(k) != null) try checkFormTwin(h, k) else try checkTwin(h, k),
             .fused => try checkFused(h, k),
         }
     }

@@ -71,7 +71,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 25), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 33), eq.kernels.len);
     try testing.expectEqual(@as(usize, 56), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
@@ -134,6 +134,22 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expect(acc.gemv.gu1_p != null);
     try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
     try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
+    // the banked route over the forms: six prepared tables (in_rin, gu_epi, din_rin, dpost, gu_one's, the pair's: + 288),
+    // no kept array (its GEMV statics are the forms' own, aliased), no check joins the report; the forms are its
+    // input, so a later forms route is refused
+    const keeps0 = t.keeps;
+    try acc.routeBanked(&t);
+    try testing.expectEqual(@as(isize, 288 + 48 + 288), t.prepared_live);
+    try testing.expectEqual(keeps0, t.keeps);
+    try testing.expectEqual(Kernel.dsv41_exl3_b3_pair_k3_5120, acc.banked.?.dn_e.kernel);
+    try testing.expectEqual(Kernel.dsv41_exl3_b3_guone_k3_2304, acc.banked.?.gu_e.kernel);
+    for (5..acc.banked.?.dn_e.inputs.len) |i| try testing.expectEqual(acc.gemv.dn_statics.arrays[i - 2], acc.banked.?.dn_st[i]);
+    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    try testing.expectError(error.FormsAfterBanked, acc.routeForms(&t, .{}));
+    try testing.expectError(error.BankedRoutedTwice, acc.routeBanked(&t));
+    acc.banked.?.deinit(&t);
+    acc.banked = null;
+    try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
     try acc.routeForms(&t, .{});
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
     // the trunk: the rest of the plan less the table-codebook text's 3 (the EXL3 subset's, registered, not checked at
@@ -146,7 +162,10 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     var form_checks: usize = 0;
     for (eq.form_texts) |k| form_checks += set.reg.get(k).checks.count();
     try testing.expectEqual(@as(usize, 6), form_checks);
-    try testing.expectEqual(plan - 60 - fused_checks - lut_checks - form_checks, rep.results.items.len);
+    var banked_checks: usize = 0;
+    for (eq.banked_texts) |k| banked_checks += set.reg.get(k).checks.count();
+    try testing.expectEqual(@as(usize, 24), banked_checks);
+    try testing.expectEqual(plan - 60 - fused_checks - lut_checks - form_checks - banked_checks, rep.results.items.len);
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
     // a scripted failure refuses its owner's accept by name; the other consumer's passes
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
@@ -609,7 +628,9 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
             e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or
             // the routed forms: their own test launches them (`Gemv.initForms`)
-            e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304;
+            e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304 or
+            // the banked route: its own test launches it (`Banked`)
+            std.mem.startsWith(u8, @tagName(e.kernel), "dsv41_exl3_b3_");
         try testing.expectEqual(!unrouted, hit.contains(e.kernel));
     }
     // the decode routes launched their prepared configs only (no config built per call)
@@ -743,11 +764,12 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
             },
         }
     }
-    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2, PREP 4; index top-k 1, softmax 2
-    try testing.expectEqual(@as(usize, 29), rule);
+    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2 + banked 4, PREP 4 + banked 4;
+    // index top-k 1, softmax 2
+    try testing.expectEqual(@as(usize, 37), rule);
     // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
     // sinkhorn16 (32 n), the head (8 M)
-    try testing.expectEqual(@as(usize, 8 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
+    try testing.expectEqual(@as(usize, 16 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
     // a route refuses M outside its table before any launch; its prepared configs are released
     const n_launch = t.launches.items.len;
@@ -804,6 +826,66 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
             try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_pair_k3_5120 else xk.Kernel.dsv41_exl3_mul1h_k3_5120, ld.k);
             // the pair text takes mul1h's signature and grid
             try testing.expectEqual([3]u32{ 10240, @intCast(m), 1 }, ld.cfg.grid);
+        }
+    }
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
+test "dsv41 kernels ops: the banked route launches its texts with every bank's arrays in bank order and the packed ids, one launch per stage" {
+    const xq = @import("exl3_quant.zig");
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    const ge = reg.get(.dsv41_exl3_mul1h_k3_2304);
+    const de = reg.get(.dsv41_exl3_mul1h_k3_5120);
+    const ie = reg.get(.q3_exl3_prep_in_rin);
+    const pe = reg.get(.q3_moeprep_dpost);
+    const ne = reg.get(.q3_exl3_prep_din_rin);
+    const s = &ge.samples[0];
+    const P = xq.ProjArrays(Trace.T);
+    var banks: [3]@import("quant.zig").BankArrays(P) = undefined;
+    for (&banks) |*b| b.* = .{
+        .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars) },
+        .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars) },
+        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.arg(pe, "rd", &s.vars), .rin = try t.arg(ne, "rn", &s.vars) },
+    };
+    for ([_]xq.Forms{ .{}, .{ .down_pair = true }, .{ .gu_one = true }, .{ .down_pair = true, .gu_one = true } }) |f| {
+        var gv = try xq.Gemv(Trace).initForms(&t, &reg, f);
+        defer gv.deinit(&t);
+        var bk = try xq.Banked(Trace).init(&t, &reg, f, &gv);
+        defer bk.deinit(&t);
+        for ([_]c_int{ 1, 6, 8 }) |m| {
+            const x = try t.node(&.{ m, 5120 }, .bfloat16, &.{});
+            const tok = try t.node(&.{m}, .int32, &.{});
+            const ids = try t.node(&.{m}, .uint32, &.{});
+            const n0 = t.launches.items.len;
+            const h = try bk.gateUp(&t, x, tok, ids, &banks);
+            try testing.expectEqual(n0 + @as(usize, if (f.gu_one) 3 else 4), t.launches.items.len);
+            const li = t.launches.items[n0];
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_in_rin, li.k);
+            try testing.expectEqualSlices(Trace.T, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, li.inputs[0..li.n_in]);
+            const lg = t.launches.items[n0 + 1];
+            if (f.gu_one) {
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_guone_k3_2304, lg.k);
+                try testing.expectEqualSlices(Trace.T, &.{ lg.inputs[0], lg.inputs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, lg.inputs[0..lg.n_in]);
+                try testing.expectEqual([3]u32{ 4608, @intCast(2 * m), 1 }, lg.cfg.grid);
+            } else {
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_mul1h_k3_2304, lg.k);
+                try testing.expectEqualSlices(Trace.T, &.{ banks[0].gate.code, banks[1].gate.code, banks[2].gate.code }, lg.inputs[2..5]);
+                try testing.expectEqualSlices(Trace.T, gv.gu_statics.arrays[3..9], lg.inputs[5..11]);
+                try testing.expectEqualSlices(Trace.T, &.{ banks[0].up.code, banks[1].up.code, banks[2].up.code }, t.launches.items[n0 + 2].inputs[2..5]);
+            }
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_gu_epi, t.back(1).k);
+            const n1 = t.launches.items.len;
+            _ = try bk.down(&t, h, ids, &banks);
+            try testing.expectEqual(n1 + 3, t.launches.items.len);
+            const ld = t.launches.items[n1 + 1];
+            try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_b3_pair_k3_5120 else xk.Kernel.dsv41_exl3_b3_mul1h_k3_5120, ld.k);
+            try testing.expectEqualSlices(Trace.T, &.{ ids, banks[0].down.code, banks[1].down.code, banks[2].down.code }, ld.inputs[1..5]);
+            try testing.expectEqualSlices(Trace.T, gv.dn_statics.arrays[3..9], ld.inputs[5..11]);
+            try testing.expectEqual([3]u32{ 10240, @intCast(m), 1 }, ld.cfg.grid);
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_moeprep_dpost, t.back(1).k);
         }
     }
     try testing.expectEqual(@as(isize, 0), t.prepared_live);

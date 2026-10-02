@@ -68,6 +68,14 @@ pub const kernels = [_]Kernel{
     .q3_exl3_dig_decmat_2304x5120_mul1k3,
     .dsv41_exl3_pair_k3_5120,
     .dsv41_exl3_guone_k3_2304,
+    .dsv41_exl3_b3_mul1h_k3_2304,
+    .dsv41_exl3_b3_mul1h_k3_5120,
+    .dsv41_exl3_b3_prep_in_rin,
+    .dsv41_exl3_b3_prep_gu_epi,
+    .dsv41_exl3_b3_prep_din_rin,
+    .dsv41_exl3_b3_moeprep_dpost,
+    .dsv41_exl3_b3_pair_k3_5120,
+    .dsv41_exl3_b3_guone_k3_2304,
 };
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
@@ -200,6 +208,8 @@ pub fn Accepted(comptime G: type) type {
         fused_down: bool = false,
         /// the decode GEMVs' routed forms (`routeForms`); all false: the stock mul1h texts
         forms: Forms = .{},
+        /// the banked route (`routeBanked`): every bank's rows of a wave in one launch per stage; null: not installed
+        banked: ?Banked(G) = null,
 
         /// Once per bank bind and per grow: the three projections' arrays are the kernels' (cap
         /// within the kernels' bound, shapes, dtypes).
@@ -225,6 +235,20 @@ pub fn Accepted(comptime G: type) type {
             const hd = try self.prep.dinRin(g, h, d.rin, slot_ids);
             const zd = try self.gemv.project(g, .down, hd, slot_ids, d.code);
             return self.prep.dpost(g, zd, d.rout, slot_ids);
+        }
+
+        /// The banked route (`routeBanked` installed it): x [rows, 5120] bf16, ids u32 [rows] packed (bank << 24 | slot
+        /// row), `banks` the three banks' arrays (base, ext, transient; a bank no row names may repeat another's) -> the
+        /// clamped SwiGLU [rows, 2304] f32, every word gateUp's per bank.
+        pub fn gateUpBanked(self: *const Self, g: *G, x: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
+            const rows = rowsOf(G, g, x, 0);
+            if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
+            return self.banked.?.gateUp(g, x, self.tok[rows - 1], ids, banks);
+        }
+
+        /// The banked route's down: h [rows, 2304] f32 (gateUpBanked's), the same packed ids -> [rows, 5120] f32.
+        pub fn downBanked(self: *const Self, g: *G, h: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
+            return self.banked.?.down(g, h, ids, banks);
         }
 
         /// Layer `layer`'s DIG-X waves over the call's routed rows (`DigXPrefill.call`): a KEPT
@@ -257,6 +281,8 @@ pub fn Accepted(comptime G: type) type {
         /// The routed decode forms, at construction (before any decode): the GEMVs rebuilt on the forms' texts. Exact by
         /// the registry's twin checks (every word == mul1h's) and kbench v9; no device check here.
         pub fn routeForms(self: *Self, g: *G, forms: Forms) !void {
+            // The banked route aliases the installed GEMVs' statics: the forms come first.
+            if (self.banked != null) return error.FormsAfterBanked;
             var next = try Gemv(G).initForms(g, self.reg, forms);
             errdefer next.deinit(g);
             self.gemv.deinit(g);
@@ -264,9 +290,19 @@ pub fn Accepted(comptime G: type) type {
             self.forms = forms;
         }
 
+        /// The banked route, at construction (before any decode; after `routeForms`, whose forms it takes): the decode
+        /// stages on the banked texts, one launch per stage over a wave's rows of all three banks. Exact by the registry's
+        /// twin checks (every word == the stock text's, per bank) and kbench v6d / v9b; no device check here. It allocates
+        /// no device array: its statics are the installed GEMVs' (aliased by input name), its plans prepared configs.
+        pub fn routeBanked(self: *Self, g: *G) !void {
+            if (self.banked != null) return error.BankedRoutedTwice;
+            self.banked = try Banked(G).init(g, self.reg, self.forms, &self.gemv);
+        }
+
         /// Releases the routes (statics, prepared configs, the row maps, the wave states) and
         /// the plan's results. The kernel set stays the load context's.
         pub fn deinit(self: *Self, g: *G) void {
+            if (self.banked) |*b| b.deinit(g);
             for (self.waves) |*w| w.deinit(g);
             self.a.free(self.waves);
             for (self.tok[0..self.n_tok]) |x| g.release(x);
@@ -294,10 +330,16 @@ const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lu
 /// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
 /// a check window and by kbench v9); the stock accept neither routes nor checks them.
 pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304 };
+/// The banked route's texts: installed at construction by `Accepted.routeBanked` (their twins are registry checks, run
+/// in a check window and by kbench v6d / v9b); the stock accept neither routes nor checks them.
+pub const banked_texts = [_]Kernel{
+    .dsv41_exl3_b3_mul1h_k3_2304,     .dsv41_exl3_b3_mul1h_k3_5120,  .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
+    .dsv41_exl3_b3_prep_din_rin,      .dsv41_exl3_b3_moeprep_dpost,  .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
+};
 const checked_at_accept = blk: {
-    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len]Kernel = undefined;
+    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len]Kernel = undefined;
     var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts), k) == null) {
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts), k) == null) {
         out[n] = k;
         n += 1;
     };
@@ -444,6 +486,135 @@ pub fn Gemv(comptime G: type) type {
             var out: [1]G.T = undefined;
             try p.launch(g, rowsOf(G, g, xh, 0), ins[0..e.inputs.len], &out);
             return out[0];
+        }
+    };
+}
+
+/// The banked route: the decode stages on the banked texts (`banked_texts`), each launch over a wave's rows of all three
+/// banks (a row's bank is its packed id's top byte: bank << 24 | slot row; banks base, ext, transient). The forms are
+/// the installed GEMVs' (`Gemv.initForms`), bound here at construction: gu_one's banked one launch or the banked
+/// mul1h pair, down_pair's banked text or the banked mul1h. The GEMV statics are the installed GEMVs' arrays (aliased by
+/// input name, checked once here): the route keeps no device array of its own.
+pub fn Banked(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        const A = ProjArrays(G.T);
+        const BA = quant.BankArrays(A);
+        in_rin_p: RowPlans(G, 48),
+        gu_epi_p: RowPlans(G, 48),
+        din_rin_p: RowPlans(G, 48),
+        dpost_p: RowPlans(G, 48),
+        /// gate / up: the banked mul1h (twice) or gu_one's banked one launch
+        gu_p: RowPlans(G, 48),
+        dn_p: RowPlans(G, 48),
+        gu_e: *const Entry,
+        dn_e: *const Entry,
+        /// the GEMVs' statics, aliased (the installed `Gemv`'s, released by it)
+        gu_st: [xk.max_inputs]G.T = undefined,
+        dn_st: [xk.max_inputs]G.T = undefined,
+        gu_call: *const GuCall,
+
+        const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
+
+        pub fn init(g: *G, reg: *const xk.Registry, forms: Forms, gemv: *const Gemv(G)) !Self {
+            const gu_e = reg.get(if (forms.gu_one) .dsv41_exl3_b3_guone_k3_2304 else .dsv41_exl3_b3_mul1h_k3_2304);
+            const dn_e = reg.get(if (forms.down_pair) .dsv41_exl3_b3_pair_k3_5120 else .dsv41_exl3_b3_mul1h_k3_5120);
+            var self: Self = .{ .in_rin_p = undefined, .gu_epi_p = undefined, .din_rin_p = undefined, .dpost_p = undefined, .gu_p = undefined, .dn_p = undefined, .gu_e = gu_e, .dn_e = dn_e, .gu_call = if (forms.gu_one) guOne else guPair };
+            // The statics: the stock GEMV's by name (gu_one has none; its gate / up statics are compiled in).
+            if (!forms.gu_one) try alias(gu_e, gemv.gu, &gemv.gu_statics, &self.gu_st);
+            try alias(dn_e, gemv.dn, &gemv.dn_statics, &self.dn_st);
+            self.in_rin_p = try .init(g, reg.get(.dsv41_exl3_b3_prep_in_rin), null, null);
+            errdefer self.in_rin_p.deinit(g);
+            self.gu_epi_p = try .init(g, reg.get(.dsv41_exl3_b3_prep_gu_epi), null, null);
+            errdefer self.gu_epi_p.deinit(g);
+            self.din_rin_p = try .init(g, reg.get(.dsv41_exl3_b3_prep_din_rin), null, null);
+            errdefer self.din_rin_p.deinit(g);
+            self.dpost_p = try .init(g, reg.get(.dsv41_exl3_b3_moeprep_dpost), null, null);
+            errdefer self.dpost_p.deinit(g);
+            self.gu_p = try .init(g, gu_e, null, null);
+            errdefer self.gu_p.deinit(g);
+            self.dn_p = try .init(g, dn_e, null, null);
+            return self;
+        }
+
+        /// Every static input of the banked text `be` is the stock text `se`'s input of the same name, dtype and values
+        /// (the manifest's banked entries are deep copies): alias the stock GEMV's array.
+        fn alias(be: *const Entry, se: *const Entry, st: *const Statics(G), out: *[xk.max_inputs]G.T) !void {
+            for (be.inputs, 0..) |*arg, i| {
+                if (arg.role != .static) continue;
+                const j = for (se.inputs, 0..) |*sa, jj| {
+                    if (std.mem.eql(u8, sa.name, arg.name)) break jj;
+                } else return error.BankedStaticUnmatched;
+                const sa = &se.inputs[j];
+                if (sa.role != .static or sa.dtype != arg.dtype or st.mask & (@as(u32, 1) << @intCast(j)) == 0) return error.BankedStaticUnmatched;
+                var b0: [1024]u8 = undefined;
+                var b1: [1024]u8 = undefined;
+                const sh0, const v0 = kr.staticBytes(arg, &b0);
+                const sh1, const v1 = kr.staticBytes(sa, &b1);
+                if (!std.mem.eql(c_int, sh0.slice(), sh1.slice()) or !std.mem.eql(u8, v0, v1)) return error.BankedStaticUnmatched;
+                out[i] = st.arrays[j];
+            }
+        }
+
+        pub fn deinit(self: *Self, g: *G) void {
+            self.in_rin_p.deinit(g);
+            self.gu_epi_p.deinit(g);
+            self.din_rin_p.deinit(g);
+            self.dpost_p.deinit(g);
+            self.gu_p.deinit(g);
+            self.dn_p.deinit(g);
+        }
+
+        /// x [tokens, 5120] bf16 (taken rows), tok [rows] i32, ids packed -> the clamped SwiGLU [rows, 2304] f32.
+        pub fn gateUp(self: *const Self, g: *G, x: G.T, tok: G.T, ids: G.T, banks: *const [3]BA) !G.T {
+            const rows = rowsOf(G, g, tok, 0);
+            var xs: [2]G.T = undefined;
+            try self.in_rin_p.launch(g, rows, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
+            const z = try self.gu_call(self, g, xs[0], xs[1], ids, banks);
+            var out: [1]G.T = undefined;
+            try self.gu_epi_p.launch(g, rows, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids }, &out);
+            return out[0];
+        }
+
+        /// h [rows, 2304] f32, ids packed -> [rows, 5120] f32: din_rin -> the down GEMV -> dpost, banked.
+        pub fn down(self: *const Self, g: *G, h: G.T, ids: G.T, banks: *const [3]BA) !G.T {
+            const rows = rowsOf(G, g, h, 0);
+            var hd: [1]G.T = undefined;
+            try self.din_rin_p.launch(g, rows, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
+            var ins: [xk.max_inputs]G.T = self.dn_st;
+            ins[0] = hd[0];
+            ins[1] = ids;
+            ins[2] = banks[0].down.code;
+            ins[3] = banks[1].down.code;
+            ins[4] = banks[2].down.code;
+            var zd: [1]G.T = undefined;
+            try self.dn_p.launch(g, rows, ins[0..self.dn_e.inputs.len], &zd);
+            var out: [1]G.T = undefined;
+            try self.dpost_p.launch(g, rows, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
+            return out[0];
+        }
+
+        fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
+            const rows = rowsOf(G, g, xg, 0);
+            var out: [2]G.T = undefined;
+            var ins: [xk.max_inputs]G.T = self.gu_st;
+            ins[1] = ids;
+            inline for (.{ .gate, .up }, 0..) |proj, o| {
+                ins[0] = if (o == 0) xg else xu;
+                ins[2] = @field(banks[0], @tagName(proj)).code;
+                ins[3] = @field(banks[1], @tagName(proj)).code;
+                ins[4] = @field(banks[2], @tagName(proj)).code;
+                var z: [1]G.T = undefined;
+                try self.gu_p.launch(g, rows, ins[0..self.gu_e.inputs.len], &z);
+                out[o] = z[0];
+            }
+            return out;
+        }
+
+        fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
+            var out: [2]G.T = undefined;
+            try self.gu_p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
+            return out;
         }
     };
 }

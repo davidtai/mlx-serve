@@ -763,6 +763,19 @@ pub fn QuantMath(comptime G: type, comptime Q: type) type {
             return self.q.down(g, h, ids, d);
         }
 
+        /// The quant's banked route, when it has one (a construction-time type choice; `Options.banked` binds it).
+        pub const has_banked = @hasDecl(Q, "gateUpBanked");
+
+        /// ids packed (bank << 24 | slot row); `banks` base, ext, transient.
+        pub fn gateUpBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [n_banks]BankArraysOf(T)) !T {
+            const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
+            return self.q.gateUpBanked(g, xb, ids, banks);
+        }
+
+        pub fn downBanked(self: *const Self, g: *G, h: T, ids: T, banks: *const [n_banks]BankArraysOf(T)) !T {
+            return self.q.downBanked(g, h, ids, banks);
+        }
+
         pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: quant.PrefillRows, bank: BankArraysOf(T)) !T {
             return self.q.prefill(g, layer, x, rows, bank);
         }
@@ -1081,8 +1094,16 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// without it), and the wide call's record, prebound at construction.
         warm_tail: []std.StaticBitSet(warm_max_experts) = &.{},
         tail_record: *const fn (*Self, u32, []const u16, u32, u32) void = recordNoTail,
+        /// The decode lane's wave stages, bound at construction (`Options.banked`): one group per bank (the stock route)
+        /// or one banked group over every bank.
+        gate_up_wave: *const GateUpWaveFn = gateUpWaveGrouped,
+        down_wave: *const DownWaveFn = downWaveGrouped,
 
-        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{} };
+        const GateUpWaveFn = fn (self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave;
+        const DownWaveFn = fn (self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T;
+
+        /// `banked`: the math's banked route (its `has_banked`; the quant installed it) runs every wave as one group.
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{}, banked: bool = false };
 
         /// The wide lane's host scratch, reused across calls.
         const WideScratch = struct {
@@ -1138,6 +1159,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.read_ahead and (!wr.seed or comptime !@hasDecl(S, "readAheadSeed"))) return error.InvalidWideRoute;
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
+            if (opt.banked and comptime !hasBanked()) return error.BankedNotInMath;
             if (wr.resident_first and !wr.base_at_seed) return error.InvalidWideRoute;
             if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
@@ -1158,10 +1180,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 @memset(self.warm_tail, .empty);
                 self.tail_record = recordTail;
             }
+            if (comptime hasBanked()) {
+                if (opt.banked) {
+                    self.gate_up_wave = gateUpWaveBanked;
+                    self.down_wave = downWaveBanked;
+                }
+            }
             return self;
         }
 
         fn recordNoTail(_: *Self, _: u32, _: []const u16, _: u32, _: u32) void {}
+
+        fn hasBanked() bool {
+            return @hasDecl(M, "has_banked") and M.has_banked;
+        }
 
         /// A wide call's routed ids (`n` rows x `k`, row order): its last `warm_tail_rows` rows' experts become the
         /// layer's warm set.
@@ -1350,7 +1382,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         /// The positions of wave `w`, grouped by bank in first-appearance order
         /// (`Exl3PackedOps.gate_up`'s groups), each group's gate/up + SwiGLU.
-        fn gateUpWave(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) !Wave {
+        fn gateUpWaveGrouped(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave {
             var wave: Wave = .{};
             for (sv.waves, sv.refs, 0..) |wv, ref, pos| {
                 if (wv != w) continue;
@@ -1382,7 +1414,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         /// Each group's down; the outputs join the call's accumulator.
-        fn downWave(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) ![]const T {
+        fn downWaveGrouped(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T {
             const first = acc.n_outs;
             for (wave.groups[0..wave.n], 0..) |*gr, i| {
                 const arrays = (if (over) |o| o[@backingInt(gr.bank)] else self.banks[layer][@backingInt(gr.bank)]).?;
@@ -1392,6 +1424,56 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     acc.pos[acc.n_pos] = pos;
                     acc.n_pos += 1;
                 }
+            }
+            return acc.outs[first..acc.n_outs];
+        }
+
+        /// A wave's bank arrays for the banked texts: each bank's; a bank without arrays (no rows bound, or not waited
+        /// in a gated part) is given another bank's (the packed ids never name it).
+        fn bankedArrays(self: *Self, layer: u32, over: ?*const [n_banks]?Arrays) ![n_banks]Arrays {
+            const src = if (over) |o| o else &self.banks[layer];
+            const fill = for (src) |b| {
+                if (b) |arr| break arr;
+            } else return error.BankedWaveWithoutArrays;
+            var out: [n_banks]Arrays = undefined;
+            for (src, &out) |b, *o| o.* = b orelse fill;
+            return out;
+        }
+
+        /// The banked route's gate/up: wave `w`'s positions as one group in routed order, ids packed (bank << 24 | slot row).
+        fn gateUpWaveBanked(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave {
+            var wave: Wave = .{};
+            const gr = &wave.groups[0];
+            gr.* = .{ .bank = .base };
+            var tok: [max_route_ids]i32 = undefined;
+            var rows: [max_route_ids]u32 = undefined;
+            for (sv.waves, sv.refs, 0..) |wv, ref, pos| {
+                if (wv != w) continue;
+                gr.pos[gr.n] = @intCast(pos);
+                tok[gr.n] = @intCast(pos / k);
+                rows[gr.n] = (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
+                gr.n += 1;
+            }
+            if (gr.n == 0) return wave;
+            wave.n = 1;
+            const banks = try self.bankedArrays(layer, over);
+            const n: c_int = @intCast(gr.n);
+            const x = try g.take(xf, try g.hostArray(std.mem.sliceAsBytes(tok[0..gr.n]), &.{n}, .int32), 0);
+            wave.ids[0] = try g.hostArray(std.mem.sliceAsBytes(rows[0..gr.n]), &.{n}, .uint32);
+            wave.h[0] = try self.math.gateUpBanked(g, x, wave.ids[0], &banks);
+            return wave;
+        }
+
+        /// The banked route's down: the wave's one group over every bank.
+        fn downWaveBanked(self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T {
+            const first = acc.n_outs;
+            if (wave.n == 0) return acc.outs[first..first];
+            const banks = try self.bankedArrays(layer, over);
+            acc.outs[acc.n_outs] = try self.math.downBanked(g, wave.h[0], wave.ids[0], &banks);
+            acc.n_outs += 1;
+            for (wave.groups[0].pos[0..wave.groups[0].n]) |pos| {
+                acc.pos[acc.n_pos] = pos;
+                acc.n_pos += 1;
             }
             return acc.outs[first..acc.n_outs];
         }
@@ -1412,7 +1494,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var hs: [max_route_ids]T = undefined;
             var n_hs: usize = 0;
             for (0..sv.n_parts) |p| {
-                waves[p] = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), &gu);
+                waves[p] = try self.gate_up_wave(self, g, layer, xf, k, sv, @intCast(p + 1), &gu);
                 for (waves[p].h[0..waves[p].n]) |h| {
                     hs[n_hs] = h;
                     n_hs += 1;
@@ -1427,7 +1509,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 for (&dn) |*d| if (d.*) |*arr| {
                     arr.down = try self.waitProj(g, arr.down, gates.down_first + p, deps[0 .. n_hs + prev.len]);
                 };
-                prev = try self.downWave(g, layer, &waves[p], acc, &dn);
+                prev = try self.down_wave(self, g, layer, &waves[p], acc, &dn);
             }
         }
 
@@ -1512,8 +1594,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (pred != null) recall.record(layer, recall.countCall(predicted, ids, sv.waves, wasted));
             var acc: Acc = .{};
             // Residents: gate/up and down at once.
-            const hits = try self.gateUpWave(g, layer, xf, k, sv, 0, null);
-            if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc, null));
+            const hits = try self.gate_up_wave(self, g, layer, xf, k, sv, 0, null);
+            if (hits.n > 0) try g.asyncEval(try self.down_wave(self, g, layer, &hits, &acc, null));
             // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave.
             if (hoist.len > 0) try g.asyncEval(hoist);
             if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
@@ -1527,12 +1609,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 tt = dt.now();
                 try self.source.waitGu(call, part);
                 _ = dt.charge(.read_wait, tt);
-                const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
+                const wave = try self.gate_up_wave(self, g, layer, xf, k, sv, @intCast(p + 1), null);
                 try g.asyncEval(wave.h[0..wave.n]);
                 tt = dt.now();
                 try self.source.waitDown(call, part);
                 _ = dt.charge(.read_wait, tt);
-                try g.asyncEval(try self.downWave(g, layer, &wave, &acc, null));
+                try g.asyncEval(try self.down_wave(self, g, layer, &wave, &acc, null));
             }
             self.source.release(call);
             released = true;
@@ -1595,18 +1677,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const sv = self.source.served(call);
             const gates = (try self.source.gate(call)) orelse return error.GateCheckNoMiss;
             var acc: Acc = .{};
-            const hits = try self.gateUpWave(g, layer, xf, k, sv, 0, null);
-            if (hits.n > 0) _ = try self.downWave(g, layer, &hits, &acc, null);
+            const hits = try self.gate_up_wave(self, g, layer, xf, k, sv, 0, null);
+            if (hits.n > 0) _ = try self.down_wave(self, g, layer, &hits, &acc, null);
             try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
             _ = try g.hostF32(try self.join(g, &acc, 1, k), gated);
             var ref: Acc = .{};
-            if (hits.n > 0) _ = try self.downWave(g, layer, &hits, &ref, null);
+            if (hits.n > 0) _ = try self.down_wave(self, g, layer, &hits, &ref, null);
             for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
                 try self.source.waitGu(call, part);
-                const wave = try self.gateUpWave(g, layer, xf, k, sv, @intCast(p + 1), null);
+                const wave = try self.gate_up_wave(self, g, layer, xf, k, sv, @intCast(p + 1), null);
                 try self.source.waitDown(call, part);
-                _ = try self.downWave(g, layer, &wave, &ref, null);
+                _ = try self.down_wave(self, g, layer, &wave, &ref, null);
             }
             _ = try g.hostF32(try self.join(g, &ref, 1, k), waited);
             self.source.release(call);
@@ -4419,4 +4501,113 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     try testing.expectEqual(@as(usize, 0), bad_old);
     try testing.expectEqual(@as(usize, 0), bad_new);
     try testing.expectEqual(@as(usize, words), finite);
+}
+
+/// A decode math whose outputs carry, per row, its slot row and the arrays it read (host arrays the trace records):
+/// the per-bank calls and the banked calls (packed ids) must hand every routed position the same words.
+const BankEnc = struct {
+    pub const has_banked = true;
+    const w = 4;
+
+    fn rowsOf(g: *TraceOps, x: u32) ![]const u32 {
+        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
+        return std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(b)));
+    }
+
+    fn floatsOf(g: *TraceOps, x: u32) ![]const f32 {
+        const b = g.hostBytesOf(x) orelse return error.NoHostBytes;
+        return std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(b)));
+    }
+
+    fn emit(g: *TraceOps, v: []const f32) !u32 {
+        return g.hostArray(std.mem.sliceAsBytes(v), &.{ @intCast(v.len / w), w }, .float32);
+    }
+
+    pub fn gateUp(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const r = try rowsOf(g, ids);
+        for (r, 0..) |row, i| v[i * w ..][0..w].* = .{ @floatFromInt(row), @floatFromInt(gate.code), @floatFromInt(up.rin), 0 };
+        return emit(g, v[0 .. r.len * w]);
+    }
+
+    pub fn down(_: *const BankEnc, g: *TraceOps, h: u32, _: u32, d: ProjOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const hv = try floatsOf(g, h);
+        @memcpy(v[0..hv.len], hv);
+        for (0..hv.len / w) |i| v[i * w + 3] = @floatFromInt(d.rout);
+        return emit(g, v[0..hv.len]);
+    }
+
+    pub fn gateUpBanked(_: *const BankEnc, g: *TraceOps, _: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const r = try rowsOf(g, ids);
+        for (r, 0..) |p, i| {
+            const b = &banks[p >> 24];
+            v[i * w ..][0..w].* = .{ @floatFromInt(p & 0xFFFFFF), @floatFromInt(b.gate.code), @floatFromInt(b.up.rin), 0 };
+        }
+        return emit(g, v[0 .. r.len * w]);
+    }
+
+    pub fn downBanked(_: *const BankEnc, g: *TraceOps, h: u32, ids: u32, banks: *const [n_banks]BankArraysOf(u32)) !u32 {
+        var v: [max_route_ids * w]f32 = undefined;
+        const hv = try floatsOf(g, h);
+        const r = try rowsOf(g, ids);
+        @memcpy(v[0..hv.len], hv);
+        for (r, 0..) |p, i| v[i * w + 3] = @floatFromInt(banks[p >> 24].down.rout);
+        return emit(g, v[0..hv.len]);
+    }
+};
+
+test "dsv41 experts: the banked waves (ROUTED_BANKED) hand every routed position the per-bank route's words, one group per wave" {
+    const a = testing.allocator;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 30;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 30, .rows = &.{16} });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.record_host = true;
+    const Ex = ExpertsWith(TraceOps, FakeSource, BankEnc, .{});
+    // One hook, both bindings (the arrays bound once): the option binds the banked stages at construction.
+    var banked = try Ex.initWith(a, &g, &src, .{}, &c, .{ .banked = true });
+    defer banked.deinit();
+    try testing.expect(banked.gate_up_wave == &Ex.gateUpWaveBanked and banked.down_wave == &Ex.downWaveBanked);
+    var grouped = banked;
+    grouped.gate_up_wave = Ex.gateUpWaveGrouped;
+    grouped.down_wave = Ex.downWaveGrouped;
+    // The ext bank is unbound: the banked arrays fill it with another bank's (never indexed).
+    try testing.expect(banked.banks[0][@backingInt(BankKind.ext)] == null);
+    try testing.expect(banked.banks[0][@backingInt(BankKind.base)].?.gate.code != banked.banks[0][@backingInt(BankKind.transient)].?.gate.code);
+    // One token, top-6, both banks in each wave.
+    const refs = [_]SlotRef{ .{ .bank = .base, .row = 3 }, .{ .bank = .transient, .row = 5 }, .{ .bank = .base, .row = 7 }, .{ .bank = .transient, .row = 0 }, .{ .bank = .base, .row = 1 }, .{ .bank = .transient, .row = 2 } };
+    const waves = [_]u8{ 0, 0, 1, 1, 0, 1 };
+    const sv: Served = .{ .refs = &refs, .waves = &waves, .n_parts = 1 };
+    const xf = try g.input(&.{ 1, 64 }, .bfloat16);
+    var words: [2][6][BankEnc.w]f32 = undefined;
+    for ([_]*Ex{ &grouped, &banked }, 0..) |ex, arm| {
+        var acc: Ex.Acc = .{};
+        for (0..2) |wv| {
+            const wave = try ex.gate_up_wave(ex, &g, 0, xf, 6, sv, @intCast(wv), null);
+            try testing.expectEqual(@as(usize, if (arm == 0) 2 else 1), wave.n);
+            _ = try ex.down_wave(ex, &g, 0, &wave, &acc, null);
+        }
+        try testing.expectEqual(@as(usize, if (arm == 0) 4 else 2), acc.n_outs);
+        var j: usize = 0;
+        for (acc.outs[0..acc.n_outs]) |o| {
+            const v = try BankEnc.floatsOf(&g, o);
+            for (0..v.len / BankEnc.w) |r| {
+                words[arm][acc.pos[j]] = v[r * BankEnc.w ..][0..BankEnc.w].*;
+                j += 1;
+            }
+        }
+        try testing.expectEqual(@as(usize, 6), j);
+    }
+    for (words[0], words[1], refs) |x, y, ref| {
+        try testing.expectEqual(x, y);
+        try testing.expectEqual(@as(f32, @floatFromInt(ref.row)), x[0]);
+        try testing.expectEqual(@as(f32, @floatFromInt(grouped.banks[0][@backingInt(ref.bank)].?.gate.code)), x[1]);
+    }
+    // A math without the banked route refuses the option at construction.
+    const Plain = ExpertsWith(TraceOps, FakeSource, TraceMath, .{});
+    try testing.expectError(error.BankedNotInMath, Plain.initWith(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c, .{ .banked = true }));
 }
