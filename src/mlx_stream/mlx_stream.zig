@@ -15,3 +15,14 @@ pub const plugin = sdk.Plugin{
         .expert_source = @import("exl3_source.zig"),
     },
 };
+
+/// What the host's tests read of the package, reached through the registry (`plugins.mlx_stream_testing`, null when a
+/// build leaves the package out): the arch's config fixture and settings type, the modules the host's reader proof
+/// drives, and the pins the conformance tests compare.
+pub const testing = struct {
+    pub const v41 = @import("deepseek_v41.zig");
+    pub const engram = @import("deepseek_v41_engram.zig");
+    pub const Settings = @import("deepseek_v41_settings.zig").Config;
+    pub const kernel_manifest_sha256 = @import("exl3_kernels.zig").manifest_sha256;
+    pub const stream_uses_reader = @import("expert_stream.zig").uses_reader;
+};

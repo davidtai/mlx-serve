@@ -119,7 +119,7 @@ pub fn build(b: *std.Build) void {
     for (plugin_build_options, &profile) |o, *on| on.* = b.option(bool, o.name, o.description) orelse o.default;
     const core: CoreOptions = .{ .version = version, .mas = mas, .mlx_c_version = mlx_c_version, .ds4_commit = ds4_commit, .llama_tag = llama_tag, .git_sha = git_sha, .profile = &profile };
     const build_options = core.add(b, !slim, with_mlx_stream);
-    const test_options = core.add(b, true, true);
+    const test_options = core.add(b, true, with_mlx_stream);
     // The decode profile's command-buffer timeline sources ride the decode-timers profile option.
     const dsv41_decode_timers = for (plugin_build_options, profile) |o, on| {
         if (std.mem.eql(u8, o.field, "dsv41_decode_timers")) break on;
@@ -304,6 +304,21 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Step.Compile{ sdk_tests, conformance_tests } ++ shared_tests) |t| sdk_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     const import_probe = probeMlxStreamImports(b);
     for ([_]*std.Build.Step{ b.getInstallStep(), check_step, test_build, test_step, conformance, sdk_test_build }) |st| st.dependOn(import_probe);
+
+    // The mlx-stream package's tests alone (src/mlx_stream_tests.zig): a package author's steps. The unit tests above
+    // include the same root when the package is registered, so `zig build test` does not run this binary as well.
+    if (with_mlx_stream) {
+        const pkg_tests = b.addTest(.{
+            .name = "mlx-stream-test",
+            .root_module = test_deps.module(b, b.path("src/mlx_stream_tests.zig"), target, optimize),
+            .filters = if (test_filter) |f| &.{f} else &.{},
+        });
+        const pkg_test_build = b.step("mlx-stream-test-build", "Compile the mlx-stream package's tests without running them");
+        pkg_test_build.dependOn(&b.addInstallArtifact(pkg_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const pkg_test = b.step("mlx-stream-test", "Run the mlx-stream package's tests (the gated ones skip without their environment)");
+        pkg_test.dependOn(&b.addRunArtifact(pkg_tests).step);
+        for ([_]*std.Build.Step{ pkg_test_build, pkg_test }) |st| st.dependOn(import_probe);
+    }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -846,7 +861,7 @@ const CoreOptions = struct {
         // The embedded engines (ds4 Metal, libllama) are linked: the macOS exe and tests, not the
         // slim host, iOS or Linux, which select src/arch/*_stub.zig and src/ds4_ffi_stub.zig.
         o.addOption(bool, "embedded_engines", embedded_engines);
-        // The registry registers mlx-stream (src/plugins.zig); the test graph always does.
+        // The registry registers mlx-stream (src/plugins.zig); the unit-test graph follows -Dmlx-stream too.
         o.addOption(bool, "plugin_mlx_stream", mlx_stream);
         for (plugin_build_options, c.profile) |opt, on| o.addOption(bool, opt.field, on);
         return o;

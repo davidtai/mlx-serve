@@ -42493,6 +42493,7 @@ pub fn archTakeReader(config: *const ModelConfig) error{ExpertReaderInUse}!bool 
 }
 
 test "dsv41 plugin: the load claim takes the one expert reader; a second load claim is refused by name until it is given back" {
+    _ = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
     var config: ModelConfig = .{};
     try std.testing.expectEqual(false, try archTakeReader(&config)); // no registered arch: nothing taken
     for (&@import("plugins.zig").registry.archs) |*e| {

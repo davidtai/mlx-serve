@@ -282,6 +282,7 @@ test "dsv41 nocache reader: a real resident shard's tensors through the reader e
 
 // DSV41_BANK=<bank> DSV41_NOCACHE_PROOF=1 [DSV41_QUIET_HOLD=<marker>]: the reads leave no page cached (mincore, vm_stat).
 test "dsv41 nocache reader: the resident shards and the Engram rows read past the page cache" {
+    const pkg = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     if (std.c.getenv("DSV41_NOCACHE_PROOF") == null) return error.SkipZigTest;
     const hold: ?[:0]const u8 = if (std.c.getenv("DSV41_QUIET_HOLD")) |v| std.mem.span(v) else null;
@@ -344,8 +345,8 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
     try testing.expect(cached_after <= cached_before);
 
     // The Engram rows through the row source's own descriptors (its open sets F_NOCACHE).
-    const v41 = @import("mlx_stream/deepseek_v41.zig");
-    const eng = @import("mlx_stream/deepseek_v41_engram.zig");
+    const v41 = pkg.v41;
+    const eng = pkg.engram;
     var cdiag: v41.Diag = .{};
     const c = try v41.Config.load(a, io, bank, &cdiag);
     var mbuf: [1024]u8 = undefined;

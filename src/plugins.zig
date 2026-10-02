@@ -11,7 +11,12 @@ const build_options = @import("build_options");
 pub const all = if (registers_mlx_stream) [_]sdk.Plugin{
     @import("mlx_stream/mlx_stream.zig").plugin,
 } else [_]sdk.Plugin{};
-const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
+/// Whether this build registers mlx-stream (`-Dmlx-stream`, default on; the unit-test graph follows it).
+pub const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
+
+/// The registered mlx-stream package's test surface (`mlx_stream.zig`'s `testing`), null in a build that leaves the package
+/// out: the host's tests reach the package through the registry only, so such a build analyzes none of its files.
+pub const mlx_stream_testing: ?type = if (registers_mlx_stream) @import("mlx_stream/mlx_stream.zig").testing else null;
 
 /// This build's registry. A macOS-only plugin registers nothing on graphs without the macOS-only sources.
 pub const registry = Registry(&all, .{ .macos = build_options.macos_engines });
@@ -219,19 +224,21 @@ test "plugins conformance: every registered plugin's kinds decline what is not t
 }
 
 test "plugins conformance: mlx-stream registers its EXL3 quant, pinned by the kernel registry's manifest" {
-    const R = Registry(&.{@import("mlx_stream/mlx_stream.zig").plugin}, .{ .macos = true });
+    const pkg = mlx_stream_testing orelse return error.SkipZigTest;
+    const R = Registry(&all, .{ .macos = true });
     try testing.expectEqual(@as(usize, 1), R.quants.len);
     try testing.expectEqualStrings("exl3-mul1-k3", R.quants[0].kind.name);
-    try testing.expectEqualStrings(@import("mlx_stream/exl3_kernels.zig").manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
+    try testing.expectEqualStrings(pkg.kernel_manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
 }
 
 test "plugins conformance: mlx-stream registers its EXL3 source, its capabilities and the one reader" {
-    const R = Registry(&.{@import("mlx_stream/mlx_stream.zig").plugin}, .{ .macos = true });
+    const pkg = mlx_stream_testing orelse return error.SkipZigTest;
+    const R = Registry(&all, .{ .macos = true });
     try testing.expectEqual(@as(usize, 1), R.expert_sources.len);
     const k = R.expert_sources[0].kind;
     try testing.expectEqualStrings("exl3-stream", k.name);
     try testing.expect(k.caps.two_phase and k.caps.transient_release and k.caps.event_gates and !k.caps.construction_reset);
-    try testing.expect(@import("mlx_stream/expert_stream.zig").uses_reader);
+    try testing.expect(pkg.stream_uses_reader);
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
@@ -241,5 +248,5 @@ test "plugins conformance: the CPU lane created no Metal device" {
 
 // The import boundary's own test runs with the conformance suite ("plugins import probe").
 comptime {
-    if (@import("builtin").is_test) _ = @import("mlx_stream/mlx_stream_imports.zig");
+    if (@import("builtin").is_test and registers_mlx_stream) _ = @import("mlx_stream/mlx_stream_imports.zig");
 }

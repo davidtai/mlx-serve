@@ -7559,7 +7559,8 @@ test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setti
 }
 
 test "dsv41 model: a deepseek_v41 config parses by its own refusals into the module arch's shell" {
-    const ok = try @import("mlx_stream/deepseek_v41.zig").testConfigJson(testing.allocator, .real);
+    const pkg = plugins.mlx_stream_testing orelse return error.SkipZigTest;
+    const ok = try pkg.v41.testConfigJson(testing.allocator, .real);
     defer testing.allocator.free(ok);
     var c = try parseConfigFromJson(testing.allocator, ok);
     defer c.deinit(testing.allocator);
