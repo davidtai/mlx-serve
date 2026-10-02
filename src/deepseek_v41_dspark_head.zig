@@ -606,6 +606,7 @@ pub fn Head(comptime G: type) type {
                 const n: usize = @intCast(si.numel());
                 if (n > expert_policy.max_route_ids) return error.DraftCacheRouteWidth;
                 var id_buf: [expert_policy.max_route_ids]u16 = undefined;
+                // The shared pool's bill (H + 15 rows) rests on this barrier: it completes the previous stage's gathers before any row is reused.
                 _ = try g.hostIds(routed_ids, id_buf[0..n]);
                 for (id_buf[0..n]) |*e| e.* += self.offset;
                 var slots: [expert_policy.max_route_ids]u32 = undefined;
@@ -1355,6 +1356,14 @@ test "dsv41 dspark head: DRAFTCACHE geometry: the even split, the bill's bytes, 
     try testing.expectEqual(@as(u32, 7), try dc.seedFirstIds());
     for ([_]u16{ 0, 128, 256, 1, 129, 257, 2 }) |e| try testing.expect(dc.cache.slotOf(0, e) != null);
     try testing.expect(dc.cache.slotOf(0, 130) == null);
+    // The shared slots are keyed by (stage, expert): stage 1's expert 2 (global 130) misses although stage 0's expert 2
+    // is resident.
+    var slots: [1]u32 = undefined;
+    const miss0 = dc.cache.stats.expert_cache_misses;
+    try testing.expect(dc.cache.slotOf(0, 2) != null);
+    try dc.cache.route(0, &.{@intCast(dc.geom.offset_of[1] + 2)}, &slots);
+    try testing.expectEqual(miss0 + 1, dc.cache.stats.expert_cache_misses);
+    for ([_]u32{ 0, 1, 2 }) |st| try testing.expectEqual(@as(u32, 0), dc.geom.group_of[st]);
 }
 
 // DSV41_BANK=<bank> (host): stage 0's real records through the cache at 2 hot + 3 transient slots (94 MB of host rows),
