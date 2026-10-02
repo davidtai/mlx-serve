@@ -238,3 +238,8 @@ test "plugins conformance: mlx-stream registers its EXL3 source, its capabilitie
 test "plugins conformance: the CPU lane created no Metal device" {
     try sdk.testing.expectNoDevice();
 }
+
+// The import boundary's own test runs with the conformance suite ("plugins import probe").
+comptime {
+    if (@import("builtin").is_test) _ = @import("mlx_stream_imports.zig");
+}

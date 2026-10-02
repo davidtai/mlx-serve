@@ -15,10 +15,9 @@ under [Behavior changes](#behavior-changes).
 ## The SDK and its five kinds
 
 The proposal's rule is that a plugin imports `sdk` (`src/sdk.zig`) and nothing else from the host. The SDK is a named
-module over three shared modules (`mlx`, `log`, `io_util`), and the host imports it by the same name, so the binary
-has one copy of its types and one MLX. mlx-stream does not meet the rule yet: its files still import five host files
-(listed under [Not built yet](#not-built-yet)). The other direction holds: the server build reaches mlx-stream only
-through the registry.
+module over shared modules (`mlx`, `log`, `io_util`), and the host imports it by the same name, so the binary has one
+copy of its types and one MLX. The server build reaches mlx-stream only through the registry, and mlx-stream reaches
+the host only through the SDK; [Imports](#imports) lists what its files may import, and every build checks it.
 
 | Kind | Extends | A plugin supplies | Outside this kind | mlx-stream provides |
 |---|---|---|---|---|
@@ -59,6 +58,27 @@ group's description) and the `expert_source` list per model directory, but no ho
 mlx-stream's arch binds its quant and its expert source at compile time. The registry answers at discovery and load
 only.
 
+## Imports
+
+mlx-stream's files are the `src/` files named `deepseek_v41*`, `dsv41_*`, `exl3_*`, `expert_*` and `mlx_stream*`. Each
+may import:
+
+- its own files;
+- the named modules `sdk`, `mlx`, `log`, `io_util` and `ngram` (the n-gram tables it shares with `qwen4_exp`), plus
+  `std`, `builtin` and `build_options` (the plugin's profile flags ride it);
+- host files only through `deepseek_v41_host.zig`, the bridge its harnesses (the AR cell, parity) and bank tests use:
+  `model.zig` (the config parse through the registry, the loaders), `gpu_ceiling.zig` and `transformer.zig`. The bridge
+  refuses to compile outside a test build, so no served path can import it.
+
+Two narrow exceptions: `dsv41_profile.zig` reads `root` in profile builds, and `mlx_stream_options.zig` (read by
+`build.zig`) imports `sdk/build_option.zig`. `src/mlx_stream_imports.zig` holds this list; every `zig build` step that
+compiles (install, `check`, `test`, `test-build`, `conformance`, `sdk-test-build`) first runs it over `src/` and fails
+naming each import outside the list.
+
+What the served path needs from the host comes through the SDK: the loaded weights and the host's loaders
+(`sdk.Weights`, `sdk.LoadCtx.loader`), the GPU ceiling and wired margin (`LoadCtx.ceiling`,
+`LoadFacts.wired_margin_bytes`), the memory ledgers (`sdk.memory`), and the reads past the page cache (`io_util`).
+
 ## Arch hooks (G1-G4)
 
 An arch hook is a declaration on the arch. An absent optional hook, or one declared `{}` (so a compile-time condition
@@ -71,7 +91,7 @@ The arch kind takes the opt-in the proposal leans toward in its open questions: 
 | G1 | `caps.owns_decode_state` | The arch keeps its per-request decode state (KV lanes, rings, draft caches) instead of the host's `KVCache`. The host turns off the prefix cache and batched decode for it and admits one request at a time. |
 | G2 | `handover` | Runs once per request between the prompt pass and the first decode step: free the prompt pass's buffers, clear the MLX cache, wait for memory to settle, allocate the decode buffers. `sdk.lifecycle` checks the order; the release step is present exactly when the arch installs a release route. |
 | G3 | `draft_lane` | The arch's own speculative decode loop over its own state. Per request, the lane picks its mode (`off`, `greedy`, `typical`, `stochastic`) from what the host knows of the request (`sdk.ArmRequest`: whether it is greedy, and whether it asks for logprobs, a grammar or penalties). The host still dispatches, stops and emits. `sdk.Spec` also names a host-driven `mtp_head`, empty until an arch claims it. |
-| G4 | `loadBytes`, `promptBytes`, `bill` | Memory. The required `loadBytes` sizes the load preflight and `promptBytes` the prompt admission. `bill` returns an itemized `sdk.MemoryBill` for a host-only `BillRequest` (the ceiling and the stop are its arguments), each term an upper bound. The terms flagged `at_construction` are compared once with the footprint after construction (`ConstructionOverBill`), and a term flagged `measured` with its one measurement there. |
+| G4 | `loadBytes`, `promptBytes`, `bill` | Memory. The required `loadBytes` sizes the load preflight and `promptBytes` the prompt admission. `bill` returns an itemized `sdk.MemoryBill` for a host-only `BillRequest` (the ceiling and the stop are its arguments), each term an upper bound. The terms flagged `at_construction` are compared once with the footprint after construction (`ConstructionOverBill`), and a term flagged `measured` with its one measurement there. A term not linear in the slot rows (the page tables over the wired bytes) is flagged `with_rows`: the fill, the admission and the process bound evaluate it through the bill's `row_terms` at the rows they ask for. |
 
 ## SDK modules (G5-G7)
 
@@ -167,9 +187,6 @@ MiMo will show what else the SDK lacks.
 As the proposal plans, a kind's full interface lands with its first real consumer. Not built yet:
 
 - `sdk.KVCache`, `sdk.ForwardCtx` and `sdk.Linear`: no registered arch runs over the host's cache.
-- The SDK surfaces mlx-stream still takes from host files: the weight map and its loader (`model.zig`), the GPU
-  memory ceiling and wired margin (`gpu_ceiling.zig`), process memory readings (`status.zig`), page-cache residency
-  (`nocache_reader.zig`) and the memory-mapped n-gram table (`qwen4_exp.zig`).
 - The `source` and `engine` kinds beyond `claims`.
 - A host load path that asks the `quant` and `expert_source` lists, and a preferred plugin from
   `model-settings.json`.

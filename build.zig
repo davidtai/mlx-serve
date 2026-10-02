@@ -240,7 +240,8 @@ pub fn build(b: *std.Build) void {
 
     // The server graph's semantic check: nothing depends on this artifact's binary, so no code is generated.
     const check_exe = b.addExecutable(.{ .name = "mlx-serve-check", .root_module = mod });
-    b.step("check", "Check that the server graph compiles, without codegen (with -Dslim: the slim host)").dependOn(&check_exe.step);
+    const check_step = b.step("check", "Check that the server graph compiles, without codegen (with -Dslim: the slim host)");
+    check_step.dependOn(&check_exe.step);
 
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
     const test_deps: TestDeps = .{ .options = test_options, .shared = shared, .ds4_metal_sources = ds4_metal_sources, .opencode2_plugin = opencode2_plugin, .agent_skills = agent_skills, .frameworks = macos_sdk_frameworks, .timeline = dsv41_decode_timers };
@@ -301,6 +302,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(conformance);
     const sdk_test_build = b.step("sdk-test-build", "Compile the SDK, conformance and shared-module tests without running them (mlx-test creates arrays)");
     for ([_]*std.Build.Step.Compile{ sdk_tests, conformance_tests } ++ shared_tests) |t| sdk_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    const import_probe = probeMlxStreamImports(b);
+    for ([_]*std.Build.Step{ b.getInstallStep(), check_step, test_build, test_step, conformance, sdk_test_build }) |st| st.dependOn(import_probe);
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -894,6 +897,19 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .imports = &.{ .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
     });
     return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk, .ngram = ngram };
+}
+
+/// mlx-stream's import boundary (src/mlx_stream_imports.zig): a host tool that reads every package file's imports on
+/// each build and fails, naming each import outside the boundary, under every compile step.
+fn probeMlxStreamImports(b: *std.Build) *std.Build.Step {
+    const probe = b.addExecutable(.{
+        .name = "mlx-stream-import-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/mlx_stream_imports.zig"), .target = b.graph.host, .optimize = .Debug }),
+    });
+    const run = b.addRunArtifact(probe);
+    run.addDirectoryArg(b.path("src"));
+    run.has_side_effects = true;
+    return &run.step;
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {
