@@ -466,10 +466,12 @@ pub const Pool = struct {
     }
 };
 
-/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts at that value, so the
-/// stream's bank tests prove each value reads the same bytes into the same rows.
+/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts with the default
+/// (stock) scheduling at that value, so the stream's bank tests prove each value reads the same bytes into the same
+/// rows; a test that asks for a scheduling itself keeps it.
 fn testSched(s: Sched) Sched {
     if (comptime !@import("builtin").is_test) return s;
+    if (s.qos or s.spin or s.demand_first) return s;
     const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
     return Sched.parse(std.mem.span(v)) orelse s;
 }
@@ -1285,4 +1287,46 @@ test "dsv41 io: demand first: no unclaimed speculative chunk starts while a dema
     try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
     try waitFor(@as(i64, @intCast(spec_base)), landedAt);
     try testing.expectEqual(@as(i64, 0), pool.counter(.max_busy_at_start));
+}
+
+test "dsv41 io: qos: a claimed speculative record's worker runs at the demand class while claimed" {
+    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    // A record of three page chunks (the demand ranges inside its first page) whose second and third chunks each sleep
+    // 200 ms: claimed during the second.
+    const rec = 3 * page;
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .sched = .{ .qos = true }, .spec = .{ .threads = 1, .slots = 2, .record_bytes = rec, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    const base: u64 = 20 * page;
+    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 200 * std.time.ns_per_ms, 200 * std.time.ns_per_ms });
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.fd, f.image.len, 1, &.{@intCast(base)}, rec));
+    std.Io.sleep(testing.io, .fromMilliseconds(60), .awake) catch {};
+    const unclaimed = ThreadProbe.scan("spec unclaimed");
+    try testing.expectEqual(@as(u32, 1), unclaimed.spec_utility);
+    var d = try Dests.init(1, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    const first = try pool.submit(f.fd, f.image.len, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+    // Past the second chunk's end: the third chunk runs claimed.
+    std.Io.sleep(testing.io, .fromMilliseconds(250), .awake) catch {};
+    var list: [*]ThreadProbe.mach_port_t = undefined;
+    var n: u32 = 0;
+    try testing.expectEqual(@as(c_int, 0), ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n));
+    var found = false;
+    for (list[0..n]) |port| {
+        const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
+        var name: [64]u8 = @splat(0);
+        _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
+        if (!std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) continue;
+        const q = ThreadProbe.qosOf(t);
+        std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{q});
+        try testing.expectEqual(ThreadProbe.user_interactive, q);
+        found = true;
+    }
+    try testing.expect(found);
+    try pool.wait(first, 2, 10 * std.time.ns_per_s);
+    try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
+    try testing.expectEqual(@as(i64, 1), pool.counter(.claimed));
 }

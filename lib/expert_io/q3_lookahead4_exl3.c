@@ -1106,6 +1106,9 @@ static void spec_drop_parked(spec_t *s) {   /* caller holds mu; s is INFLIGHT &&
 static void *spec_worker(void *arg) {
     int ti = (int)(intptr_t)arg;
     sched_thread(QOS_CLASS_UTILITY, "q3ld-spec-%d", ti);
+    /* SCHED_QOS: a CLAIMED record's chunks run at the demand class (a demand read waits on them), unclaimed ones at
+     * UTILITY; set by the worker itself at each chunk boundary. */
+    int claimed_qos = 0;
     pthread_mutex_lock(&mu);
     for (;;) {
         int i;
@@ -1170,7 +1173,12 @@ static void *spec_worker(void *arg) {
             char *dst = s->buf + s->got;
             int fd = s->fd;
             off_t off = (off_t)(s->aligned + s->got);
+            int want_claimed = s->claimed;
             pthread_mutex_unlock(&mu);
+            if ((sched_mode & SCHED_QOS) && want_claimed != claimed_qos) {
+                pthread_set_qos_class_self_np(want_claimed ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_UTILITY, 0);
+                claimed_qos = want_claimed;
+            }
             SPEC_DELAY();
             int64_t done = 0;
             int err = 0;
