@@ -100,6 +100,8 @@ pub const Options = struct {
     wide_depth: u8 = 1,
     /// The phase change's transient release (`expert_stream.Options.transient_release`; the Module's route).
     transient_release: bool = false,
+    /// The grow's new rows' allocation (`expert_stream.Options.grow_fill`; the Module's route).
+    grow_fill: expert_stream.GrowFill = .zeros,
     /// A0 (a): the first verify's warm reads (`expert_stream.Options.first_verify_warm`; the Module's route).
     first_verify_warm: ?expert_stream.FirstVerifyWarm = null,
     /// The draft head's resident bytes for the admission: null charges the
@@ -286,6 +288,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .wide_depth = opt.wide_depth,
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
+                .grow_fill = opt.grow_fill,
                 .first_verify_warm = opt.first_verify_warm,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();

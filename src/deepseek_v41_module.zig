@@ -147,7 +147,14 @@ pub const RouteOverrides = struct {
     /// The phase change's frees (transient release, cache clear, decode cache limit) at the prompt's last trunk chunk,
     /// before the DSpark seed, so they land while the seed runs (`tailRelease`). null: the default, off.
     phase_tail_release: ?bool = null,
+    /// The grow's new rows without the zero fill (`expert_stream.GrowFill`). null: the default, zeros.
+    grow_fill: ?expert_stream.GrowFill = null,
 };
+
+/// The grow fill route the Module installs in the stream (zeros by default).
+pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
+    return ov.grow_fill orelse .zeros;
+}
 
 /// The tail release route the Module installs (off by default; it needs the transient release and the DSpark seed).
 pub fn phaseTailRelease(ov: RouteOverrides) bool {
@@ -597,7 +604,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .first_verify_warm = t.arm.stream.warm != null },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .first_verify_warm = t.arm.stream.warm != null },
         };
         var line_buf: [384]u8 = undefined;
         log.info("{s}", .{self.installed.line(&line_buf)});
@@ -617,6 +624,10 @@ pub const Module = struct {
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
+        log.info("NATIVE grow fill: {t} ({s})", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
+            .zeros => "the grown rows zero-filled on the GPU",
+            .unfilled => "the grown rows MLX-owned without a fill; each is written by its read before any kernel reads it",
+        } });
         log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
@@ -773,6 +784,7 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
+        opts.grow_fill = growFill(self.overrides);
         const warm = firstVerifyWarm(self.overrides);
         opts.first_verify_warm = if (warm) .{} else null;
         var wide = wideRoute(config);
@@ -1478,6 +1490,8 @@ pub const Installed = struct {
     host_relief: bool = false,
     /// The phase change's frees at the prompt's tail, as installed (`phaseTailRelease`).
     phase_tail_release: bool = false,
+    /// The grow's new rows' allocation, as installed in the stream.
+    grow_fill: expert_stream.GrowFill = .zeros,
     /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
     draft_cache_hot: ?u32 = null,
     /// DRAFTCACHE's pool form, as installed (null: the route off).
@@ -2687,6 +2701,10 @@ test "dsv41 memory: the tail release route: off by default; the grow's bound and
     try std.testing.expect(!phaseTailRelease(.{}));
     try std.testing.expect(!(Installed{}).phase_tail_release);
     try std.testing.expect(phaseTailRelease(.{ .phase_tail_release = true }));
+    // The grow fill route: zeros unless set (the stream installs it; Installed reads it back).
+    try std.testing.expectEqual(expert_stream.GrowFill.zeros, growFill(.{}));
+    try std.testing.expectEqual(expert_stream.GrowFill.zeros, (Installed{}).grow_fill);
+    try std.testing.expectEqual(expert_stream.GrowFill.unfilled, growFill(.{ .grow_fill = .unfilled }));
     // A split prompt: only its final part arms the hook; the route off never does.
     try std.testing.expect(tailArms(true, true));
     try std.testing.expect(!tailArms(true, false));

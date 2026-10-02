@@ -99,6 +99,26 @@ pub const LayerSlotBank = struct {
         return b;
     }
 
+    /// `init`'s arrays without the zero fill: MLX-owned buffers (`dsv41_alloc_uninit`), evaluated as built, bound at once.
+    fn initUnfilled(layer: *const Layer, rows: u32) !LayerSlotBank {
+        var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
+        errdefer b.deinit();
+        for (layer.segments, 0..) |seg, c| {
+            var shape: [4]c_int = undefined;
+            shape[0] = @intCast(rows);
+            for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+            const dtype: mlx.mlx_dtype = switch (seg.dtype) {
+                .I16 => .int16,
+                .F16 => .float16,
+            };
+            b.arrays[c] = mlx.mlx_array_new();
+            if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
+            b.row_bytes[c] = seg.length;
+        }
+        try b.bind();
+        return b;
+    }
+
     /// The evaluated arrays' data pointers (after `initLazy` and an eval that covered them).
     fn bind(b: *LayerSlotBank) !void {
         for (b.arrays, &b.base) |arr, *base| base.* = @intFromPtr(mlx.mlx_array_data_uint8(arr) orelse return error.MlxNoData);
@@ -123,6 +143,8 @@ pub const LayerSlotBank = struct {
         return d;
     }
 };
+
+extern fn dsv41_alloc_uninit(out: *mlx.mlx_array, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
 
 /// MLX's allocated bytes (MLX slot memory only: the first read creates the Metal device).
 fn mlxActive() u64 {
@@ -188,6 +210,19 @@ const Rows = struct {
             .mlx => |stream| {
                 const m = try LayerSlotBank.initLazy(layer, rows, stream);
                 return .{ .rows = rows, .row_bytes = m.row_bytes, .backing = .{ .mlx = m } };
+            },
+        }
+    }
+
+    /// `init` without the fill: an MLX bank's buffers taken from the allocator as they are (`LayerSlotBank.initUnfilled`);
+    /// host rows as `init`'s.
+    fn initUnfilled(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+        if (rows == 0) return .{};
+        switch (memory) {
+            .host => return init(layer, rows, memory),
+            .mlx => {
+                const m = try LayerSlotBank.initUnfilled(layer, rows);
+                return .{ .rows = rows, .base = m.base, .row_bytes = m.row_bytes, .backing = .{ .mlx = m } };
             },
         }
     }
@@ -269,7 +304,14 @@ pub const Options = struct {
     /// A0 (a): the first verify's warm reads (`warmIssue` after the grow, settled at each layer's first decode route)
     /// on the read pool's warm class; null: no warm tickets, no warm state.
     first_verify_warm: ?FirstVerifyWarm = null,
+    /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
+    grow_fill: GrowFill = .zeros,
 };
+
+/// The grow's new rows: `zeros` evaluates MLX zeros (a GPU fill of every row); `unfilled` takes MLX-owned buffers without
+/// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
+/// every record lands by its read into the row before that state is set.
+pub const GrowFill = enum { zeros, unfilled };
 
 /// A0 (a)'s budget: at most `max_records` warm records (layer-major: the earliest layers first) and the jobs the
 /// reader may run at once while demand is idle (`expert_io.Warm.busy_max`; below the worker count, so one stays free).
@@ -444,6 +486,8 @@ pub const Stream = struct {
     transient_released: bool = false,
     /// The release route, installed at construction (`Options.transient_release`).
     release_installed: bool = false,
+    /// The grow's allocation, installed at construction (`Options.grow_fill`).
+    grow_fill: GrowFill = .zeros,
     /// The prompt phase's scratch rows and windows (`Options`): `regrowTransient` re-creates them for a later prompt.
     prompt_transient_rows: u32 = 0,
     prompt_wide_depth: u8 = 1,
@@ -651,6 +695,7 @@ pub const Stream = struct {
             .transient_meta = transient_meta,
             .transient_layer = @intCast(widest),
             .release_installed = opt.transient_release,
+            .grow_fill = opt.grow_fill,
             .prompt_transient_rows = opt.transient_rows,
             .prompt_wide_depth = opt.wide_depth,
             .memory = opt.slot_memory,
@@ -1322,7 +1367,12 @@ pub const Stream = struct {
             a.free(meta0);
         };
         if (self.transient_released) {
-            window0 = try Rows.init(&self.bank.layers[self.transient_layer], self.max_route_ids + decode_staging_rows, self.memory);
+            const geom0 = &self.bank.layers[self.transient_layer];
+            const n0 = self.max_route_ids + decode_staging_rows;
+            window0 = switch (self.grow_fill) {
+                .zeros => try Rows.init(geom0, n0, self.memory),
+                .unfilled => try Rows.initUnfilled(geom0, n0, self.memory),
+            };
             meta0 = a.alloc(SlotMeta, window0.?.rows) catch |e| {
                 window0.?.deinit();
                 window0 = null;
@@ -1335,10 +1385,14 @@ pub const Stream = struct {
         @memset(exts, null);
         errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
         for (self.layers, decode_rows, exts, self.bank.layers) |*ls, rows, *e, *geom| {
-            if (rows > ls.policy.capacity) e.* = try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory);
+            if (rows > ls.policy.capacity) e.* = switch (self.grow_fill) {
+                .zeros => try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory),
+                .unfilled => try Rows.initUnfilled(geom, rows - ls.policy.capacity, self.memory),
+            };
         }
-        // Every layer's new MLX arrays in one eval (growth-overlap step 1: not nine evals per layer, 360 at 40).
-        try evalRows(a, exts);
+        // Every layer's new MLX arrays in one eval (growth-overlap step 1: not nine evals per layer, 360 at 40); unfilled
+        // arrays are already evaluated.
+        if (self.grow_fill == .zeros) try evalRows(a, exts);
         for (exts) |*e| if (e.*) |*r| try r.bind();
         if (window0) |w| {
             self.transient = w;
@@ -2955,6 +3009,24 @@ test "dsv41 stream: a gate the watchdog forces fails the stream at the next flus
     try testing.expectError(error.StreamFailed, s.route(1, &.{2}, &.{}));
 }
 
+test "dsv41 stream: a forced gate fails the flush every round runs before it returns its tokens (an unfilled row read under it never reaches a client)" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false }, .event = .{ .watchdog_ms = 50 }, .grow_fill = .unfilled });
+    defer s.deinit();
+    defer expert_io.clearFaults();
+    try s.grow(&.{ 4, 4 });
+    const page = std.heap.pageSize();
+    expert_io.injectFault(sb.bank.spans(0, 11).gu_offset / page * page, 5, 400 * std.time.ns_per_ms);
+    const r = try s.route(0, &.{11}, &.{});
+    const g = (try s.gate(r)).?;
+    try waitWord(s, g.down_first);
+    s.release(r);
+    // The round's own flush (dspark_loop round: `ex.flush()` before `return .{ .tokens ...}`) raises it by name.
+    try testing.expectError(error.GateForced, s.flush());
+    try testing.expectError(error.StreamFailed, s.route(1, &.{2}, &.{}));
+}
+
 test "dsv41 stream: lookahead options outside the lane's ranges are refused at construction" {
     var sb = try SynthBank.open(32);
     defer sb.close();
@@ -3211,6 +3283,56 @@ test "dsv41 stream: a request cancelled in its prompt phase: its live and held r
     try expectServed(s, &sb, r, &ids);
     s.release(r);
     try s.flush();
+}
+
+test "dsv41 stream: grow fill unfilled: no route reads a grown row before its record lands in it (rows poisoned after the grow)" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    // The served decode configuration (lookahead, pre-reads, gates) at depth 5, the transient release on, unfilled grow.
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 2 }, .transient_rows = 5 * max_route_ids, .wide_depth = 5, .pool = la_pool, .lookahead = .{}, .event = .{ .watchdog_ms = 10_000 }, .transient_release = true, .grow_fill = .unfilled });
+    defer s.deinit();
+    try testing.expectEqual(GrowFill.unfilled, s.grow_fill);
+    for (0..5) |w| {
+        var pids: [6]u16 = undefined;
+        for (&pids, 0..) |*e, i| e.* = @intCast(w * 6 + i);
+        s.release(try serve(s, 0, &pids));
+    }
+    _ = try s.releaseTransient();
+    try s.grow(&.{ 12, 10 });
+    // Every row the grow added (each layer's ext and decode's window 0) holds garbage, as an unfilled buffer may; the
+    // grown slots are empty by the state machine, so a kernel can reach a row only after a load wrote its record.
+    for (s.layers, 0..) |*ls, l| {
+        const e = &ls.ext.?;
+        for (0..e.rows) |r| for (0..n_components) |c| @memset(e.row(@enumFromInt(c), @intCast(r)), 0xA5);
+        for (ls.meta[ls.base.rows..ls.policy.capacity]) |m| try testing.expect(m.state != .ready);
+        _ = l;
+    }
+    for (0..s.transient.rows) |r| for (0..n_components) |c| @memset(s.transient.row(@enumFromInt(c), @intCast(r)), 0xA5);
+    for (s.transient_meta) |m| try testing.expect(m.state != .ready);
+    var rng = std.Random.DefaultPrng.init(4242);
+    const rand = rng.random();
+    var ids: [2][48]u16 = undefined;
+    var scores: [8 * 32]f32 = undefined;
+    for (0..60) |_| {
+        const m = [2]usize{ rand.intRangeAtMost(usize, 1, 8), rand.intRangeAtMost(usize, 1, 8) };
+        for (0..2) |layer| for (ids[layer][0 .. 6 * m[layer]]) |*e| {
+            e.* = rand.intRangeLessThan(u16, 0, 32);
+        };
+        for (0..m[0]) |row| for (scores[row * 32 ..][0..32], 0..) |*v, e| {
+            v.* = if (std.mem.indexOfScalar(u16, ids[1][0 .. 6 * m[1]], @intCast(e)) != null) 1 + rand.float(f32) else rand.float(f32) / 2;
+        };
+        for (0..2) |layer| {
+            const n = 6 * m[layer];
+            const pred: []const f32 = if (layer == 0) scores[0 .. 32 * m[0]] else &.{};
+            const r = try serveGated(s, @intCast(layer), ids[layer][0..n], pred);
+            // Every slot the route hands the kernels (hits, demand loads, pre-reads, adopted reads) holds its record.
+            try expectServed(s, &sb, r, ids[layer][0..n]);
+            s.release(r);
+        }
+    }
+    try s.flush();
+    // The grown rows were used: loads landed past the prompt rows.
+    try testing.expect(s.stats().spec_issued > 0);
 }
 
 /// One replay of the phase-2 fixture's layers 13 and 14 (served lookahead 8:inf:2, 4 chunks, pre-read, gates) at the
