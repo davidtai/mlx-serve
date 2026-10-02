@@ -1319,3 +1319,97 @@ test "dsv41 dspark head: DRAFTCACHE on the bank: every routed id's slot rows are
     try testing.expect(cache.stats.expert_cache_evictions > 0);
     std.debug.print("dsv41 draft cache bank: {d} routes, {d} hits, {d} misses, {d} evictions, {d} B read\n", .{ cache.stats.route_calls, cache.stats.expert_cache_hits, cache.stats.expert_cache_misses, cache.stats.expert_cache_evictions, cache.stats.expert_bytes_read });
 }
+
+// DSV41_PHASE0B_MLX=1 DSV41_BANK=<bank> (device, the window's smoke step): stage 0's switch over the cache's MLX slots
+// (8 hot + 15 transient rows, misses read by the pool) against the resident bank of all 128 experts (stacked as the
+// head does), 16 blocks of 5 rows x top-3 forcing evictions, f32 and bf16 inputs: outputs equal bit for bit. Peak
+// device ~5.3 GB (the 2.41 GB bank, its 2.41 GB of sources while it stacks, 0.43 GB of slots); a few seconds.
+test "dsv41 smoke 0b: DRAFTCACHE: a draft stage's switch over the cache's slots equals the resident bank's, bit for bit, on real records" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse {
+        std.debug.print("\ndraft cache smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
+        return error.TestUnexpectedResult;
+    });
+    const mlx = @import("mlx.zig");
+    const model_io = @import("model.zig");
+    const G = ops.MlxOps;
+    const T = G.T;
+    const H = Head(G);
+    const a = testing.allocator;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, dir, &vd);
+    var ck = try v41.Checkpoint.openIndexed(a, testing.io, dir, &vd);
+    defer ck.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    // The resident bank: stage 0's shard loaded past the page cache, its 128 experts stacked per part.
+    var w = model_io.Weights.init(a);
+    defer w.deinit();
+    const t0 = ck.tensors.get("mtp.0.ffn.experts.0.w1.weight").?;
+    const shard = try ck.shardPath(a, t0.shard);
+    defer a.free(shard);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try model_io.loadSafetensorsFile(a, &w, shard.ptr, cpu, .{ .nocache = true });
+    var res: H.Experts = undefined;
+    var name: [96]u8 = undefined;
+    inline for (.{ "w1", "w3", "w2" }) |proj| {
+        var ws: [128]T = undefined;
+        var ss: [128]T = undefined;
+        for (0..c.dspark.n_routed_experts) |e| {
+            ws[e] = w.get(try std.fmt.bufPrint(&name, "mtp.0.ffn.experts.{d}." ++ proj ++ ".weight", .{e})).?;
+            ss[e] = w.get(try std.fmt.bufPrint(&name, "mtp.0.ffn.experts.{d}." ++ proj ++ ".scales", .{e})).?;
+        }
+        @field(res, proj) = .{ .w = g.keep(try g.stack(ws[0..c.dspark.n_routed_experts], 0)), .s = g.keep(try g.stack(ss[0..c.dspark.n_routed_experts], 0)), .mode = .mxfp4 };
+        try g.evalAll(&.{ @field(res, proj).w, @field(res, proj).s });
+    }
+    defer inline for (.{ "w1", "w3", "w2" }) |proj| {
+        g.release(@field(res, proj).w);
+        g.release(@field(res, proj).s);
+    };
+    w.deinit();
+    w = model_io.Weights.init(a);
+    // The cache: stage 0 at 8 hot + 15 transient MLX rows, reads through a pool, the first 8 ids seeded.
+    var dg = try DraftGeometry.of(&c, 0);
+    var geom = dg.geometry();
+    geom.capacity = &.{8};
+    var pool = try expert_io.Pool.start(a, .{ .workers = 4, .tickets = 256 });
+    defer pool.stop();
+    const cache = try xsc.Cache.init(a, geom, .{ .mlx = s }, pool);
+    defer cache.deinit();
+    try placeParts(cache, a, &ck, &dg.shapes, 1);
+    try cache.checkLocs();
+    _ = try cache.seed(0, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
+    const cached: H.Experts = .{ .w1 = .{ .w = cache.arrays[0][0], .s = cache.arrays[0][1], .mode = .mxfp4 }, .w3 = .{ .w = cache.arrays[0][2], .s = cache.arrays[0][3], .mode = .mxfp4 }, .w2 = .{ .w = cache.arrays[0][4], .s = cache.arrays[0][5], .mode = .mxfp4 } };
+    var script: ScriptIds = .{ .prng = std.Random.DefaultPrng.init(23), .n_experts = 40, .k = 3 };
+    var prng = std.Random.DefaultPrng.init(29);
+    var xs: [5 * 5120]f32 = undefined;
+    var out_r: [15 * 5120]f32 = undefined;
+    var out_c: [15 * 5120]f32 = undefined;
+    for (0..16) |blk| {
+        for (&xs) |*v| v.* = prng.random().floatNorm(f32);
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        var xf = try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ 5, 5120 }, .float32);
+        if (blk % 2 == 1) xf = try g.astype(xf, .bfloat16);
+        var ids: [15]u16 = undefined;
+        try ScriptIds.ids(&script, &ids);
+        var ids_i: [15]i32 = undefined;
+        for (&ids_i, ids) |*d, v| d.* = v;
+        const ids_dev = try g.hostArray(std.mem.sliceAsBytes(&ids_i), &.{ 5, 3 }, .int32);
+        var slots: [15]u32 = undefined;
+        try cache.route(0, &ids, &slots);
+        var sl: [15]i32 = undefined;
+        for (&sl, slots) |*d, v| d.* = @intCast(v);
+        const idx = try g.hostArray(std.mem.sliceAsBytes(&sl), &.{ 5, 3 }, .int32);
+        const yr = try g.astype(try H.switchGlu(&g, &res, c.swiglu_limit, xf, ids_dev), .float32);
+        const yc = try g.astype(try H.switchGlu(&g, &cached, c.swiglu_limit, xf, idx), .float32);
+        _ = try g.hostF32(yr, &out_r);
+        _ = try g.hostF32(yc, &out_c);
+        try testing.expectEqualSlices(u32, @ptrCast(&out_r), @ptrCast(&out_c));
+    }
+    std.debug.print("\ndraft cache smoke: 16 blocks bit for bit (f32 and bf16 inputs); {d} hits, {d} misses, {d} evictions, {d} B read\n", .{ cache.stats.expert_cache_hits, cache.stats.expert_cache_misses, cache.stats.expert_cache_evictions, cache.stats.expert_bytes_read });
+    try testing.expect(cache.stats.expert_cache_evictions > 0);
+}
