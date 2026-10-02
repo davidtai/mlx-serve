@@ -52,6 +52,24 @@ pub fn boundedLatentCap(max_kv: ?u32) ?u32 {
     return (max_kv orelse return null) + bounded_latent_slack;
 }
 
+/// A request's lane bound (the arch's constants): the positions a request that declared no budget may still
+/// generate, and the rows one forward may append past the last committed position (a verify block).
+pub const Bound = struct { headroom: u64, scratch: u32 };
+
+/// The positions a request's lanes are allocated at, once, at its prompt pass: its reservation (prompt plus
+/// max_tokens when the shell declares one), else the prompt plus the headroom; plus the scratch rows.
+pub fn capacity(prompt_tokens: u64, reserved_tokens: u64, b: Bound) u32 {
+    const budget: u64 = if (reserved_tokens > prompt_tokens) reserved_tokens else prompt_tokens + b.headroom;
+    return @intCast(budget + b.scratch);
+}
+
+/// The positions the bill charges for a request of `prompt_tokens` + `max_tokens`: the larger of the undeclared
+/// (headroom) and the declared (reservation) allocation, so the bill bounds either form of the request at that
+/// prompt. Kept apart from `capacity` by name: capacity is what one request allocates, billed capacity the bound.
+pub fn billedCapacity(prompt_tokens: u64, max_tokens: u64, b: Bound) u32 {
+    return @max(capacity(prompt_tokens, 0, b), capacity(prompt_tokens, prompt_tokens + max_tokens, b));
+}
+
 pub const Error = error{ BoundedLaneFull, RingRollbackTooDeep, TrimPastStart };
 
 pub fn Lanes(comptime G: type) type {
@@ -395,4 +413,13 @@ test "sdk kv: the bounded caps are one row per fed token or completed group, plu
     try std.testing.expectEqual(@as(?u32, 17416 + 8), boundedCompCap(17416, 0));
     try std.testing.expectEqual(@as(?u32, null), boundedCompCap(null, 4));
     try std.testing.expectEqual(@as(?u32, null), boundedLatentCap(null));
+}
+
+test "sdk kv: capacity is the reservation or the prompt plus the headroom, plus the scratch rows; the bill takes the larger" {
+    const b: Bound = .{ .headroom = 8192, .scratch = 8 };
+    try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), capacity(16384, 0, b));
+    try std.testing.expectEqual(@as(u32, 16384 + 1024 + 8), capacity(16384, 16384 + 1024, b));
+    try std.testing.expectEqual(@as(u32, 40000 + 8), capacity(32768, 40000, b));
+    try std.testing.expectEqual(@as(u32, 24584), billedCapacity(16384, 1024, b));
+    try std.testing.expectEqual(@as(u32, 16384 + 10000 + 8), billedCapacity(16384, 10000, b));
 }

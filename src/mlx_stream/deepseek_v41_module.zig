@@ -1385,9 +1385,11 @@ pub const Module = struct {
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
     /// generation headroom), plus one verify block.
     pub fn maxPositions(prompt: usize, reserved_tokens: u64) u32 {
-        const budget: u64 = if (reserved_tokens > prompt) reserved_tokens else prompt + generation_headroom;
-        return @intCast(budget + mdl.Model(G).scratch_rows);
+        return sdk.kv.capacity(prompt, reserved_tokens, kv_bound);
     }
+
+    /// The lanes' bound (`sdk.kv.Bound`): the shell's generation headroom and one verify block of scratch rows.
+    pub const kv_bound: sdk.kv.Bound = .{ .headroom = generation_headroom, .scratch = mdl.Model(G).scratch_rows };
 
     /// A decode step of the request (the served seam's every call after the prompt; the phase is the
     /// decode handover's, `decodeHandover`): refused by name before the handover, so a driver that skips it

@@ -413,7 +413,7 @@ pub fn billWired(wired_bytes: ?u64, envelope_record: bool) ?u64 {
 /// bills. Until SERVED18 the bill charged prompt + max_tokens + a block (17,416 at the standard request) while the served
 /// Module allocated 24,584 (about 46 MB of lanes and 15 MB of the verify wave's index chain unbilled on servers).
 pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
-    return @max(module.Module.maxPositions(@intCast(prompt_tokens), 0), module.Module.maxPositions(@intCast(prompt_tokens), prompt_tokens + max_tokens));
+    return sdk.kv.billedCapacity(prompt_tokens, max_tokens, module.Module.kv_bound);
 }
 
 /// The bill at `config`'s rows (both set: the native rows; `expert_rows` alone: the Python-paired forced-rows
