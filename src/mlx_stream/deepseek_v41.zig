@@ -300,34 +300,50 @@ pub const PrefillBill = struct {
     }
 
     pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
+        var buf: PlanBuf = undefined;
+        return sdk.kv.lanesBytes(b.kvPlan(positions, &buf));
+    }
+
+    /// The bill reads the rings at the default geometry (`kvc.Geometry{}`: the served tier sets no WINDOW_RING_*
+    /// geometry lever).
+    const ring_geo: kvc.Geometry = .{};
+
+    pub const PlanBuf = struct { lanes: [max_layers]sdk.kv.LanePlan, rings: [max_layers + 1]sdk.kv.RingPlan };
+
+    /// The served tier's KV plan (`sdk.kv.Plan`) for a request of `positions`: per kv source its compressed and index
+    /// lane (one lane of head_dim + index_head_dim f32 rows at `boundedCompCap`), the window ring (one row over every
+    /// layer), and per ratio > 1 kv source its frontier's two rings (raw_kv, raw_score: head_dim f32 rows each).
+    pub fn kvPlan(b: PrefillBill, positions: u64, buf: *PlanBuf) sdk.kv.Plan {
         const m: u32 = @intCast(positions);
-        var n: u64 = 0;
-        for (b.kv_sources[0..b.n_kv_sources]) |r| n += @as(u64, kvc.boundedCompCap(m, r).?) * (b.head_dim + b.index_head_dim) * 4;
-        return n;
+        var n_rings: usize = 0;
+        buf.rings[0] = .{ .window = b.window, .row_bytes = b.ring_row_bytes };
+        n_rings += 1;
+        for (b.kv_sources[0..b.n_kv_sources], 0..) |r, i| {
+            buf.lanes[i] = .{ .rows = kvc.boundedCompCap(m, r).?, .row_bytes = (b.head_dim + b.index_head_dim) * 4 };
+            if (r > 1) {
+                buf.rings[n_rings] = .{ .window = r, .row_bytes = 2 * b.head_dim * 4 };
+                n_rings += 1;
+            }
+        }
+        return .{ .lanes = buf.lanes[0..b.n_kv_sources], .rings = buf.rings[0..n_rings] };
     }
 
     /// A `deepseek_v41_cache` Ring of `window` rows (the window ring: the model's window; the compressor frontier: the
     /// source's ratio): its base, the window plus a verify block, its slack and the headroom.
     pub fn ringBase(window: u64) u64 {
-        const geo: kvc.Geometry = .{};
-        return window + geo.max_verify + geo.slack + geo.headroom;
+        return sdk.kv.ringBase(window, ring_geo);
     }
 
     /// A ring's rows through the prompt pass: from the third chunk on both of its slots at the compaction size (a
     /// chunk plus the window less one, at least the base); a shorter prompt holds one.
     pub fn ringPromptRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        const chunk = @min(b.chunkRows(seq), @max(seq, 1));
-        const chunks = std.math.divCeil(u64, @max(seq, 1), chunk) catch unreachable;
-        const slot = @max(ringBase(window), chunk + window -| 1);
-        return (if (chunks >= 3) @as(u64, 2) else 1) * slot;
+        return sdk.kv.ringPromptRows(window, b.chunkRows(seq), seq, ring_geo);
     }
 
     /// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus
     /// the window less one, at least the base) beside a new base; steady decode holds two bases.
     pub fn ringDecodeRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        const chunk = @min(b.chunkRows(seq), @max(seq, 1));
-        const n_last = ((@max(seq, 1) - 1) % chunk) + 1;
-        return @max(ringBase(window), n_last + window -| 1) + ringBase(window);
+        return sdk.kv.ringDecodeRows(window, b.chunkRows(seq), seq, ring_geo);
     }
 
     /// The window ring (one row over every layer: bf16 on layer 0, f32 after) through the prompt and in decode.
@@ -360,11 +376,13 @@ pub const PrefillBill = struct {
     /// The served tier's KV for a prompt of `seq` in a request of `positions`: the lanes, and the window ring and the
     /// frontier rings at their widest in the phase.
     pub fn kvPromptBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
-        return b.laneBytes(positions) + b.ringPromptBytes(seq) + b.frontierPromptBytes(seq);
+        var buf: PlanBuf = undefined;
+        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .prompt, b.chunkRows(seq), seq, ring_geo);
     }
 
     pub fn kvDecodeBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
-        return b.laneBytes(positions) + b.ringDecodeBytes(seq) + b.frontierDecodeBytes(seq);
+        var buf: PlanBuf = undefined;
+        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, ring_geo);
     }
 
     /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the

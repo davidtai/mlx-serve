@@ -70,6 +70,55 @@ pub fn billedCapacity(prompt_tokens: u64, max_tokens: u64, b: Bound) u32 {
     return @max(capacity(prompt_tokens, 0, b), capacity(prompt_tokens, prompt_tokens + max_tokens, b));
 }
 
+/// A `Ring` of `window` rows at `geo`: its base, the window plus a verify block, its slack and the headroom.
+pub fn ringBase(window: u64, geo: Geometry) u64 {
+    return window + geo.max_verify + geo.slack + geo.headroom;
+}
+
+/// A ring's rows through a prompt of `seq` positions fed in chunks of `chunk_rows` (the arch's chunk rule): from the
+/// third chunk on both of its slots at the compaction size (a chunk plus the window less one, at least the base); a
+/// shorter prompt holds one.
+pub fn ringPromptRows(window: u64, chunk_rows: u64, seq: u64, geo: Geometry) u64 {
+    const chunk = @min(chunk_rows, @max(seq, 1));
+    const chunks = std.math.divCeil(u64, @max(seq, 1), chunk) catch unreachable;
+    const slot = @max(ringBase(window, geo), chunk + window -| 1);
+    return (if (chunks >= 3) @as(u64, 2) else 1) * slot;
+}
+
+/// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus the
+/// window less one, at least the base) beside a new base; steady decode holds two bases.
+pub fn ringDecodeRows(window: u64, chunk_rows: u64, seq: u64, geo: Geometry) u64 {
+    const chunk = @min(chunk_rows, @max(seq, 1));
+    const n_last = ((@max(seq, 1) - 1) % chunk) + 1;
+    return @max(ringBase(window, geo), n_last + window -| 1) + ringBase(window, geo);
+}
+
+/// One bounded lane of a request's plan: the rows of its cap and the bytes of one row.
+pub const LanePlan = struct { rows: u64, row_bytes: u64 };
+/// One ring of a request's plan: its window and the bytes of one ring row (over every array that row spans).
+pub const RingPlan = struct { window: u64, row_bytes: u64 };
+/// A request's KV as its arch describes it: the bounded lanes, each allocated once at its cap, and the rings.
+pub const Plan = struct { lanes: []const LanePlan, rings: []const RingPlan };
+pub const Phase = enum { prompt, decode };
+
+/// The plan's bounded lanes at their caps.
+pub fn lanesBytes(p: Plan) u64 {
+    var n: u64 = 0;
+    for (p.lanes) |l| n += l.rows * l.row_bytes;
+    return n;
+}
+
+/// The plan's KV at its widest in `phase` for a prompt of `seq` fed in chunks of `chunk_rows` (the bill's KV term):
+/// the lanes at their caps and every ring at its phase's widest rows.
+pub fn planBytes(p: Plan, phase: Phase, chunk_rows: u64, seq: u64, geo: Geometry) u64 {
+    var n = lanesBytes(p);
+    for (p.rings) |r| n += r.row_bytes * switch (phase) {
+        .prompt => ringPromptRows(r.window, chunk_rows, seq, geo),
+        .decode => ringDecodeRows(r.window, chunk_rows, seq, geo),
+    };
+    return n;
+}
+
 pub const Error = error{ BoundedLaneFull, RingRollbackTooDeep, TrimPastStart };
 
 pub fn Lanes(comptime G: type) type {
@@ -422,4 +471,20 @@ test "sdk kv: capacity is the reservation or the prompt plus the headroom, plus 
     try std.testing.expectEqual(@as(u32, 40000 + 8), capacity(32768, 40000, b));
     try std.testing.expectEqual(@as(u32, 24584), billedCapacity(16384, 1024, b));
     try std.testing.expectEqual(@as(u32, 16384 + 10000 + 8), billedCapacity(16384, 10000, b));
+}
+
+test "sdk kv: a ring's rows per phase (both slots from the third chunk; decode compacts the last chunk beside a base) and a plan's bytes" {
+    // a 16,384-token prompt in chunks of 953: the window ring (128) and a frontier ring (2) at the default geometry
+    try std.testing.expectEqual(@as(u64, 208), ringBase(128, .{}));
+    try std.testing.expectEqual(@as(u64, 2 * (953 + 127)), ringPromptRows(128, 953, 16384, .{}));
+    try std.testing.expectEqual(@as(u64, (183 + 127) + 208), ringDecodeRows(128, 953, 16384, .{}));
+    try std.testing.expectEqual(@as(u64, 2 * (953 + 1)), ringPromptRows(2, 953, 16384, .{}));
+    try std.testing.expectEqual(@as(u64, (183 + 1) + 82), ringDecodeRows(2, 953, 16384, .{}));
+    // two chunks hold one slot; a prompt shorter than a chunk is one chunk
+    try std.testing.expectEqual(@as(u64, 953 + 127), ringPromptRows(128, 953, 1000, .{}));
+    try std.testing.expectEqual(@as(u64, 208), ringPromptRows(128, 953, 50, .{}));
+    const p: Plan = .{ .lanes = &.{ .{ .rows = 10, .row_bytes = 3 }, .{ .rows = 4, .row_bytes = 5 } }, .rings = &.{.{ .window = 128, .row_bytes = 7 }} };
+    try std.testing.expectEqual(@as(u64, 50), lanesBytes(p));
+    try std.testing.expectEqual(@as(u64, 50 + 7 * 2160), planBytes(p, .prompt, 953, 16384, .{}));
+    try std.testing.expectEqual(@as(u64, 50 + 7 * 518), planBytes(p, .decode, 953, 16384, .{}));
 }
