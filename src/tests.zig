@@ -70,6 +70,7 @@ test {
     _ = @import("dsv41_draft_routes.zig");
     _ = @import("dsv41_verify_timeline.zig");
     _ = @import("dsv41_host_heap.zig");
+    _ = @import("dsv41_hcpost_emul_bench.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("expert_policy.zig");
     _ = @import("expert_stream.zig");
