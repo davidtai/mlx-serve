@@ -102,6 +102,8 @@ pub const Options = struct {
     transient_release: bool = false,
     /// A0 (a): the first verify's warm reads (`expert_stream.Options.first_verify_warm`; the Module's route).
     first_verify_warm: ?expert_stream.FirstVerifyWarm = null,
+    /// Option (b): decode pool rows re-owned from decode's own misses (`expert_stream.DecodePool`; route decode_first16).
+    decode_pool: ?expert_stream.DecodePool = null,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -201,7 +203,7 @@ pub fn wideWindowBytes(depth: u8, record: u64) u64 {
 
 /// How the phase change sizes each layer's decode rows: `uniform` (the admitted count everywhere) or `prompt_stats`
 /// (`DecodeRows`: the same total, shifted toward the layers whose own prompt routing is spread widest).
-pub const DecodeRowsAlloc = enum { uniform, prompt_stats };
+pub const DecodeRowsAlloc = enum { uniform, prompt_stats, decode_first16 };
 
 /// The fill's granule at decode: `row` (one record on every layer, today's) or `record` (the leftover below one row
 /// handed out as single records: `bill.fillExtraRecords`).
@@ -396,6 +398,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
                 .first_verify_warm = opt.first_verify_warm,
+                .decode_pool = opt.decode_pool,
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();
             self.source = xp.StreamSource.init(self.stream);
