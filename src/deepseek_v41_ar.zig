@@ -1043,6 +1043,8 @@ const CellReceipt = struct {
     tail_release: ?module.TailReleaseRecord = null,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
+    /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
+    request: u32 = 1,
     /// DRAFTCACHE's hot slots as installed (`module.draftCacheHot`; null: every draft expert resident), and its stream
     /// statistics over the request (route calls, hits, misses, loads, bytes read), read after the timed decode.
     draft_cache_hot: ?u32 = null,
@@ -1156,14 +1158,14 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
             const t_end = std.Io.Timestamp.now(io, .boot);
             if (!end_at_prefill) try md.requestEnd();
             const end_ms: ?f64 = if (end_at_prefill) null else @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
-            const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k, .request_end_ms = end_ms, .reverse = md.reverse_change }, .{});
+            const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k + 1, .request_end_ms = end_ms, .reverse = if (end_at_prefill) null else md.reverse_change }, .{});
             std.debug.print("NATIVE DSV41_REQUEST_END {s}\n", .{rj});
             marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
         }
         const out_k = if (k == 0) out_path else try std.fmt.allocPrint(a, "{s}.req{d}.json", .{ out_path, k + 1 });
         // Either arm the configuration builds: host waits (the served default) or event gates (C6).
         switch (md.arm) {
-            inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_k, .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
+            inline else => |t| try cellRun(t.arm, .{ .a = a, .gpa = gpa, .io = io, .md = md, .config = &config, .prompt = prompt, .delta = delta, .max_tokens = max_tokens, .case_id = case_id, .prompt_path = prompt_path, .out_path = out_k, .request = @intCast(k + 1), .bill = bill, .constructed = constructed, .file_backed_start = vm_start.external, .marks = &marks, .wired = wired, .host_allocator = host.name }),
         }
     }
 }
@@ -1223,6 +1225,8 @@ const CellCtx = struct {
     case_id: ?[]const u8,
     prompt_path: []const u8,
     out_path: []const u8,
+    /// The request's index through this Module (1 = the first; `DSV41_CELL_REQUESTS`).
+    request: u32 = 1,
     bill: CellBill,
     constructed: PhaseMemory,
     /// File-backed pages at the step's vm start (the page cache the step creates is measured from here).
@@ -1491,6 +1495,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_tail_release = md.installed.phase_tail_release,
         .tail_release = md.tail_release,
         .grow_fill = @tagName(md.installed.grow_fill),
+        .request = cx.request,
         .draft_cache_hot = md.installed.draft_cache_hot,
         .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
