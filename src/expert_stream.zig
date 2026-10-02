@@ -777,6 +777,17 @@ pub const Stream = struct {
         return n;
     }
 
+    /// `layer`'s routed rows per expert over the request's prompt seeds (`LayerPolicy.prefill_freq`).
+    pub fn promptCounts(self: *const Stream, layer: u32) []const u32 {
+        return self.layers[layer].policy.prefill_freq;
+    }
+
+    /// A request's start: every layer's prompt counts zeroed (they would otherwise add up across requests). The
+    /// policy's rank tie-break reads them too, so request 1 (zeroed by the construction's forget) is unchanged.
+    pub fn resetPromptCounts(self: *Stream) void {
+        for (self.layers) |*ls| @memset(ls.policy.prefill_freq, 0);
+    }
+
     /// The last `seedPrefill` of `layer`: its seed's ranks (the call's hottest experts, hottest first).
     pub fn seedRanks(self: *const Stream, layer: u32) u32 {
         return self.layers[layer].policy.seed_ranks;
@@ -3290,4 +3301,60 @@ test "dsv41 stream: wide depth 1 plans as before (one window, a live route's slo
     for (r.plan.loadsOf()) |l| try testing.expect(l.persistent and l.slot < 16);
     s.release(r);
     try s.flush();
+}
+
+// #23: per-layer decode rows change only which records stay resident. The same prompt and decode trace through a
+// stream grown uniform and one grown per layer (same total): every routed id is served from a slot holding its record
+// in both, so the routed math reads the same bytes; only the hit / miss split moves.
+test "dsv41 stream: per-layer decode rows serve every routed id its record, as uniform rows do, on the same trace" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    var st: [2]Stats = undefined;
+    for ([_][2]u32{ .{ 8, 8 }, .{ 12, 4 } }, 0..) |grown, arm| {
+        const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .pool = la_pool, .lookahead = .{ .k = 6, .budget = 2, .chunks = 2 }, .event = .{ .watchdog_ms = 10_000 } });
+        defer s.deinit();
+        try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
+        s.release(try serve(s, 0, &.{ 1, 2, 3, 5, 9 }));
+        s.release(try serve(s, 1, &.{ 7, 8, 9 }));
+        try s.grow(&grown);
+        try testing.expectEqual(grown[0], s.layers[0].policy.capacity);
+        try testing.expectEqual(grown[1], s.layers[1].policy.capacity);
+        var rng = std.Random.DefaultPrng.init(23);
+        const rand = rng.random();
+        var ids: [48]u16 = undefined;
+        var scores: [8 * 32]f32 = undefined;
+        for (0..80) |step| {
+            const layer: u32 = @intCast(step % 2);
+            const m = rand.intRangeAtMost(usize, 1, 8);
+            // Layer 0 routes over all 32 experts, layer 1 over 10: the wide layer is the one that gains rows.
+            const span: u16 = if (layer == 0) 32 else 10;
+            for (ids[0 .. 6 * m]) |*e| e.* = rand.intRangeLessThan(u16, 0, span);
+            for (scores[0 .. 32 * m]) |*v| v.* = rand.float(f32);
+            const pred: []const f32 = if (layer == 0) scores[0 .. 32 * m] else &.{};
+            const r = try serveGated(s, layer, ids[0 .. 6 * m], pred);
+            try expectServed(s, &sb, r, ids[0 .. 6 * m]);
+            s.release(r);
+        }
+        try s.flush();
+        st[arm] = s.stats();
+        try testing.expectEqual(@as(u64, 0), st[arm].gates_forced);
+    }
+    try testing.expectEqual(st[0].route_calls, st[1].route_calls);
+    try testing.expectEqual(st[0].expert_cache_hits + st[0].expert_cache_misses, st[1].expert_cache_hits + st[1].expert_cache_misses);
+    std.debug.print("\nper-layer rows: misses uniform {d}, per-layer {d}\n", .{ st[0].expert_cache_misses, st[1].expert_cache_misses });
+}
+
+test "dsv41 stream: a request's start zeroes every layer's prompt counts, and only them" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
+    defer s.deinit();
+    try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
+    try s.seedPrefill(1, &.{7});
+    s.release(try serve(s, 0, &.{ 1, 2, 3 }));
+    try testing.expectEqual(@as(u32, 2), s.promptCounts(0)[1]);
+    const resident = s.layers[0].policy.occupancy;
+    s.resetPromptCounts();
+    for (0..2) |l| for (s.promptCounts(@intCast(l))) |c| try testing.expectEqual(@as(u32, 0), c);
+    try testing.expectEqual(resident, s.layers[0].policy.occupancy);
 }

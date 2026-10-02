@@ -54,6 +54,8 @@ pub const Bill = struct {
     n_experts: u32 = 0,
     prefill_rows: u32,
     decode_rows: u32,
+    /// Decode's single records past layers x decode_rows (`fillExtraRecords`; the record granule route), in `slot_decode`.
+    decode_extra_records: u64 = 0,
     /// (layers x rows + the transient bank's rows: one max_route_ids window per wide read in flight) x the
     /// bank's record.
     slot_prefill: u64,
@@ -466,7 +468,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .prefill_rows = p.prefill_rows,
         .decode_rows = p.decode_rows,
         .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
-        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + transient_decode) * rec,
+        .decode_extra_records = ov.decode_extra_records orelse 0,
+        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + (ov.decode_extra_records orelse 0) + transient_decode) * rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
         .residents = m.totalBytes() - droppedResidentBytes(&m, headRoute(ov)) + builtResidentBytes(&c, headRoute(ov)) - draftResidentBytes(&m, ov) + try draftCacheBytes(&c, ov),
@@ -615,16 +618,30 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: model.ModelConfig, prompt_
 /// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
 /// layer, and each phase's wired bytes less its slot rows (the wiring terms, re-evaluated at every row count).
 pub fn fillBillOf(b: Bill) FillBill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
     const per_row = @as(u64, b.layers) * rec;
     const p = b.prefillTerms();
     const d = b.decodeTerms();
+    const decode_slots = b.decode_rows * per_row + b.decode_extra_records * rec;
     return .{
         .prefill_fixed = b.prefillTotal() - p.wire_tables - b.prefill_rows * per_row,
-        .decode_fixed = b.decodeTotal() - d.wire_tables - b.decode_rows * per_row,
+        .decode_fixed = b.decodeTotal() - d.wire_tables - decode_slots,
         .per_row = per_row,
-        .wiring = .{ .prefill_wired = wiredOf(p) - b.prefill_rows * per_row, .decode_wired = wiredOf(d) - b.decode_rows * per_row },
+        .record = rec,
+        .wiring = .{ .prefill_wired = wiredOf(p) - b.prefill_rows * per_row, .decode_wired = wiredOf(d) - decode_slots },
     };
+}
+
+/// The record granule route: at the admitted rows `b.decode_rows` (U), the most single records past layers x U whose
+/// decode total stays under `target`, below one row (at most layers - 1). 0 when U is the layer's every expert or a
+/// whole row still fits (rows not at the fill's top: forced rows below it). The prompt phase is untouched.
+pub fn fillExtraRecords(b: Bill, target: u64) u32 {
+    const fb = fillBillOf(b);
+    const u: u64 = b.decode_rows;
+    if (u >= b.n_experts or fb.total(true, u + 1) <= target) return 0;
+    var k: u64 = b.layers - 1;
+    while (k > 0 and fb.totalSlots(true, u * fb.per_row + k * fb.record) > target) k -= 1;
+    return @intCast(k);
 }
 
 /// The bill at the fill's floor rows (`min_fill_rows` in both phases).
@@ -653,6 +670,8 @@ pub const FillBill = struct {
     prefill_fixed: u64,
     decode_fixed: u64,
     per_row: u64,
+    /// One record (per_row / layers); the record granule's step.
+    record: u64 = 0,
     wiring: ?Wiring = null,
 
     /// Each phase's wired bytes without its slot rows.
@@ -663,9 +682,13 @@ pub const FillBill = struct {
 
     /// A phase's total at `rows`: exactly the bill's at those rows.
     pub fn total(b: FillBill, decode: bool, rows: u64) u64 {
+        return b.totalSlots(decode, rows * b.per_row);
+    }
+
+    /// A phase's total at `slots` slot-row bytes (rows x per_row, plus any single records).
+    pub fn totalSlots(b: FillBill, decode: bool, slots: u64) u64 {
         const fixed = if (decode) b.decode_fixed else b.prefill_fixed;
-        const w = b.wiring orelse return fixed + rows * b.per_row;
-        const slots = rows * b.per_row;
+        const w = b.wiring orelse return fixed + slots;
         if (!decode) return fixed + slots + wireTables(w.prefill_wired + slots);
         const tables = wireTables(w.decode_wired + slots);
         return fixed + slots + tables;
@@ -1472,4 +1495,88 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
             try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[hi], .decode = w.decode[hi] }, r);
         }
     }
+}
+
+// DSV41_BANK=<bank> (host): #23's route bills nothing new. The bill at prompt_stats is uniform's, term for term, at the
+// served baseline; every layer's record is the same size on the bank, so any per-layer split of the same total grows
+// the same bytes, and the until_freed bound (rounding per array) is unchanged.
+test "dsv41 memory: per-layer decode rows (prompt_stats) bill exactly what uniform rows bill (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_200_000_000;
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    const b_u = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+    const b_p = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .decode_rows_alloc = .prompt_stats });
+    try testing.expectEqualDeep(b_u, b_p);
+    const rows = try fillRows(fillBillOf(b_u), target, b_u.n_experts);
+    try testing.expectEqual(rows, try fillRows(fillBillOf(b_p), target, b_p.n_experts));
+    var bd: expert_bank.Diag = .{};
+    var bank = try expert_bank.Bank.open(a, testing.io, bank_dir, expert_bank.dsv41, &bd);
+    defer bank.deinit();
+    const rec = bank.layers[0].logical_bytes;
+    for (bank.layers) |l| try testing.expectEqual(rec, l.logical_bytes);
+    const L: u32 = @intCast(bank.layers.len);
+    var dr = try arm_mod.DecodeRows.init(a, L, bank.n_experts);
+    const prompt_rows = try a.alloc(u32, L);
+    @memset(prompt_rows, rows.prefill);
+    // A skewed prompt: layer l's counts fall off at a layer-dependent rate (flat layers want rows).
+    for (0..L) |l| for (dr.layerCounts(l), 0..) |*c, e| {
+        c.* = @intCast(1000 / (1 + e * (1 + (l * 7) % 13) / 16));
+    };
+    const grown = try dr.plan(prompt_rows, rows.decode);
+    var grow_bytes: u64 = 0;
+    var arrays: u64 = 0;
+    for (grown, bank.layers) |r, l| {
+        grow_bytes += (r - rows.prefill) * l.logical_bytes;
+        arrays += @as(u64, @intFromBool(r > rows.prefill)) * expert_bank.n_components;
+    }
+    try testing.expect(std.mem.min(u32, grown) != std.mem.max(u32, grown));
+    try testing.expectEqual(@as(u64, L) * (rows.decode - rows.prefill) * rec, grow_bytes);
+    try testing.expect(arrays <= @as(u64, L) * expert_bank.n_components);
+    std.debug.print("\nprompt_stats at {d} / {d} rows: grown {d} B over {d} arrays (uniform's), rows min {d} max {d}\n", .{ rows.prefill, rows.decode, grow_bytes, arrays, std.mem.min(u32, grown), std.mem.max(u32, grown) });
+}
+
+/// `b` with `k` single decode records past its rows, billed as billAt bills them.
+fn withExtra(b: Bill, k: u64) Bill {
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
+    var x = b;
+    x.slot_decode = (@as(u64, b.layers) * b.decode_rows + k + b.transient_decode_rows) * rec;
+    x.decode_extra_records = k;
+    return x;
+}
+
+test "dsv41 memory: the record granule admits the fill's leftover below one row as single records, billed, to the record" {
+    const b = cell4Bill();
+    const fb = fillBillOf(b);
+    const rec: u64 = 13_315_584;
+    try testing.expectEqual(rec, fb.record);
+    // Every leftover below one row: the most records whose billed decode total fits, never a whole row.
+    var k_seen: u64 = 0;
+    var d: u64 = 0;
+    while (d < fb.per_row) : (d += fb.per_row / 97) {
+        const target = b.decodeTotal() + d;
+        if (fb.total(true, b.decode_rows + 1) <= target) break;
+        const k = fillExtraRecords(b, target);
+        try testing.expect(k < b.layers);
+        const x = withExtra(b, k);
+        try testing.expect(x.decodeTotal() <= target);
+        if (k + 1 < b.layers) try testing.expect(withExtra(b, k + 1).decodeTotal() > target);
+        // The fill's shape is row-free whatever the records: the same fixed terms and wiring.
+        try testing.expectEqualDeep(fb, fillBillOf(x));
+        try testing.expectEqual(x.decodeTotal(), fb.totalSlots(true, b.decode_rows * fb.per_row + k * rec));
+        // The prompt phase never sees them.
+        try testing.expectEqual(b.prefillTotal(), x.prefillTotal());
+        k_seen = @max(k_seen, k);
+    }
+    try testing.expect(k_seen >= 30);
+    // A whole row still fits (rows below the fill's top, e.g. forced): no records.
+    try testing.expectEqual(@as(u32, 0), fillExtraRecords(b, fb.total(true, b.decode_rows + 1)));
+    // Every expert already resident: no records.
+    var all = b;
+    all.n_experts = b.decode_rows;
+    try testing.expectEqual(@as(u32, 0), fillExtraRecords(all, b.decodeTotal() + fb.per_row - 1));
 }
