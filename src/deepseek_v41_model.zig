@@ -46,7 +46,7 @@ pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameT
 
 /// `_derive_moe_row_cap`: rows one K16 routed call may carry.
 /// JOINLESS takes a wide call only (the experts' wide lane: more than one route of ids).
-const joinless_min_ids: u64 = 48;
+const joinless_min_ids = v41.PrefillBill.joinless_min_ids;
 
 pub fn moeRowCap(c: *const v41.Config, target_bytes: f64) u64 {
     const per_row: u64 = @as(u64, c.n_experts_per_tok) * c.hidden_size * 4;
@@ -843,7 +843,7 @@ pub fn Model(comptime G: type) type {
                     @memset(pre_shared, null);
                     if (rt.prefill_host_shared) {
                         try g.evalAll(&.{cat_idx});
-                        for (i..j, pre_shared) |k, *ps| ps.* = try g.astype(try Tr.sharedExpert(g, c, lw, xfs[k]), .float32);
+                        for (i..j, pre_shared) |k, *ps| ps.* = try g.astype(try Tr.sharedExpertPrompt(g, c, rt, lw, xfs[k]), .float32);
                         const started = try a.alloc(T, j - i);
                         for (pre_shared, started) |ps, *st_| st_.* = ps.?;
                         try g.asyncEval(started);
@@ -905,7 +905,7 @@ pub fn Model(comptime G: type) type {
                         const nk = nks[k - i];
                         const y = if (parts) |pt| blk: {
                             const loc = if (j - i == 1) pt.loc else try g.slice(pt.loc, &.{ pos, 0, 0 }, &.{ pos + nk, top, 2 }, &.{ 1, 1, 1 });
-                            const shared = pre_shared[k - i] orelse try g.astype(try Tr.sharedExpert(g, c, lw, xfs[k]), .float32);
+                            const shared = pre_shared[k - i] orelse try g.astype(try Tr.sharedExpertPrompt(g, c, rt, lw, xfs[k]), .float32);
                             break :blk try lk.joinless.?.call(g, pt.outs, loc, try g.astype(routes_[k].weights, .float32), shared);
                         } else blk: {
                             const rs = g.shapeOf(ro);

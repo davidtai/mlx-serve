@@ -189,6 +189,10 @@ pub const Routes = struct {
     /// waves drained and the host-shared experts were issued from them, before the group's final evaluation. Lifetime
     /// only: the same ops. Needs JOINLESS and the host shared experts (the combine then reads neither input).
     prefill_input_release: bool = false,
+    /// The shared expert's middle (clamps, silu, product) as C22's compiled SharedMid region at prompt widths (rows
+    /// above rc_max_rows); decode widths keep their own route (`shared_mid`). The device probe found the region equal
+    /// to the op chain word for word at 953 and 183 f32 rows (kbench hcpostx1ff57a9e, SHAREDMIDX).
+    prefill_shared_mid: bool = false,
     /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
     /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
     predict_bf16: bool = false,
@@ -2033,6 +2037,15 @@ pub fn Trunk(comptime G: type) type {
             return sharedExpertQ(g, c, x, w.sh_w1, w.sh_w3, w.sh_w2);
         }
 
+        /// The shared expert at a prompt-width call: its middle as the compiled SharedMid region when the route is
+        /// installed (rows above rc_max_rows), else `sharedExpert`.
+        pub fn sharedExpertPrompt(g: *G, c: *const v41.Config, rt: *const Routes, w: *const W, x: T) !T {
+            if (!rt.prefill_shared_mid or rowsOf(g, x, 1) <= rc_max_rows) return sharedExpert(g, c, w, x);
+            var o: [1]T = undefined;
+            try g.tape(SharedMid, c, &.{ try qlinear(g, x, w.sh_w1), try qlinear(g, x, w.sh_w3), x }, &o);
+            return qlinear(g, o[0], w.sh_w2);
+        }
+
         /// C16: `sharedExpertQ`'s statements with the three projections on the draft FMA kernel.
         fn sharedExpertRc(g: *G, c: *const v41.Config, rt: *const Routes, s: *const SharedRc(G), x: T) !T {
             const gl = try s.w1.linear(g, x);
@@ -2042,8 +2055,8 @@ pub fn Trunk(comptime G: type) type {
 
         /// The shared expert with C29's rows at rows <= 8 when bound (else `sharedExpert`).
         fn sharedExpertMinv(g: *G, c: *const v41.Config, rt: *const Routes, w: *const W, ms: ?*const MinvSites(G), x: T) !T {
-            const m = ms orelse return sharedExpert(g, c, w, x);
-            if (m.sh_w1 == null or rowsOf(g, x, 1) > rc_max_rows) return sharedExpert(g, c, w, x);
+            const m = ms orelse return sharedExpertPrompt(g, c, rt, w, x);
+            if (m.sh_w1 == null or rowsOf(g, x, 1) > rc_max_rows) return sharedExpertPrompt(g, c, rt, w, x);
             const gl = try m1Linear(g, &m.sh_w1.?, x, w.sh_w1);
             const ul = try m1Linear(g, &m.sh_w3.?, x, w.sh_w3);
             return m1Linear(g, &m.sh_w2.?, try sharedMidAt(g, c, rt, gl, ul, x), w.sh_w2);
@@ -2278,7 +2291,7 @@ pub fn Trunk(comptime G: type) type {
             if (rt.hc_rows > 0) inline for (.{ HcAttnPrep, HcFfnPrep, HcPost }) |B| try g.prepareTape(B, c);
             if (rt.small_rows > 0) inline for (.{ HcAttnPrep, Seg2, Seg3, HcPost }) |B| try g.prepareTape(B, c);
             if (layer_major or rt.prefill_hc_post) try g.prepareTape(HcPost, c);
-            if (rt.shared_mid) try g.prepareTape(SharedMid, c);
+            if (rt.shared_mid or rt.prefill_shared_mid) try g.prepareTape(SharedMid, c);
         }
 
         /// `DecoderLayer.__call__`: attention and MoE, each inside a
@@ -2356,7 +2369,7 @@ pub fn Trunk(comptime G: type) type {
         /// `MoE.combine_routed`: the shared expert and the f32 combine (K22 at
         /// rows <= 32) of routed rows computed elsewhere (K16's batched switch).
         pub fn combineRouted(g: *G, p: anytype, c: *const v41.Config, rt: *const Routes, lk: LK, w: *const W, ro: T, weights: T, xf: T, pre_shared: ?T) !T {
-            const shared = pre_shared orelse try g.astype(try sharedExpert(g, c, w, xf), .float32);
+            const shared = pre_shared orelse try g.astype(try sharedExpertPrompt(g, c, rt, w, xf), .float32);
             try p.put("moe.shared", shared);
             if (g.shapeOf(xf).dim(0) <= rt.attn_rows) {
                 var o: [1]T = undefined;
@@ -3853,6 +3866,50 @@ test "dsv41 graph: HCPOST compiles both HC posts above 8 rows over the eager ops
     const span = [_]c_int{ 16, 16, 12 };
     try testing.expectEqual(@as(usize, 0), try spanHcPostTraces(&.{}, &span));
     try testing.expectEqual(@as(usize, 4), try spanHcPostTraces(&.{ .prefill_hc_post = true }, &span));
+}
+
+test "dsv41 graph: PREFILL_SHAREDMID compiles the shared middle above 8 rows over the eager ops; 8 rows and below keep their chain" {
+    const O = ops.Op;
+    const Run = struct {
+        fn ops_(rt: *const Routes, rows: c_int, regions: *usize) ![]O {
+            var g = TraceOps.init(testing.allocator);
+            defer g.deinit();
+            const cc = try realConfig();
+            try Tr.prepareRegions(&g, &cc, rt, true);
+            const w = try traceLayerW(&g, &cc, cc.layers[1]);
+            const x = try g.input(&.{ rows, @intCast(cc.hidden_size) }, .float32);
+            const n0 = g.nodes.items.len;
+            const y = try Tr.sharedExpertPrompt(&g, &cc, rt, &w, x);
+            try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(y));
+            regions.* = g.compiles;
+            return g.opsSince(testing.allocator, n0);
+        }
+    };
+    for ([_]c_int{ 9, 183, 953 }) |rows| {
+        var r_off: usize = 0;
+        var r_on: usize = 0;
+        const off = try Run.ops_(&.{}, rows, &r_off);
+        defer testing.allocator.free(off);
+        const on = try Run.ops_(&.{ .prefill_shared_mid = true }, rows, &r_on);
+        defer testing.allocator.free(on);
+        // The region traced once, holding the eager chain's op multiset (the markers aside).
+        try testing.expectEqual(@as(usize, 0), r_off);
+        try testing.expectEqual(@as(usize, 1), r_on);
+        var got = countOps(on);
+        try testing.expectEqual(@as(u32, 1), got[@backingInt(O.tape_begin)]);
+        got[@backingInt(O.tape_begin)] = 0;
+        got[@backingInt(O.tape_end)] = 0;
+        try testing.expectEqual(countOps(off), got);
+    }
+    // Decode and verify widths keep the chain, op for op.
+    for ([_]c_int{ 1, 8 }) |rows| {
+        var r: usize = 0;
+        const off = try Run.ops_(&.{}, rows, &r);
+        defer testing.allocator.free(off);
+        const on = try Run.ops_(&.{ .prefill_shared_mid = true }, rows, &r);
+        defer testing.allocator.free(on);
+        try testing.expectEqualSlices(O, off, on);
+    }
 }
 
 test "dsv41 graph: head codecs and the cached wo_a keep the Python dtypes" {

@@ -120,6 +120,8 @@ pub const RouteOverrides = struct {
     input_stream_early_release: ?bool = null,
     /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
     prefill_input_release: ?bool = null,
+    /// The shared expert's middle compiled (C22's region) at prompt widths. null: the default, off.
+    prefill_shared_mid: ?bool = null,
     /// P1's predictor GEMM on the gate as stored (bf16) instead of an f32 copy; exact outputs (it only chooses reads).
     predict_bf16: ?bool = null,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
@@ -645,6 +647,7 @@ pub const Module = struct {
         if (ov.decode_memos) |v| tier.routes.decode_memos = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         tier.routes.prefill_input_release = prefillInputRelease(ov);
+        if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         // The release frees the inputs the combine would read without the host shared experts and JOINLESS.
         if (tier.routes.prefill_input_release and (!tier.routes.prefill_host_shared or !tier.routes.prefill_joinless))
             return refused(refuse(&diag, error.InputReleaseRoute, "prefill input release needs the host shared experts and JOINLESS", .{}), &diag);
@@ -700,6 +703,7 @@ pub const Module = struct {
         self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
+        self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
@@ -708,6 +712,7 @@ pub const Module = struct {
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
+        if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)", .{});
         if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)", .{});
         log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
@@ -1717,6 +1722,8 @@ pub const Installed = struct {
     input_stream_early_release: bool = false,
     /// K16's routed groups' MoE inputs freed after the wide call, as installed.
     prefill_input_release: bool = false,
+    /// The shared expert's middle compiled at prompt widths, as installed.
+    prefill_shared_mid: bool = false,
     /// P1's predictor GEMM in bf16, as installed.
     predict_bf16: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).
