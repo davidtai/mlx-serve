@@ -177,6 +177,11 @@ pub const RouteOverrides = struct {
     grow_fill: ?expert_stream.GrowFill = null,
     /// DRAFTCACHE's residency policy (shipped: the streamer's decode policy; lru). Only with `draft_cache_hot`.
     draft_cache_policy: ?xsc.PolicyKind = null,
+    /// The ring levers (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM) over the numeric tier's (`ringGeometry`): the states
+    /// and the bill take the same geometry. null: the tier's.
+    window_ring_max_verify: ?u32 = null,
+    window_ring_slack: ?u32 = null,
+    window_ring_headroom: ?u32 = null,
 };
 
 /// The grow fill route the Module installs in the stream (zeros by default).
@@ -655,8 +660,8 @@ pub const Module = struct {
         self.embed_rows = try dsp.openEmbeddingRows(gpa, io, dir, &c, &vd);
         errdefer self.embed_rows.close();
         var tier = numericTier(config.numeric_tier orelse .served);
-        // The states' ring geometry: the one the bill reads (`kvGeometry`).
-        tier.kv = kvGeometry(config);
+        // The states' ring geometry, evaluated once here (`Installed.ring_geo`): the bill reads the same (`ringGeometry`).
+        tier.kv = try ringGeometry(config, ov);
         if (ov.prefill_attn) |v| {
             // The core reads K30's selection: only a tier with selected keys can take it.
             if (v and !tier.routes.selected_keys) return error.PrefillAttnNeedsSelectedKeys;
@@ -740,6 +745,7 @@ pub const Module = struct {
         log.info("{s}", .{self.installed.line(&line_buf)});
         log.info("{s}", .{self.installed.callSites(&line_buf)});
         self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
+        self.installed.ring_geo = self.model.tier.kv;
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
@@ -1758,6 +1764,8 @@ pub const Installed = struct {
     phase_tail_release: bool = false,
     /// The read pool's scheduling, as installed at its start (`readerSched`).
     reader_sched: expert_io.Sched = .{},
+    /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
+    ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
     grow_fill: expert_stream.GrowFill = .zeros,
     /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
@@ -1844,10 +1852,17 @@ pub fn prefillIndexRoute(config: *const settings.Config, ov: RouteOverrides) !bo
     return on;
 }
 
-/// The KV lanes' geometry as the Module builds its states (the numeric tier's `kv`: the route and the ring levers);
-/// the bill reads the same answer (`PrefillBill.of`), so its ring rows follow every lever the states use.
-pub fn kvGeometry(config: *const settings.Config) kvc.Geometry {
-    return numericTier(config.numeric_tier orelse .served).kv;
+/// The KV lanes' geometry as the Module builds its states: the numeric tier's `kv` with a harness's ring levers
+/// (`RouteOverrides.window_ring_*`), refused by name outside the box the bill's ring tests cover. Evaluated once at
+/// installation (`Installed.ring_geo`); the bill reads the same answer (`PrefillBill.of`), so its ring rows follow every
+/// lever the states use.
+pub fn ringGeometry(config: *const settings.Config, ov: RouteOverrides) routes.RingRefusal!kvc.Geometry {
+    var kv = numericTier(config.numeric_tier orelse .served).kv;
+    if (ov.window_ring_max_verify) |v| kv.max_verify = v;
+    if (ov.window_ring_slack) |v| kv.slack = v;
+    if (ov.window_ring_headroom) |v| kv.headroom = v;
+    try routes.checkRingGeometry(kv, mdl.Model(ops.MlxOps).scratch_rows);
+    return kv;
 }
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
@@ -3452,11 +3467,21 @@ test "dsv41 module: the fill's decode granule is a row unless set; the records a
     try std.testing.expect((RouteOverrides{}).decode_extra_records == null);
 }
 
-test "dsv41 module: the states and the bill read one ring geometry, the numeric tier's" {
+test "dsv41 module: the states and the bill read one ring geometry: the numeric tier's, with a harness's ring levers" {
     var config: settings.Config = .{};
-    try std.testing.expectEqual(numericTier(.served).kv, kvGeometry(&config));
+    try std.testing.expectEqual(numericTier(.served).kv, try ringGeometry(&config, .{}));
     config.numeric_tier = .stock;
-    try std.testing.expectEqual(numericTier(.stock).kv, kvGeometry(&config));
+    try std.testing.expectEqual(numericTier(.stock).kv, try ringGeometry(&config, .{}));
+    config.numeric_tier = null;
+    // Each lever over the tier's; outside the box, refused by name.
+    var want = numericTier(.served).kv;
+    want.max_verify = 9;
+    want.slack = 0;
+    want.headroom = 937;
+    try std.testing.expectEqual(want, try ringGeometry(&config, .{ .window_ring_max_verify = 9, .window_ring_slack = 0, .window_ring_headroom = 937 }));
+    try std.testing.expectError(error.RingVerifyBelowForward, ringGeometry(&config, .{ .window_ring_max_verify = 7 }));
+    try std.testing.expectError(error.RingLeverRange, ringGeometry(&config, .{ .window_ring_slack = 65 }));
+    try std.testing.expectError(error.RingLeverRange, ringGeometry(&config, .{ .window_ring_headroom = 4097 }));
     // The bill rows its rings at the geometry it is handed: a lever moves the rings and nothing else.
     const json = try v41.testConfigJson(std.testing.allocator, .real);
     defer std.testing.allocator.free(json);

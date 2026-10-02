@@ -39,7 +39,7 @@ pub const PrefillBill = struct {
     kv_sources: [max_layers]u8 = @splat(0),
     n_kv_sources: u8 = 0,
     ring_row_bytes: u64 = 0,
-    /// The ring geometry the states are built with (`module.kvGeometry`: the numeric tier's `kv`), handed to `of`. The
+    /// The ring geometry the states are built with (`module.ringGeometry`, as installed), handed to `of`. The
     /// rings' rows (`ringBase`, `ringPromptRows`, `ringDecodeRows`) follow every WINDOW_RING_* lever the allocation
     /// reads, so no lever value can under-bill them.
     ring_geo: kvc.Geometry,
@@ -335,8 +335,8 @@ pub const PrefillBill = struct {
         return sdk.kv.ringBase(window, b.ring_geo);
     }
 
-    /// A ring's rows through the prompt pass: from the third chunk on both of its slots at the compaction size (a
-    /// chunk plus the window less one, at least the base); a shorter prompt holds one.
+    /// A ring's rows through the prompt pass: both of its slots at the compaction size (a chunk plus the window less
+    /// one, at least the base), at every chunk count (`sdk.kv.ringPromptRows`: a bound at every instant).
     pub fn ringPromptRows(b: PrefillBill, window: u64, seq: u64) u64 {
         return sdk.kv.ringPromptRows(window, b.chunkRows(seq), seq, b.ring_geo);
     }

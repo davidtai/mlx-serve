@@ -75,14 +75,14 @@ pub fn ringBase(window: u64, geo: Geometry) u64 {
     return window + geo.max_verify + geo.slack + geo.headroom;
 }
 
-/// A ring's rows through a prompt of `seq` positions fed in chunks of `chunk_rows` (the arch's chunk rule): from the
-/// third chunk on both of its slots at the compaction size (a chunk plus the window less one, at least the base); a
-/// shorter prompt holds one.
+/// A ring's rows through a prompt of `seq` positions fed in chunks of `chunk_rows` (the arch's chunk rule): both of its
+/// slots at the compaction size (a chunk plus the window less one, at least the base), at every chunk count. That bounds
+/// the ring at every instant: its first write holds its slot twice (the zeros the write consumes, and the write), a
+/// compaction holds its source beside its destination, and from the third chunk both slots stay live. The bill adds
+/// every layer's ring at the same instant, so only a per-ring bound at every instant is a global one.
 pub fn ringPromptRows(window: u64, chunk_rows: u64, seq: u64, geo: Geometry) u64 {
     const chunk = @min(chunk_rows, @max(seq, 1));
-    const chunks = std.math.divCeil(u64, @max(seq, 1), chunk) catch unreachable;
-    const slot = @max(ringBase(window, geo), chunk + window -| 1);
-    return (if (chunks >= 3) @as(u64, 2) else 1) * slot;
+    return 2 * @max(ringBase(window, geo), chunk + window -| 1);
 }
 
 /// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus the
@@ -473,16 +473,16 @@ test "sdk kv: capacity is the reservation or the prompt plus the headroom, plus 
     try std.testing.expectEqual(@as(u32, 16384 + 10000 + 8), billedCapacity(16384, 10000, b));
 }
 
-test "sdk kv: a ring's rows per phase (both slots from the third chunk; decode compacts the last chunk beside a base) and a plan's bytes" {
+test "sdk kv: a ring's rows per phase (both slots at every chunk count; decode compacts the last chunk beside a base) and a plan's bytes" {
     // a 16,384-token prompt in chunks of 953: the window ring (128) and a frontier ring (2) at the default geometry
     try std.testing.expectEqual(@as(u64, 208), ringBase(128, .{}));
     try std.testing.expectEqual(@as(u64, 2 * (953 + 127)), ringPromptRows(128, 953, 16384, .{}));
     try std.testing.expectEqual(@as(u64, (183 + 127) + 208), ringDecodeRows(128, 953, 16384, .{}));
     try std.testing.expectEqual(@as(u64, 2 * (953 + 1)), ringPromptRows(2, 953, 16384, .{}));
     try std.testing.expectEqual(@as(u64, (183 + 1) + 82), ringDecodeRows(2, 953, 16384, .{}));
-    // two chunks hold one slot; a prompt shorter than a chunk is one chunk
-    try std.testing.expectEqual(@as(u64, 953 + 127), ringPromptRows(128, 953, 1000, .{}));
-    try std.testing.expectEqual(@as(u64, 208), ringPromptRows(128, 953, 50, .{}));
+    // two slots at every chunk count: two chunks, and a prompt shorter than a chunk (one chunk of its own length)
+    try std.testing.expectEqual(@as(u64, 2 * (953 + 127)), ringPromptRows(128, 953, 1000, .{}));
+    try std.testing.expectEqual(@as(u64, 2 * 208), ringPromptRows(128, 953, 50, .{}));
     const p: Plan = .{ .lanes = &.{ .{ .rows = 10, .row_bytes = 3 }, .{ .rows = 4, .row_bytes = 5 } }, .rings = &.{.{ .window = 128, .row_bytes = 7 }} };
     try std.testing.expectEqual(@as(u64, 50), lanesBytes(p));
     try std.testing.expectEqual(@as(u64, 50 + 7 * 2160), planBytes(p, .prompt, 953, 16384, .{}));

@@ -135,6 +135,8 @@ pub fn Model(comptime G: type) type {
         pub const scratch_rows = 8;
         comptime {
             std.debug.assert(scratch_rows <= routes.min_prefill_chunk);
+            // The ring's verify margin runs from this forward's rows to the box's top: never an empty box.
+            std.debug.assert(scratch_rows <= routes.ring_lever_box.max_verify_max);
         }
 
         pub const Mark = struct { offset: u32, layers: []Cache.Mark };
@@ -2110,8 +2112,10 @@ test "dsv41 model: a ring geometry below the widest forward or outside the teste
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
     const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
-    // A verify margin under the widest forward (scratch_rows, 8): a verify block would push read rows out of the ring.
-    var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_WINDOW_RING", "1" }, .{ "MTPLX_DSV41_WINDOW_RING_MAX_VERIFY", "7" } }, null);
+    // A tier built past the parser (which refuses these levers by name) meets the same box here. A verify margin under
+    // the widest forward (scratch_rows, 8): a verify block would push read rows out of the ring.
+    var tier = try routes.parse(&.{.{ "MTPLX_DSV41_WINDOW_RING", "1" }}, null);
+    tier.kv.max_verify = TM.scratch_rows - 1;
     try testing.expectError(error.RingVerifyBelowForward, TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src));
     // A lever past the box the bill's ring tests cover.
     tier.kv.max_verify = TM.scratch_rows;

@@ -1721,6 +1721,11 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
     if (envStr("DSV41_CELL_DECODE_MEMOS")) |v| ov.decode_memos = try cellBool("DSV41_CELL_DECODE_MEMOS", v);
+    // The ring levers over the tier's (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM): the Module installs them and the
+    // bill rows its rings at them (`module.ringGeometry`, which refuses a value outside the tested box by name).
+    if (envStr("DSV41_CELL_WINDOW_RING_MAX_VERIFY")) |v| ov.window_ring_max_verify = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
+    if (envStr("DSV41_CELL_WINDOW_RING_SLACK")) |v| ov.window_ring_slack = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
+    if (envStr("DSV41_CELL_WINDOW_RING_HEADROOM")) |v| ov.window_ring_headroom = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
     if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
     if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
@@ -3711,4 +3716,37 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     });
     try testing.expect(first_accept == null);
     try testing.expectEqualSlices(u32, ref.tokens[1..][0..n], out.items[0..n]);
+}
+
+// (c) DSV41_BANK=<bank> (host): a non-default ring lever's bill against the default geometry's, at the same rows (the
+// floor fill). It differs: the KV line moves (the rings), wire_tables by exactly the wiring of that KV (it bills the
+// phase's wired bytes, the KV among them), the totals by both; every other printed line is the same.
+test "dsv41 served cell: a ring lever moves only the bill's KV line, its wiring and the totals (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_200_000_000;
+    const ceiling: u64 = 120_259_084_288;
+    const b0 = try bill_mod.billAtFloor(a, testing.io, config, 16_384, 8_192, null, ceiling, .{});
+    const b1 = try bill_mod.billAtFloor(a, testing.io, config, 16_384, 8_192, null, ceiling, .{ .window_ring_headroom = 937 });
+    try testing.expect(b1.kv > b0.kv and b1.kv_decode > b0.kv_decode);
+    const wire_p = bill_mod.wireTables(bill_mod.wiredOf(b0.prefillTerms()) + (b1.kv - b0.kv));
+    const wire_d = bill_mod.wireTables(bill_mod.wiredOf(b0.decodeTerms()) + (b1.kv_decode - b0.kv_decode));
+    for (billLines(b0), billLines(b1)) |x, y| {
+        try testing.expectEqualStrings(x.name, y.name);
+        if (std.mem.startsWith(u8, x.name, "KV ")) {
+            try testing.expectEqual(b1.kv, y.p);
+            try testing.expectEqual(b1.kv_decode, y.d);
+        } else if (std.mem.startsWith(u8, x.name, "wire_tables")) {
+            try testing.expectEqual(wire_p, y.p);
+            try testing.expectEqual(wire_d, y.d);
+        } else {
+            try testing.expectEqual(x.p, y.p);
+            try testing.expectEqual(x.d, y.d);
+        }
+    }
+    try testing.expectEqual(b0.prefillTotal() + (b1.kv - b0.kv) + (wire_p - b0.prefillTerms().wire_tables), b1.prefillTotal());
+    try testing.expectEqual(b0.decodeTotal() + (b1.kv_decode - b0.kv_decode) + (wire_d - b0.decodeTerms().wire_tables), b1.decodeTotal());
 }

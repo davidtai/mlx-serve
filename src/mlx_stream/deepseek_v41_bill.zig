@@ -107,6 +107,8 @@ pub const Bill = struct {
     /// widest wave (one live, one in the cache).
     wire_arrays_prompt: u64 = 0,
     wire_arrays_decode: u64 = 0,
+    /// The ring geometry the bill rows its rings at: the one the Module installs (`module.ringGeometry`).
+    ring_geo: kvc.Geometry = .{},
 
     pub fn prefillTotal(b: Bill) u64 {
         return b.baseline + b.prefillTerms().sum();
@@ -462,7 +464,8 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
     const variant = try billVariant();
     const tight_streams = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
-    const bill = v41.PrefillBill.of(&c, module.kvGeometry(config)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4).withInputRelease(module.prefillInputRelease(ov));
+    const ring_geo = try module.ringGeometry(config, ov);
+    const bill = v41.PrefillBill.of(&c, ring_geo).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinless) shape else null).withGroupStreams(if (variant == .tight) tight_streams else 4).withInputRelease(module.prefillInputRelease(ov));
     const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).
@@ -511,6 +514,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
         .wire_arrays_prompt = persistent_arrays + 2 * wire_arrays_prompt_wave,
         .wire_arrays_decode = persistent_arrays + 2 * wire_arrays_decode_wave,
+        .ring_geo = ring_geo,
     };
 }
 
@@ -1270,7 +1274,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const fenced = v41.PrefillBill.of(&c, module.kvGeometry(&config)).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
+    const fenced = v41.PrefillBill.of(&c, try module.ringGeometry(&config, .{})).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape).withGroupStreams(tightGroupStreams(true, false));
     const Want = struct { base: u64, conservative: arm_mod.NativeRows, tight: arm_mod.NativeRows };
     for ([_]Want{
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
@@ -1455,7 +1459,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids };
-    const pb = v41.PrefillBill.of(&c, module.kvGeometry(&config)).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape);
+    const pb = v41.PrefillBill.of(&c, try module.ringGeometry(&config, .{})).withIndexLaunch(try module.prefillIndexRoute(&config, .{})).withJoinless(shape);
     const Rows = arm_mod.NativeRows;
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
@@ -1761,3 +1765,190 @@ test "dsv41 memory: MLX's cache overshoot (one freed buffer over the limit) is b
 }
 
 
+
+// (a) The bill's ring bytes against the real LayerState rings (`LayerState.init` per layer of the real config, as the
+// model's state builder makes them, `Ring.append` through the bill's chunks and then decode) on the trace backend: the
+// same slot bookkeeping as MLX, no device. A ring's live rows through an append (the memory lane's rule, 10-02 §140):
+// each slot from its first write to its release (a never-written zeros slot holds nothing), a source the append
+// released (live until its destination is built), and at the ring's first write its slot once more (the zeros the
+// write consumes). A compaction's own intermediates (a fresh destination's zeros, its first write's result) are wave
+// memory, measured by C2 / K16, not the ring.
+const TraceState = kvc.LayerState(ops.TraceOps);
+const TraceRing = kvc.Lanes(ops.TraceOps).Ring;
+
+fn traceBytes(g: *ops.TraceOps, x: u32) u64 {
+    const n = g.node(x);
+    return @as(u64, @intCast(n.shape.numel())) * @as(u64, ops.dtypeSize(n.dtype));
+}
+
+fn ringAppendLive(g: *ops.TraceOps, r: *TraceRing, new: u32) !u64 {
+    const first = r.bufs[r.cur] == null;
+    const cur = r.cur;
+    const src = r.bufs[r.cur];
+    try r.append(g, new);
+    var live: u64 = 0;
+    for (r.bufs) |b| if (b) |x| {
+        if (g.node(x).op != .zeros) live += traceBytes(g, x);
+    };
+    if (first) live += traceBytes(g, r.bufs[r.cur].?);
+    if (src) |s| if (r.cur != cur and r.bufs[cur] == null) {
+        live += traceBytes(g, s);
+    };
+    return live;
+}
+
+const RingLive = struct { window: u64 = 0, frontier: u64 = 0 };
+
+fn appendRows(g: *ops.TraceOps, states: []TraceState, rows: u64, head_dim: u32) !RingLive {
+    const n: c_int = @intCast(rows);
+    const hd: c_int = @intCast(head_dim);
+    // The window ring's row: layer 0's KV off the bf16 embedding stream, every later layer's f32 (`PrefillBill.of`);
+    // the frontier's raw_kv and raw_score: head_dim f32 rows.
+    const x16 = try g.input(&.{ 1, n, hd }, .bfloat16);
+    const x32 = try g.input(&.{ 1, n, hd }, .float32);
+    var live: RingLive = .{};
+    for (states, 0..) |*st, l| {
+        live.window += try ringAppendLive(g, &st.window.ring, if (l == 0) x16 else x32);
+        if (st.frontier) |*fr| {
+            live.frontier += try ringAppendLive(g, &fr.kv.ring, x32);
+            live.frontier += try ringAppendLive(g, &fr.score.ring, x32);
+        }
+    }
+    return live;
+}
+
+/// The real states of `c` at `geo` (the ring route) through a prompt of `seq` in `bill`'s chunks, then decode (one row,
+/// then verify blocks of the model's scratch rows, past two bases so the ring compacts in decode): each phase's most
+/// live bytes of the window rings and of the frontier rings.
+fn ringLive(c: *const v41.Config, bill: v41.PrefillBill, geo: kvc.Geometry, seq: u64) ![2]RingLive {
+    const a = testing.allocator;
+    var g = ops.TraceOps.init(a);
+    defer g.deinit();
+    var kv = geo;
+    kv.route = .window_ring;
+    const states = try a.alloc(TraceState, c.n_layers);
+    defer a.free(states);
+    for (states, 0..) |*st, l| st.* = TraceState.init(c.layers[l], c.window, kv);
+    defer for (states) |*st| st.deinit(&g);
+    var out: [2]RingLive = .{ .{}, .{} };
+    const chunk = bill.chunkRows(seq);
+    var fed: u64 = 0;
+    while (fed < seq) {
+        const n = @min(chunk, seq - fed);
+        const live = try appendRows(&g, states, n, c.head_dim);
+        out[0].window = @max(out[0].window, live.window);
+        out[0].frontier = @max(out[0].frontier, live.frontier);
+        fed += n;
+    }
+    const scratch: u64 = mdl.Model(ops.TraceOps).scratch_rows;
+    const budget = 2 * bill.ringBase(c.window) + 2 * scratch;
+    var dfed: u64 = 0;
+    while (dfed < budget) {
+        const n: u64 = if (dfed == 0) 1 else scratch;
+        const live = try appendRows(&g, states, n, c.head_dim);
+        out[1].window = @max(out[1].window, live.window);
+        out[1].frontier = @max(out[1].frontier, live.frontier);
+        dfed += n;
+    }
+    return out;
+}
+
+test "dsv41 memory: the bill's ring bytes bound the real LayerState rings at every ring lever, equal from the third chunk (trace)" {
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    const def = module.numericTier(.served).kv;
+    const chunk = v41.PrefillBill.of(&c, def).chunkRows(16_384);
+    try testing.expectEqual(@as(u64, 953), chunk);
+    // X: the smallest headroom whose base passes the compaction size (chunk + window - 1) at the default verify margin
+    // and slack, at every window; 936 is the tie, where both sides give the same rows.
+    const x: u32 = @intCast(chunk - def.max_verify - def.slack);
+    try testing.expectEqual(@as(u32, 937), x);
+    // Equality where the ring reaches both slots: prompts of >= 3 chunks, and decode after a prompt that ended in a
+    // compaction. One and two chunks: the bill bounds the live rows (the first write holds its slot twice).
+    const Point = struct { seq: u64 = 16_384, max_verify: u32 = 8, slack: u32 = 8, headroom: u32 = 64, prompt_eq: bool = true, decode_eq: bool = true };
+    const points = [_]Point{
+        .{},
+        .{ .max_verify = 9 },
+        .{ .max_verify = 64 },
+        .{ .slack = 0 },
+        .{ .slack = 1 },
+        .{ .slack = 64 },
+        .{ .headroom = 1 },
+        .{ .headroom = x },
+        .{ .headroom = x + 1 },
+        .{ .headroom = 4096 },
+        .{ .max_verify = 64, .slack = 64, .headroom = x + 1 },
+        .{ .max_verify = 64, .slack = 64, .headroom = 4096 },
+        // chunk 988, n_last 1: decode on the base side at the defaults
+        .{ .seq = 15_809 },
+        // two chunks (3,814 + 282); one chunk at or under the base rows; one chunk above them
+        .{ .seq = 4_096, .prompt_eq = false },
+        .{ .seq = 100, .prompt_eq = false, .decode_eq = false },
+        .{ .seq = 2_000, .prompt_eq = false, .decode_eq = false },
+    };
+    // Both sides of the prompt slot's max() and of the decode term's, among the equality points. Every point is checked
+    // and printed before the verdict, so a red run names each one it breaks.
+    var sides: [2][2]bool = .{ .{ false, false }, .{ false, false } };
+    var violated: u32 = 0;
+    for (points) |p| {
+        var geo = def;
+        geo.max_verify = p.max_verify;
+        geo.slack = p.slack;
+        geo.headroom = p.headroom;
+        const b = v41.PrefillBill.of(&c, geo);
+        const live = try ringLive(&c, b, geo, p.seq);
+        const prompt_bill = [2]u64{ b.ringPromptBytes(p.seq), b.frontierPromptBytes(p.seq) };
+        const decode_bill = [2]u64{ b.ringDecodeBytes(p.seq), b.frontierDecodeBytes(p.seq) };
+        const prompt_ok = if (p.prompt_eq) prompt_bill[0] == live[0].window and prompt_bill[1] == live[0].frontier else prompt_bill[0] >= live[0].window and prompt_bill[1] >= live[0].frontier;
+        const decode_ok = if (p.decode_eq) decode_bill[0] == live[1].window and decode_bill[1] == live[1].frontier else decode_bill[0] >= live[1].window and decode_bill[1] >= live[1].frontier;
+        const verdict = [2][]const u8{ if (prompt_ok) "ok" else "VIOLATED", if (decode_ok) "ok" else "VIOLATED" };
+        std.debug.print("DSV41_RING_LIVE seq {d} max_verify {d} slack {d} headroom {d}: prompt bill {d} / {d} live {d} / {d} ({s} {s}); decode bill {d} / {d} live {d} / {d} ({s} {s})\n", .{ p.seq, p.max_verify, p.slack, p.headroom, prompt_bill[0], prompt_bill[1], live[0].window, live[0].frontier, if (p.prompt_eq) "==" else ">=", verdict[0], decode_bill[0], decode_bill[1], live[1].window, live[1].frontier, if (p.decode_eq) "==" else ">=", verdict[1] });
+        violated += @as(u32, @intFromBool(!prompt_ok)) + @intFromBool(!decode_ok);
+        if (p.prompt_eq and p.decode_eq) {
+            const ch = b.chunkRows(p.seq);
+            const n_last = (p.seq - 1) % ch + 1;
+            const base = b.ringBase(c.window);
+            sides[0][@intFromBool(base > ch + c.window - 1)] = true;
+            sides[1][@intFromBool(base >= n_last + c.window - 1)] = true;
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), violated);
+    for (sides) |s| try testing.expect(s[0] and s[1]);
+    // The pinned rows at the defaults: 16,384 prompt 2,160 / decode 518 a window ring; 15,809 prompt 2,230 / decode 416.
+    const b16 = v41.PrefillBill.of(&c, def);
+    try testing.expectEqual(@as(u64, 2_160), b16.ringPromptRows(c.window, 16_384));
+    try testing.expectEqual(@as(u64, 518), b16.ringDecodeRows(c.window, 16_384));
+    try testing.expectEqual(@as(u64, 2_230), b16.ringPromptRows(c.window, 15_809));
+    try testing.expectEqual(@as(u64, 416), b16.ringDecodeRows(c.window, 15_809));
+}
+
+// (b) DSV41_BANK=<bank> (host): the ring levers' plumbing. With each lever set (a harness's RouteOverrides), the bill
+// rows its rings at the geometry the Module installs (`ringGeometry`), and its KV terms move by exactly the rings' delta.
+test "dsv41 memory: each ring lever reaches the bill as installed, and the KV terms move by exactly the rings (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_200_000_000;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const ceiling: u64 = 120_259_084_288;
+    const seq = fill_prompt_tokens;
+    const b0 = try billAtFloor(a, testing.io, config, seq, fill_max_tokens, null, ceiling, .{});
+    try testing.expectEqual(try module.ringGeometry(&config, .{}), b0.ring_geo);
+    const p0 = v41.PrefillBill.of(&c, b0.ring_geo);
+    for ([_]module.RouteOverrides{
+        .{ .window_ring_max_verify = 64 },
+        .{ .window_ring_slack = 0 },
+        .{ .window_ring_headroom = 937 },
+        .{ .window_ring_max_verify = 64, .window_ring_slack = 64, .window_ring_headroom = 4096 },
+    }) |ov| {
+        const b = try billAtFloor(a, testing.io, config, seq, fill_max_tokens, null, ceiling, ov);
+        try testing.expectEqual(try module.ringGeometry(&config, ov), b.ring_geo);
+        const p = v41.PrefillBill.of(&c, b.ring_geo);
+        try testing.expectEqual(b0.kv + p.ringPromptBytes(seq) + p.frontierPromptBytes(seq), b.kv + p0.ringPromptBytes(seq) + p0.frontierPromptBytes(seq));
+        try testing.expectEqual(b0.kv_decode + p.ringDecodeBytes(seq) + p.frontierDecodeBytes(seq), b.kv_decode + p0.ringDecodeBytes(seq) + p0.frontierDecodeBytes(seq));
+    }
+}

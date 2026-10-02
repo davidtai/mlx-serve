@@ -373,6 +373,10 @@ pub fn parse(pairs: []const [2][]const u8, diag: ?*v41.Diag) Refusal!Tier {
         t.kv.route = .window_ring;
         t.kv.max_kv = ring_maxkv;
     } else if (chunk_grow) t.kv.route = .chunk_grow;
+    // The ring levers, like PREFILL_CHUNK's floor: a verify forward (<= min_prefill_chunk rows) fits the margin, and every
+    // lever sits in the box the bill's ring tests cover; refused here by name.
+    const box = ring_lever_box;
+    checkRingGeometry(t.kv, min_prefill_chunk) catch |e| return refuse(diag, error.LeverValue, "{s}WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM {d} / {d} / {d}: {s} (the box: {d}..{d} / 0..{d} / {d}..{d})", .{ prefix, t.kv.max_verify, t.kv.slack, t.kv.headroom, @errorName(e), min_prefill_chunk, box.max_verify_max, box.slack_max, box.headroom_min, box.headroom_max });
     return t;
 }
 
@@ -541,11 +545,17 @@ test "dsv41 routes: a ring geometry below the widest forward or outside the test
     try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .slack = 65 }, 8));
     try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .headroom = 0 }, 8));
     try testing.expectError(error.RingLeverRange, checkRingGeometry(.{ .headroom = 4097 }, 8));
-    // The parser keeps the u32 a lever names; the model's construction refuses it.
+    // The parser refuses a ring lever outside the box by name, like PREFILL_CHUNK's floor; the box's corners parse.
     const a = testing.allocator;
-    const pairs = try splitPairs(a, "MTPLX_DSV41_WINDOW_RING=1 MTPLX_DSV41_WINDOW_RING_HEADROOM=4294967295");
-    defer a.free(pairs);
-    const t = try parse(pairs, null);
-    try testing.expectEqual(@as(u32, 4294967295), t.kv.headroom);
-    try testing.expectError(error.RingLeverRange, checkRingGeometry(t.kv, 8));
+    var diag: v41.Diag = .{};
+    for ([_][]const u8{ "MTPLX_DSV41_WINDOW_RING_MAX_VERIFY=7", "MTPLX_DSV41_WINDOW_RING_MAX_VERIFY=65", "MTPLX_DSV41_WINDOW_RING_SLACK=65", "MTPLX_DSV41_WINDOW_RING_HEADROOM=0", "MTPLX_DSV41_WINDOW_RING_HEADROOM=4097", "MTPLX_DSV41_WINDOW_RING_HEADROOM=4294967295" }) |text| {
+        const pairs = try splitPairs(a, text);
+        defer a.free(pairs);
+        try testing.expectError(error.LeverValue, parse(pairs, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "WINDOW_RING_MAX_VERIFY") != null);
+    }
+    const corners = try splitPairs(a, "MTPLX_DSV41_WINDOW_RING=1 MTPLX_DSV41_WINDOW_RING_MAX_VERIFY=64 MTPLX_DSV41_WINDOW_RING_SLACK=0 MTPLX_DSV41_WINDOW_RING_HEADROOM=4096");
+    defer a.free(corners);
+    const t = try parse(corners, null);
+    try testing.expectEqual(kvc.Geometry{ .route = .window_ring, .max_verify = 64, .slack = 0, .headroom = 4096 }, t.kv);
 }
