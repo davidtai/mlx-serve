@@ -2222,7 +2222,7 @@ test "dsv41 module: the load refuses a bank its quant does not claim, by name, b
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;
     const root = try expert_bank.tmpRoot(&tmp, &rbuf);
-    const fixture = @embedFile("fixtures/dsv41_bank_peek.json");
+    const fixture = @embedFile("../fixtures/dsv41_bank_peek.json");
     var diag: arm_mod.Diag = .{};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = fixture });
     try claimBank(a, std.testing.io, root, &diag);

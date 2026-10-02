@@ -2401,7 +2401,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
             calls: []const struct { name: []const u8, a_rows: u32, route: struct { seed: u64, slots: []const u32, counts: []const u32 }, events: []const []const u8 },
         },
     };
-    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("../fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const tier = for (parsed.value.cases) |cs| {
         if (std.mem.eql(u8, cs.case, "tier")) break cs;

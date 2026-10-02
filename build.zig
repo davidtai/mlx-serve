@@ -25,7 +25,7 @@ const stb_write_flags: []const []const u8 = &.{ "-O2", "-fno-sanitize=undefined"
 
 /// Build options the registered plugins declare (G7, docs/plugins.md): profile code each compiles in on request and
 /// out of every served build. One line per plugin that declares any.
-const plugin_build_options = @import("src/mlx_stream_options.zig").options;
+const plugin_build_options = @import("src/mlx_stream/mlx_stream_options.zig").options;
 
 pub fn build(b: *std.Build) void {
     // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
@@ -904,10 +904,10 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 fn probeMlxStreamImports(b: *std.Build) *std.Build.Step {
     const probe = b.addExecutable(.{
         .name = "mlx-stream-import-probe",
-        .root_module = b.createModule(.{ .root_source_file = b.path("src/mlx_stream_imports.zig"), .target = b.graph.host, .optimize = .Debug }),
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/mlx_stream/mlx_stream_imports.zig"), .target = b.graph.host, .optimize = .Debug }),
     });
     const run = b.addRunArtifact(probe);
-    run.addDirectoryArg(b.path("src"));
+    run.addDirectoryArg(b.path("src/mlx_stream"));
     run.has_side_effects = true;
     return &run.step;
 }

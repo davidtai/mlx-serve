@@ -1,5 +1,5 @@
 //! mlx-stream's build options (G7): the DeepSeek-V4.1 profile timers, compiled out of every served build.
-const BuildOption = @import("sdk/build_option.zig").BuildOption;
+const BuildOption = @import("../sdk/build_option.zig").BuildOption;
 
 pub const options = [_]BuildOption{
     // The DSpark cycle's host split (src/dsv41_decode_timers.zig).

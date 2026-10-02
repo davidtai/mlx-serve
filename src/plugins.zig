@@ -9,7 +9,7 @@ const build_options = @import("build_options");
 /// One line per plugin: `@import("<its root file>").plugin`. A plugin left out (`-Dmlx-stream=false`) leaves none
 /// of its files in the build: the host reaches a plugin through this table only.
 pub const all = if (registers_mlx_stream) [_]sdk.Plugin{
-    @import("mlx_stream.zig").plugin,
+    @import("mlx_stream/mlx_stream.zig").plugin,
 } else [_]sdk.Plugin{};
 const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
 
@@ -219,19 +219,19 @@ test "plugins conformance: every registered plugin's kinds decline what is not t
 }
 
 test "plugins conformance: mlx-stream registers its EXL3 quant, pinned by the kernel registry's manifest" {
-    const R = Registry(&.{@import("mlx_stream.zig").plugin}, .{ .macos = true });
+    const R = Registry(&.{@import("mlx_stream/mlx_stream.zig").plugin}, .{ .macos = true });
     try testing.expectEqual(@as(usize, 1), R.quants.len);
     try testing.expectEqualStrings("exl3-mul1-k3", R.quants[0].kind.name);
-    try testing.expectEqualStrings(@import("exl3_kernels.zig").manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
+    try testing.expectEqualStrings(@import("mlx_stream/exl3_kernels.zig").manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
 }
 
 test "plugins conformance: mlx-stream registers its EXL3 source, its capabilities and the one reader" {
-    const R = Registry(&.{@import("mlx_stream.zig").plugin}, .{ .macos = true });
+    const R = Registry(&.{@import("mlx_stream/mlx_stream.zig").plugin}, .{ .macos = true });
     try testing.expectEqual(@as(usize, 1), R.expert_sources.len);
     const k = R.expert_sources[0].kind;
     try testing.expectEqualStrings("exl3-stream", k.name);
     try testing.expect(k.caps.two_phase and k.caps.transient_release and k.caps.event_gates and !k.caps.construction_reset);
-    try testing.expect(@import("expert_stream.zig").uses_reader);
+    try testing.expect(@import("mlx_stream/expert_stream.zig").uses_reader);
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
@@ -241,5 +241,5 @@ test "plugins conformance: the CPU lane created no Metal device" {
 
 // The import boundary's own test runs with the conformance suite ("plugins import probe").
 comptime {
-    if (@import("builtin").is_test) _ = @import("mlx_stream_imports.zig");
+    if (@import("builtin").is_test) _ = @import("mlx_stream/mlx_stream_imports.zig");
 }

@@ -1,32 +1,30 @@
-//! mlx-stream's import boundary, checked on every build (build.zig runs this file as a host tool over src/): a package
-//! file imports `sdk`, the shared named modules and its own files; host files only through the test-only bridge.
+//! mlx-stream's import boundary, checked on every build (build.zig runs this file as a host tool over src/mlx_stream/): a
+//! package file imports `sdk`, the shared named modules and its own files (its directory's); host files only through the
+//! test-only bridge.
 
 const std = @import("std");
 
-/// The package's files: `src/` basenames with these prefixes.
-pub const prefixes = [_][]const u8{ "deepseek_v41", "dsv41_", "exl3_", "expert_", "mlx_stream" };
 
 /// Named modules any package file may import: the SDK, the modules it shares with the host, and the build's options
-/// (the plugin's profile flags ride `build_options`, src/mlx_stream_options.zig).
+/// (the plugin's profile flags ride `build_options`, mlx_stream_options.zig).
 pub const named = [_][]const u8{ "std", "builtin", "sdk", "mlx", "log", "io_util", "ngram", "build_options" };
 
 /// The only path imports of a non-package file, each by the one package file allowed to make it.
 pub const Allowed = struct { file: []const u8, import: []const u8 };
 pub const allowed = [_]Allowed{
     // The harness and test bridge: it refuses to compile outside a test build.
-    .{ .file = "deepseek_v41_host.zig", .import = "model.zig" },
-    .{ .file = "deepseek_v41_host.zig", .import = "gpu_ceiling.zig" },
-    .{ .file = "deepseek_v41_host.zig", .import = "transformer.zig" },
+    .{ .file = "deepseek_v41_host.zig", .import = "../model.zig" },
+    .{ .file = "deepseek_v41_host.zig", .import = "../gpu_ceiling.zig" },
+    .{ .file = "deepseek_v41_host.zig", .import = "../transformer.zig" },
     // The profile build's guard reads the root's declarations (profile builds only).
     .{ .file = "dsv41_profile.zig", .import = "root" },
     // build.zig's view of the plugin's build options (std only).
-    .{ .file = "mlx_stream_options.zig", .import = "sdk/build_option.zig" },
+    .{ .file = "mlx_stream_options.zig", .import = "../sdk/build_option.zig" },
 };
 
+/// A file of the package's directory: every .zig file there, and an import of a sibling (no path separator).
 pub fn isPackageFile(name: []const u8) bool {
-    if (!std.mem.endsWith(u8, name, ".zig")) return false;
-    for (prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
-    return false;
+    return std.mem.endsWith(u8, name, ".zig") and std.mem.indexOfScalar(u8, name, '/') == null;
 }
 
 /// Whether package file `file` may import `import` (an `@import` string).
@@ -67,9 +65,13 @@ pub fn main(init: std.process.Init) !void {
     const Found = struct {
         file: []const u8,
         bad: *usize,
+        dir: std.Io.Dir,
+        io: std.Io,
         fn check(f: @This(), import: []const u8) void {
-            if (allows(f.file, import)) return;
-            std.debug.print("mlx-stream import outside its boundary (src/mlx_stream_imports.zig): src/{s}: @import(\"{s}\")\n", .{ f.file, import });
+            // A sibling import must name a file of the package's directory (a host file is "../").
+            const sibling_ok = !isPackageFile(import) or if (f.dir.access(f.io, import, .{})) |_| true else |_| false;
+            if (allows(f.file, import) and sibling_ok) return;
+            std.debug.print("mlx-stream import outside its boundary (src/mlx_stream/mlx_stream_imports.zig): src/mlx_stream/{s}: @import(\"{s}\")\n", .{ f.file, import });
             f.bad.* += 1;
         }
     };
@@ -79,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
         if (entry.kind != .file or !isPackageFile(entry.name)) continue;
         const file = try a.dupe(u8, entry.name);
         const source = try dir.readFileAllocOptions(io, file, a, .limited(64 << 20), .of(u8), 0);
-        eachImport(source, Found{ .file = file, .bad = &bad }, Found.check);
+        eachImport(source, Found{ .file = file, .bad = &bad, .dir = dir, .io = io }, Found.check);
     }
     if (bad > 0) std.process.exit(1);
 }
@@ -90,15 +92,15 @@ test "plugins import probe: the package's own files, the SDK and the shared modu
     try testing.expect(allows("deepseek_v41_module.zig", "sdk"));
     try testing.expect(allows("deepseek_v41_module.zig", "ngram"));
     try testing.expect(allows("deepseek_v41_module.zig", "expert_bank.zig"));
-    try testing.expect(!allows("deepseek_v41_module.zig", "model.zig"));
-    try testing.expect(!allows("deepseek_v41_module.zig", "status.zig"));
-    try testing.expect(!allows("deepseek_v41_ar.zig", "gpu_ceiling.zig"));
-    try testing.expect(allows("deepseek_v41_host.zig", "model.zig"));
-    try testing.expect(!allows("deepseek_v41_host.zig", "status.zig"));
-    try testing.expect(!isPackageFile("model.zig") and isPackageFile("exl3_quant.zig"));
+    try testing.expect(!allows("deepseek_v41_module.zig", "../model.zig"));
+    try testing.expect(!allows("deepseek_v41_module.zig", "../status.zig"));
+    try testing.expect(!allows("deepseek_v41_ar.zig", "../gpu_ceiling.zig"));
+    try testing.expect(allows("deepseek_v41_host.zig", "../model.zig"));
+    try testing.expect(!allows("deepseek_v41_host.zig", "../status.zig"));
+    try testing.expect(!isPackageFile("../model.zig") and isPackageFile("exl3_quant.zig"));
     const src =
         \\const a = @import("sdk");
-        \\// @import("model.zig") in a comment
+        \\// @import("../model.zig") in a comment
         \\const s = "@import(\"status.zig\")";
         \\test { _ = @import("qwen4_exp.zig"); }
     ;

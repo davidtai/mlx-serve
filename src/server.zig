@@ -21677,13 +21677,13 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
 
 test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks and waves; it does not batch decode" {
     const t = std.testing;
-    const v41 = @import("deepseek_v41.zig");
+    const v41 = @import("mlx_stream/deepseek_v41.zig");
     const json = try v41.testConfigJson(t.allocator, .real);
     defer t.allocator.free(json);
     var cfg = try model_mod.parseConfigFromJson(t.allocator, json);
     defer cfg.deinit(t.allocator);
     // The arch's own config behind the registry: its settings and its bill.
-    const ac: *@import("deepseek_v41_settings.zig").Config = @ptrCast(@alignCast(cfg.arch_cfg.?));
+    const ac: *@import("mlx_stream/deepseek_v41_settings.zig").Config = @ptrCast(@alignCast(cfg.arch_cfg.?));
     const bill = ac.dsv41_prefill.?;
     // The whole prompt reaches the arch (chunk = seq); the bill is the arch's, at the model's own chunk.
     // The served tier's default pass is K16 layer-major; the chunk-major bill when the setting turns it off.

@@ -1282,7 +1282,7 @@ const v41_spec: quant.Spec = .{ .hidden = 5120, .inter = 2304, .top_k = 6, .n_la
 
 // ── 2. claims on C1's description of the bank ──
 
-const bank_peek_fixture = @embedFile("fixtures/dsv41_bank_peek.json");
+const bank_peek_fixture = @embedFile("../fixtures/dsv41_bank_peek.json");
 
 test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (C1's peek) and declines each mutation, by field" {
     const a = testing.allocator;
@@ -1449,7 +1449,7 @@ test "dsv41 kernels ops: wave tables are the lanes' (DIG wave_table, rebuild slo
 
 // ── The prefill wave route vs the lane of record's own dispatch (dump_prefill_waves.py --samples) ──
 
-const prefill_samples = @embedFile("fixtures/dsv41_prefill_wave_samples.json");
+const prefill_samples = @embedFile("../fixtures/dsv41_prefill_wave_samples.json");
 const JRoute = struct { seed: u64, slots: []const u32, counts: []const u32 };
 const JCall = struct { name: []const u8, a_rows: u32, route: JRoute, events: []const []const u8, ret: []const u8, ret_shape: []const i64 };
 const JShapeCfg = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };

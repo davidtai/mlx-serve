@@ -25,7 +25,7 @@ pub const LaunchKey = if (launch_observed) u64 else void;
 /// The observer a profile hook installs: the kernel's name, the launch key and the inputs.
 pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const mlx.mlx_array) void else void;
 pub const format = "mlx-serve-exl3-kernels-v1";
-const dir = "kernels/exl3/";
+const dir = "../kernels/exl3/";
 
 /// The bank these texts decode: EXL3 codebook mul1, K = 3 on every layer.
 pub const bank_codebook = "mul1";

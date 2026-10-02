@@ -10,9 +10,9 @@ comptime {
     if (!builtin.is_test) @compileError("deepseek_v41_host.zig is the harness and test bridge to the host; served code reaches the host only through sdk");
 }
 
-pub const model = @import("model.zig");
-pub const gpu_ceiling = @import("gpu_ceiling.zig");
-pub const transformer = @import("transformer.zig");
+pub const model = @import("../model.zig");
+pub const gpu_ceiling = @import("../gpu_ceiling.zig");
+pub const transformer = @import("../transformer.zig");
 
 /// The host's loaders, as the served load hands them over (`sdk.LoadCtx.loader`).
 pub const loader: *const @import("sdk").WeightLoader = &model.weight_loader;

@@ -344,8 +344,8 @@ test "dsv41 nocache reader: the resident shards and the Engram rows read past th
     try testing.expect(cached_after <= cached_before);
 
     // The Engram rows through the row source's own descriptors (its open sets F_NOCACHE).
-    const v41 = @import("deepseek_v41.zig");
-    const eng = @import("deepseek_v41_engram.zig");
+    const v41 = @import("mlx_stream/deepseek_v41.zig");
+    const eng = @import("mlx_stream/deepseek_v41_engram.zig");
     var cdiag: v41.Diag = .{};
     const c = try v41.Config.load(a, io, bank, &cdiag);
     var mbuf: [1024]u8 = undefined;
