@@ -1045,6 +1045,10 @@ const CellReceipt = struct {
     draft_cache_pool: ?[]const u8 = null,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
+    /// The phase change's per-layer decode rows route as installed ("uniform" | "prompt_stats"; `module.decodeRowsAlloc`)
+    /// and the rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
+    decode_rows_alloc: ?[]const u8 = null,
+    decode_rows_layers: ?struct { layers: []const u32, total: u64, min: u32, max: u32 } = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1466,6 +1470,12 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .draft_cache_stats = if (md.draft_cache) |dc| dc.cache.stats else null,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
+        .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
+        .decode_rows_layers = blk: {
+            const gr = md.grownRows();
+            const s = module.rowsSummary(gr);
+            break :blk .{ .layers = gr, .total = s.total, .min = s.min, .max = s.max };
+        },
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
@@ -1596,6 +1606,8 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
+    // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
+    if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {

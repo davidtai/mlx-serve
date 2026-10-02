@@ -199,6 +199,99 @@ pub fn wideWindowBytes(depth: u8, record: u64) u64 {
     return @as(u64, depth -| 1) * expert_policy.max_route_ids * record;
 }
 
+/// How the phase change sizes each layer's decode rows: `uniform` (the admitted count everywhere) or `prompt_stats`
+/// (`DecodeRows`: the same total, shifted toward the layers whose own prompt routing is spread widest).
+pub const DecodeRowsAlloc = enum { uniform, prompt_stats };
+
+/// prompt_stats moves a layer at most this many rows from the admitted count.
+pub const decode_rows_shift_cap: u32 = 20;
+
+/// prompt_stats' scratch, sized at construction (the phase change allocates nothing).
+/// Rule: layer l keeps floor_l = max(prompt rows, U - cap) rows; each further row r <= min(n, U + cap) is a
+/// candidate worth c_l(r) / N_l (c_l = the layer's prompt routing counts sorted descending, N_l their sum); the
+/// top L x U - sum floor_l candidates win, ordered by value desc, then r asc, then layer asc. The total is exactly
+/// L x U, equal values everywhere give exactly U, and the winners are a prefix of each layer's rows.
+pub const DecodeRows = struct {
+    n_experts: u32,
+    /// [layers x n_experts]: each layer's prompt counts, sorted descending in place.
+    counts: []u32,
+    totals: []u64,
+    cands: []Cand,
+    rows: []u32,
+    /// Per layer, the prompt mass outside its top-U experts, in parts per million (the prompt-side miss proxy).
+    tail_ppm: []u32,
+
+    const Cand = struct { count: u32, total: u64, row: u32, layer: u32 };
+
+    pub fn init(a: std.mem.Allocator, n_layers: u32, n_experts: u32) !DecodeRows {
+        const counts = try a.alloc(u32, @as(usize, n_layers) * n_experts);
+        errdefer a.free(counts);
+        const totals = try a.alloc(u64, n_layers);
+        errdefer a.free(totals);
+        const cands = try a.alloc(Cand, @as(usize, n_layers) * 2 * decode_rows_shift_cap);
+        errdefer a.free(cands);
+        const rows = try a.alloc(u32, n_layers);
+        errdefer a.free(rows);
+        const tail = try a.alloc(u32, n_layers);
+        return .{ .n_experts = n_experts, .counts = counts, .totals = totals, .cands = cands, .rows = rows, .tail_ppm = tail };
+    }
+
+    pub fn deinit(self: *DecodeRows, a: std.mem.Allocator) void {
+        a.free(self.counts);
+        a.free(self.totals);
+        a.free(self.cands);
+        a.free(self.rows);
+        a.free(self.tail_ppm);
+    }
+
+    /// Layer l's count row, for the caller to fill with its prompt counts before `plan`.
+    pub fn layerCounts(self: *DecodeRows, l: usize) []u32 {
+        return self.counts[l * self.n_experts ..][0..self.n_experts];
+    }
+
+    fn before(_: void, x: Cand, y: Cand) bool {
+        const vx = @as(u128, x.count) * y.total;
+        const vy = @as(u128, y.count) * x.total;
+        if (vx != vy) return vx > vy;
+        if (x.row != y.row) return x.row < y.row;
+        return x.layer < y.layer;
+    }
+
+    /// The rows per layer from the filled counts, the prompt rows and the admitted count `uniform`.
+    pub fn plan(self: *DecodeRows, prompt_rows: []const u32, uniform: u32) ![]const u32 {
+        const n_layers = self.rows.len;
+        if (prompt_rows.len != n_layers or uniform > self.n_experts) return error.InvalidRows;
+        var k: u64 = @as(u64, n_layers) * uniform;
+        var nc: usize = 0;
+        for (0..n_layers) |l| {
+            const c = self.layerCounts(l);
+            std.sort.pdq(u32, c, {}, std.sort.desc(u32));
+            var total: u64 = 0;
+            var top: u64 = 0;
+            for (c, 0..) |x, i| {
+                total += x;
+                if (i < uniform) top += x;
+            }
+            self.totals[l] = total;
+            self.tail_ppm[l] = if (total == 0) 0 else @intCast(((total - top) * 1_000_000) / total);
+            if (prompt_rows[l] > uniform) return error.InvalidRows;
+            const lo = @max(prompt_rows[l], uniform -| decode_rows_shift_cap);
+            const hi = @min(self.n_experts, uniform + decode_rows_shift_cap);
+            self.rows[l] = lo;
+            k -= lo;
+            var r = lo + 1;
+            while (r <= hi) : (r += 1) {
+                // A layer with no prompt counts is worth 0 (count 0 over 1), never "equal to anything" (0 over 0).
+                self.cands[nc] = .{ .count = c[r - 1], .total = @max(total, 1), .row = r, .layer = @intCast(l) };
+                nc += 1;
+            }
+        }
+        std.sort.pdq(Cand, self.cands[0..nc], {}, before);
+        for (self.cands[0..@intCast(k)]) |x| self.rows[x.layer] += 1;
+        return self.rows;
+    }
+};
+
 /// The arm over graph backend `G` (`MlxOps` serving, `TraceOps` host tests)
 /// with routed-expert math `M` (`M.init(math_arg, *const Config)`).
 pub fn Arm(comptime G: type, comptime M: type) type {
@@ -321,9 +414,20 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         /// The one phase change, at the admitted decode rows (after `releaseTransient`).
         pub fn grow(self: *Self, g: *G) !void {
-            try self.hook.grow(g, self.decode_rows);
+            return self.growRows(g, self.decode_rows);
+        }
+
+        /// The phase change at per-layer rows (`decode_rows` stays the admitted count the bill and receipts read).
+        pub fn growRows(self: *Self, g: *G, rows: []const u32) !void {
+            try self.hook.grow(g, rows);
             if (self.grown_check) |c| try c.check(c.ctx, self, g);
             self.grown = true;
+        }
+
+        /// prompt_stats' rows: each layer's prompt routing counts (`Stream.promptCounts`) through `DecodeRows.plan`.
+        pub fn promptRows(self: *Self, dr: *DecodeRows) ![]const u32 {
+            for (0..self.config.n_layers) |l| @memcpy(dr.layerCounts(l), self.stream.promptCounts(@intCast(l)));
+            return dr.plan(self.prefill_rows, self.decode_rows[0]);
         }
 
         /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
@@ -930,4 +1034,105 @@ test "dsv41 arm: a lookahead hook routes its scores through the real stream befo
     _ = try d.cycle(arm, &g, a, &out);
     _ = try d.cycle(arm, &g, a, &out);
     try testing.expectEqual(@as(u64, 5 * 5), arm.stream.stats().route_calls);
+}
+
+/// `DecodeRows.plan` over `n_layers` layers whose counts `fill(l, counts)` writes; checks the invariants every plan keeps.
+fn planChecked(dr: *DecodeRows, prompt_rows: []const u32, uniform: u32, fill: *const fn (usize, []u32) void) ![]const u32 {
+    for (0..dr.rows.len) |l| fill(l, dr.layerCounts(l));
+    const rows = try dr.plan(prompt_rows, uniform);
+    var total: u64 = 0;
+    for (rows, prompt_rows) |r, p| {
+        total += r;
+        try testing.expect(r >= @max(p, uniform -| decode_rows_shift_cap));
+        try testing.expect(r <= @min(dr.n_experts, uniform + decode_rows_shift_cap));
+    }
+    try testing.expectEqual(@as(u64, rows.len) * uniform, total);
+    return rows;
+}
+
+test "dsv41 rows: prompt_stats keeps the total, the floor and the cap, and is uniform on equal counts" {
+    const a = testing.allocator;
+    var dr = try DecodeRows.init(a, 5, 64);
+    defer dr.deinit(a);
+    const p10: [5]u32 = @splat(10);
+    const F = struct {
+        fn zeros(_: usize, c: []u32) void {
+            @memset(c, 0);
+        }
+        fn equal(_: usize, c: []u32) void {
+            for (c, 0..) |*x, e| x.* = @intCast(64 - e);
+        }
+        // Layer 2 flat over every expert; the others put every row on one expert.
+        fn oneHot(l: usize, c: []u32) void {
+            @memset(c, 0);
+            if (l == 2) @memset(c, 7) else c[l] = 1000;
+        }
+        // Each layer decays at its own rate; layer 4 is flat, layer 0 the steepest.
+        fn skew(l: usize, c: []u32) void {
+            for (c, 0..) |*x, e| x.* = @intCast(1_000_000 / (1 + e * (4 - l) * 8));
+        }
+        fn noise(l: usize, c: []u32) void {
+            var rng = std.Random.DefaultPrng.init(l);
+            for (c) |*x| x.* = rng.random().intRangeLessThan(u32, 0, 50);
+        }
+    };
+    for ([_]*const fn (usize, []u32) void{ F.zeros, F.equal }) |f| {
+        for (try planChecked(&dr, &p10, 30, f)) |r| try testing.expectEqual(@as(u32, 30), r);
+    }
+    // The flat layer takes the cap; the 60 rows the others keep go by row, then layer: 25 each.
+    try testing.expectEqualSlices(u32, &.{ 25, 25, 50, 25, 25 }, try planChecked(&dr, &p10, 30, F.oneHot));
+    const skewed = try planChecked(&dr, &p10, 30, F.skew);
+    try testing.expectEqual(@as(u32, 50), skewed[4]);
+    try testing.expect(skewed[0] < 30 and std.sort.isSorted(u32, skewed, {}, std.sort.asc(u32)));
+    // The prompt rows bind the floor: no layer drops under 25.
+    const p25: [5]u32 = @splat(25);
+    try testing.expectEqualSlices(u32, &.{ 25, 25, 50, 25, 25 }, try planChecked(&dr, &p25, 30, F.oneHot));
+    // Deterministic: the same counts plan the same rows.
+    var first: [5]u32 = undefined;
+    @memcpy(&first, try planChecked(&dr, &p10, 30, F.noise));
+    try testing.expectEqualSlices(u32, &first, try planChecked(&dr, &p10, 30, F.noise));
+    // The cap at the expert count, and prompt rows above the decode rows refused.
+    for (try planChecked(&dr, &p10, 60, F.oneHot), [_]u32{ 59, 59, 64, 59, 59 }) |r, want| try testing.expectEqual(want, r);
+    try testing.expectError(error.InvalidRows, dr.plan(&@as([5]u32, @splat(31)), 30));
+    // The tail proxy: the oneHot layers hold everything in their top rows, the flat one 34 of 64 outside its top 30.
+    _ = try planChecked(&dr, &p10, 30, F.oneHot);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 531_250, 0, 0 }, dr.tail_ppm);
+}
+
+test "dsv41 rows: an arm grows each layer to prompt_stats' rows from its prompt seeds; every grown bank is billed bytes" {
+    const tm = try TestModel.createWith(true, 8);
+    defer tm.destroy();
+    var g = ops.TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const a = testing.allocator;
+    var diag: Diag = .{};
+    var o = tm.options();
+    o.envelope_record = false;
+    o.implemented.n_experts = 8;
+    o.native_rows = .{ .prefill = 2, .decode = 4 };
+    const arm = try TraceArm.init(a, std.testing.io, &g, {}, o, &diag);
+    defer arm.deinit();
+    // Prompt seeds: layer 3 spreads over 8 experts, the others over 2.
+    for (0..5) |l| {
+        const ids: []const u16 = if (l == 3) &.{ 0, 1, 2, 3, 4, 5, 6, 7 } else &.{ 0, 1, 0, 1 };
+        try arm.stream.seedPrefill(@intCast(l), ids);
+    }
+    var dr = try DecodeRows.init(a, 5, 8);
+    defer dr.deinit(a);
+    const rows = try arm.promptRows(&dr);
+    try testing.expectEqual(@as(u32, 8), rows[3]);
+    var total: u32 = 0;
+    for (rows) |r| total += r;
+    try testing.expectEqual(@as(u32, 5 * 4), total);
+    try arm.growRows(&g, rows);
+    try testing.expect(arm.grown);
+    // decode_rows stays the admitted count (bill, receipts); the stream holds the per-layer rows.
+    for (arm.decode_rows) |d| try testing.expectEqual(@as(u32, 4), d);
+    var grown_bytes: u64 = 0;
+    for (rows, 0..) |r, l| {
+        try testing.expectEqual(r, arm.stream.layers[l].policy.capacity);
+        try testing.expectEqual(r - 2, arm.source.bankRows(@intCast(l), .ext));
+        grown_bytes += (r - 2) * arm.bank.layers[l].logical_bytes;
+    }
+    try testing.expectEqual(@as(u64, 5) * (4 - 2) * arm.inputs.record_bytes, grown_bytes);
 }
