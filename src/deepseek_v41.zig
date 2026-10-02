@@ -73,6 +73,9 @@ pub const PrefillBill = struct {
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
     /// (into the last source) and reads the others in place, so it copies at most (n - 23) / n of the routed rows.
     pub const joinless_sources: u64 = 24;
+    /// A routed group takes JOINLESS's parts above this many routed ids (`deepseek_v41_model`); at or below it the
+    /// call is joined and the input release does not run.
+    pub const joinless_min_ids: u64 = 48;
     /// The wide lane's shape the outputs follow: the DIG-X prefill wave's experts and assignment-row budget
     /// (`exl3_quant.PrefillShape.tier`) and a call's experts (a group: `experts.max_route_ids`).
     /// `base_calls`: the deferred base calls a wide call makes (`wide_base_calls`, one more with P1d's resident call).
@@ -258,8 +261,11 @@ pub const PrefillBill = struct {
         // tight bill with the early release).
         const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * 4 + b.top_k * 20);
         // With the input release the final evaluation runs without the moe_in rows and their concat (the attention
-        // side and the routed call still hold both).
-        const released: u64 = if (b.input_release) seq * d * 4 + g_rows * d * 4 else 0;
+        // side and the routed call still hold both). Only a group that takes JOINLESS's parts releases: the bill's group
+        // (g_rows, the widest) does above joinless_min_ids routed ids; a narrower last group of a longer prompt keeps
+        // its own <= 8 rows, while the earlier groups' rows are already gone, so the widest group still bounds it.
+        const releases = b.input_release and g_rows * b.top_k > joinless_min_ids;
+        const released: u64 = if (releases) seq * d * 4 + g_rows * d * 4 else 0;
         return kept_stream + selection + @max(halves + @max(attn, group), halves + final_eval - released);
     }
 

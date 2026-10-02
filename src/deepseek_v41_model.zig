@@ -46,7 +46,7 @@ pub const Error = error{ EngramSourceRequired, TrimTooDeep, MissingWeight, NameT
 
 /// `_derive_moe_row_cap`: rows one K16 routed call may carry.
 /// JOINLESS takes a wide call only (the experts' wide lane: more than one route of ids).
-const joinless_min_ids: u64 = 48;
+const joinless_min_ids = v41.PrefillBill.joinless_min_ids;
 
 pub fn moeRowCap(c: *const v41.Config, target_bytes: f64) u64 {
     const per_row: u64 = @as(u64, c.n_experts_per_tok) * c.hidden_size * 4;
