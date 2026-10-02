@@ -18,6 +18,7 @@ const MxBank = struct {
     pub const Segment = struct { offset: u64, length: u64, dtype: Dtype, shape: [3]u64, rank: u8 };
     pub const Layer = struct { logical_bytes: u64, segments: [n_components]Segment };
     pub const BankArrays = [n_components]mlx.mlx_array;
+    pub const routed_top_k = 8;
 
     pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {
         return switch (d) {
@@ -115,4 +116,27 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
         }
         s.release(r);
     }
+}
+
+test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's eighth score, a top-6 arch's from its sixth" {
+    const a = testing.allocator;
+    // One row over 16 experts, scores 15 - e: the 6th score is 10, the 8th is 8. With tau 1 and k 10, a top-6 selector keeps
+    // scores >= 9 (experts 0..6), a top-8 selector scores >= 7 (experts 0..8); none is resident.
+    var row: [16]f32 = undefined;
+    for (&row, 0..) |*v, e| v.* = 15 - @as(f32, @floatFromInt(e));
+    var none = try sdk.expert.policy.LayerPolicy.init(a, 16, 0);
+    defer none.deinit(a);
+    var out: [4]u16 = undefined;
+    var s6 = try sdk.expert.lookahead.SelectorOf(6).init(a, 16, 10, 1.0, 4);
+    defer s6.deinit(a);
+    var s8 = try sdk.expert.lookahead.SelectorOf(8).init(a, 16, 10, 1.0, 4);
+    defer s8.deinit(a);
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s6.select(&row, &none, &out));
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s8.select(&row, &none, &out));
+    // The candidate counts differ by the threshold: read through a budget wide enough to see the cut.
+    var wide: [12]u16 = undefined;
+    try testing.expectEqual(@as(usize, 7), s6.select(&row, &none, &wide).len);
+    try testing.expectEqual(@as(usize, 9), s8.select(&row, &none, &wide).len);
+    // A top-8 arch cannot keep fewer than eight candidates per row.
+    try testing.expectError(error.InvalidSelector, sdk.expert.lookahead.SelectorOf(8).init(a, 16, 7, 1.0, 4));
 }

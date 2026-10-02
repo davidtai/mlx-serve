@@ -226,12 +226,13 @@ pub fn assertSource(comptime S: type) void {
 ///   `logical_bytes` (a record's bytes); `mlxDtype(dtype) mlx_dtype` (a slot array's dtype);
 /// - `Bank`: fields `layers: []Layer` (the arch's routed layers), `n_experts`, `sidecar: UncachedFd`; methods
 ///   `recordOffset(*const Bank, layer, expert) u64` and `spans(*const Bank, layer, expert)` (`.gu_offset`, `.down_offset`);
-/// - `BankArrays` and `bankArraysOf([n_components]mlx_array) BankArrays`: the slot arrays as the bank's quant binds them.
+/// - `BankArrays` and `bankArraysOf([n_components]mlx_array) BankArrays`: the slot arrays as the bank's quant binds them;
+/// - `routed_top_k`: the arch's routed experts per token (the lookahead selector's per-row threshold rank).
 /// The stream allocates the slot rows, plans routes, reads, gates and releases; the arch keeps the MoE math.
 pub fn assertBank(comptime B: type) void {
     comptime {
         const where = @typeName(B) ++ " is not an expert bank: ";
-        for ([_][]const u8{ "n_components", "gu_components", "Records", "Component", "Layer", "Bank", "mlxDtype", "BankArrays", "bankArraysOf" }) |d|
+        for ([_][]const u8{ "n_components", "gu_components", "Records", "Component", "Layer", "Bank", "mlxDtype", "BankArrays", "bankArraysOf", "routed_top_k" }) |d|
             if (!@hasDecl(B, d)) @compileError(where ++ "no " ++ d);
         if (B.Records != io.Records(B.n_components, B.gu_components)) @compileError(where ++ "Records is not io.Records(n_components, gu_components)");
         if (!@hasField(B.Layer, "segments") or !@hasField(B.Layer, "logical_bytes")) @compileError(where ++ "Layer needs segments and logical_bytes");

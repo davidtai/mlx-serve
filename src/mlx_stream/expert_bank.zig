@@ -187,6 +187,9 @@ pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const 
 // The stream's bank contract (sdk.expert.assertBank; sdk.expert.stream): with the topology, `Component`, `Layer`,
 // `Records` and `Bank` above and below, a segment's MLX dtype and the slot arrays by projection.
 
+/// DeepSeek-V4.1 routes six experts per token.
+pub const routed_top_k = 6;
+
 pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {
     return switch (d) {
         .I16 => .int16,

@@ -5,13 +5,13 @@ const mlx = @import("mlx");
 const lookahead = @import("sdk").expert.lookahead;
 const expert_policy = @import("sdk").expert.policy;
 const LayerPolicy = expert_policy.LayerPolicy;
-pub const routed_top_k = lookahead.routed_top_k;
-pub const min_k = lookahead.min_k;
+pub const routed_top_k = @import("expert_bank.zig").routed_top_k;
+pub const min_k = routed_top_k;
 pub const max_k = lookahead.max_k;
 pub const max_budget = lookahead.max_budget;
 pub const max_rows = lookahead.max_rows;
 pub const max_candidates = lookahead.max_candidates;
-pub const Selector = lookahead.Selector;
+pub const Selector = lookahead.SelectorOf(routed_top_k);
 
 const testing = std.testing;
 

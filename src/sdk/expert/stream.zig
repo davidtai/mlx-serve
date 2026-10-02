@@ -471,7 +471,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// A route's held-slot scratch (live routes' slots and `held_base`).
             held_scratch: std.ArrayList(u32) = .empty,
             read_ns: u64 = 0,
-            selector: ?expert_lookahead.Selector = null,
+            selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null,
             preread: bool = false,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
@@ -568,8 +568,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
                     };
                 }
-                var selector: ?expert_lookahead.Selector = null;
-                if (opt.lookahead) |la| selector = try expert_lookahead.Selector.init(a, bank.n_experts, la.k, la.tau, la.budget);
+                var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
+                if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                 errdefer if (selector) |*sel| sel.deinit(a);
                 // The pool writes the event word until it stops.
                 var word: ?*i64 = null;
