@@ -126,7 +126,7 @@ pub const RouteOverrides = struct {
     /// matmul; needs head_mode mxfp8. Rounding-class like the codec itself. null: the default, off.
     head_mxfp8_rc: ?bool = null,
     /// DENSE_RC (kbench v7): C29's mxfp8 sites on RCPROJ (shared gate | up stacked in one launch, w2 at 8-wide steps,
-    /// the indexer wq_b, the Engram wkv) and the verify head on MLX's matmul. Rounding-class. null: the default, off.
+    /// the indexer wq_b, the Engram wkv). Rounding-class (the head keeps C11's M-invariant m1rows). null: off.
     dense_rc: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
@@ -527,7 +527,6 @@ pub const Module = struct {
         if (ov.dense_rc) |v| if (v) {
             if (!tier.routes.rc_mxfp8_rows) return error.DenseRcNeedsRows;
             tier.routes.dense_rc = true;
-            tier.routes.rc_head = false;
         };
         if (ov.head_mxfp8_rc) |v| {
             if (v and tier.routes.head != .mxfp8) return error.HeadMxfp8RcNeedsMxfp8;
@@ -586,7 +585,7 @@ pub const Module = struct {
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
-        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch), shared w2 kv8, indexer wq_b and Engram wkv on RCPROJ, verify head on MLX matmul; stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
+        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch), shared w2 kv8, indexer wq_b and Engram wkv on RCPROJ; stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });

@@ -204,8 +204,7 @@ pub const Routes = struct {
     rc_mxfp8_rows: bool = false,
     /// DENSE_RC (kbench v7, rounding-class): C29's sites on RCPROJ's FMA text instead of m1rows (needs
     /// rc_mxfp8_rows): the shared expert's gate and up as ONE launch over their stacked weights (`LayerW.sh_w13`),
-    /// w2 at 8-wide lane steps, the indexer wq_b and the Engram wkv; the verify head on MLX's own matmul (rc_head
-    /// off). Bound at construction.
+    /// w2 at 8-wide lane steps, the indexer wq_b and the Engram wkv. Bound at construction.
     dense_rc: bool = false,
     /// C27 INDEX_TOPK=metal at rows <= 8: an index source's select as one dispatch (the prefill
     /// route's kernel at the verify rows).
