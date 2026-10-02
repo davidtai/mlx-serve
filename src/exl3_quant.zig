@@ -384,6 +384,10 @@ pub fn Gemv(comptime G: type) type {
         dn_p: RowPlans(G, 48),
         /// gu_one: gate and up in one launch (`dsv41_exl3_guone_k3_2304`), bound by `initForms`.
         gu1_p: ?RowPlans(G, 48) = null,
+        /// The gate / up call bound at construction: `guOne` (gu_one's one launch) or `guPair` (the two stock launches).
+        gu_call: *const GuCall = guPair,
+
+        const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T;
 
         pub fn init(g: *G, reg: *const xk.Registry) !Self {
             return initForms(g, reg, .{});
@@ -402,7 +406,7 @@ pub fn Gemv(comptime G: type) type {
             errdefer if (gu1_p) |*x| x.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p };
+            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -413,11 +417,18 @@ pub fn Gemv(comptime G: type) type {
             self.dn_statics.deinit(g);
         }
 
-        /// Gate and up: one launch under gu_one, else the two stock launches (a construction-time route).
+        /// Gate and up through the call `initForms` bound (no per-call choice).
         pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) ![2]G.T {
-            const p = if (self.gu1_p) |*x| x else return .{ try self.project(g, .gate, xg, ids, code_g), try self.project(g, .up, xu, ids, code_u) };
+            return self.gu_call(self, g, xg, xu, ids, code_g, code_u);
+        }
+
+        fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
+            return .{ try self.project(g, .gate, xg, ids, code_g), try self.project(g, .up, xu, ids, code_u) };
+        }
+
+        fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
             var out: [2]G.T = undefined;
-            try p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
+            try self.gu1_p.?.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
             return out;
         }
 
