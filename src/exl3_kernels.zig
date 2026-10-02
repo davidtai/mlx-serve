@@ -13,7 +13,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "9033520a3565e84d0d3ece55ba5f9e0db096b7e27f7c955f6ed8de9acf26cdf9";
+pub const manifest_sha256 = "21521ce4d44e18a8ad828f1e14447053903b6e5c0df4e25f84b175d265d1858f";
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -131,6 +131,16 @@ pub const Kernel = enum {
     // tail); the f32 residual and layer 0's bf16 one (checked against the region at model construction)
     dsv41_hcpost_tf32,
     dsv41_hcpost_tf32__rbf16,
+    // The banked hit wave (10-02, kbench v6d / v9b: exact): each routed decode text over three banks (base, ext,
+    // transient) in one launch, a row's bank from its packed slot (bank << 24 | row) (twin: the stock text on bank 0)
+    dsv41_exl3_b3_mul1h_k3_2304,
+    dsv41_exl3_b3_mul1h_k3_5120,
+    dsv41_exl3_b3_prep_in_rin,
+    dsv41_exl3_b3_prep_gu_epi,
+    dsv41_exl3_b3_prep_din_rin,
+    dsv41_exl3_b3_moeprep_dpost,
+    dsv41_exl3_b3_pair_k3_5120,
+    dsv41_exl3_b3_guone_k3_2304,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -1148,7 +1158,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 83), n_kernels);
+    try testing.expectEqual(@as(usize, 91), n_kernels);
     try testing.expectEqual(@as(usize, 17), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1163,7 +1173,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 10), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 12), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
@@ -1175,8 +1185,11 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     try testing.expect(reg.acceptsManifest("833379693155e8c9079809f0c00d480b1eda4432ef4138d6dc8dca962855ff71"));
     // the routed forms' manifest lists the LUT gate|up text's (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("4e286ab2619c78422435052a5d801abdb6a6e0bdde126e4068ec92cfb0e2312e"));
-    // the HC post texts' manifest lists the routed forms' (every kernel and header unchanged)
+    // the HC post texts' manifest and the banked texts' manifest each list the routed forms' (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("97f18db269ec892749d5d72f310bc25b9366451d92b74865567b1a2322780d15"));
+    // served19j's union manifest lists both (every kernel and header of each unchanged)
+    try testing.expect(reg.acceptsManifest("9033520a3565e84d0d3ece55ba5f9e0db096b7e27f7c955f6ed8de9acf26cdf9"));
+    try testing.expect(reg.acceptsManifest("1aee687704d0009f85155621acdfb8917c7ba1446f652f5209b19028204beac4"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each

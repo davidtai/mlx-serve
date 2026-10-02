@@ -357,7 +357,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         /// The hook's construction inputs the arm's routes need beyond `Options`: every routed layer's gate
         /// (`.lookahead`: the predictor reads the next layer's) and the stream's event (`.gated`).
-        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null, wide: xp.Wide = .{} };
+        pub const HookInputs = struct { gates: []const Hook.Gate = &.{}, event: ?@import("expert_event.zig").Event = null, wide: xp.Wide = .{}, banked: bool = false };
 
         pub fn initHooked(a: std.mem.Allocator, io: std.Io, g: *G, math_arg: anytype, opt: Options, hx: HookInputs, diag: *Diag) !*Self {
             // The hook's predictor feeds the stream's read-ahead: the route needs the stream's class.
@@ -404,7 +404,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             self.source = xp.StreamSource.init(self.stream);
             // The wide read-ahead's windows are the stream's (one transient window per group in flight).
             if (hx.wide.depth > opt.wide_depth) return refuse(diag, error.WideDepthExceedsStream, "arm: the hook reads {d} groups ahead, the stream holds {d} windows", .{ hx.wide.depth, opt.wide_depth });
-            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .gates = hx.gates, .event = hx.event, .wide = hx.wide }) catch |e|
+            self.hook = Hook.initWith(a, g, &self.source, M.init(math_arg, &self.config), &self.config, .{ .gates = hx.gates, .event = hx.event, .wide = hx.wide, .banked = hx.banked }) catch |e|
                 return refuse(diag, e, "routed-expert hook: {s}", .{@errorName(e)});
             return self;
         }

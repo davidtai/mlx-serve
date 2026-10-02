@@ -1130,6 +1130,8 @@ const CellReceipt = struct {
     routed_forms: []const u8 = "stock",
     /// DENSE_RC as installed.
     dense_rc: ?bool = null,
+    /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
+    routed_banked: bool = false,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1607,6 +1609,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
         .routed_forms = formsName(md.installed.routed_forms),
         .dense_rc = md.installed.dense_rc,
+        .routed_banked = md.installed.routed_banked,
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1749,6 +1752,7 @@ fn cellConfig(config: *model.ModelConfig) !CellArgs {
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
+    if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
     if (envStr("DSV41_CELL_HEAD_MXFP8_RC")) |v| ov.head_mxfp8_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellHeadMxfp8Rc;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;

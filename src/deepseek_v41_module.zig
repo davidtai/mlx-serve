@@ -139,6 +139,9 @@ pub const RouteOverrides = struct {
     /// DENSE_RC (kbench v7 / v7b): the shared gate | up stacked on RCPROJ, one launch (C29's other sites stay on
     /// m1rows). Rounding-class (the head keeps C11's m1rows). null: off.
     dense_rc: ?bool = null,
+    /// ROUTED_BANKED (kbench v6d / v9b, exact): the routed decode stages on the banked texts, one launch per stage
+    /// over a wave's rows of every bank (packed slot ids), the forms above taken. null: the default, off (per bank).
+    routed_banked: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -591,6 +594,8 @@ pub const Module = struct {
         }
         // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
         if (ov.routed_forms) |f| if (f.down_pair or f.gu_one) try self.exl3.routeForms(&self.g, f);
+        // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
+        if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
         // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
@@ -731,7 +736,8 @@ pub const Module = struct {
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
-        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
+        self.installed.routed_banked = self.exl3.banked != null;
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
@@ -948,7 +954,7 @@ pub const Module = struct {
         opts.first_verify_warm = if (warm) .{} else null;
         var wide = wideRoute(config);
         wide.warm_tail = warm;
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide }, diag) catch |e| return refused(e, diag);
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         // LOOKAHEAD4, once before any request: a gated call's waves against the same slots waited.
@@ -1764,6 +1770,8 @@ pub const Installed = struct {
     routed_forms: xq.Forms = .{},
     /// DENSE_RC as installed.
     dense_rc: bool = false,
+    /// ROUTED_BANKED as installed (the quant's banked route and the hook's banked waves).
+    routed_banked: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.
