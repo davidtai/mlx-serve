@@ -1905,6 +1905,105 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     inline for (.{ .stock, .served }) |t| std.debug.print("\nDSV41_PREFILL_BILL {{\"tier\": \"{t}\", \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}", .{ @as(v41.PrefillBill.Tier, t), bill.bytes(64, 32, t), bill.bytes(16384, 1024, t), bill.waveBytes(bill.chunkRows(16384), 16384, t) });
 }
 
+/// A traced forward's live set by its layer waves (no frees inside a wave credited): the bytes outside every top-level
+/// wave (what crosses layers) and the widest top-level wave's (`graph.heldBytes`).
+const LayerHeld = struct {
+    outside: u64,
+    layer: u64,
+
+    fn of(g: *const ops.TraceOps, from: usize, to: usize, freed: []const ops.TraceOps.Freed) LayerHeld {
+        const total = graph.heldBytes(g, from, to).sum;
+        var in_waves: u64 = 0;
+        var widest: u64 = 0;
+        for (freed, 0..) |w, i| {
+            if (w.to <= w.from) continue;
+            const inner = for (freed, 0..) |o, j| {
+                if (j != i and o.from <= w.from and w.to <= o.to and (o.from != w.from or o.to != w.to)) break true;
+            } else false;
+            if (inner) continue;
+            const all = graph.heldBytes(g, w.from, w.to).sum;
+            in_waves += all;
+            widest = @max(widest, all);
+        }
+        return .{ .outside = total -| in_waves, .layer = widest };
+    }
+};
+
+// DSV41_BANK=<bank> (host, the trace backend): verify_wave (G3) against the served tier's decode on the bank. The loop's
+// prefill over the fill's prompt less one verify block (the lanes at P' = 24,592 after the verify), one verify forward
+// of 8 rows (every row's logits, the DSpark taps) and one draft block: verify_wave covers the verify's widest layer
+// wave plus everything outside its waves (the carry, the tail's logits), the draft block's likewise, and stays under
+// today's decode_wave.
+test "dsv41 memory: verify_wave covers a served decode forward's layer waves, its tail and the draft block on the bank (trace backend)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var vd: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 verify_wave: {s}\n", .{vd.message()});
+    const c = try v41.Config.load(a, io, bank, &vd);
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/" ++ engram_token_map_file, .{bank}), &c, &vd);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    var g = ops.TraceOps.init(a);
+    defer g.deinit();
+    const L = dsl.Loop(ops.TraceOps);
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const rows = try aa.alloc(u32, c.n_layers);
+    @memset(rows, 8);
+    var fsrc = try xp.FakeSource.init(a, .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .n_experts = c.n_routed_experts, .rows = rows });
+    defer fsrc.deinit();
+    const TChain = xp.EagerChain(ops.TraceOps, xp.TraceGemv);
+    const Wide = xq.DigXPrefill(ops.TraceOps);
+    const digx = try aa.alloc(Wide, c.n_layers);
+    for (digx) |*d| d.* = try Wide.init(a, &reg, .tier, null);
+    defer for (digx) |*d| d.deinit(&g);
+    const Ex = xp.ExpertsWith(ops.TraceOps, xp.FakeSource, xp.WithPrefillRoutes(ops.TraceOps, TChain, Wide), .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &fsrc, .{ .d = TChain.init(.{}, &c), .routes = digx }, &c);
+    defer ex.deinit();
+    var rid: RandomIds = .{ .n_experts = @intCast(c.n_routed_experts) };
+    g.host_values = rid.values();
+    const model_ = try L.M.initWith(a, &g, c, routes.served, &lookup, &src, .{ .registry = &reg });
+    defer model_.deinit(&g);
+    const head = try L.H.initWith(a, &g, c, routes.served.draftRoutes(), &lookup, .{ .registry = &reg });
+    defer head.deinit(&g);
+    const verify_rows = mdl.Model(ops.TraceOps).scratch_rows;
+    const positions = bill_mod.billedPositions(bill_mod.fill_prompt_tokens, bill_mod.fill_max_tokens);
+    const prompt = try aa.alloc(u32, positions - verify_rows);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    var st = try model_.newState();
+    defer st.deinit(&g, a);
+    const n_st = head.nStages();
+    var caches: [4]L.H.Cache = @splat(.{});
+    defer for (caches[0..n_st]) |*cc| cc.deinit(&g);
+    var lp = L.init(&g, model_, head, &st, caches[0..n_st], .{ .lookup = null, .max_tokens = 8, .prompt_chunk = dsl.whole_prompt });
+    defer lp.deinit();
+    _ = try lp.prefill(a, &ex, prompt);
+    g.reset();
+    const v0 = g.nodes.items.len;
+    const vw0 = g.freed.items.len;
+    const ver = try model_.forward(&g, &st, prompt[0..verify_rows], .{ .logits = .all, .main_hidden = true }, &ex, graph.NoProbe{});
+    const vh = LayerHeld.of(&g, v0, g.nodes.items.len, g.freed.items[vw0..]);
+    try L.M.fence(&g, &st, &.{ ver.logits.?, ver.main_hidden.? });
+    try ex.flush();
+    g.reset();
+    const d0 = g.nodes.items.len;
+    const dw0 = g.freed.items.len;
+    _ = try head.draftBlock(&g, lp.main_h.?, 1, caches[0..n_st], model_.embed, model_.head);
+    const dh_ = LayerHeld.of(&g, d0, g.nodes.items.len, g.freed.items[dw0..]);
+    g.reset();
+    const form = bill_mod.verifyWaveBytes(&c, verify_rows, positions, c.dspark.block_size);
+    std.debug.print("\nDSV41_VERIFY_WAVE {{\"positions\": {d}, \"rows\": {d}, \"verify_layer\": {d}, \"verify_outside\": {d}, \"draft_layer\": {d}, \"draft_outside\": {d}, \"form\": {d}, \"decode_wave_today\": 365449216}}\n", .{ positions, verify_rows, vh.layer, vh.outside, dh_.layer, dh_.outside, form });
+    try std.testing.expect(vh.layer + vh.outside <= form);
+    try std.testing.expect(dh_.layer + dh_.outside <= form);
+    try std.testing.expect(form <= 365_449_216);
+}
+
 /// The routed hook with a record of each forward's rows (layer 0's routed call), the order the model feeds it.
 fn Recorder(comptime Ex: type) type {
     return struct {
