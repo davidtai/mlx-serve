@@ -482,7 +482,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const model.ModelConfig
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
         .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
         .prefill_cache = module.prefillCacheLimit(.served),
-        .decode_cache = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes,
+        .decode_cache = try module.decodeCacheLimit(ov),
         .decode_wave = decode_wave,
         .draft_wave = decode_wave,
         .host_reserve = measured_host_side_bytes,
@@ -1175,6 +1175,43 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
 // after construction (1,323,827,200 B) out of the residents, its codes and scales (682,598,400 B) in, net -641,228,800 B.
 // Arm 5's own fill therefore sits about a row a phase above the bf16 arm's. Both at the default route (the transient
 // release on: decode bills window 0).
+// DSV41_BANK=<bank> (host): the decode cache limit route (decodecache0) bills the installed limit: 0 frees the envelope's
+// 268,435,456 B in the decode phase only (one decode row at 7.29 and 8.99 GB, none at 9.20 / 9.55).
+test "dsv41 memory: the decode cache term follows the decode cache limit route (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try model.parseConfig(testing.io, a, bank_dir);
+    const ceiling_bytes: u64 = 120_259_084_288;
+    const target = ceiling_bytes - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
+    const Want = struct { base: u64, stock: arm_mod.NativeRows, zero: arm_mod.NativeRows };
+    for ([_]Want{
+        .{ .base = 7_290_000_000, .stock = .{ .prefill = 137, .decode = 171 }, .zero = .{ .prefill = 137, .decode = 172 } },
+        .{ .base = 8_990_000_000, .stock = .{ .prefill = 134, .decode = 168 }, .zero = .{ .prefill = 134, .decode = 169 } },
+        .{ .base = 9_200_000_000, .stock = .{ .prefill = 133, .decode = 168 }, .zero = .{ .prefill = 133, .decode = 168 } },
+        .{ .base = 9_550_000_000, .stock = .{ .prefill = 133, .decode = 167 }, .zero = .{ .prefill = 133, .decode = 167 } },
+    }) |w| {
+        config.memory_baseline_bytes = w.base;
+        var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
+        var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .decode_cache_bytes = 0 });
+        try testing.expectEqual(@as(u64, 268_435_456), b1.decode_cache);
+        try testing.expectEqual(@as(u64, 0), b0.decode_cache);
+        try testing.expectEqual(b1.prefillTotal(), b0.prefillTotal());
+        b1.engram_posted = posted;
+        b0.engram_posted = posted;
+        const r1 = try fillRows(fillBillOf(b1), target, b1.n_experts);
+        const r0 = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        std.debug.print("\ndecode cache at baseline {d:.2} GB (posted gathers on): envelope {d} / {d}, decodecache0 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r0.prefill, r0.decode });
+        try testing.expectEqual(w.stock, r1);
+        try testing.expectEqual(w.zero, r0);
+    }
+    std.debug.print("\n", .{});
+}
+
 test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
