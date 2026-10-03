@@ -10,6 +10,7 @@ const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 
 const sdk_kv = @import("sdk").kv;
+const sdk_testing = @import("sdk").testing;
 comptime {
     std.debug.assert(ops.max_dims == sdk_kv.max_dims);
 }
@@ -268,92 +269,9 @@ pub fn prefillSpans(a: std.mem.Allocator, s: u32, chunk: i64) ![][2]u32 {
 
 const testing = std.testing;
 
-/// Arrays of row ids (`[1, n]` rows, the feature axis elided): enough of the
-/// op surface for the lanes, so every append / compaction / view / trim is
-/// checked against the absolute positions it must hold.
-const RowOps = struct {
-    pub const T = u32;
-    gpa: std.mem.Allocator,
-    arrays: std.ArrayList(std.ArrayList(i64)) = .empty,
-    kept: std.ArrayList(u32) = .empty,
-    allocs: u32 = 0,
-
-    fn deinit(g: *RowOps) void {
-        for (g.arrays.items) |*a| a.deinit(g.gpa);
-        g.arrays.deinit(g.gpa);
-        g.kept.deinit(g.gpa);
-    }
-
-    fn new(g: *RowOps, ids: []const i64) !u32 {
-        var a: std.ArrayList(i64) = .empty;
-        try a.appendSlice(g.gpa, ids);
-        try g.arrays.append(g.gpa, a);
-        return @intCast(g.arrays.items.len - 1);
-    }
-
-    fn range(g: *RowOps, lo: i64, hi: i64) !u32 {
-        var buf: [4096]i64 = undefined;
-        for (0..@intCast(hi - lo)) |i| buf[i] = lo + @as(i64, @intCast(i));
-        return g.new(buf[0..@intCast(hi - lo)]);
-    }
-
-    fn rows(g: *RowOps, x: u32) []const i64 {
-        return g.arrays.items[x].items;
-    }
-
-    pub fn shapeOf(g: *RowOps, x: u32) ops.Shape {
-        return ops.Shape.of(&.{ 1, @intCast(g.arrays.items[x].items.len), 3 });
-    }
-    pub fn dtypeOf(_: *RowOps, _: u32) ops.Dtype {
-        return .float32;
-    }
-    pub fn keep(g: *RowOps, x: u32) u32 {
-        g.kept.append(g.gpa, x) catch unreachable;
-        return x;
-    }
-    pub fn release(g: *RowOps, x: u32) void {
-        const i = std.mem.indexOfScalar(u32, g.kept.items, x) orelse unreachable;
-        _ = g.kept.swapRemove(i);
-    }
-    pub fn zeros(g: *RowOps, shape: []const c_int, _: ops.Dtype) !u32 {
-        g.allocs += 1;
-        var buf: [4096]i64 = @splat(-1);
-        return g.new(buf[0..@intCast(shape[1])]);
-    }
-    pub fn hostArray(g: *RowOps, bytes: []const u8, _: []const c_int, _: ops.Dtype) !u32 {
-        const s = std.mem.bytesAsSlice(i32, bytes);
-        return g.new(&.{s[1]});
-    }
-    pub fn sliceUpdateDyn(g: *RowOps, buf: u32, upd: u32, starts: u32) !u32 {
-        const row: usize = @intCast(g.rows(starts)[0]);
-        var out: [4096]i64 = undefined;
-        const b = g.rows(buf);
-        @memcpy(out[0..b.len], b);
-        const u = g.rows(upd);
-        if (row + u.len > b.len) return error.SliceUpdateBounds;
-        @memcpy(out[row..][0..u.len], u);
-        return g.new(out[0..b.len]);
-    }
-    pub fn slice(g: *RowOps, x: u32, start: []const c_int, stop: []const c_int, _: []const c_int) !u32 {
-        const r = g.rows(x);
-        if (stop[1] > r.len) return error.SliceBounds;
-        var out: [4096]i64 = undefined;
-        const lo: usize = @intCast(start[1]);
-        const hi: usize = @intCast(stop[1]);
-        @memcpy(out[0 .. hi - lo], r[lo..hi]);
-        return g.new(out[0 .. hi - lo]);
-    }
-    pub fn concat(g: *RowOps, xs: []const u32, _: c_int) !u32 {
-        var out: [4096]i64 = undefined;
-        var n: usize = 0;
-        for (xs) |x| {
-            const r = g.rows(x);
-            @memcpy(out[n..][0..r.len], r);
-            n += r.len;
-        }
-        return g.new(out[0..n]);
-    }
-};
+/// The SDK's row-id backend (`sdk.testing.RowOps`): every append / compaction / view / trim checked against the
+/// absolute positions it must hold.
+const RowOps = sdk_testing.RowOps;
 
 const RS = LayerState(RowOps);
 
@@ -399,6 +317,13 @@ test "dsv41 cache: the window ring keeps every reachable row across prefill chun
     }
     // The ring stayed bounded: two buffers of window + 8 + 8 + 64 rows after the wide prefill chunk shrank back.
     try testing.expectEqual(@as(u32, 128 + 8 + 8 + 64), st.window.ring.phys_cap);
+    // The same script on the bare ring lane, against the concatenated store; a rollback past the window refused by name.
+    var ring: Lanes(RowOps).Window = .{ .ring = Lanes(RowOps).Ring.init(128, .{ .route = .window_ring }) };
+    defer ring.deinit(&g);
+    var lane_steps: [steps.len + 1]sdk_testing.LaneStep = undefined;
+    for (steps, lane_steps[0..steps.len]) |sp, *ls| ls.* = .{ .n = sp.n, .trim = sp.trim };
+    lane_steps[steps.len] = .{ .n = 1, .trim = 200 };
+    try sdk_testing.expectLaneEquivalence(&g, &ring, &lane_steps, 128 - 1);
     // A rollback past the resident window is a clean miss, never a wrong read.
     try testing.expectEqual(@as(u32, 0), try st.trim(&g, 200));
     try testing.expectEqual(pos, st.offset);
@@ -418,14 +343,8 @@ test "dsv41 cache: grow and bounded lanes read like the concatenated store, trim
         defer g.deinit();
         var lane: L.Store = .{ .grow = lane0 };
         defer lane.deinit(&g);
-        var pos: u32 = 0;
-        for ([_]u32{ 333, 1, 1, 6, 17, 300 }) |n| {
-            try lane.append(&g, try g.range(pos, pos + n));
-            pos += n;
-            const v = (try lane.view(&g)).?;
-            try testing.expectEqual(@as(usize, pos), g.rows(v).len);
-            for (g.rows(v), 0..) |id, j| try testing.expectEqual(@as(i64, @intCast(j)), id);
-        }
+        // Every append against the concatenated store, row for row (sdk.testing's lane equivalence).
+        try sdk_testing.expectLaneEquivalence(&g, &lane, &.{ .{ .n = 333 }, .{ .n = 1 }, .{ .n = 1 }, .{ .n = 6 }, .{ .n = 17 }, .{ .n = 300 } }, 0);
         const allocs = g.allocs;
         try lane.truncate(&g, 500);
         try lane.append(&g, try g.range(500, 510));
