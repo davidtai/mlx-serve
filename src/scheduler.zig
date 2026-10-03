@@ -7195,7 +7195,7 @@ test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-
 }
 
 /// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
+pub const SpecTickMode = enum { draft_lane, mtp, dflash, drafter, pld, regular };
 
 /// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
 /// wish; the generator-side values carry what `Generator.initWithOptions`
@@ -7220,7 +7220,7 @@ pub fn specTickMode(
     gen_pld_enabled: bool,
     gen_dspark_enabled: bool,
 ) SpecTickMode {
-    if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
+    if (gen_dspark_enabled and slot_enable_mtp) return .draft_lane;
     if (slot_enable_drafter and gen_has_dflash) return .dflash;
     if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
@@ -7406,7 +7406,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         gen.pld_enabled,
         gen.dspark_enabled,
     );
-    if (tick_mode == .dspark) {
+    if (tick_mode == .draft_lane) {
         const result = try gen.nextDspark(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -10008,8 +10008,8 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     // stage-bearing dsv4; the n-gram gate never touches enable_mtp). It wins
     // over everything (a set mtp/pld generator conjunct alongside dspark is
     // unreachable by the chokepoint's construction, but priority must hold).
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, false, true));
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, false, true, true, true));
+    try testing.expectEqual(SpecTickMode.draft_lane, specTickMode(true, false, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.draft_lane, specTickMode(true, true, true, true, false, true, true, true));
     // PLD/drafter intent alone never drives dspark (their flags are
     // prompt-gated — riding them made engagement depend on the n-gram gate).
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false, true));
@@ -10028,7 +10028,7 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, false, false, false));
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, false, true, false, false, true));
+    try testing.expectEqual(SpecTickMode.draft_lane, specTickMode(true, true, true, false, true, false, false, true));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }
 
