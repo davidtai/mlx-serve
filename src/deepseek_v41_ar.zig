@@ -1088,7 +1088,7 @@ const CellReceipt = struct {
     draft_cache_stats: ?expert_stream.Stats = null,
     /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
     draft_cache_pool: ?[]const u8 = null,
-    /// The read pool's scheduling as installed ("off" or the list of qos, spin, demandfirst; `module.readerSched`), and its
+    /// The read pool's scheduling as installed ("off" or the list of qos, qosdemand, spin, demandfirst; `module.readerSched`), and its
     /// demand-first knob on its own.
     reader_sched: ?[]const u8 = null,
     reader_demand_first: ?bool = null,

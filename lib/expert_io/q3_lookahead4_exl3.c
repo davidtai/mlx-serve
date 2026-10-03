@@ -284,17 +284,20 @@ static int nworkers = 0, running = 0, stopping = 0, busy = 0;
 /* SCHED (set on a stopped pool before q3ld_start; read at each thread's start, by the bounded spins and by the
  * speculative queue rule), bits: SCHED_QOS demand workers and the watchdog USER_INTERACTIVE, speculative workers
  * UTILITY, every thread named; SCHED_SPIN a bounded spin before a demand worker or a q3ld_wait caller sleeps;
- * SCHED_DEMAND_FIRST no unclaimed speculative chunk starts while any demand job is queued or executing.  0 = the stock
+ * SCHED_DEMAND_FIRST no unclaimed speculative chunk starts while any demand job is queued or executing;
+ * SCHED_QOS_DEMAND (not with SCHED_QOS) the demand workers and the watchdog USER_INTERACTIVE, the speculative workers
+ * keeping the inherited class (no UTILITY anywhere: no per-claim switch either), every thread named.  0 = the stock
  * pool (threads inherit the creating thread's QoS). */
 #define SCHED_QOS 1
 #define SCHED_SPIN 2
 #define SCHED_DEMAND_FIRST 4
+#define SCHED_QOS_DEMAND 8
 static int sched_mode = 0;
 #define SCHED_SPIN_NS 30000
 
 static void sched_thread(qos_class_t qos, const char *fmt, int i) {
-    if (!(sched_mode & SCHED_QOS)) return;
-    pthread_set_qos_class_self_np(qos, 0);
+    if (!(sched_mode & (SCHED_QOS | SCHED_QOS_DEMAND))) return;
+    if ((sched_mode & SCHED_QOS) || qos != QOS_CLASS_UTILITY) pthread_set_qos_class_self_np(qos, 0);
     char name[32];
     snprintf(name, sizeof name, fmt, i);
     pthread_setname_np(name);
@@ -1250,11 +1253,12 @@ int q3ld_spec_streams(int32_t idle_busy) {
     return 0;
 }
 
-/* SCHED: the pool's scheduling bits (SCHED_QOS, SCHED_SPIN (only with SCHED_QOS), SCHED_DEMAND_FIRST; 0 = stock); a
+/* SCHED: the pool's scheduling bits (SCHED_QOS, SCHED_SPIN (only with SCHED_QOS), SCHED_DEMAND_FIRST, SCHED_QOS_DEMAND
+ * (not with SCHED_QOS); 0 = stock); a
  * stopped pool only, before q3ld_start. 0 or -1. */
 int q3ld_sched_config(int32_t mode) {
     pthread_mutex_lock(&mu);
-    if (running || mode < 0 || mode > 7 || ((mode & SCHED_SPIN) && !(mode & SCHED_QOS))) { pthread_mutex_unlock(&mu); return -1; }
+    if (running || mode < 0 || mode > 15 || ((mode & SCHED_SPIN) && !(mode & SCHED_QOS)) || ((mode & SCHED_QOS) && (mode & SCHED_QOS_DEMAND))) { pthread_mutex_unlock(&mu); return -1; }
     sched_mode = mode;
     pthread_mutex_unlock(&mu);
     return 0;

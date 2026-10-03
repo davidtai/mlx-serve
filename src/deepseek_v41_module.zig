@@ -834,7 +834,7 @@ pub const Module = struct {
         {
             const rs = self.installed.reader_sched;
             var nb: [24]u8 = undefined;
-            log.info("NATIVE reader scheduling: {s} (threads {s}; spin {s}; speculative chunks {s})", .{ rs.name(&nb), if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)" });
+            log.info("NATIVE reader scheduling: {s} (threads {s}; spin {s}; speculative chunks {s})", .{ rs.name(&nb), if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else if (rs.qos_demand) "USER_INTERACTIVE demand + watchdog, speculative inherited (no UTILITY), named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)" });
         }
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
