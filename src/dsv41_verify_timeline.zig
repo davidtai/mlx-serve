@@ -56,16 +56,22 @@ var t0: u64 = 0;
 var stream: ?mlx.mlx_stream = null;
 
 const c = if (enabled) struct {
-    extern fn dsv41tl_mlx_buffer(s: mlx.mlx_stream) ?*anyopaque;
-    extern fn dsv41tl_install(buf: ?*anyopaque, rows: [*]Row, cap: u32) c_int;
-    extern fn dsv41tl_tag(tag: u64) void;
-    extern fn dsv41tl_counts(out: *[3]u32) void;
-    extern fn dsv41tl_rehook(buf: ?*anyopaque) c_int;
-    extern fn dsv41tl_hook_stats(out: *[4]u64) void;
-    extern fn dsv41tl_hooked_names(out: [*]u8, cap: usize) usize;
-    extern fn dsv41tl_selftest(rows: [*]Row, cap: u32) c_int;
-    extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
+    pub extern fn dsv41tl_mlx_buffer(s: mlx.mlx_stream) ?*anyopaque;
+    pub extern fn dsv41tl_install(buf: ?*anyopaque, rows: [*]Row, cap: u32) c_int;
+    pub extern fn dsv41tl_tag(tag: u64) void;
+    pub extern fn dsv41tl_counts(out: *[3]u32) void;
+    pub extern fn dsv41tl_rehook(buf: ?*anyopaque) c_int;
+    pub extern fn dsv41tl_hook_stats(out: *[4]u64) void;
+    pub extern fn dsv41tl_hooked_names(out: [*]u8, cap: usize) usize;
+    pub extern fn dsv41tl_selftest(rows: [*]Row, cap: u32) c_int;
+    pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else struct {};
+// The guards below (`@hasDecl(c, ...)`) see only pub declarations: a profile build must reach every shim call.
+comptime {
+    if (enabled) for (.{ "dsv41tl_tag", "dsv41tl_rehook", "dsv41tl_counts", "dsv41tl_hook_stats", "dsv41tl_hooked_names", "q3ld_test_ev_log" }) |n| {
+        if (!@hasDecl(c, n)) @compileError("dsv41 verify timeline: the shim's " ++ n ++ " is not reachable");
+    };
+}
 
 pub fn now() u64 {
     var ts: std.c.timespec = undefined;
@@ -612,6 +618,9 @@ test "dsv41 verify timeline (profile builds): the -commit hook on a fake buffer 
     if (comptime !enabled) return error.SkipZigTest;
     // dsv41tl_selftest (lib/expert_io/dsv41_cb_timeline.mm): no Metal object; 0 or the failed check's number
     try std.testing.expectEqual(@as(c_int, 0), c.dsv41tl_selftest(&selftest_rows, selftest_rows.len));
+    // the Zig side reaches the shim's counters (the fake commits: 5 override entries recorded as rows)
+    try std.testing.expect(hookStats()[0] > 0);
+    try std.testing.expect(counts()[0] > 0);
 }
 
 test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, idle split, hit spans, router gaps, the gated waits to the pool's signals" {
