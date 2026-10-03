@@ -44,6 +44,9 @@ const first_cycle = @import("dsv41_decode_first.zig");
 const draft_routes = @import("dsv41_draft_routes.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
 const host_heap = @import("dsv41_host_heap.zig");
+/// PROFILE builds only (lib/expert_io/dsv41_newbuffer_count.mm; referenced only under `dt.enabled`).
+pub extern fn dsv41nb_install() c_int;
+pub extern fn dsv41nb_read(out: *[2]u64) void;
 
 /// One phase's memory for the bill (C4), printed on its own line: MLX's active bytes now, its
 /// high-water mark since the previous probe (then reset), and the process footprint now
@@ -636,12 +639,17 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
 }
 
 /// A profile build's read-outs, armed by a decode-profile run (DSV41_CELL_DECODE_PROFILE), each off with its env set
-/// to 0: the draft's routed ids, the verify's GPU timeline, the host heap at three marks.
+/// to 0: the draft's routed ids, the verify's GPU timeline, the host heap at three marks, and MLX_NEWBUFFER:
+/// -[MTLDevice newBufferWithLength:options:] calls and bytes (MLX's buffer-cache miss allocations; MLX keeps no
+/// allocation or hit counter) at the prompt's start, the phase change and the decode end.
 const ProfReadOuts = struct {
     routes: bool,
     timeline: bool,
     heap: bool,
+    newbuffer: bool = false,
     heap_samples: [host_heap.marks.len]host_heap.Mark = @splat(.{}),
+    newbuffer_samples: [3][2]u64 = @splat(.{ 0, 0 }),
+    newbuffer_cycles: usize = 0,
 
     fn of(profile: bool) ProfReadOuts {
         const on = struct {
@@ -649,11 +657,17 @@ const ProfReadOuts = struct {
                 return !std.mem.eql(u8, envStr(name) orelse "1", "0");
             }
         }.f;
-        return .{ .routes = profile and on("DSV41_CELL_DRAFT_ROUTE_HIST"), .timeline = profile and on("DSV41_CELL_VERIFY_GPU_TIMELINE"), .heap = profile and on("DSV41_CELL_HOST_HEAP") };
+        return .{ .routes = profile and on("DSV41_CELL_DRAFT_ROUTE_HIST"), .timeline = profile and on("DSV41_CELL_VERIFY_GPU_TIMELINE"), .heap = profile and on("DSV41_CELL_HOST_HEAP"), .newbuffer = profile and on("DSV41_CELL_MLX_NEWBUFFER") };
     }
 
     fn any(self: *const ProfReadOuts) bool {
-        return self.routes or self.timeline or self.heap;
+        return self.routes or self.timeline or self.heap or self.newbuffer;
+    }
+
+    /// The MLX_NEWBUFFER object: calls and bytes at the three marks and the decode's own (decode end less the phase change).
+    fn newbufferJson(self: *const ProfReadOuts, buf: []u8) []const u8 {
+        const s = self.newbuffer_samples;
+        return std.fmt.bufPrint(buf, "{{\"marks\": [\"prompt start\", \"phase change\", \"decode end\"], \"calls\": [{d}, {d}, {d}], \"bytes\": [{d}, {d}, {d}], \"decode_calls\": {d}, \"decode_bytes\": {d}, \"decode_cycles\": {d}}}", .{ s[0][0], s[1][0], s[2][0], s[0][1], s[1][1], s[2][1], s[2][0] -| s[1][0], s[2][1] -| s[1][1], self.newbuffer_cycles }) catch "null";
     }
 
     /// The receipt with the armed read-outs' objects added before its closing brace.
@@ -674,6 +688,10 @@ const ProfReadOuts = struct {
         if (self.heap) {
             try w.writeAll(",\n \"host_heap\": ");
             try host_heap.writeJson(w, &self.heap_samples);
+        }
+        if (self.newbuffer) {
+            var nb: [512]u8 = undefined;
+            try w.print(",\n \"mlx_newbuffer\": {s}", .{self.newbufferJson(&nb)});
         }
         try w.writeAll("\n}");
         return aw.written();
@@ -697,6 +715,16 @@ test "dsv41 ar: profile read-outs (profile builds): the receipt keeps its fields
     try testing.expect(v.object.get("draft_route_stream").?.object.get("cycles") != null);
     try testing.expect(v.object.get("verify_gpu_timeline").?.object.get("buffers") != null);
     try testing.expectEqual(@as(i64, 1000), v.object.get("host_heap").?.object.get("decode_end").?.object.get("cached").?.integer);
+    // MLX_NEWBUFFER (no device here: its samples set by hand): the decode's own calls and bytes, as valid JSON
+    var nbo: ProfReadOuts = .{ .routes = false, .timeline = false, .heap = false, .newbuffer = true, .newbuffer_samples = .{ .{ 10, 1000 }, .{ 40, 9000 }, .{ 151, 241000 } }, .newbuffer_cycles = 111 };
+    const nv = try std.json.parseFromSliceLeaky(std.json.Value, a, try nbo.receipt(a, json0), .{});
+    const nbj = nv.object.get("mlx_newbuffer").?.object;
+    try testing.expectEqual(@as(i64, 111), nbj.get("decode_calls").?.integer);
+    try testing.expectEqual(@as(i64, 232000), nbj.get("decode_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 111), nbj.get("decode_cycles").?.integer);
+    try testing.expectEqual(@as(usize, 3), nbj.get("calls").?.array.items.len);
+    nbo.newbuffer = false;
+    try testing.expectEqualStrings(json0, try nbo.receipt(a, json0));
 }
 
 test "dsv41 ar: the served schedule's variants parse by name and plan their Module calls (pass3ab)" {
@@ -1341,6 +1369,9 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (comptime dt.enabled) if (ro.heap) {
         ro.heap_samples[0] = host_heap.sample();
     };
+    if (comptime dt.enabled) if (ro.newbuffer) {
+        if (dsv41nb_install() != 0) ro.newbuffer = false else dsv41nb_read(&ro.newbuffer_samples[0]);
+    };
     const s_start = arm.hook.source.stats();
     _ = mlx.mlx_reset_peak_memory();
     // A0 (profile builds): construction's first dispatches are behind the prompt's.
@@ -1381,6 +1412,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     if (comptime dt.enabled) if (ro.heap) {
         ro.heap_samples[1] = host_heap.sample();
     };
+    if (comptime dt.enabled) if (ro.newbuffer) dsv41nb_read(&ro.newbuffer_samples[1]);
     mlx_peak = @max(mlx_peak, @max(phases[2].mlx_peak_bytes, memProbePeak("dsv41 served cell", "the phase change (embedding fence, slot banks grown)")));
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
@@ -1491,6 +1523,12 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         ro.heap_samples[2] = host_heap.sample();
         var hb: [8192]u8 = undefined;
         std.debug.print("NATIVE {s}\n", .{host_heap.line(&hb, &ro.heap_samples)});
+    };
+    if (comptime dt.enabled) if (ro.newbuffer) {
+        dsv41nb_read(&ro.newbuffer_samples[2]);
+        ro.newbuffer_cycles = cycles.items.len;
+        var nb: [512]u8 = undefined;
+        std.debug.print("NATIVE MLX_NEWBUFFER {s}\n", .{ro.newbufferJson(&nb)});
     };
     mlx_peak = @max(mlx_peak, @max(phases[3].mlx_peak_bytes, memProbePeak("dsv41 served cell", "cycles")));
 
