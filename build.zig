@@ -242,6 +242,15 @@ pub fn build(b: *std.Build) void {
     const check_exe = b.addExecutable(.{ .name = "mlx-serve-check", .root_module = mod });
     const check_step = b.step("check", "Check that the server graph compiles, without codegen (with -Dslim: the slim host)");
     check_step.dependOn(&check_exe.step);
+    // The Linux graph's semantic check (stub engines; macOS-only plugins register nothing): its module without link
+    // inputs, nothing emitted, Homebrew's webp headers in place of the system's; glibc 2.39 (arc4random_buf, as a
+    // current distribution's).
+    const linux_check = b.addExecutable(.{
+        .name = "mlx-serve-linux-check",
+        .root_module = linuxModule(b, b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } }), .Debug, version, "unknown", "/opt/homebrew/include"),
+    });
+    const check_linux = b.step("check-linux", "Check that the Linux server graph (stub engines) compiles, without codegen or a Linux MLX stage");
+    check_linux.dependOn(&linux_check.step);
 
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
     const test_deps: TestDeps = .{ .options = test_options, .shared = shared, .ds4_metal_sources = ds4_metal_sources, .opencode2_plugin = opencode2_plugin, .agent_skills = agent_skills, .frameworks = macos_sdk_frameworks, .timeline = dsv41_decode_timers };
@@ -388,7 +397,43 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
+    const mod = linuxModule(b, target, optimize, version, mlx_c_version, "/usr/include");
 
+    // Jinja2 template engine — same vendored sources as the macOS graph, built
+    // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
+    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+
+    // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
+    addMlxLib(b, mod);
+    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
+    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
+
+    // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
+    mod.linkSystemLibrary("webp", .{});
+
+    // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
+    // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
+    mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
+
+    const exe = b.addExecutable(.{
+        .name = "mlx-serve",
+        .root_module = mod,
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+    const run_step = b.step("run", "Run mlx-serve");
+    run_step.dependOn(&run_cmd.step);
+}
+
+/// The Linux server graph's module: its build options (stub engines), imports, include paths and portable C sources,
+/// without the link inputs (the staged Linux mlx / mlx-c, libjinja-linux.a, libwebp, dns_sd), which `addLinuxServe` adds.
+/// `check-linux` checks this module alone from the macOS host: nothing is emitted, so no Linux MLX stage is needed.
+fn linuxModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, version: []const u8, mlx_c_version: []const u8, webp_include: []const u8) *std.Build.Module {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", false);
@@ -422,14 +467,12 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{webp_include}) }, .{ .cwd_relative = webp_include }, target, optimize, "") },
         },
     });
     addShared(b, target, optimize).importInto(mod);
 
-    // Jinja2 template engine — same vendored sources as the macOS graph, built
-    // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+    // Jinja2's headers (its ELF static lib, built by scripts/build-mlx-linux.sh, is a link input: addLinuxServe).
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
     // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
@@ -444,32 +487,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
     // compiles unchanged and gates itself off via available() == false.
     mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
-
-    // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
-    addMlxLib(b, mod);
-    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
-    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
-
-    // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
-    mod.linkSystemLibrary("webp", .{});
-
-    // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
-    // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
-    mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
-
-    const exe = b.addExecutable(.{
-        .name = "mlx-serve",
-        .root_module = mod,
-    });
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.addPassthruArgs();
-    const run_step = b.step("run", "Run mlx-serve");
-    run_step.dependOn(&run_cmd.step);
+    return mod;
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
@@ -649,6 +667,10 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     });
     const step = b.step(slice.step, b.fmt("Build the iOS engine static lib ({s})", .{slice.sdk}));
     step.dependOn(&install.step);
+    // The same graph's semantic check: nothing emitted.
+    const check_lib = b.addLibrary(.{ .name = "mlxserve-check", .root_module = mod, .linkage = .static });
+    const check = b.step(b.fmt("{s}-check", .{slice.step}), b.fmt("Check that the iOS engine graph ({s}) compiles, without codegen", .{slice.sdk}));
+    check.dependOn(&check_lib.step);
 }
 
 /// Translates a single C header into an importable module (`@import("name")`
