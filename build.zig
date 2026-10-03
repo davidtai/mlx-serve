@@ -736,6 +736,7 @@ fn addExpertIoSources(b: *std.Build, module: *std.Build.Module, inject: bool, ti
     module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
     if (timeline) {
         module.addCSourceFile(.{ .file = b.path("lib/expert_io/dsv41_cb_timeline.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+        module.addCSourceFile(.{ .file = b.path("lib/expert_io/dsv41_newbuffer_count.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
         module.addCSourceFile(.{ .file = b.path("lib/expert_io/dsv41_tl_mlx.cpp"), .flags = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" } });
     }
 }
