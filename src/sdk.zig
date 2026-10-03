@@ -47,6 +47,7 @@ pub const LoadFacts = arch.LoadFacts;
 pub const LoadCtx = arch.LoadCtx;
 pub const RequestShape = arch.RequestShape;
 pub const DecodeHandover = arch.DecodeHandover;
+pub const Binds = arch.Binds;
 
 const spec = @import("sdk/spec.zig");
 pub const Spec = spec.Spec;

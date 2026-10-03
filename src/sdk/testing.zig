@@ -207,6 +207,8 @@ pub const FakeOptions = struct {
     block_size: u32 = 0,
     /// The prompt admission's bytes; null = the host's estimator.
     prompt_bytes: ?u64 = null,
+    /// The kinds the fake binds (`sdk.Binds`); none by default.
+    binds: arch.Binds = .{},
 };
 
 /// Every call a fake arch's module received.
@@ -224,6 +226,7 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
     return struct {
         pub const name = "fake-arch";
         pub const caps = opts.caps;
+        pub const binds: arch.Binds = opts.binds;
         pub const Config = struct { settings_applied: u32 = 0 };
         pub const Module = struct {
             gpa: std.mem.Allocator,

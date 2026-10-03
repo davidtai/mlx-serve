@@ -35,6 +35,12 @@ pub const Caps = struct {
     uses_expert_reader: bool = false,
 };
 
+/// The kinds an arch binds at comptime: the quant of its routed experts and the expert source that streams them. The
+/// arch calls them directly (nothing per layer crosses the registry); the registry names them beside the arch where a
+/// user sees what served a model (`/v1/models` and `/props` `plugins`). Each must be its own plugin's: the registry
+/// refuses, at compile time and by name, a binding its plugin does not provide.
+pub const Binds = struct { quant: ?type = null, expert_source: ?type = null };
+
 /// The parsed model's facts the host keeps on its own config.
 pub const Shell = struct { num_experts: u32 = 0, num_layers: u32 = 0 };
 
@@ -108,7 +114,7 @@ pub const Arch = struct {
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
-    /// draft_lane, bill.
+    /// draft_lane, bill, binds (a `Binds`, read by the registry).
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -131,6 +137,7 @@ pub const Arch = struct {
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
             if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
+            if (check.has(T, "binds")) check.valueDecl(w, T, "binds", Binds);
         }
         const W = struct {
             fn cfgOf(cfg: *anyopaque) *T.Config {

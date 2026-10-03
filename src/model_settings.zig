@@ -160,6 +160,27 @@ pub fn applyArch(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8, a
     arch.apply_settings(cfg, s.entry(model_path) orelse .null);
 }
 
+/// The plugin a model's entry names to break a `claims` tie between registered archs (`"plugin": "<name>"`, borrowed
+/// from the entry); null when it names none. Not part of `Override`: the host's override and its log line stay as
+/// they are, and only a build where two archs can tie reads it (`plugins.registry.arch_ties_possible`).
+pub fn pluginOf(entry: std.json.Value) ?[]const u8 {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("plugin") orelse return null;
+    return if (v == .string and v.string.len > 0) v.string else null;
+}
+
+/// `pluginOf` for the model in the default file, owned by the caller.
+pub fn pluginFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) ?[]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    const name = pluginOf(s.entry(model_path) orelse return null) orelse return null;
+    return alloc.dupe(u8, name) catch null;
+}
+
 /// The one call load sites make: read the default file, look the model up, log
 /// a hit. The caller owns the result (`Override.deinit`).
 pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
@@ -299,4 +320,18 @@ test "model_settings: a registered arch reads its own keys from the model's entr
     const e = s.entry("/m/a/").?;
     try std.testing.expectEqualStrings("stock", e.object.get("numeric_tier").?.string);
     try std.testing.expect(s.entry("/m/b") == null);
+}
+
+test "dsv41 plugins: model-settings.json's plugin names a claims tie-break; anything else is unset, and the override stays empty" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"plugin": "mlx-stream"}, "/m/b": {"plugin": 1}, "/m/c": {"plugin": ""}, "/m/d": {"ctx_size": 4096}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqualStrings("mlx-stream", pluginOf(s.entry("/m/a/").?).?);
+    try std.testing.expect(pluginOf(s.entry("/m/b").?) == null);
+    try std.testing.expect(pluginOf(s.entry("/m/c").?) == null);
+    try std.testing.expect(pluginOf(s.entry("/m/d").?) == null);
+    try std.testing.expect(pluginOf(.null) == null);
+    // The key is the registry's, not the host override's: an entry naming only a plugin logs no [model-settings] line.
+    try std.testing.expect(s.lookup(std.testing.allocator, "/m/a").isEmpty());
 }

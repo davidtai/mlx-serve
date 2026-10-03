@@ -21,6 +21,10 @@ pub const caps: sdk.Caps = .{
 pub const Config = settings.Config;
 pub const Module = module.Module;
 
+/// What the module binds at comptime: the EXL3 quant of its routed experts (the module's `exl3_quant` import) and the
+/// EXL3 expert source that streams them. `/v1/models` and `/props` name both beside the arch.
+pub const binds: sdk.Binds = .{ .quant = @import("exl3_quant.zig"), .expert_source = @import("exl3_source.zig") };
+
 pub fn claims(p: *const sdk.ConfigPeek) ?sdk.Priority {
     const t = p.modelType() orelse return null;
     return if (std.mem.eql(u8, t, name)) .native else null;

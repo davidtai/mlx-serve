@@ -48,6 +48,33 @@ pub fn Registry(comptime plugins: []const sdk.Plugin, comptime platform: Platfor
         pub const archs = tableOf(sdk.Arch, "arch", plugins, platform);
         pub const engines = tableOf(sdk.Engine, "engine", plugins, platform);
 
+        /// Whether two archs can tie on a model in this build (two or more registered). Only then does the host read
+        /// the model's `plugin` setting (model-settings.json) to break the tie: a build with one arch never reads it.
+        pub const arch_ties_possible = archs.len > 1;
+
+        /// Whether `name` is a plugin this build registers.
+        pub fn registered(name: []const u8) bool {
+            inline for (plugins) |p| {
+                if (comptime registers(p, platform)) {
+                    if (std.mem.eql(u8, p.name, name)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// What served a model, as `/v1/models` and `/props` carry it: `,"plugins":[...]`, one object per kind (the
+        /// arch, then the quant and the expert source it binds, `sdk.Binds`), each naming its plugin. Built at compile
+        /// time; "" for a model no registered arch serves (an in-tree arch, an embedded engine), which leaves those
+        /// bodies as they were.
+        pub fn servedJson(a: ?*const sdk.Arch) []const u8 {
+            const want = a orelse return "";
+            for (&archs, &arch_served) |*e, j| {
+                if (&e.kind == want) return j;
+            }
+            return "";
+        }
+        const arch_served = servedOf(plugins, platform);
+
         /// The arch that serves a model (discovery): the highest claim; among the tied, the plugin
         /// model-settings.json names (`prefer`), else the first in registry order. Null: no arch claims it.
         pub fn arch(peek: *const sdk.ConfigPeek, prefer: ?[]const u8) ?*const Entry(sdk.Arch) {
@@ -90,6 +117,44 @@ fn tableOf(comptime K: type, comptime field: []const u8, comptime plugins: []con
         }
     }
     return out;
+}
+
+/// Each registered arch's `plugins` fragment, in its table's order. An arch may bind only its own plugin's quant and
+/// expert source: anything else is refused here, by name.
+fn servedOf(comptime plugins: []const sdk.Plugin, comptime platform: Platform) [countOf("arch", plugins, platform)][]const u8 {
+    comptime {
+        var out: [countOf("arch", plugins, platform)][]const u8 = undefined;
+        var i: usize = 0;
+        for (plugins) |p| {
+            if (!registers(p, platform)) continue;
+            const A = p.provides.arch orelse continue;
+            const b: sdk.Binds = if (@hasDecl(A, "binds") and @TypeOf(A.binds) != void) A.binds else .{};
+            var s: []const u8 = ",\"plugins\":[" ++ servedItem(p.name, "arch", A.name);
+            for (.{ "quant", "expert_source" }) |kind| {
+                if (@field(b, kind)) |K| {
+                    const own = @field(p.provides, kind);
+                    if (own == null or own.? != K) @compileError("plugin " ++ p.name ++ ": arch " ++ A.name ++ " binds " ++ kind ++ " " ++ @typeName(K) ++ ", which the plugin does not provide");
+                    s = s ++ "," ++ servedItem(p.name, kind, K.name);
+                }
+            }
+            out[i] = s ++ "]";
+            i += 1;
+        }
+        const final = out;
+        return final;
+    }
+}
+
+fn servedItem(comptime plugin: []const u8, comptime kind: []const u8, comptime name: []const u8) []const u8 {
+    return "{\"plugin\":\"" ++ jsonSafe(plugin) ++ "\",\"kind\":\"" ++ kind ++ "\",\"name\":\"" ++ jsonSafe(name) ++ "\"}";
+}
+
+/// A name spliced into JSON verbatim: printable ASCII without a quote or a backslash, else a compile error.
+fn jsonSafe(comptime s: []const u8) []const u8 {
+    for (s) |c| {
+        if (c < 0x20 or c > 0x7e or c == '"' or c == '\\') @compileError("plugin name not JSON-safe: " ++ s);
+    }
+    return s;
 }
 
 fn countOf(comptime field: []const u8, comptime plugins: []const sdk.Plugin, comptime platform: Platform) usize {
@@ -249,4 +314,43 @@ test "plugins conformance: the CPU lane created no Metal device" {
 // The import boundary's own test runs with the conformance suite ("plugins import probe").
 comptime {
     if (@import("builtin").is_test and registers_mlx_stream) _ = @import("mlx_stream/mlx_stream_imports.zig");
+}
+
+const FakeStream = struct {
+    pub const name = "fake-stream";
+    pub fn claims(_: *const sdk.ConfigPeek) ?sdk.Priority {
+        return .native;
+    }
+};
+const fake_d: sdk.Plugin = .{ .name = "fake-d", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "fake_d", .binds = .{ .expert_source = FakeStream } }), .expert_source = FakeStream } };
+
+test "plugins registry: what served a model names its arch and what the arch binds, each with its plugin; nothing for a model no arch serves" {
+    const R = Registry(&.{ fake_a, fake_d }, .{ .macos = true });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = R.arch(&try peekOf(a, "{\"model_type\":\"fake_d\"}"), null).?;
+    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"fake-d\",\"kind\":\"arch\",\"name\":\"fake-arch\"},{\"plugin\":\"fake-d\",\"kind\":\"expert_source\",\"name\":\"fake-stream\"}]", R.servedJson(&d.kind));
+    const f = R.arch(&try peekOf(a, "{\"model_type\":\"fake_arch\"}"), null).?;
+    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"fake-a\",\"kind\":\"arch\",\"name\":\"fake-arch\"}]", R.servedJson(&f.kind));
+    try testing.expectEqualStrings("", R.servedJson(null));
+    // An arch table that is not this registry's entry (an in-tree arch's own) is served by no plugin.
+    const loose = comptime sdk.Arch.of(FakeArch(.{}));
+    try testing.expectEqualStrings("", R.servedJson(&loose));
+    // Two archs can tie here, so the host reads the model's plugin setting; a one-arch registry never does.
+    try testing.expect(R.arch_ties_possible and R.registered("fake-d") and !R.registered("mlx-stream"));
+    try testing.expect(!Registry(&.{ fake_a, fake_c }, .{ .macos = true }).arch_ties_possible);
+}
+
+test "plugins registry: mlx-stream serves deepseek_v41 with the EXL3 quant and stream it binds; one arch, no tie to break" {
+    if (comptime registry.archs.len == 0) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const peek = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
+    const e = registry.arch(&peek, null).?;
+    try testing.expectEqualStrings("mlx-stream", e.plugin);
+    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"mlx-stream\",\"kind\":\"arch\",\"name\":\"deepseek_v41\"},{\"plugin\":\"mlx-stream\",\"kind\":\"quant\",\"name\":\"exl3-mul1-k3\"},{\"plugin\":\"mlx-stream\",\"kind\":\"expert_source\",\"name\":\"exl3-stream\"}]", registry.servedJson(&e.kind));
+    // The served build registers one arch: discovery never reads the plugin setting, and a preference changes nothing.
+    try testing.expect(!registry.arch_ties_possible and registry.registered("mlx-stream"));
+    try testing.expect(registry.arch(&peek, "fake-a").? == e);
 }

@@ -12,6 +12,7 @@ const chat_mod = @import("chat.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
+const plugins = @import("plugins.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
@@ -6447,7 +6448,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}{s}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6481,6 +6482,8 @@ fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
+            // The plugins that serve it (`,"plugins":[...]`), "" for a model no registered arch serves.
+            plugins.registry.servedJson(config.arch),
         });
     }
 
@@ -7354,7 +7357,8 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    // The plugins that serve the model (`,"plugins":[...]`), "" for a model no registered arch serves.
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, plugins.registry.servedJson(config.arch) });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -19963,6 +19967,41 @@ test "renderPropsBody omits chat_template" {
     try testing.expect(std.mem.indexOf(u8, body, "\"ane\"") == null);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     parsed.deinit();
+}
+
+test "dsv41 plugins: /props and /v1/models carry the plugins that serve deepseek_v41; a model no plugin serves carries none" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "gemma4";
+    try testing.expectEqualStrings("", plugins.registry.servedJson(config.arch));
+    const plain = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, plugins.registry.servedJson(config.arch));
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "\"plugins\"") == null);
+    _ = plugins.mlx_stream_testing orelse return error.SkipZigTest;
+    // The arch the registry's claims route a deepseek_v41 config to (model.zig's discovery), as the load keeps it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const peek = try @import("sdk").ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"deepseek_v41\"}");
+    config.arch = &(plugins.registry.arch(&peek, null) orelse return error.NotClaimed).kind;
+    config.model_type = "deepseek_v41";
+    const frag = plugins.registry.servedJson(config.arch);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+    defer testing.allocator.free(body);
+    std.debug.print("dsv41 plugins props: {s}\n", .{body});
+    // A /v1/models ready row ends `...,"meta":{...}<frag>}`.
+    const row = try std.fmt.allocPrint(testing.allocator, "{{\"id\":\"m\",\"meta\":{{\"architecture\":\"deepseek_v41\"}}{s}}}", .{frag});
+    defer testing.allocator.free(row);
+    for ([_][]const u8{ body, row }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const list = (parsed.value.object.get("plugins") orelse return error.MissingPlugins).array.items;
+        const want = [_][3][]const u8{ .{ "mlx-stream", "arch", "deepseek_v41" }, .{ "mlx-stream", "quant", "exl3-mul1-k3" }, .{ "mlx-stream", "expert_source", "exl3-stream" } };
+        try testing.expectEqual(want.len, list.len);
+        for (want, list) |w, got| {
+            try testing.expectEqualStrings(w[0], got.object.get("plugin").?.string);
+            try testing.expectEqualStrings(w[1], got.object.get("kind").?.string);
+            try testing.expectEqualStrings(w[2], got.object.get("name").?.string);
+        }
+    }
 }
 
 test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {

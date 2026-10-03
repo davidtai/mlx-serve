@@ -11,6 +11,7 @@ const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const sdk = @import("sdk");
 const plugins = @import("plugins.zig");
+const model_settings = @import("model_settings.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -1391,7 +1392,12 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
-    var config = try parseConfigFromJsonIn(allocator, content, model_dir);
+    // Two registered archs can tie on a model only in a build that registers two or more; there the model's
+    // model-settings.json entry may name the plugin that breaks the tie (`plugin`). A build with one arch reads nothing.
+    const prefer: ?[]u8 = if (plugins.registry.arch_ties_possible) model_settings.pluginFor(allocator, io, model_dir) else null;
+    defer if (prefer) |p| allocator.free(p);
+    if (prefer) |p| if (!plugins.registry.registered(p)) log.warn("[model-settings] {s}: plugin {s} is not registered in this build, ignored\n", .{ model_dir, p });
+    var config = try parseConfigFromJsonPrefer(allocator, content, model_dir, prefer);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
     }
@@ -1889,6 +1895,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
 /// `parseConfigFromJson` for the model in `model_dir` ("" for none): a registered arch's own parse sees it.
 pub fn parseConfigFromJsonIn(allocator: std.mem.Allocator, content: []const u8, model_dir: []const u8) !ModelConfig {
+    return parseConfigFromJsonPrefer(allocator, content, model_dir, null);
+}
+
+/// `parseConfigFromJsonIn` with the plugin that breaks a `claims` tie between registered archs (`prefer`, from the
+/// model's settings; null: registry order).
+pub fn parseConfigFromJsonPrefer(allocator: std.mem.Allocator, content: []const u8, model_dir: []const u8, prefer: ?[]const u8) !ModelConfig {
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
@@ -3158,7 +3170,7 @@ pub fn parseConfigFromJsonIn(allocator: std.mem.Allocator, content: []const u8, 
                 return error.UnsupportedInklingConfig;
             }
         }
-    } else if (plugins.registry.arch(&.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, null)) |e| {
+    } else if (plugins.registry.arch(&.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, prefer)) |e| {
         // A registered arch (src/plugins.zig): its own parse refuses by name; its module owns everything past the
         // shell's generic fields, which it states (`shell`).
         var diag: sdk.Diag = .{};
