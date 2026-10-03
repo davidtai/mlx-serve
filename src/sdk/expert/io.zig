@@ -462,7 +462,7 @@ pub const Pool = struct {
 /// rows; a test that asks for a scheduling itself keeps it.
 fn testSched(s: Sched) Sched {
     if (comptime !@import("builtin").is_test) return s;
-    if (s.qos or s.spin or s.demand_first) return s;
+    if (s.qos or s.qos_demand or s.spin or s.demand_first) return s;
     const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
     return Sched.parse(std.mem.span(v)) orelse s;
 }

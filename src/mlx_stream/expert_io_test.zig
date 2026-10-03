@@ -696,7 +696,7 @@ const ThreadProbe = struct {
     const user_interactive: c_uint = 0x21;
     const utility: c_uint = 0x11;
 
-    const Seen = struct { demand: u32 = 0, demand_ui: u32 = 0, spec: u32 = 0, spec_utility: u32 = 0, watchdog: u32 = 0, watchdog_ui: u32 = 0, named: u32 = 0 };
+    const Seen = struct { demand: u32 = 0, demand_ui: u32 = 0, spec: u32 = 0, spec_utility: u32 = 0, spec_inherited: u32 = 0, watchdog: u32 = 0, watchdog_ui: u32 = 0, named: u32 = 0 };
 
     fn qosOf(t: std.c.pthread_t) c_uint {
         var q: c_uint = 0;
@@ -726,6 +726,7 @@ const ThreadProbe = struct {
             } else if (std.mem.startsWith(u8, nm, "q3ld-spec-")) {
                 s.spec += 1;
                 s.spec_utility += @intFromBool(q == utility);
+                s.spec_inherited += @intFromBool(q == qosOf(pthread_self()));
             } else if (std.mem.eql(u8, nm, "q3ld-watchdog")) {
                 s.watchdog += 1;
                 s.watchdog_ui += @intFromBool(q == user_interactive);
@@ -739,7 +740,7 @@ test "dsv41 io: the reader scheduling sets each pool thread's QoS and name at st
     // The bank sweep (DSV41_TEST_READER_SCHED) runs every pool at one value: this test reads all three itself.
     if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
     const page = std.heap.pageSize();
-    for ([_]Sched{ .{}, .{ .qos = true }, .{ .qos = true, .spin = true }, .{ .demand_first = true }, .{ .qos = true, .spin = true, .demand_first = true } }) |sched| {
+    for ([_]Sched{ .{}, .{ .qos = true }, .{ .qos = true, .spin = true }, .{ .demand_first = true }, .{ .qos = true, .spin = true, .demand_first = true }, .{ .qos_demand = true } }) |sched| {
         var nb: [24]u8 = undefined;
         const label = sched.name(&nb);
         var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .sched = sched, .spec = .{ .threads = 1, .slots = 1, .record_bytes = page, .chunk_bytes = page } });
@@ -751,11 +752,18 @@ test "dsv41 io: the reader scheduling sets each pool thread's QoS and name at st
         var tries: u32 = 0;
         while (tries < 200) : (tries += 1) {
             seen = ThreadProbe.scan(label);
-            if (!sched.qos or seen.named == 4) break;
+            if (!(sched.qos or sched.qos_demand) or seen.named == 4) break;
             std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
         }
         std.debug.print("QOSPROBE {s}: self qos 0x{x}; demand {d} (UI {d}), spec {d} (UTILITY {d}), watchdog {d} (UI {d})\n", .{ label, ThreadProbe.qosOf(ThreadProbe.pthread_self()), seen.demand, seen.demand_ui, seen.spec, seen.spec_utility, seen.watchdog, seen.watchdog_ui });
-        if (!sched.qos) {
+        if (sched.qos_demand) {
+            // qosdemand: demand + watchdog raised, the speculative worker at the creating thread's class (no UTILITY)
+            try testing.expectEqual(@as(u32, 2), seen.demand_ui);
+            try testing.expectEqual(@as(u32, 0), seen.spec_utility);
+            try testing.expectEqual(@as(u32, 1), seen.spec_inherited);
+            try testing.expectEqual(@as(u32, 1), seen.watchdog_ui);
+            try testing.expectEqual(@as(u32, 4), seen.named);
+        } else if (!sched.qos) {
             try testing.expectEqual(@as(u32, 0), seen.named);
         } else {
             try testing.expectEqual(@as(u32, 2), seen.demand_ui);
@@ -772,6 +780,13 @@ test "dsv41 io: the reader scheduling list: off or qos, spin, demandfirst (spin 
     try testing.expectEqualStrings("qos,spin,demandfirst", (Sched.parse("demandfirst,spin,qos").?).name(&nb));
     try testing.expectEqual(@as(i32, 5), (Sched.parse("qos,demandfirst").?).bits());
     for ([_][]const u8{ "spin", "qos,qos", "qos,fast", "", "QOS" }) |bad| try testing.expect(Sched.parse(bad) == null);
+    // qosdemand: its own bit, named after qos, refused with qos and with spin; the C pool refuses the pair as well
+    try testing.expectEqualStrings("qosdemand", (Sched.parse("qosdemand").?).name(&nb));
+    try testing.expectEqual(@as(i32, 8), (Sched.parse("qosdemand").?).bits());
+    try testing.expectEqualStrings("qosdemand,demandfirst", (Sched.parse("demandfirst,qosdemand").?).name(&nb));
+    try testing.expectEqual(@as(i32, 12), (Sched.parse("qosdemand,demandfirst").?).bits());
+    for ([_][]const u8{ "qos,qosdemand", "qosdemand,spin", "qosdemand,qosdemand", "qosdemand," }) |bad| try testing.expect(Sched.parse(bad) == null);
+    try testing.expectError(error.PoolUnavailable, Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = .{ .qos = true, .qos_demand = true } }));
     try testing.expectError(error.PoolUnavailable, Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = .{ .spin = true } }));
 }
 

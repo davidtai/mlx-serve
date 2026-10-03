@@ -1077,6 +1077,9 @@ const CellReceipt = struct {
     /// and its bytes in `phase_change.tail_release_bytes`.
     phase_tail_release: ?bool = null,
     tail_release: ?module.TailReleaseRecord = null,
+    /// STOCKDELAY as installed (`module.phaseGrowDelayMs`; 0: off): the sleep between the phase change's settled frees and
+    /// the grow (its time and the frees-to-grow interval ride in `phase_change`).
+    phase_grow_delay_ms: u32 = 0,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1087,7 +1090,7 @@ const CellReceipt = struct {
     draft_cache_stats: ?expert_stream.Stats = null,
     /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
     draft_cache_pool: ?[]const u8 = null,
-    /// The read pool's scheduling as installed ("off" or the list of qos, spin, demandfirst; `module.readerSched`), and its
+    /// The read pool's scheduling as installed ("off" or the list of qos, qosdemand, spin, demandfirst; `module.readerSched`), and its
     /// demand-first knob on its own.
     reader_sched: ?[]const u8 = null,
     reader_demand_first: ?bool = null,
@@ -1134,6 +1137,9 @@ const CellReceipt = struct {
     dense_rc: ?bool = null,
     /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
     routed_banked: bool = false,
+    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction (the stock-route leak's
+    /// discriminator; false: off).
+    gemv_rebuild: bool = false,
     /// File-backed pages at the step's vm start (each phase record's file_cache_created_bytes is from here).
     file_backed_start_bytes: ?u64 = null,
 };
@@ -1577,6 +1583,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .host_relief = md.installed.host_relief,
         .phase_tail_release = md.installed.phase_tail_release,
         .tail_release = md.tail_release,
+        .phase_grow_delay_ms = md.installed.phase_grow_delay_ms,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .draft_cache_hot = md.installed.draft_cache_hot,
@@ -1612,6 +1619,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .routed_forms = formsName(md.installed.routed_forms),
         .dense_rc = md.installed.dense_rc,
         .routed_banked = md.installed.routed_banked,
+        .gemv_rebuild = md.installed.gemv_rebuild,
         .file_backed_start_bytes = cx.file_backed_start,
     };
     if (profile) printDecodeProfile(prof.items);
@@ -1738,6 +1746,9 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // The phase change's settle condition (interval | until_freed; anything else refused here).
     if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
     if (envStr("DSV41_CELL_PHASE_TAIL_RELEASE")) |v| ov.phase_tail_release = try cellBool("DSV41_CELL_PHASE_TAIL_RELEASE", v);
+    // STOCKDELAY (W5): ms between the stock phase change's settled frees and the grow (the Module refuses 0, > 2000 and
+    // the tail release by name at construction).
+    if (envStr("DSV41_CELL_PHASE_GROW_DELAY_MS")) |v| ov.phase_grow_delay_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhaseGrowDelay;
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
     if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
@@ -1760,6 +1771,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
+    if (envStr("DSV41_CELL_GEMV_REBUILD")) |v| ov.gemv_rebuild = try cellBool("DSV41_CELL_GEMV_REBUILD", v);
     if (envStr("DSV41_CELL_HEAD_MXFP8_RC")) |v| ov.head_mxfp8_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellHeadMxfp8Rc;
     if (envStr("DSV41_CELL_WIDE_DEPTH")) |v| {
         const d = std.fmt.parseInt(u8, v, 10) catch return error.CellWideDepth;

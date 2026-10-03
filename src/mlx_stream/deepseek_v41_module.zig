@@ -142,6 +142,10 @@ pub const RouteOverrides = struct {
     /// ROUTED_BANKED (kbench v6d / v9b, exact): the routed decode stages on the banked texts, one launch per stage
     /// over a wave's rows of every bank (packed slot ids), the forms above taken. null: the default, off (per bank).
     routed_banked: ?bool = null,
+    /// GEMV_REBUILD (the stock-route leak's discriminator; info): the accept-time decode GEMVs freed and rebuilt at
+    /// construction on the forms above even when they are the stock texts (`formsRoute`). Exact: the same texts,
+    /// statics and launch configs. null: the default, off (the accept-time GEMVs kept unless a form is set).
+    gemv_rebuild: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
@@ -167,6 +171,10 @@ pub const RouteOverrides = struct {
     /// The phase change's frees (transient release, cache clear, decode cache limit) at the prompt's last trunk chunk,
     /// before the DSpark seed, so they land while the seed runs (`tailRelease`). null: the default, off.
     phase_tail_release: ?bool = null,
+    /// STOCKDELAY (W5's discriminator for the tail release's decode reading): the stock phase change with a fixed sleep
+    /// (ms, 1..`phase_grow_delay_max_ms`) between its settled frees and the grow, so the freed pages retire before the
+    /// decode rows are allocated; refused with the tail release. null: the default, off.
+    phase_grow_delay_ms: ?u32 = null,
     /// The phase change's per-layer decode rows (`arm_mod.DecodeRowsAlloc`). null: the default, uniform.
     decode_rows_alloc: ?arm_mod.DecodeRowsAlloc = null,
     /// The fill's decode granule (`arm_mod.DecodeFillGranule`). null: the default, a row.
@@ -192,6 +200,49 @@ pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
 /// The tail release route the Module installs (off by default; it needs the transient release and the DSpark seed).
 pub fn phaseTailRelease(ov: RouteOverrides) bool {
     return ov.phase_tail_release orelse false;
+}
+
+/// STOCKDELAY's bound: the longest sleep the discriminator may put between the frees and the grow.
+pub const phase_grow_delay_max_ms: u32 = 2000;
+
+/// STOCKDELAY as installed (0: off): refused by name at construction outside 1..`phase_grow_delay_max_ms` or with the
+/// tail release (the discriminator is the stock route plus the delay).
+pub fn phaseGrowDelayMs(ov: RouteOverrides) error{ PhaseGrowDelayOutOfRange, PhaseGrowDelayWithTailRelease }!u32 {
+    const d = ov.phase_grow_delay_ms orelse return 0;
+    if (d == 0 or d > phase_grow_delay_max_ms) return error.PhaseGrowDelayOutOfRange;
+    if (phaseTailRelease(ov)) return error.PhaseGrowDelayWithTailRelease;
+    return d;
+}
+
+/// The forms `routeForms` rebuilds the decode GEMVs on at construction, or null (the accept-time GEMVs kept): any
+/// form set, or GEMV_REBUILD (then the stock texts are rebuilt too). Unset, exactly the routing before GEMV_REBUILD.
+pub fn formsRoute(ov: RouteOverrides) ?xq.Forms {
+    const f = ov.routed_forms orelse xq.Forms{};
+    return if (f.down_pair or f.gu_one or (ov.gemv_rebuild orelse false)) f else null;
+}
+
+test "dsv41 module: GEMV_REBUILD routes the stock forms through routeForms; unset, the forms route exactly as before" {
+    // unset or 0: the accept-time GEMVs stay unless a form is set (the routing before GEMV_REBUILD)
+    try std.testing.expect(formsRoute(.{}) == null);
+    try std.testing.expect(formsRoute(.{ .routed_forms = .{} }) == null);
+    try std.testing.expect(formsRoute(.{ .gemv_rebuild = false }) == null);
+    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }).?);
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true }, .gemv_rebuild = false }).?);
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }).?);
+    // set: the stock texts rebuilt (with or without an explicit stock ROUTED_FORMS); a form set is unchanged by it
+    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .gemv_rebuild = true }).?);
+    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .routed_forms = .{}, .gemv_rebuild = true }).?);
+    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true }, .gemv_rebuild = true }).?);
+}
+
+test "dsv41 module: STOCKDELAY is off by default, 1..2000 ms, and refused with the tail release" {
+    try std.testing.expectEqual(@as(u32, 0), try phaseGrowDelayMs(.{}));
+    try std.testing.expectEqual(@as(u32, 250), try phaseGrowDelayMs(.{ .phase_grow_delay_ms = 250 }));
+    try std.testing.expectEqual(@as(u32, 2000), try phaseGrowDelayMs(.{ .phase_grow_delay_ms = 2000 }));
+    try std.testing.expectError(error.PhaseGrowDelayOutOfRange, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 0 }));
+    try std.testing.expectError(error.PhaseGrowDelayOutOfRange, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 2001 }));
+    try std.testing.expectError(error.PhaseGrowDelayWithTailRelease, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 250, .phase_tail_release = true }));
+    try std.testing.expectEqual(@as(u32, 0), try phaseGrowDelayMs(.{ .phase_tail_release = true }));
 }
 
 /// The loop's tail hook for one prompt part: armed before the part's forward, cleared after it, so the request's later
@@ -513,6 +564,8 @@ pub const Module = struct {
     phase_change: ?PhaseChangeRecord = null,
     /// The request's tail release (`tailRelease`; reset at each prefill).
     tail_release: ?TailReleaseRecord = null,
+    /// When the tail release's frees ended (the phase change's free_to_grow_ms starts here on that route).
+    tail_freed_at: ?std.Io.Timestamp = null,
     /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
     /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
     prompt_ready: bool = true,
@@ -611,8 +664,9 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
-        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
-        if (ov.routed_forms) |f| if (f.down_pair or f.gu_one) try self.exl3.routeForms(&self.g, f);
+        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins);
+        // GEMV_REBUILD: rebuilt on the stock texts too (the accept-time GEMVs freed; the stock-route leak's discriminator).
+        if (formsRoute(ov)) |f| try self.exl3.routeForms(&self.g, f);
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
         if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
@@ -761,6 +815,8 @@ pub const Module = struct {
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
         log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
+        self.installed.gemv_rebuild = self.overrides.gemv_rebuild orelse false;
+        if (self.installed.gemv_rebuild) log.info("NATIVE gemv rebuild: installed (the accept-time decode GEMVs freed and rebuilt at construction; forms down_pair {}, gu_one {})", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
@@ -788,7 +844,7 @@ pub const Module = struct {
         {
             const rs = self.installed.reader_sched;
             var nb: [24]u8 = undefined;
-            log.info("NATIVE reader scheduling: {s} (threads {s}; spin {s}; speculative chunks {s})", .{ rs.name(&nb), if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)" });
+            log.info("NATIVE reader scheduling: {s} (threads {s}; spin {s}; speculative chunks {s})", .{ rs.name(&nb), if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else if (rs.qos_demand) "USER_INTERACTIVE demand + watchdog, speculative inherited (no UTILITY), named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)" });
         }
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
@@ -860,6 +916,13 @@ pub const Module = struct {
             return error.PhaseTailReleaseUnsupported;
         }
         log.info("NATIVE phase tail release: {s}", .{if (self.installed.phase_tail_release) "installed (the transient release, the cache clear and the decode cache limit at the prompt's last trunk chunk, before the DSpark seed; the phase change keeps its settle, bound and grow)" else "off"});
+        self.installed.phase_grow_delay_ms = phaseGrowDelayMs(ov) catch |e| {
+            log.err("phase grow delay refused: {t} ({?d} ms, the tail release {})", .{ e, ov.phase_grow_delay_ms, self.installed.phase_tail_release });
+            return e;
+        };
+        if (self.installed.phase_grow_delay_ms > 0) {
+            log.info("NATIVE phase grow delay: installed ({d} ms between the settled frees and the grow; the stock phase change otherwise)", .{self.installed.phase_grow_delay_ms});
+        } else log.info("NATIVE phase grow delay: off", .{});
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
         // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
         // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
@@ -1194,6 +1257,7 @@ pub const Module = struct {
         try self.requestEnd();
         try self.gate.begin(.prefill);
         self.tail_release = null;
+        self.tail_freed_at = null;
         // #23: the prompt counts the phase change reads are this request's alone.
         switch (self.arm) {
             inline else => |t| t.arm.stream.resetPromptCounts(),
@@ -1299,6 +1363,7 @@ pub const Module = struct {
         const after = BoundaryMemory.now();
         const ns = @max(t0.untilNow(self.io, .boot).nanoseconds, 0);
         self.tail_release = .{ .freed_bytes = freed, .before = before, .after = after, .ms = @as(f64, @floatFromInt(ns)) / 1e6 };
+        self.tail_freed_at = std.Io.Timestamp.now(self.io, .boot);
         const json = std.json.Stringify.valueAlloc(self.gpa, self.tail_release.?, .{}) catch return;
         defer self.gpa.free(json);
         log.info("NATIVE DSV41_TAIL_RELEASE {s}", .{json});
@@ -1604,6 +1669,8 @@ pub const Module = struct {
         self.g.clearCache();
         setCacheLimit(self.installed.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
+        // The frees' end: here, or at the prompt's tail on the tail release route (free_to_grow_ms starts there).
+        const freed_at = self.tail_freed_at orelse std.Io.Timestamp.now(self.io, .boot);
         // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
         const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
         // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
@@ -1624,6 +1691,10 @@ pub const Module = struct {
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = acct.boundary, .tail_release_bytes = if (self.tail_release) |tr| tr.freed_bytes else null, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
+        // STOCKDELAY (W5's discriminator; 0 = off, fixed at construction): the settled frees retire before the grow.
+        if (self.installed.phase_grow_delay_ms > 0) std.Io.sleep(self.io, .fromMilliseconds(self.installed.phase_grow_delay_ms), .awake) catch {};
+        self.phase_change.?.grow_delay_ms = self.installed.phase_grow_delay_ms;
+        self.phase_change.?.free_to_grow_ms = @as(f64, @floatFromInt(@max(freed_at.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
         switch (self.arm) {
             inline else => |t| try t.arm.growRows(&self.g, self.grown_rows orelse t.arm.decode_rows),
         }
@@ -1762,6 +1833,8 @@ pub const Installed = struct {
     host_relief: bool = false,
     /// The phase change's frees at the prompt's tail, as installed (`phaseTailRelease`).
     phase_tail_release: bool = false,
+    /// STOCKDELAY's sleep before the grow (ms), as installed (`phaseGrowDelayMs`; 0: off).
+    phase_grow_delay_ms: u32 = 0,
     /// The read pool's scheduling, as installed at its start (`readerSched`).
     reader_sched: expert_io.Sched = .{},
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
@@ -1824,6 +1897,8 @@ pub const Installed = struct {
     dense_rc: bool = false,
     /// ROUTED_BANKED as installed (the quant's banked route and the hook's banked waves).
     routed_banked: bool = false,
+    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction.
+    gemv_rebuild: bool = false,
 
     /// The attention call sites' construction line (apart from the ladder routes' line).
     /// The verify-row routes' construction line.
@@ -1929,6 +2004,10 @@ pub const PhaseChangeRecord = struct {
     margin_bytes: ?i64 = null,
     /// The host relief route only: the bytes malloc reported returned (`malloc_zone_pressure_relief`).
     host_relief_bytes: ?u64 = null,
+    /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared: here, or at the
+    /// prompt's tail on the tail release route) to the grow's start, and STOCKDELAY's sleep inside it (0: off).
+    free_to_grow_ms: ?f64 = null,
+    grow_delay_ms: u32 = 0,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
 };
