@@ -212,3 +212,35 @@ pub fn totalMemBytes() u64 {
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
     return total_mem;
 }
+
+const testing = std.testing;
+
+test "sdk memory: the process and box readings are the kernel's, self-consistent, and zero only off Darwin" {
+    if (comptime !builtin.os.tag.isDarwin()) {
+        try testing.expectEqual(Footprint{ .now = 0, .peak = 0 }, footprint());
+        try testing.expectEqual(ProcessMemory{}, processMemory());
+        try testing.expectEqual(VmBytes{}, vmBytes());
+        try testing.expectEqual(@as(u64, 0), totalMemBytes());
+        return;
+    }
+    const total = totalMemBytes();
+    try testing.expect(total >= 1 << 30);
+    const f = footprint();
+    try testing.expect(f.now > 0 and f.peak >= f.now and f.peak <= total);
+    startFootprintInterval();
+    // a touched allocation the footprint must count
+    const block = try testing.allocator.alloc(u8, 32 << 20);
+    defer testing.allocator.free(block);
+    @memset(block, 0xa5);
+    const m = processMemory();
+    try testing.expect(m.footprint > 0 and m.footprint_lifetime_peak >= m.footprint);
+    try testing.expect(m.footprint_interval_peak >= 32 << 20 and m.footprint_interval_peak <= m.footprint_lifetime_peak);
+    const v = vmBytes();
+    try testing.expect(v.wired > 0 and v.active > 0);
+    try testing.expect(physicalUsedBytes(v) <= total and physicalUsedBytes(v) >= v.wired);
+}
+
+test "sdk memory: physical used is wired + active + inactive + compressor, free and speculative and file counts aside" {
+    const v: VmBytes = .{ .free = 1000, .active = 1, .inactive = 20, .wired = 300, .purgeable = 5000, .speculative = 7000, .compressor = 4000, .external = 50000, .internal = 600000 };
+    try testing.expectEqual(@as(u64, 4321), physicalUsedBytes(v));
+}

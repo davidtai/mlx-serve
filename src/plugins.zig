@@ -274,10 +274,6 @@ test "plugins registry: the winner of a claims round" {
     try testing.expectEqual(@as(?usize, 3), pick(&names, &.{ .generic, null, .generic, .native }, "a"));
 }
 
-// Declared last so it runs after every other conformance test (the CPU lane's bar).
-test "plugins conformance: the CPU lane created no Metal device" {
-    try sdk.testing.expectNoDevice();
-}
 
 const fake_d: sdk.Plugin = .{ .name = "fake-d", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "fake_d" }) } };
 
@@ -297,4 +293,137 @@ test "plugins registry: what served a model names its arch with its plugin; noth
     // Two archs can tie here, so the host reads the model's plugin setting; a one-arch registry never does.
     try testing.expect(R.arch_ties_possible and R.registered("fake-d") and !R.registered("mlx-stream"));
     try testing.expect(!Registry(&.{ fake_a, fake_c }, .{ .macos = true }).arch_ties_possible);
+}
+
+fn FakeKind(comptime name_: []const u8, comptime model_type: []const u8, comptime priority: sdk.Priority) type {
+    return struct {
+        pub const name = name_;
+        pub fn claims(p: *const sdk.ConfigPeek) ?sdk.Priority {
+            const t = p.modelType() orelse return null;
+            return if (std.mem.eql(u8, t, model_type)) priority else null;
+        }
+    };
+}
+
+const kind_a: sdk.Plugin = .{ .name = "kind-a", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .engine = FakeKind("engine-a", "gguf_x", .generic) } };
+const kind_b: sdk.Plugin = .{ .name = "kind-b", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .engine = FakeKind("engine-b", "gguf_x", .generic), .source = FakeKind("source-b", "gguf_x", .generic) } };
+const kind_n: sdk.Plugin = .{ .name = "kind-n", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .source = FakeKind("source-n", "own_arch", .native), .arch = FakeArch(.{ .model_type = "own_arch" }) } };
+
+test "plugins registry: engines and sources route like archs; a macOS-only plugin is not registered elsewhere" {
+    const mac_b: sdk.Plugin = .{ .name = kind_b.name, .api = kind_b.api, .mlx = kind_b.mlx, .macos_only = true, .provides = kind_b.provides };
+    const R = Registry(&.{ kind_a, mac_b, kind_n }, .{ .macos = true });
+    const Linux = Registry(&.{ kind_a, mac_b, kind_n }, .{ .macos = false });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gguf = try peekOf(arena.allocator(), "{\"model_type\":\"gguf_x\"}");
+    try testing.expectEqualStrings("engine-a", R.engine(&gguf, null).?.kind.name);
+    try testing.expectEqualStrings("engine-b", R.engine(&gguf, "kind-b").?.kind.name);
+    try testing.expectEqualStrings("engine-a", Linux.engine(&gguf, "kind-b").?.kind.name);
+    try testing.expectEqualStrings("source-b", R.source(&gguf, null).?.kind.name);
+    try testing.expect(Linux.source(&gguf, null) == null);
+    try testing.expectEqualStrings("source-n", R.source(&try peekOf(arena.allocator(), "{\"model_type\":\"own_arch\"}"), "kind-b").?.kind.name);
+    try testing.expect(R.registered("kind-b") and !Linux.registered("kind-b") and Linux.registered("kind-a"));
+    try testing.expect(!R.registered("") and !R.registered("kind") and !R.registered("kind-a "));
+    try testing.expect(Linux.sources.len == 1 and Linux.engines.len == 1 and Linux.archs.len == 1);
+}
+
+test "plugins registry: what served a model names the arch's plugin; ties are possible only where two archs register" {
+    const R = Registry(&.{ kind_a, kind_n }, .{ .macos = true });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const e = R.arch(&try peekOf(arena.allocator(), "{\"model_type\":\"own_arch\"}"), null).?;
+    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"kind-n\",\"kind\":\"arch\",\"name\":\"fake-arch\"}]", R.servedJson(&e.kind));
+    // the only arch: no tie is possible, whatever the other kinds register
+    try testing.expect(!R.arch_ties_possible);
+    // a second arch that registers only on macOS makes ties possible there and nowhere else
+    const mac_arch: sdk.Plugin = .{ .name = "mac-arch", .api = sdk.api, .mlx = sdk.mlx_pin, .macos_only = true, .provides = .{ .arch = FakeArch(.{ .model_type = "own_arch" }) } };
+    try testing.expect(Registry(&.{ kind_n, mac_arch }, .{ .macos = true }).arch_ties_possible);
+    try testing.expect(!Registry(&.{ kind_n, mac_arch }, .{ .macos = false }).arch_ties_possible);
+}
+
+test "plugins registry: the claims round's edge cases (one entry, a preference for a lower claim, an unknown or repeated preference)" {
+    const names = [_][]const u8{ "a", "b", "c" };
+    try testing.expectEqual(@as(?usize, 0), pick(names[0..1], &.{.generic}, null));
+    try testing.expectEqual(@as(?usize, null), pick(&.{}, &.{}, "a"));
+    try testing.expectEqual(@as(?usize, 2), pick(&names, &.{ null, null, .generic }, null));
+    // the preference breaks ties only: it never lifts a lower claim
+    try testing.expectEqual(@as(?usize, 1), pick(&names, &.{ .generic, .native, .generic }, "a"));
+    try testing.expectEqual(@as(?usize, 1), pick(&names, &.{ .generic, .native, .generic }, "c"));
+    // an unknown preference keeps registry order; one naming the first of the tied keeps it
+    try testing.expectEqual(@as(?usize, 0), pick(&names, &.{ .native, .native, .native }, "zz"));
+    try testing.expectEqual(@as(?usize, 0), pick(&names, &.{ .native, .native, .native }, "a"));
+    try testing.expectEqual(@as(?usize, 2), pick(&names, &.{ .native, .native, .native }, "c"));
+    // a preferred entry that is outclaimed later loses to the higher claim
+    try testing.expectEqual(@as(?usize, 2), pick(&names, &.{ .generic, .generic, .native }, "b"));
+    // two entries with the preferred name (two quants of one plugin): the first of them wins the tie
+    try testing.expectEqual(@as(?usize, 1), pick(&.{ "x", "p", "p" }, &.{ .generic, .generic, .generic }, "p"));
+}
+
+test "plugins registry: model-settings.json's plugin breaks a tie between two archs; an unregistered or empty name changes nothing" {
+    const model_settings = @import("model_settings.zig");
+    const twin_a: sdk.Plugin = .{ .name = "twin-a", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "twin" }) } };
+    const twin_b: sdk.Plugin = .{ .name = "twin-b", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "twin" }) } };
+    const R = Registry(&.{ twin_a, twin_b }, .{ .macos = true });
+    try testing.expect(R.arch_ties_possible);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const peek = try peekOf(a, "{\"model_type\":\"twin\"}");
+    const Case = struct { entry: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .entry = "{\"plugin\":\"twin-b\"}", .want = "twin-b" },
+        .{ .entry = "{\"plugin\":\"twin-a\"}", .want = "twin-a" },
+        .{ .entry = "{\"plugin\":\"mlx-stream-gone\"}", .want = "twin-a" },
+        .{ .entry = "{\"plugin\":\"\"}", .want = "twin-a" },
+        .{ .entry = "{\"plugin\":7}", .want = "twin-a" },
+        .{ .entry = "{}", .want = "twin-a" },
+    }) |c| {
+        const entry = try std.json.parseFromSliceLeaky(std.json.Value, a, c.entry, .{});
+        try testing.expectEqualStrings(c.want, R.arch(&peek, model_settings.pluginOf(entry)).?.plugin);
+    }
+}
+
+test "plugins registry: this build's registry follows -Dmlx-stream (the plugin's tables, its tests and its name together)" {
+    try testing.expectEqual(registers_mlx_stream, all.len == 1);
+    try testing.expectEqual(registers_mlx_stream, mlx_stream_testing != null);
+    try testing.expectEqual(registers_mlx_stream and build_options.macos_engines, registry.registered("mlx-stream"));
+    const n: usize = if (registers_mlx_stream and build_options.macos_engines) 1 else 0;
+    try testing.expectEqual(n, registry.archs.len);
+    try testing.expect(registry.sources.len == 0 and registry.engines.len == 0 and !registry.arch_ties_possible);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v41 = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
+    try testing.expectEqual(n == 1, registry.arch(&v41, null) != null);
+    inline for (all) |p| try sdk.negotiate(p, sdk.host);
+}
+
+test "plugins conformance: the host's weight map a plugin binds owns its keys and handles; replace and drop touch only present names" {
+    // empty handles: freeing one is a no-op in mlx-c, so the map's ownership runs without an array
+    var w = sdk.Weights.init(testing.allocator);
+    defer w.deinit();
+    try w.map.put(try testing.allocator.dupe(u8, "a.weight"), .{});
+    try w.map.put(try testing.allocator.dupe(u8, "b.weight"), .{});
+    try testing.expectEqual(@as(u32, 2), w.count());
+    try testing.expect(w.get("a.weight") != null and w.get("c.weight") == null);
+    w.replace("c.weight", .{});
+    try testing.expectEqual(@as(u32, 2), w.count());
+    w.replace("a.weight", .{});
+    w.drop("c.weight");
+    w.drop("b.weight");
+    try testing.expect(w.count() == 1 and w.get("b.weight") == null);
+}
+
+
+test "plugins conformance: the host's MLX pin is the MLX this binary links, and every registered plugin's matches it" {
+    var v = sdk.mlx.mlx_string_new();
+    defer _ = sdk.mlx.mlx_string_free(v);
+    try testing.expectEqual(@as(c_int, 0), sdk.mlx.mlx_version(&v));
+    const linked = std.mem.span(sdk.mlx.mlx_string_data(v));
+    try testing.expectEqualStrings(linked, sdk.mlx_pin[1..]);
+    inline for (all) |p| try testing.expectEqualStrings(sdk.mlx_pin, p.mlx);
+}
+
+// Declared last so it runs after every other conformance test (the CPU lane's bar).
+test "plugins conformance: the CPU lane created no Metal device" {
+    try sdk.testing.expectNoDevice();
 }

@@ -18,6 +18,7 @@ const arch = @import("arch.zig");
 const spec = @import("spec.zig");
 const bill = @import("memory_bill.zig");
 const lifecycle = @import("lifecycle.zig");
+const bill_mod = bill;
 
 pub const Lane = enum { cpu, gpu_small, window };
 
@@ -393,4 +394,112 @@ test "sdk testing: the phase change's order and a sticky refusal; a receipt's st
     try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"head_mode"}));
     try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"decode_stream.bytes"}));
     try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"decode_lane.x"}));
+}
+
+test "sdk testing: the fake's draft lane names itself, arms only greedy clean requests and counts its rounds; a lane-less fake has no rounds" {
+    const Fake = FakeArch(.{ .block_size = 3 });
+    Fake.calls = .{};
+    const vt = comptime arch.Arch.of(Fake);
+    const lane = vt.spec.draft_lane;
+    var calls: FakeCalls = .{};
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &calls };
+    try testing.expectEqual(@as(u32, 3), lane.block_size(&m));
+    try testing.expectEqualStrings("fake lane", lane.lane_name(&m));
+    try testing.expectEqual(spec.DraftArm.typical, lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = true, .clean = false }));
+    try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = false, .clean = true }));
+    // a cap past the block keeps block - 1 drafts
+    var r = try lane.round(&m, testing.allocator, 40, 9);
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &.{ 40, 41, 42 }, r.tokens);
+    try testing.expectEqual(@as(u32, 43), r.next_token);
+    try testing.expectEqual(@as(u64, 1), lane.stats(&m).rounds);
+    var none: u32 = 0;
+    try testing.expectError(error.NoDraftLane, expectRoundInvariant(&comptime arch.Arch.of(FakeArch(.{})), &none, 1, &.{1}));
+}
+
+test "sdk testing: an arch's bill bounds its load preflight at the floor rows, or the check names the gap" {
+    const gb: u64 = 1_000_000_000;
+    const Bills = struct {
+        fn of(per_row: u64) type {
+            return struct {
+                pub const Config = struct {};
+                const terms = [_]bill_mod.MemoryBill.Term{.{ .name = "residents", .bytes = .{ 1 * gb, 1 * gb }, .at_construction = true }};
+                pub fn bill(gpa: std.mem.Allocator, _: std.Io, _: *const bill_mod.BillRequest) !bill_mod.MemoryBill {
+                    return .{ .terms = try gpa.dupe(bill_mod.MemoryBill.Term, &terms), .per_row = per_row };
+                }
+                pub fn loadBytes(_: std.mem.Allocator, _: std.Io, _: *const Config, _: *const arch.LoadFacts, _: u64) !u64 {
+                    // the fake arch's own preflight: 1 GB of residents and 1 GB of slot rows
+                    return 2 * gb;
+                }
+            };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{}");
+    const req: bill.BillRequest = .{ .peek = &p, .cfg = &p, .routes = &p, .prompt_tokens = 1, .max_tokens = 1, .ceiling = 100 * gb, .stop = 2 * gb };
+    const facts: arch.LoadFacts = .{ .wired_margin_bytes = 0 };
+    const floor: bill.Rows = .{ .prompt = 8, .decode = 16 };
+    const cfg: Bills.of(0).Config = .{};
+    // 1 GB + 16 decode rows x 1/16 GB = the preflight's 2 GB
+    try expectBillBoundsLoad(Bills.of(gb / 16), testing.allocator, testing.io, &cfg, &facts, &req, floor);
+    // twice the row bytes: the bill bounds 3 GB where the preflight asks 2
+    try testing.expectError(error.TestExpectedEqual, expectBillBoundsLoad(Bills.of(gb / 8), testing.allocator, testing.io, &cfg, &facts, &req, floor));
+}
+
+test "sdk testing: the CPU lane's device probe reads the loaded images and has created no device here" {
+    try testing.expect(!deviceCreated());
+    try expectNoDevice();
+}
+
+test "sdk arch: the table's load preflight and bill call the arch's own; a hook switched off is absent" {
+    const Base = FakeArch(.{ .handover = false });
+    const Billed = struct {
+        pub const name = Base.name;
+        pub const caps = Base.caps;
+        pub const Config = Base.Config;
+        pub const Module = Base.Module;
+        pub const claims = Base.claims;
+        pub const parse = Base.parse;
+        pub const freeConfig = Base.freeConfig;
+        pub const shell = Base.shell;
+        pub const applySettings = Base.applySettings;
+        pub const loadBytes = Base.loadBytes;
+        pub const init = Base.init;
+        pub const deinit = Base.deinit;
+        pub const prefill = Base.prefill;
+        pub const step = Base.step;
+        pub const position = Base.position;
+        pub const handover = {};
+        pub const draft_lane = {};
+        pub fn bill(_: std.mem.Allocator, _: std.Io, req: *const bill_mod.BillRequest) !bill_mod.MemoryBill {
+            return .{ .per_row = req.prompt_tokens };
+        }
+    };
+    const vt = comptime arch.Arch.of(Billed);
+    try testing.expect(vt.handover == null and vt.spec == .none and vt.prompt_bytes == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag: peek.Diag = .{};
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"fake_arch\"}");
+    const cfg = try vt.parse(testing.allocator, &p, &diag);
+    defer vt.free_config(testing.allocator, cfg);
+    const facts: arch.LoadFacts = .{ .wired_margin_bytes = 0 };
+    try testing.expectEqual(@as(u64, 1_000_000_000), try vt.load_bytes(testing.allocator, testing.io, cfg, &facts, 0));
+    const req: bill.BillRequest = .{ .peek = &p, .cfg = cfg, .routes = cfg, .prompt_tokens = 77, .max_tokens = 1, .ceiling = 0, .stop = 0 };
+    try testing.expectEqual(@as(u64, 77), (try vt.bill.?(testing.allocator, testing.io, &req)).per_row);
+}
+
+test "sdk testing: a claims fixture, a group fixture and a phase order that disagree fail the check" {
+    try testing.expectError(error.TestExpectedEqual, expectClaims(FakeArch(.{}).claims, &.{.{ .config = "{\"model_type\":\"fake_arch\"}", .want = .generic }}));
+    const Never = struct {
+        fn claims(_: *const peek.GroupPeek, why: ?*peek.Diag) ?peek.Priority {
+            if (why) |d| d.set("never", .{});
+            return null;
+        }
+    };
+    try expectGroupClaims(Never.claims, &.{.{ .quantization = "{}", .hidden = 1, .inter = 1, .want = null }});
+    try testing.expectError(error.TestExpectedEqual, expectGroupClaims(Never.claims, &.{.{ .quantization = "null", .hidden = 1, .inter = 1, .want = .native }}));
+    try testing.expectError(error.PhaseOrderViolated, expectPhaseOrder(&.{ .fence, .synchronize }, false));
 }

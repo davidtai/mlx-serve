@@ -31,3 +31,12 @@ pub const QuantMode = enum {
         return self == .affine;
     }
 };
+
+test "sdk quant mode: names round-trip through fromString and cstr; only affine carries biases" {
+    inline for (@typeInfo(QuantMode).@"enum".field_names) |n| {
+        const m = @field(QuantMode, n);
+        try std.testing.expectEqual(m, QuantMode.fromString(std.mem.span(m.cstr())).?);
+        try std.testing.expectEqual(m == .affine, m.hasBiases());
+    }
+    try std.testing.expect(QuantMode.fromString("int4") == null and QuantMode.fromString("") == null and QuantMode.fromString("Affine") == null);
+}

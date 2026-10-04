@@ -34,3 +34,34 @@ pub const Engine = struct {
         return .{ .name = T.name, .claims = T.claims };
     }
 };
+
+const testing = std.testing;
+
+fn claimsModel(p: *const peek.ConfigPeek) ?peek.Priority {
+    return if (p.modelType() != null) .generic else null;
+}
+
+test "sdk kinds: source and engine tables carry the name and the claim; a claim runs through the table" {
+    const S = struct {
+        pub const name = "fixture-source";
+        pub const claims = claimsModel;
+    };
+    const src = comptime Source.of(S);
+    const eng = comptime Engine.of(S);
+    try testing.expectEqualStrings("fixture-source", src.name);
+    try testing.expectEqualStrings("fixture-source", eng.name);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"llama\"}");
+    const none = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{}");
+    try testing.expectEqual(@as(?peek.Priority, .generic), src.claims(&p));
+    try testing.expectEqual(@as(?peek.Priority, null), eng.claims(&none));
+}
+
+test "sdk kinds: an optional hook is present when declared and not `{}`" {
+    const T = struct {
+        pub const on = claimsModel;
+        pub const off = {};
+    };
+    try testing.expect(check.has(T, "on") and !check.has(T, "off") and !check.has(T, "absent"));
+}

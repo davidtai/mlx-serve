@@ -52,3 +52,14 @@ test "sdk negotiation: a major mismatch and another MLX are refused by name; min
     try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "new", .api = .{ .major = 2, .minor = 0 }, .mlx = "v0.32.3", .provides = .{} }, host));
     try testing.expectError(error.MlxPinMismatch, negotiate(.{ .name = "mlx", .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.31.2", .provides = .{} }, host));
 }
+
+test "sdk negotiation: the pin is compared whole (no prefix, no suffix, no case folding); the major is checked first" {
+    const host: Host = .{ .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.32.3" };
+    const pins = [_][]const u8{ "v0.32", "v0.32.3-rc1", "V0.32.3", "0.32.3", "", "v0.32.3 " };
+    inline for (pins) |pin| try testing.expectError(error.MlxPinMismatch, negotiate(.{ .name = "p", .api = .{ .major = 1, .minor = 0 }, .mlx = pin, .provides = .{} }, host));
+    // a plugin wrong on both counts is refused for the SDK, the breaking change
+    try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "both", .api = .{ .major = 3, .minor = 0 }, .mlx = "v0.1.0", .provides = .{} }, host));
+    // the minor's whole range is compatible
+    try negotiate(.{ .name = "max-minor", .api = .{ .major = 1, .minor = std.math.maxInt(u16) }, .mlx = "v0.32.3", .provides = .{} }, host);
+    try negotiate(.{ .name = "old-minor", .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.32.3", .provides = .{} }, .{ .api = .{ .major = 1, .minor = std.math.maxInt(u16) }, .mlx = "v0.32.3" });
+}

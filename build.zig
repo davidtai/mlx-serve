@@ -304,6 +304,20 @@ pub fn build(b: *std.Build) void {
     const conformance = b.step("conformance", "Run the SDK's tests and the plugin conformance suite (CPU lane, no device)");
     conformance.dependOn(&b.addRunArtifact(sdk_tests).step);
     conformance.dependOn(&b.addRunArtifact(conformance_tests).step);
+    // The registry's compile-time refusals: each case compiles src/plugins_refusals.zig with one bad plugin line and
+    // passes only on the compile error that names it.
+    for (registry_refusals) |c| {
+        const case_options = b.addOptions();
+        case_options.addOption([]const u8, "name", c.case);
+        const m = b.createModule(.{ .root_source_file = b.path("src/plugins_refusals.zig"), .target = target, .optimize = optimize, .imports = &.{
+            .{ .name = "sdk", .module = shared.sdk },
+            .{ .name = "build_options", .module = test_options.createModule() },
+            .{ .name = "refusal_case", .module = case_options.createModule() },
+        } });
+        const obj = b.addObject(.{ .name = b.fmt("refusal-{s}", .{c.case}), .root_module = m });
+        obj.expect_errors = .{ .contains = c.err };
+        conformance.dependOn(&obj.step);
+    }
     test_step.dependOn(conformance);
     const sdk_test_build = b.step("sdk-test-build", "Compile the SDK, conformance and shared-module tests without running them (mlx-test creates arrays)");
     for ([_]*std.Build.Step.Compile{ sdk_tests, conformance_tests } ++ shared_tests) |t| sdk_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
@@ -875,6 +889,24 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
 }
 
 /// What the macOS unit-test graphs link and import: the unit tests and the conformance suite share it.
+/// src/plugins_refusals.zig's cases and the compile error line each must end with. A negotiation refusal ends with the
+/// host's MLX pin, so its line matches up to `/?/` from the registry's refusal site (plugins.zig:55).
+const registry_refusals = [_]struct { case: []const u8, err: []const u8 }{
+    .{ .case = "api_major", .err = "src/plugins.zig:55:50: error: plugin bad-api: ApiMajorMismatch (built against SDK 2.0 on MLX /?/)" },
+    .{ .case = "mlx_pin", .err = "src/plugins.zig:55:50: error: plugin bad-mlx: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1; this host is SDK 1.0 on MLX v/?/)" },
+    .{ .case = "mlx_pin_macos_only", .err = "src/plugins.zig:55:50: error: plugin mac-pin: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1;/?/)" },
+    .{ .case = "duplicate", .err = "plugin twin: registered twice" },
+    .{ .case = "source_no_claims", .err = "NoClaims: no claims" },
+    .{ .case = "engine_wrong_claims", .err = "WrongClaims.claims: parameter *const sdk.peek.GroupPeek where the SDK has *const sdk.peek.ConfigPeek" },
+    .{ .case = "arch_batches_owned_state", .err = ": batches_decode with owns_decode_state" },
+    .{ .case = "arch_claim_unpaired", .err = ": claimProcess and releaseProcess come as a pair" },
+    .{ .case = "name_not_json_safe", .err = "plugin name not JSON-safe: quo\"te" },
+    .{ .case = "source_claims_not_fn", .err = "ClaimsNotFn.claims is not a function" },
+    .{ .case = "engine_claims_param_count", .err = "ClaimsTwoParams.claims: takes a different parameter count than the SDK's" },
+    .{ .case = "source_claims_returns", .err = "ClaimsReturnsBool.claims: returns bool where the SDK has ?sdk.peek.Priority" },
+    .{ .case = "source_no_name", .err = "Nameless: no name" },
+};
+
 const TestDeps = struct {
     options: *std.Build.Step.Options,
     shared: Shared,
