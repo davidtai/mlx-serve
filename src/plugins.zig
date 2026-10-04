@@ -425,5 +425,8 @@ test "plugins conformance: the host's MLX pin is the MLX this binary links, and 
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
 test "plugins conformance: the CPU lane created no Metal device" {
+    // Only the conformance run (`zig build conformance`: the registry's tests alone) is the CPU lane. The unit-test
+    // binary reaches this file too, after device tests in the same process.
+    for (@import("builtin").test_functions) |t| if (std.mem.indexOf(u8, t.name, "plugins ") == null) return error.SkipZigTest;
     try sdk.testing.expectNoDevice();
 }

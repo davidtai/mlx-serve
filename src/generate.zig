@@ -3012,19 +3012,19 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-            // An arch whose prompt forward yields the last row's logits takes the whole prompt in the final
-            // span's one forward: no prefix forwards, no separate 1-row logits forward.
-            const loop_end = if (xfm.config.prefillYieldsLastLogits()) 0 else prefix_len - snapshot_backoff;
+            // An arch whose prompt forward yields the last row's logits, or that chunks the prompt itself
+            // (`prefillUnchunked`), takes the whole prompt in the final span's one forward: no prefix forwards, no
+            // separate 1-row logits forward.
+            const loop_end = if (xfm.config.prefillYieldsLastLogits() or xfm.config.prefillWholePrompt()) 0 else prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
-            const whole = prefillUnchunked(&xfm.config, has_vision);
-            const default_chunk = if (whole) loop_end else PREFILL_CHUNK;
+            const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
             // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
             // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
             // for this prompt, never wider than `ssm_cp_stride`.
-            const adapt_chunked = !whole;
+            const adapt_chunked = !(has_vision and !vision_chunked);
             // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
             // (installed process-wide).
             const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
