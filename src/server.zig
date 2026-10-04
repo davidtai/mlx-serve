@@ -9637,8 +9637,11 @@ fn handleNonStreamingCompletion(
         "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
+    // The usage object is chat completions' (`formatChatUsage`): prompt_tokens_details.cached_tokens always present.
+    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+    defer allocator.free(usage_obj);
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -9647,9 +9650,7 @@ fn handleNonStreamingCompletion(
         lp_json,
         finish_reason,
         finishDetailsField(finish_reason, result.finish_details),
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
+        usage_obj,
     });
     defer allocator.free(response);
 
@@ -9851,9 +9852,11 @@ fn handleStreamingCompletion(
         // Usage rides its own empty-choices chunk (OpenAI's stream_options
         // shape) — never the finish chunk, so the ending is stated once.
         if (include_usage) {
+            const usage_obj = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
+            defer allocator.free(usage_obj);
             const usage_chunk = try std.fmt.allocPrint(allocator,
-                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-            , .{ cmpl_id, created_ts, model_name, total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}}}
+            , .{ cmpl_id, created_ts, model_name, usage_obj });
             defer allocator.free(usage_chunk);
             logHttpSseData(usage_chunk);
             try stream.writeAllNoFlush("data: ");
@@ -23079,6 +23082,24 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "completions usage (/v1/completions, stream and not): the legacy keys kept, prompt_tokens_details.cached_tokens added" {
+    // A reused 16K turn: 16,383 of 16,384 prompt tokens restored. Additive: prompt / completion / total unchanged.
+    const a = std.testing.allocator;
+    const u = try formatChatUsage(a, 16384, 587, 16383, "");
+    defer a.free(u);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, u, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 16384), o.get("prompt_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 587), o.get("completion_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 16971), o.get("total_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 16383), o.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    // Both completions emitters build their usage with it (no hand-written usage object left on that path).
+    const src = @embedFile("server.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"object\":\"text_completion\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[{{\"index\":0,\"text\":{s},\"logprobs\":{s},\"finish_reason\":\"{s}\"{s}}}],\"usage\":{s}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"object\":\"text_completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[],\"usage\":{s}}}") != null);
 }
 
 test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
