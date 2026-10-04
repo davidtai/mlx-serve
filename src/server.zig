@@ -24462,3 +24462,176 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }
+
+// ── host seams: gpu_ceiling.zig, the native draft readiness and the plugins fragment (characterization) ──
+
+/// Upstream af34af04's server-side ceiling helpers, verbatim (moved whole into gpu_ceiling.zig).
+const upstream_ceiling = struct {
+    fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system: u64) u64 {
+        return @min(working_set_limit, mlx_footprint +| free_system);
+    }
+    fn wiredLimitFloor(wired_limit: u64, total_ram: u64, margin: u64) u64 {
+        if (wired_limit == 0 or total_ram == 0) return 0;
+        if (wired_limit <= total_ram * 75 / 100) return 0;
+        return @min(wired_limit -| margin, total_ram -| margin);
+    }
+    fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
+        const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidWiredMargin;
+        if (n < 2 or n > 32) return error.InvalidWiredMargin;
+        return @as(u64, n) << 30;
+    }
+    fn gpuCeilingWithWiredFloor(working_set_limit: u64, mlx_footprint: u64, free_system: u64, wired_floor: u64) u64 {
+        return @max(@This().physicalMemoryCeiling(working_set_limit, mlx_footprint, free_system), wired_floor);
+    }
+    fn osReserveBytes(total_ram: u64) u64 {
+        return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
+    }
+    fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
+        const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
+        if (n > 64) return error.InvalidOsReserve;
+        return @as(u64, n) << 30;
+    }
+    fn getMetalBufferLimit() u64 {
+        var mem: u64 = 0;
+        if (comptime builtin.os.tag.isDarwin()) {
+            var len: usize = @sizeOf(u64);
+            _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+        } else {
+            mem = metrics.getTotalMemBytes();
+        }
+        if (mem == 0) return 8 * 1024 * 1024 * 1024;
+        return mem * 75 / 100;
+    }
+};
+
+test "host seams: the ceiling helpers in gpu_ceiling.zig compute what upstream's server-side copies did" {
+    var prng = std.Random.DefaultPrng.init(0xCE11);
+    const r = prng.random();
+    const gb: u64 = 1 << 30;
+    for (0..20_000) |_| {
+        // Mix the edges (0, the 75% line, saturation) with random sizes.
+        const pick = struct {
+            fn f(rr: std.Random, g: u64) u64 {
+                return switch (rr.uintLessThan(u8, 5)) {
+                    0 => 0,
+                    1 => std.math.maxInt(u64) - rr.uintLessThan(u64, 4),
+                    2 => rr.uintLessThan(u64, 4) * g,
+                    else => rr.uintLessThan(u64, 512 * g),
+                };
+            }
+        }.f;
+        const a = pick(r, gb);
+        const b = pick(r, gb);
+        const c = pick(r, gb);
+        const d = pick(r, gb);
+        try testing.expectEqual(upstream_ceiling.physicalMemoryCeiling(a, b, c), physicalMemoryCeiling(a, b, c));
+        try testing.expectEqual(upstream_ceiling.gpuCeilingWithWiredFloor(a, b, c, d), gpuCeilingWithWiredFloor(a, b, c, d));
+        try testing.expectEqual(upstream_ceiling.osReserveBytes(a), osReserveBytes(a));
+        // RAM sizes a Mac can have (both versions multiply total_ram by 75): random, and the 75% line itself.
+        const ram = r.uintLessThan(u64, 1 << 41);
+        const wired = r.uintLessThan(u64, 1 << 41);
+        for ([_]u64{ wired, ram * 75 / 100, ram * 75 / 100 + 1 }) |w|
+            try testing.expectEqual(upstream_ceiling.wiredLimitFloor(w, ram, c % (64 * gb)), wiredLimitFloor(w, ram, c % (64 * gb)));
+    }
+    for ([_][]const u8{ "", "0", "1", "2", "8", "32", "33", "64", "65", "-1", "x", " 8", "4294967296" }) |raw| {
+        const w_old = upstream_ceiling.parseWiredMarginGib(raw);
+        if (w_old) |v| try testing.expectEqual(v, try parseWiredMarginGib(raw)) else |e| try testing.expectError(e, parseWiredMarginGib(raw));
+        const o_old = upstream_ceiling.parseOsReserveGib(raw);
+        if (o_old) |v| try testing.expectEqual(v, try parseOsReserveGib(raw)) else |e| try testing.expectError(e, parseOsReserveGib(raw));
+    }
+    try testing.expectEqual(@as(u64, 8 << 30), WIRED_LIMIT_MARGIN_BYTES);
+    try testing.expectEqual(WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling_mod.wired_limit_margin_bytes);
+    try testing.expectEqual(upstream_ceiling.getMetalBufferLimit(), getMetalBufferLimit());
+    // The static ceiling's override (MLX_SERVE_GPU_CEILING_MB, tests) still stands in for the working set.
+    const saved = gpu_ceiling_mod.static_ceiling_override;
+    defer gpu_ceiling_mod.static_ceiling_override = saved;
+    gpu_ceiling_mod.static_ceiling_override = 12_345 << 20;
+    try testing.expectEqual(@as(u64, 12_345 << 20), staticGpuMemoryCeiling());
+    try testing.expectEqual(@as(u64, 12_345 << 20), getGpuWorkingSetLimit());
+}
+
+test "host seams: MTP capability and its default read upstream's deepseek_v4 stage readiness" {
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    var lm: LoadedModel = undefined;
+    lm.mtp = null;
+    lm.transformer = null;
+    // af34af04's `dsv4DraftStages`: a transformer whose dsv4 module has stages.
+    const upstream = struct {
+        fn stages(m: *LoadedModel) bool {
+            const x = m.transformer orelse return false;
+            const d = x.dsv4 orelse return false;
+            return d.n_mtp > 0;
+        }
+    }.stages;
+    try testing.expectEqual(upstream(&lm), nativeDraftStages(&lm));
+    lm.transformer = &t;
+    for ([_]bool{ false, true }) |with| for ([_]usize{ 0, 1, 3 }) |n_mtp| {
+        t.dsv4 = if (with) &dsv4 else null;
+        dsv4.n_mtp = n_mtp;
+        dsv4.ds_block = if (n_mtp > 0) 5 else 0;
+        try testing.expectEqual(upstream(&lm), nativeDraftStages(&lm));
+        try testing.expectEqual(upstream(&lm), mtpCapable(&lm));
+        try testing.expectEqual(upstream(&lm), defaultEnableMtp(lm.mtp != null, nativeDraftStages(&lm)));
+    };
+}
+
+test "host seams: a host with zero plugins routes nothing and adds nothing to /v1/models or /props" {
+    const none = plugins.Registry(&.{}, .{ .macos = true });
+    try testing.expectEqual(@as(usize, 0), none.archs.len);
+    try testing.expect(!none.arch_ties_possible);
+    try testing.expect(!none.registered("mlx-stream"));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "{\"model_type\":\"deepseek_v41\"}", "{\"model_type\":\"gemma4\"}", "{}" }) |text| {
+        const peek = try @import("sdk").ConfigPeek.parse(arena.allocator(), "/m", text);
+        try testing.expect(none.arch(&peek, null) == null);
+        try testing.expect(none.source(&peek, null) == null and none.engine(&peek, null) == null);
+    }
+    try testing.expectEqualStrings("", none.servedJson(null));
+    // This build's registry: a model no registered arch serves gets the empty fragment too.
+    try testing.expectEqualStrings("", plugins.registry.servedJson(null));
+}
+
+test "host seams: a ready /v1/models row for a model no plugin serves keeps upstream's keys, in order" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3";
+    config.pinned_context = 4096;
+    var chat_config = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    var entry: LoadedModel = .{
+        .allocator = testing.allocator,
+        .id = "m",
+        .path = "/nonexistent/host-seams-model",
+        .bytes_on_disk = 1234,
+        .arch_hint = "",
+        .config = &config,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_config,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = .init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 99,
+        .state = .ready,
+        .error_name = null,
+    };
+    const json = try renderModelEntry(testing.allocator, testing.io, &entry);
+    defer testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const top = [_][]const u8{ "id", "object", "created", "owned_by", "loaded", "state", "bytes_resident", "bytes_on_disk", "context_length", "max_model_len", "batched_decode", "capabilities", "input_modalities", "meta" };
+    try testing.expectEqual(top.len, parsed.value.object.count());
+    for (top, parsed.value.object.keys()) |want, got| try testing.expectEqualStrings(want, got);
+    const meta_keys = [_][]const u8{ "architecture", "engine", "vocab_size", "hidden_size", "num_layers", "quantization", "context_length", "model_max_tokens", "embedding_max_length", "is_moe", "drafter_loaded", "drafter_path", "mtp_loaded", "mtp_available", "spec_exact", "kv_quant", "gen_temperature", "gen_top_p", "gen_top_k" };
+    const meta = parsed.value.object.get("meta").?.object;
+    try testing.expectEqual(meta_keys.len, meta.count());
+    for (meta_keys, meta.keys()) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expect(std.mem.endsWith(u8, json, "}}"));
+}

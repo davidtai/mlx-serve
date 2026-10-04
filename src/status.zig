@@ -390,3 +390,93 @@ test "gpuCoreCount reads the GPU's core count" {
     if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
     try std.testing.expect(n >= 7 and n <= 256);
 }
+
+// ── host seams: the ledgers moved into sdk.memory (characterization against upstream af34af04's readers) ──
+
+/// Upstream af34af04's `TaskVmInfo` (rev1, through phys_footprint) and its footprint reader, verbatim.
+const UpstreamTaskVmInfo = extern struct {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+};
+
+fn upstreamAppMemFootprintMb() u32 {
+    var info = std.mem.zeroes(UpstreamTaskVmInfo);
+    var count: u32 = @sizeOf(UpstreamTaskVmInfo) / @sizeOf(i32);
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    return @intCast(info.phys_footprint / (1024 * 1024));
+}
+
+fn upstreamTotalMemBytes() u64 {
+    var total_mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    return total_mem;
+}
+
+/// Upstream af34af04's `VmStats64` (vm_statistics64), verbatim: `getAvailableMemBytes` and the CPU sampler now read sdk.memory's.
+const UpstreamVmStats64 = extern struct {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+};
+
+test "host seams: status's vm_statistics64 is upstream's layout, field for field" {
+    try std.testing.expectEqual(@sizeOf(UpstreamVmStats64), @sizeOf(VmStats64));
+    const info = @typeInfo(UpstreamVmStats64).@"struct";
+    try std.testing.expectEqual(info.field_names.len, @typeInfo(VmStats64).@"struct".field_names.len);
+    inline for (info.field_names, info.field_types) |name, T| {
+        try std.testing.expectEqual(@offsetOf(UpstreamVmStats64, name), @offsetOf(VmStats64, name));
+        try std.testing.expectEqual(T, @FieldType(VmStats64, name));
+    }
+}
+
+test "host seams: total RAM and the app footprint read what upstream's own readers read" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    try std.testing.expectEqual(upstreamTotalMemBytes(), getTotalMemBytes());
+    try std.testing.expect(getTotalMemBytes() > 0);
+    // The footprint moves between two reads; both readers see the same ledger within a few MB.
+    const before = upstreamAppMemFootprintMb();
+    const now = getAppMemFootprintMb();
+    const after = upstreamAppMemFootprintMb();
+    try std.testing.expect(before > 0 and now > 0);
+    try std.testing.expect(now + 8 >= @min(before, after) and now <= @max(before, after) + 8);
+}

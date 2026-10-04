@@ -22302,3 +22302,119 @@ test "dsv41 handover: the clock is the transformer's answer: due exactly when th
     xfm.arch = .{ .vt = &without, .cfg = &module, .module = &module };
     try testing.expect(!HandoverClock.of(&xfm).due);
 }
+
+// ── host seams: deepseek_v4's DSpark behind sdk.DraftLane (characterization against upstream af34af04) ──
+
+/// Upstream af34af04's spec chokepoint in `Generator.initWithOptions`, as a pure function of what it read: the
+/// deepseek_v4 module (present, stage count), the request and the init options. Returns {active, stochastic}.
+pub fn upstreamDsv4Chokepoint(has_dsv4: bool, n_mtp: usize, sampling: SamplingParams, options: *Generator.InitOptions) [2]bool {
+    var out = [2]bool{ false, false };
+    if (has_dsv4 and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+        // af34af04's `dsparkArmFor`, verbatim.
+        const clean = sampling.repeat_penalty == 1.0 and sampling.presence_penalty == 0.0 and
+            sampling.constraint == null and options.logprobs_n == 0;
+        const arm: Generator.DsparkArm = if (!clean) .off else if (sampling.temperature < 0.01 or sampling.top_k == 1)
+            .greedy
+        else if (Generator.dsparkStochEnabled()) .stochastic else .off;
+        if (n_mtp > 0 and !dspark_env_off and arm != .off) {
+            out = .{ true, arm == .stochastic };
+        }
+        options.pld_enabled = false;
+        options.drafter_enabled = false;
+        options.drafter = null;
+        options.mtp_enabled = false;
+        options.mtp = null;
+        options.dflash_enabled = false;
+        options.dflash = null;
+    }
+    return out;
+}
+
+fn hostSeamRequests() [7]SamplingParams {
+    return .{
+        .{ .temperature = 0.0 },
+        .{ .temperature = 0.7, .top_k = 1 },
+        .{ .temperature = 0.6, .top_p = 0.95 },
+        .{ .temperature = 0.0, .repeat_penalty = 1.1 },
+        .{ .temperature = 0.7, .presence_penalty = 0.5 },
+        .{ .temperature = 0.005, .top_p = 0.5 },
+        .{ .temperature = 1.0, .top_k = 40 },
+    };
+}
+
+test "host seams: the spec chokepoint arms and disarms exactly as upstream's did, for no module and for deepseek_v4 with and without stages" {
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    // n_mtp > 0 implies a block (`dsparkStageCount` is 0 without one): the reachable stage states.
+    const models = [_]struct { dsv4: bool, n_mtp: usize, block: usize }{
+        .{ .dsv4 = false, .n_mtp = 0, .block = 0 },
+        .{ .dsv4 = true, .n_mtp = 0, .block = 0 },
+        .{ .dsv4 = true, .n_mtp = 0, .block = 5 },
+        .{ .dsv4 = true, .n_mtp = 3, .block = 5 },
+    };
+    const dummy_drafter: *DrafterModel = @ptrFromInt(0x10000);
+    const dummy_dflash: *DflashModel = @ptrFromInt(0x20000);
+    for (models) |m| {
+        dsv4.n_mtp = m.n_mtp;
+        dsv4.ds_block = m.block;
+        xfm.dsv4 = if (m.dsv4) &dsv4 else null;
+        for (hostSeamRequests()) |sp| for ([_]u32{ 0, 3 }) |lp| for (0..16) |flags| {
+            const base: Generator.InitOptions = .{
+                .pld_enabled = flags & 1 != 0,
+                .drafter_enabled = flags & 2 != 0,
+                .mtp_enabled = flags & 4 != 0,
+                .dflash_enabled = flags & 8 != 0,
+                .drafter = if (flags & 2 != 0) dummy_drafter else null,
+                .dflash = if (flags & 8 != 0) dummy_dflash else null,
+                .logprobs_n = lp,
+            };
+            var want_opts = base;
+            const want = upstreamDsv4Chokepoint(m.dsv4, m.n_mtp, sp, &want_opts);
+            var got_opts = base;
+            const got = try Generator.armNativeDraft(testing.allocator, &xfm, sp, &got_opts);
+            defer if (got.lane) |nd| nd.release();
+            try testing.expectEqual(want[0], got.active);
+            try testing.expectEqual(want[1], got.stochastic);
+            try testing.expectEqual(got.active, got.lane != null);
+            inline for (.{ "pld_enabled", "drafter_enabled", "mtp_enabled", "dflash_enabled", "drafter", "dflash" }) |f|
+                try testing.expectEqual(@field(want_opts, f), @field(got_opts, f));
+            try testing.expectEqual(want_opts.mtp == null, got_opts.mtp == null);
+            if (got.lane) |nd| {
+                // deepseek_v4's lane is the Generator's own (owned), named as before, at the module's block.
+                try testing.expect(nd.owned != null and nd.lane == &Dsv4Lane.table);
+                try testing.expectEqualStrings("deepseek_v4", nd.name);
+                try testing.expectEqual(@as(u32, @intCast(m.block)), nd.lane.block_size(nd.module));
+            }
+        };
+    }
+}
+
+test "host seams: prefillUnchunked is upstream's visionPrefillUnchunked for every model no registered arch claims" {
+    const types = [_][]const u8{ "gemma3", "gemma4", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "llama", "mistral", "laguna", "mimo_v2", "deepseek_v4", "nemotron_h", "lfm2", "glm5_next", "bailing_hybrid" };
+    for (types) |t| for ([_]bool{ false, true }) |has_vision| {
+        var cfg: model_mod.ModelConfig = .{};
+        cfg.model_type = t;
+        // af34af04: `has_vision and !visionChunkedPrefillEnabled()`.
+        try testing.expectEqual(has_vision and !visionChunkedPrefillEnabled(), prefillUnchunked(&cfg, has_vision));
+        try testing.expect(!cfg.prefillWholePrompt() and !cfg.prefillYieldsLastLogits());
+    };
+}
+
+test "host seams: deepseek_v4 and every in-tree model take no decode handover (upstream's init path)" {
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    for ([_]bool{ false, true }) |with_dsv4| {
+        xfm.dsv4 = if (with_dsv4) &dsv4 else null;
+        var clock = HandoverClock.of(&xfm);
+        try testing.expect(!clock.due);
+        // The lazy pre-forward is skipped exactly when the caller asked, as before the clock.
+        try testing.expect(!clock.skipsLazyPreforward(false) and clock.skipsLazyPreforward(true));
+        try testing.expect(!clock.fire());
+        try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = with_dsv4 });
+    }
+}

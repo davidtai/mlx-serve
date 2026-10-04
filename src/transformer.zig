@@ -72708,3 +72708,49 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
     try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
 }
+
+// ── host seams: arch dispatch through the registry (characterization against upstream af34af04) ──
+
+test "host seams: the native draft block is upstream's DSpark readiness (deepseek_v4 with stages), 0 for every other model" {
+    var t: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    t.qwen4 = null;
+    try testing.expectEqual(@as(u32, 0), t.nativeDraftBlock());
+    var m: dsv4_mod.Dsv4Model = undefined;
+    t.dsv4 = &m;
+    // af34af04's server readiness was `dsv4.n_mtp > 0`; n_mtp > 0 always comes with a block (`dsparkStageCount`).
+    for ([_][2]usize{ .{ 0, 0 }, .{ 0, 5 }, .{ 1, 5 }, .{ 3, 5 }, .{ 3, 16 } }) |c| {
+        m.n_mtp = c[0];
+        m.ds_block = c[1];
+        try testing.expectEqual(m.n_mtp > 0, t.nativeDraftBlock() > 0);
+        if (m.n_mtp > 0) try testing.expectEqual(@as(u32, @intCast(m.ds_block)), t.nativeDraftBlock());
+        // deepseek_v4 takes no handover and its module has no request end: both calls stay no-ops.
+        try testing.expect(!t.decodeHandoverWanted());
+        try t.decodeHandover(.{ .prompt_tokens = 1, .reserved_tokens = 2, .native_draft = m.n_mtp > 0 });
+        try t.requestEnd();
+    }
+    try testing.expect(!@hasDecl(dsv4_mod.Dsv4Model, "requestEnd"));
+    t.dsv4 = null;
+    try t.requestEnd();
+}
+
+test "host seams: an in-tree model warms up with upstream's passes, each on the default context (the request shape is read by registered archs only)" {
+    try testing.expectEqualSlices(u32, &.{ 1, 8, 32 }, &Transformer.warmup_passes);
+    var t: Transformer = undefined;
+    t.cache.step = 0;
+    t.moe_seq_offset = 0;
+    t.ssm_entries = null;
+    t.capture_hidden = null;
+    t.vision_embeddings = null;
+    t.config.max_position_embeddings = 32_768;
+    for (Transformer.warmup_passes) |n| {
+        var ctx = t.warmupCtx(n);
+        try testing.expect(ctx.request != null);
+        ctx.request = null;
+        const plain = t.defaultCtx();
+        inline for (@typeInfo(ForwardCtx).@"struct".field_names) |name| {
+            try testing.expect(std.meta.eql(@field(plain, name), @field(ctx, name)));
+        }
+    }
+}

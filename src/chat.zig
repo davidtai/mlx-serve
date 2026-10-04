@@ -14893,3 +14893,11 @@ test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0
     try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
 }
+
+test "host seams: the default macOS build embeds the engines upstream's macos_engines switch did" {
+    // The engine picks key on `embedded_engines` (was `macos_engines`); only the slim host's exe turns it off.
+    const bo = @import("build_options");
+    try std.testing.expectEqual(bo.macos_engines, bo.embedded_engines);
+    try std.testing.expectEqual(bo.embedded_engines, arch_ds4 == @import("arch/ds4.zig"));
+    try std.testing.expectEqual(bo.embedded_engines, arch_llama == @import("arch/llama.zig"));
+}

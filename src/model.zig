@@ -8279,3 +8279,162 @@ test "parseConfigFromJson accepts real checkpoint configs" {
     }
     try testing.expect(!failed);
 }
+
+// ── host seams: the registry's arch dispatch and the SDK types, as upstream's models see them ──
+
+/// Upstream af34af04's `QuantMode`, verbatim (now `sdk.QuantMode`).
+const UpstreamQuantMode = enum {
+    affine,
+    nvfp4,
+    mxfp4,
+    mxfp8,
+    gguf,
+
+    fn fromString(name: []const u8) ?UpstreamQuantMode {
+        return std.meta.stringToEnum(UpstreamQuantMode, name);
+    }
+    fn cstr(self: UpstreamQuantMode) [*:0]const u8 {
+        return switch (self) {
+            .affine => "affine",
+            .nvfp4 => "nvfp4",
+            .mxfp4 => "mxfp4",
+            .mxfp8 => "mxfp8",
+            .gguf => "gguf",
+        };
+    }
+    fn hasBiases(self: UpstreamQuantMode) bool {
+        return self == .affine;
+    }
+};
+
+test "host seams: QuantMode (now sdk.QuantMode) parses, names and bills biases as upstream's enum" {
+    const old_tags = @typeInfo(UpstreamQuantMode).@"enum".field_names;
+    try testing.expectEqual(old_tags.len, @typeInfo(QuantMode).@"enum".field_names.len);
+    inline for (old_tags) |name| {
+        const new = QuantMode.fromString(name).?;
+        const old = UpstreamQuantMode.fromString(name).?;
+        try testing.expectEqualStrings(name, @tagName(new));
+        try testing.expectEqualStrings(std.mem.span(old.cstr()), std.mem.span(new.cstr()));
+        try testing.expectEqual(old.hasBiases(), new.hasBiases());
+    }
+    for ([_][]const u8{ "", "Affine", "fp8", "int4", "nvfp4 " }) |s|
+        try testing.expectEqual(UpstreamQuantMode.fromString(s) == null, QuantMode.fromString(s) == null);
+    // LoadOpts (now sdk.LoadOpts): upstream's two fields keep their defaults, and the new one is off.
+    const o: LoadOpts = .{};
+    try testing.expect(!o.vision and !o.keep_f16 and !o.nocache);
+}
+
+test "host seams: no registered arch claims an upstream model_type; this build reads no tie-break setting" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const types = [_][]const u8{ "gemma3", "gemma3_text", "gemma4", "gemma4_text", "diffusion_gemma", "muse_glimmer", "spark2_5", "qwen2", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "qwen4_exp", "qwen3_moe", "gpt_oss", "glm5_next", "glm5_next_text", "mimo_v2", "mimo_v2_flash", "hy_v3", "bailing_hybrid", "laguna", "inkling_mm_model", "deepseek_v4", "deepseek_v3", "llama", "mistral", "nemotron_h", "lfm2", "lfm2_moe", "lfm2_vl", "k2_horizon", "prism_hadamard_qwen35", "bert", "" };
+    for (types) |t| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "{{\"model_type\":\"{s}\"}}", .{t});
+        const peek = try sdk.ConfigPeek.parse(arena.allocator(), "/m", text);
+        try testing.expect(plugins.registry.arch(&peek, null) == null);
+        try testing.expect(plugins.registry.arch(&peek, "mlx-stream") == null);
+    }
+    // One registered arch at most: `parseConfig` never reads model-settings.json's `plugin`.
+    try testing.expect(!plugins.registry.arch_ties_possible);
+}
+
+test "host seams: upstream configs parse to no arch, with every new field at its upstream-neutral default" {
+    const dsv4_json =
+        \\{
+        \\  "architectures": ["DeepseekV4ForCausalLM"],
+        \\  "model_type": "deepseek_v4",
+        \\  "bos_token_id": 0,
+        \\  "eos_token_id": 1,
+        \\  "head_dim": 512,
+        \\  "hidden_act": "silu",
+        \\  "hidden_size": 4096,
+        \\  "index_head_dim": 128,
+        \\  "index_n_heads": 64,
+        \\  "index_topk": 512,
+        \\  "max_position_embeddings": 1048576,
+        \\  "moe_intermediate_size": 2048,
+        \\  "n_routed_experts": 256,
+        \\  "n_shared_experts": 1,
+        \\  "norm_topk_prob": true,
+        \\  "num_attention_heads": 64,
+        \\  "num_experts_per_tok": 6,
+        \\  "num_hidden_layers": 43,
+        \\  "num_hash_layers": 3,
+        \\  "num_key_value_heads": 1,
+        \\  "num_nextn_predict_layers": 3,
+        \\  "dspark_block_size": 5,
+        \\  "dspark_noise_token_id": 128799,
+        \\  "dspark_target_layer_ids": [40, 41, 42],
+        \\  "dspark_markov_rank": 256,
+        \\  "o_groups": 8,
+        \\  "o_lora_rank": 1024,
+        \\  "q_lora_rank": 1024,
+        \\  "qk_rope_head_dim": 64,
+        \\  "hc_eps": 1e-06,
+        \\  "hc_mult": 4,
+        \\  "hc_sinkhorn_iters": 20,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32,
+        \\    "beta_slow": 1,
+        \\    "factor": 16,
+        \\    "original_max_position_embeddings": 65536,
+        \\    "type": "yarn"
+        \\  },
+        \\  "rope_theta": 10000,
+        \\  "routed_scaling_factor": 1.5,
+        \\  "scoring_func": "sqrtsoftplus",
+        \\  "sliding_window": 128,
+        \\  "swiglu_limit": 10.0,
+        \\  "tie_word_embeddings": false,
+        \\  "topk_method": "noaux_tc",
+        \\  "torch_dtype": "bfloat16",
+        \\  "vocab_size": 129280,
+        \\  "compress_rope_theta": 160000,
+        \\  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0],
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine",
+        \\    "layers.0.ffn.experts.w1": {"group_size": 64, "bits": 2, "mode": "affine"}}
+        \\}
+    ;
+    const qwen3_moe_json =
+        \\{
+        \\  "model_type": "qwen3_moe",
+        \\  "hidden_size": 2048,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 768,
+        \\  "shared_expert_intermediate_size": 0,
+        \\  "use_qk_norm": true,
+        \\  "use_sliding_window": false,
+        \\  "rope_theta": 10000000,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 8, "group_size": 64}
+        \\}
+    ;
+    const qwen2_json =
+        \\{"model_type": "qwen2", "hidden_size": 5120, "num_hidden_layers": 64, "num_attention_heads": 40,
+        \\ "num_key_value_heads": 8, "intermediate_size": 27648, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+        \\ "hidden_act": "silu", "tie_word_embeddings": false, "quantization": {"bits": 8, "group_size": 64}}
+    ;
+    try testing.expect(memory_baseline_override == null and expert_rows_override == null);
+    for ([_][]const u8{ dsv4_json, qwen3_moe_json, qwen2_json }) |json| {
+        var c = try parseConfigFromJson(testing.allocator, json);
+        defer c.deinit(testing.allocator);
+        try testing.expect(c.arch == null and c.arch_cfg == null);
+        try testing.expect(c.nocache_weights == null and c.memory_baseline_bytes == null);
+        try testing.expect(c.expert_rows == null and c.expert_prefill_rows == null);
+        try testing.expect(!c.prefillWholePrompt() and !c.prefillYieldsLastLogits());
+        // af34af04 keyed module-owned decode state on the model_type alone.
+        try testing.expectEqual(std.mem.eql(u8, c.model_type, "deepseek_v4"), c.moduleOwnsDecodeState());
+        const facts = c.loadFacts();
+        try testing.expect(facts.nocache_weights == null and facts.memory_baseline_bytes == null and facts.expert_rows == null);
+    }
+    var dsv4 = try parseConfigFromJson(testing.allocator, dsv4_json);
+    defer dsv4.deinit(testing.allocator);
+    try testing.expectEqualStrings("deepseek_v4", dsv4.model_type);
+    try testing.expect(!dsv4.supportsBatchedGdnDecode());
+}

@@ -11012,3 +11012,68 @@ test "availForLoad: only a load that would be refused makes media residency let 
     _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
     try std.testing.expectEqual(@as(u64, 0), held.bytes);
 }
+
+// ── host seams: one draft-lane dispatch (characterization against upstream af34af04) ──
+
+test "host seams: runPrefill's spec wiring reaches the generator options and lane upstream's did (deepseek_v4 with and without stages, no module)" {
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    inline for (transformer_mod.Transformer.module_shared_readonly_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    t.qwen4_mtp = null;
+    var dsv4: @import("deepseek_v4.zig").Dsv4Model = undefined;
+    var lm: model_registry_mod.LoadedModel = undefined;
+    lm.transformer = &t;
+    const models = [_][2]usize{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 3 } }; // {dsv4?, n_mtp}
+    for (models) |m| {
+        dsv4.n_mtp = m[1];
+        dsv4.ds_block = if (m[1] > 0) 5 else 0;
+        t.dsv4 = if (m[0] == 1) &dsv4 else null;
+        for (0..32) |bits| {
+            const enable_mtp = bits & 1 != 0;
+            const has_mtp = bits & 2 != 0;
+            const enable_drafter = bits & 4 != 0;
+            const has_drafter = bits & 8 != 0;
+            const enable_pld = bits & 16 != 0;
+            const owns = t.moduleSpecWiring();
+            const rollback = t.moduleStateSpecRollback();
+            // af34af04 read `has_native_draft` as `transformer.dsv4 != null`.
+            const old_w = specInitWiring(owns, rollback, t.dsv4 != null, enable_mtp, has_mtp, enable_drafter, has_drafter, false, enable_pld);
+            const new_w = specInitWiring(owns, rollback, modelHasNativeDraft(&lm), enable_mtp, has_mtp, enable_drafter, has_drafter, false, enable_pld);
+            try testing.expectEqual(old_w.use_mtp, new_w.use_mtp);
+            try testing.expectEqual(old_w.use_drafter, new_w.use_drafter);
+            try testing.expectEqual(old_w.use_dflash, new_w.use_dflash);
+            try testing.expectEqual(old_w.use_pld, new_w.use_pld);
+            for ([_]generate_mod.SamplingParams{ .{ .temperature = 0.0 }, .{ .temperature = 0.6, .top_p = 0.95 }, .{ .temperature = 0.0, .repeat_penalty = 1.2 } }) |sp| {
+                var old_o: Generator.InitOptions = .{ .pld_enabled = old_w.use_pld or old_w.native_intent, .drafter_enabled = old_w.use_drafter, .dflash_enabled = old_w.use_dflash, .mtp_enabled = old_w.use_mtp };
+                var new_o: Generator.InitOptions = .{ .pld_enabled = new_w.use_pld or new_w.native_intent, .drafter_enabled = new_w.use_drafter, .dflash_enabled = new_w.use_dflash, .mtp_enabled = new_w.use_mtp };
+                const old_arm = generate_mod.upstreamDsv4Chokepoint(t.dsv4 != null, dsv4.n_mtp, sp, &old_o);
+                const new_arm = try Generator.armNativeDraft(testing.allocator, &t, sp, &new_o);
+                defer if (new_arm.lane) |nd| nd.release();
+                try testing.expectEqual(old_arm[0], new_arm.active);
+                try testing.expectEqual(old_arm[1], new_arm.stochastic);
+                inline for (.{ "pld_enabled", "drafter_enabled", "dflash_enabled", "mtp_enabled" }) |f|
+                    try testing.expectEqual(@field(old_o, f), @field(new_o, f));
+                // The decode tick then dispatches as before (`.dspark` is now `.draft_lane`).
+                const old_tick = specTickMode(enable_mtp, old_o.mtp_enabled, enable_drafter, old_o.drafter_enabled, old_o.dflash_enabled, enable_pld, old_o.pld_enabled, old_arm[0]);
+                const new_tick = specTickMode(enable_mtp, new_o.mtp_enabled, enable_drafter, new_o.drafter_enabled, new_o.dflash_enabled, enable_pld, new_o.pld_enabled, new_arm.active);
+                try testing.expectEqual(old_tick, new_tick);
+            }
+        }
+    }
+}
+
+test "host seams: applyModelSettings leaves the load's page-cache choice alone unless the entry names nocache_weights" {
+    var cfg: ModelConfig = .{};
+    var chat: ChatConfig = .{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    var o: model_settings.Override = .{ .ctx_size = 4096, .mtp = false };
+    applyModelSettings(&cfg, &chat, &o, true);
+    try testing.expect(cfg.nocache_weights == null);
+    cfg.nocache_weights = true;
+    var o2: model_settings.Override = .{};
+    applyModelSettings(&cfg, &chat, &o2, true);
+    try testing.expectEqual(@as(?bool, true), cfg.nocache_weights);
+    var o3: model_settings.Override = .{ .nocache_weights = false };
+    applyModelSettings(&cfg, &chat, &o3, true);
+    try testing.expectEqual(@as(?bool, false), cfg.nocache_weights);
+}

@@ -554,3 +554,74 @@ test "model_settings: an alias two models claim is named with both paths" {
     defer one.deinit();
     try std.testing.expect(one.duplicateAlias() == null);
 }
+
+// ── host seams: lookup split into entry + fromValue; plugin tie-break (characterization against upstream af34af04) ──
+
+/// Upstream af34af04's `Settings.lookup`, verbatim.
+fn upstreamLookup(self: *const Settings, alloc: std.mem.Allocator, model_path: []const u8) Override {
+    const p = self.parsed orelse return .{};
+    const root = switch (p.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+    const want = trimSlash(model_path);
+    var it = root.iterator();
+    while (it.next()) |kv| {
+        if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
+        return fromValue(alloc, kv.value_ptr.*);
+    }
+    return .{};
+}
+
+/// Upstream af34af04's `Override.isEmpty` (no `nocache_weights`).
+fn upstreamIsEmpty(o: Override) bool {
+    return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
+        o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
+}
+
+fn expectSameOverride(a: Override, b: Override) !void {
+    const info = @typeInfo(Override).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const x = @field(a, name);
+        const y = @field(b, name);
+        if (T == ?[]const u8) {
+            try std.testing.expectEqual(x == null, y == null);
+            if (x) |s| try std.testing.expectEqualStrings(s, y.?);
+        } else try std.testing.expect(std.meta.eql(x, y));
+    }
+}
+
+test "host seams: a model's settings resolve exactly as upstream's lookup did, for files written before the plugin keys" {
+    const t = std.testing.allocator;
+    const files = [_][]const u8{
+        "{}",
+        "[]",
+        "{\"/m/a\": 3}",
+        \\{"/m/a/": {"ctx_size": 8192, "kv_quant": "8", "mtp": false}, "/m/a": {"ctx_size": 1}}
+        ,
+        \\{"/m/b": {"mtp_acceptance": "typical", "mtp_greedy_tail": true, "int8_prefill": true, "drafter": "off"}}
+        ,
+        \\{"/m/c": {"chat_template_kwargs": {"preserve_thinking": true}, "enable_thinking": false, "reasoning_effort": "low"}}
+        ,
+        \\{"/m/d": {"ctx_size": "big", "kv_quant": 3, "drafter": "relative/path", "alias": "x"}}
+        ,
+        \\{"/m/e": {"plugin": "mlx-stream", "numeric_tier": "stock"}, "/m/f": {"drafter": "/abs/dir", "plugin": 7}}
+        ,
+    };
+    const paths = [_][]const u8{ "/m/a", "/m/a/", "/m/b", "/m/c", "/m/d", "/m/e", "/m/f", "/m/zz", "" };
+    for (files, 0..) |body, fi| {
+        var s = try parse(t, body);
+        defer s.deinit();
+        for (paths) |p| {
+            var want = upstreamLookup(&s, t, p);
+            defer want.deinit(t);
+            var got = s.lookup(t, p);
+            defer got.deinit(t);
+            try expectSameOverride(want, got);
+            try std.testing.expectEqual(upstreamIsEmpty(want), got.isEmpty());
+            // The tie-break reads the entry `lookup` resolved; only /m/e names a plugin by string.
+            const named = if (s.entry(p)) |e| pluginOf(e) else null;
+            try std.testing.expectEqual(fi == files.len - 1 and std.mem.eql(u8, trimSlash(p), "/m/e"), named != null);
+        }
+    }
+}
