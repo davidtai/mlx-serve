@@ -54,7 +54,6 @@ pub const DecodeHandover = arch.DecodeHandover;
 
 const spec = @import("sdk/spec.zig");
 pub const Spec = spec.Spec;
-pub const MtpHeadOps = spec.MtpHeadOps;
 pub const DraftLane = spec.DraftLane;
 pub const ArmRequest = spec.ArmRequest;
 pub const DraftArm = spec.DraftArm;
@@ -73,7 +72,6 @@ pub const checkConstruction = memory_bill.checkConstruction;
 
 pub const lifecycle = @import("sdk/lifecycle.zig");
 pub const PhaseObserver = lifecycle.PhaseObserver;
-pub const Freed = lifecycle.Freed;
 
 const kinds = @import("sdk/kinds.zig");
 pub const Source = kinds.Source;

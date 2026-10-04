@@ -6035,9 +6035,6 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         );
     }
     publishSlotTerminator(slot, reason, latched);
-    // A module arch's return to its prompt configuration (dsv41's reverse phase change): after the terminator, so it
-    // is on neither of this request's clocks; the next request's prefill waits for it on this thread.
-    if (slot.model.transformer) |x| x.requestEnd() catch |e| log.err("[scheduler] request end failed: {s}\n", .{@errorName(e)});
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
             hc.flushPendingDisk(s);

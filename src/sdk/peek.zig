@@ -67,10 +67,6 @@ pub const ConfigPeek = struct {
         return if (f == .object) f.object else null;
     }
 
-    /// `quantization_config`, else MLX's own `quantization`.
-    pub fn quantization(p: *const ConfigPeek) ?std.json.ObjectMap {
-        return p.obj("quantization_config") orelse p.obj("quantization");
-    }
 };
 
 /// One per-expert tensor of a weight group, as the group's description names it.
@@ -103,7 +99,7 @@ test "sdk peek: a config peek reads config.json's fields and refuses what is not
     try testing.expectEqual(@as(?i64, 43), p.int("n_layers"));
     try testing.expectEqual(@as(?i64, null), p.int("model_type"));
     try testing.expect(p.obj("x") == null and p.str("absent") == null);
-    try testing.expectEqual(@as(i64, 4), p.quantization().?.get("bits").?.integer);
+    try testing.expectEqual(@as(i64, 4), p.obj("quantization").?.get("bits").?.integer);
     try testing.expectEqualStrings("/m", p.model_dir);
     try testing.expectError(error.ConfigNotJson, ConfigPeek.parse(a, "/m", "{not json"));
     try testing.expectError(error.ConfigNotObject, ConfigPeek.parse(a, "/m", "[1, 2]"));

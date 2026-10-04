@@ -151,9 +151,6 @@ pub fn reader(path: [:0]const u8) !mlx.mlx_io_reader {
 }
 
 /// The aligned reads, the row gather and the residency probe are shared I/O helpers (io_util).
-pub const readAligned = io_util.readAligned;
-pub const RowGather = io_util.RowGather;
-pub const residentBytes = io_util.residentBytes;
 
 // ── Tests (host: no MLX array; the reader's callbacks driven as MLX drives them) ──
 
@@ -277,74 +274,6 @@ test "dsv41 nocache reader: a real resident shard's tensors through the reader e
     const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/model-00003.safetensors", .{bank}, 0);
     const r = try compareTensors(a, path);
     std.debug.print("nocache reader: {s}: {d} tensors, {d} B byte-identical to the plain reads\n", .{ path, r.n, r.bytes });
-}
-
-test "dsv41 nocache reader: the row gather reads whole aligned pages, each row once, and scatters them in the caller's order" {
-    const a = testing.allocator;
-    // 300 rows of 10,240 B (not a page multiple) after a 1,000 B prefix (unaligned), the embedding's row shape.
-    const base: u64 = 1000;
-    const rb: usize = 10240;
-    const n_rows: usize = 300;
-    const image = try a.alloc(u8, base + n_rows * rb);
-    defer a.free(image);
-    for (image[0..base], 0..) |*b, i| b.* = @truncate(i *% 5);
-    for (0..n_rows) |r| for (0..rb) |k| {
-        image[base + r * rb + k] = @truncate(r *% 131 +% k *% 7 +% 3);
-    };
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try td.dir.writeFile(testing.io, .{ .sub_path = "rows.bin", .data = image });
-    var root: [512]u8 = undefined;
-    var pbuf: [700]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/rows.bin", .{root[0..try td.dir.realPath(testing.io, &root)]}, 0);
-    const fd = try io_util.openNoCache(path.ptr, .{});
-    defer _ = std.c.close(fd);
-    // The serial path's bytes: one plain pread per row (what gatherRaw read before), on its own descriptor.
-    const plain = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    defer _ = std.c.close(plain);
-    // Unsorted ids with repeats, the first and the last row (the file ends inside the last row's page).
-    var rng = std.Random.DefaultPrng.init(0x5eed_e3b);
-    var ids: [200]u32 = undefined;
-    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, n_rows);
-    ids[3] = 0;
-    ids[7] = n_rows - 1;
-    ids[8] = ids[2];
-    ids[150] = ids[2];
-    for ([_]usize{ 0, 7 }) |helpers| {
-        // Pieces of 64 ids (a 200-id call runs 4); the caller alone below 8.
-        const rg = try RowGather.init(fd, base, rb, n_rows, helpers, 64, 8);
-        defer rg.deinit();
-        const out = try a.alloc(u8, ids.len * rb);
-        defer a.free(out);
-        @memset(out, 0xAA);
-        try rg.gather(&ids, out);
-        const want = try a.alloc(u8, rb);
-        defer a.free(want);
-        for (ids, 0..) |r, i| {
-            try testing.expectEqual(@as(isize, @intCast(rb)), std.c.pread(plain, want.ptr, rb, @intCast(base + r * rb)));
-            try testing.expectEqualSlices(u8, want, out[i * rb ..][0..rb]);
-        }
-        // The last piece's runs: whole aligned pages, each distinct row in exactly one.
-        var rows_in_runs: usize = 0;
-        for (rg.runs[0..rg.n_runs]) |run| {
-            try testing.expect(rg.aligned(run, rg.stages[0]));
-            var k = run.first;
-            while (k < run.end) : (k += 1) rows_in_runs += @intFromBool(k == run.first or rg.items[k].id != rg.items[k - 1].id);
-        }
-        var distinct: usize = 0;
-        for (rg.items[0 .. ids.len - 3 * 64], 0..) |it, k| distinct += @intFromBool(k == 0 or it.id != rg.items[k - 1].id);
-        try testing.expectEqual(distinct, rows_in_runs);
-        // One row (the caller alone), and the refusals by name.
-        var one: [10240]u8 = undefined;
-        try rg.gather(&.{n_rows - 1}, &one);
-        try testing.expectEqualSlices(u8, image[base + (n_rows - 1) * rb ..][0..rb], &one);
-        try testing.expectError(error.RowOutOfRange, rg.gather(&.{@intCast(n_rows)}, &one));
-        try testing.expectError(error.GatherShape, rg.gather(&.{ 0, 1 }, &one));
-        // An unaligned run is refused by the reader's check (never planned: `plan` aligns by construction).
-        try testing.expect(!rg.aligned(.{ .off = 1000, .len = 16384, .need = 10240, .first = 0, .end = 1 }, rg.stages[0]));
-        try testing.expect(!rg.aligned(.{ .off = 0, .len = 12288, .need = 10240, .first = 0, .end = 1 }, rg.stages[0]) or std.heap.pageSize() == 4096);
-    }
-    try testing.expectEqual(@as(u64, 16 * RowGather.stage_len + 1024 * 40), RowGather.persistentBytes(15, 1024));
 }
 
 test "dsv41 nocache reader: MLX's reader handle owns the descriptor and frees it; reads past one staging buffer equal the plain reads" {

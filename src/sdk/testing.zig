@@ -11,10 +11,7 @@ const peek = @import("peek.zig");
 const arch = @import("arch.zig");
 const spec = @import("spec.zig");
 const bill = @import("memory_bill.zig");
-const lifecycle = @import("lifecycle.zig");
 const bill_mod = bill;
-
-pub const Lane = enum { cpu, gpu_small, window };
 
 // ── The CPU lane's device check ──
 
@@ -73,121 +70,12 @@ pub fn expectClaims(claims: *const fn (*const peek.ConfigPeek) ?peek.Priority, c
 
 // ── Bills, fills and admission (cpu) ──
 
-/// A (baseline, ceiling, stop) triple and the fill it must reach, or the refusal it must name.
-pub const AdmissionCase = struct {
-    baseline: u64,
-    ceiling: u64,
-    stop: u64,
-    want: union(enum) { rows: bill.Rows, refused: anyerror },
-};
-
-/// The fill at each triple, then the admission of the filled rows (each phase within one row of the target).
-pub fn expectAdmission(b: bill.MemoryBill, n_experts: u32, min_rows: u32, cases: []const AdmissionCase) !void {
-    for (cases) |c| {
-        const target = c.ceiling -| c.stop;
-        const got = bill.fill(b, c.baseline, target, n_experts, min_rows);
-        switch (c.want) {
-            .refused => |e| try std.testing.expectError(e, got),
-            .rows => |want| {
-                const rows = try got;
-                try std.testing.expectEqual(want, rows);
-                try bill.admit(b, c.baseline, rows, target);
-                if (rows.prompt < rows.decode) try std.testing.expect(b.total(.prompt, c.baseline, rows.prompt + 1) > target);
-                if (rows.decode < n_experts) try std.testing.expect(b.total(.decode, c.baseline, rows.decode + 1) > target);
-            },
-        }
-    }
-}
-
 /// G4: an arch's itemized bill (`A.bill`) bounds the process exactly as its load preflight (`A.loadBytes`) bills it, at
 /// the fill's floor rows: the preflight and the admission read one bill.
 pub fn expectBillBoundsLoad(comptime A: type, gpa: std.mem.Allocator, io: std.Io, cfg: *const A.Config, facts: *const arch.LoadFacts, req: *const bill.BillRequest, floor: bill.Rows) !void {
     const mb = try A.bill(gpa, io, req);
     defer mb.free(gpa);
     try std.testing.expectEqual(try A.loadBytes(gpa, io, cfg, facts, req.ceiling), mb.processBound(floor));
-}
-
-/// A route override changes exactly the terms its owner bills: `a` and `b` (one bill at two routes) differ in the
-/// `owned` terms only, and keep the same term names in the same order.
-pub fn expectRouteFollowing(a: bill.MemoryBill, b: bill.MemoryBill, owned: []const []const u8) !void {
-    try std.testing.expectEqual(a.terms.len, b.terms.len);
-    var moved = false;
-    for (a.terms, b.terms) |x, y| {
-        try std.testing.expectEqualStrings(x.name, y.name);
-        const is_owned = for (owned) |o| {
-            if (std.mem.eql(u8, o, x.name)) break true;
-        } else false;
-        if (std.mem.eql(u64, &x.bytes, &y.bytes)) continue;
-        if (!is_owned) {
-            std.debug.print("route moved a term it does not own: {s}\n", .{x.name});
-            return error.RouteMovedForeignTerm;
-        }
-        moved = true;
-    }
-    if (!moved) return error.RouteMovedNothing;
-}
-
-// ── The phase change (cpu) ──
-
-/// A recorded phase change keeps the contract's order (lifecycle.order), the release as its route says.
-pub fn expectPhaseOrder(steps: []const lifecycle.Step, release_installed: bool) !void {
-    var at: ?lifecycle.Step = null;
-    lifecycle.checkOrder(steps, release_installed, &at) catch |e| {
-        std.debug.print("phase change out of order: {s} was due\n", .{@tagName(at.?)});
-        return e;
-    };
-}
-
-/// A refused boundary is sticky: after `refuse`, every later `request` is refused by name (PhaseChangeRefused), so
-/// no retry grows over what the refused check saw. `Gate` declares `request` and `refuse`.
-pub fn expectStickyRefusal(comptime Gate: type) !void {
-    var g: Gate = .{};
-    try g.request();
-    g.refuse(error.PhaseChangeFootprintNotFreed);
-    for (0..3) |_| try std.testing.expectError(error.PhaseChangeRefused, g.request());
-}
-
-// ── The draft lane (gpu_small on a real module; cpu on a fake) ──
-
-/// Each round returns [t1, <= cap accepted drafts] and its next token; the committed position advances by the
-/// tokens kept; the next round starts from the next token. One round per entry of `caps`.
-pub fn expectRoundInvariant(vt: *const arch.Arch, module: *anyopaque, t1: u32, caps: []const u32) !void {
-    const lane = switch (vt.spec) {
-        .draft_lane => |l| l,
-        else => return error.NoDraftLane,
-    };
-    var t = t1;
-    for (caps) |cap| {
-        const before = vt.position(module);
-        var r = try lane.round(module, std.testing.allocator, t, cap);
-        defer r.deinit(std.testing.allocator);
-        try std.testing.expect(r.tokens.len >= 1 and r.tokens[0] == t);
-        try std.testing.expect(r.accepted <= cap and r.tokens.len == r.accepted + 1);
-        try std.testing.expectEqual(before + r.tokens.len, vt.position(module));
-        t = r.next_token;
-    }
-}
-
-// ── Receipts (cpu) ──
-
-/// A receipt carries every stamp its readers need (a JSON null is a stamp); a dotted name walks nested objects
-/// ("stream.misses").
-pub fn expectStamps(receipt_json: []const u8, stamps: []const []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), receipt_json, .{});
-    for (stamps) |name| {
-        var v: ?std.json.Value = root;
-        var it = std.mem.splitScalar(u8, name, '.');
-        while (it.next()) |key| {
-            const cur = v orelse break;
-            v = if (cur == .object) cur.object.get(key) else null;
-        }
-        if (v == null) {
-            std.debug.print("receipt lacks stamp {s}\n", .{name});
-            return error.ReceiptStampMissing;
-        }
-    }
 }
 
 // ── Fakes for the host's tests (cpu) ──
@@ -336,10 +224,9 @@ test "sdk testing: the fake arch's table counts every call, and its optional hoo
     const m = try vt.init(&load, cfg);
     _ = try vt.prefill(m, &.{ 1, 2, 3 }, .{ .prompt_tokens = 3, .max_tokens = 8, .host_context = 4096 });
     try vt.handover.?(m, .{ .prompt_tokens = 3, .reserved_tokens = 0, .native_draft = true });
-    try expectRoundInvariant(&vt, m, 11, &.{ 4, 0, 2 });
     _ = try vt.step(m, &.{9});
     vt.deinit(m);
-    try testing.expectEqual(FakeCalls{ .init = 1, .deinit = 1, .prefill = 1, .step = 1, .handover = 1, .rounds = 3 }, Fake.calls);
+    try testing.expectEqual(FakeCalls{ .init = 1, .deinit = 1, .prefill = 1, .step = 1, .handover = 1 }, Fake.calls);
 
     const Bare = FakeArch(.{ .handover = false, .caps = .{} });
     const bare = comptime arch.Arch.of(Bare);
@@ -348,49 +235,15 @@ test "sdk testing: the fake arch's table counts every call, and its optional hoo
     try testing.expectEqualStrings("fake arch: refused by the fixture", diag.message());
 }
 
-test "sdk testing: claims fixtures, admission triples and route-following run on any bill" {
+test "sdk testing: claims fixtures run on any arch's claim" {
     try expectClaims(FakeArch(.{}).claims, &.{
         .{ .config = "{\"model_type\":\"fake_arch\"}", .want = .native },
         .{ .config = "{\"model_type\":\"deepseek_v4\"}", .want = null },
         .{ .config = "{\"architectures\":[\"X\"]}", .want = null },
     });
-    const gb: u64 = 1_000_000_000;
-    const terms = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb }, .at_construction = true }, .{ .name = "waves", .bytes = .{ 14 * gb, 2 * gb }, .at_construction = false } };
-    const b: bill.MemoryBill = .{ .terms = &terms, .per_row = gb / 4 };
-    try expectAdmission(b, 128, 16, &.{
-        // the decode rows capped by the experts, the prompt rows by the decode rows
-        .{ .baseline = 9 * gb, .ceiling = 120 * gb, .stop = 2 * gb, .want = .{ .rows = .{ .prompt = 128, .decode = 128 } } },
-        .{ .baseline = 9 * gb, .ceiling = 100 * gb, .stop = 2 * gb, .want = .{ .rows = .{ .prompt = 60, .decode = 112 } } },
-        // the upstream 8 GiB margin in place of the 2 GB stop costs 27 rows a phase
-        .{ .baseline = 9 * gb, .ceiling = 100 * gb, .stop = 8 * (1 << 30), .want = .{ .rows = .{ .prompt = 33, .decode = 85 } } },
-        .{ .baseline = 21 * gb, .ceiling = 100 * gb, .stop = 2 * gb, .want = .{ .refused = error.NativeBillDoesNotFit } },
-    });
-    const release = [_]bill.MemoryBill.Term{ .{ .name = "residents", .bytes = .{ 60 * gb, 59 * gb }, .at_construction = true }, .{ .name = "waves", .bytes = .{ 14 * gb, 1 * gb }, .at_construction = false } };
-    try expectRouteFollowing(b, .{ .terms = &release, .per_row = gb / 4 }, &.{"waves"});
-    try testing.expectError(error.RouteMovedForeignTerm, expectRouteFollowing(b, .{ .terms = &release, .per_row = gb / 4 }, &.{"residents"}));
-    try testing.expectError(error.RouteMovedNothing, expectRouteFollowing(b, b, &.{"waves"}));
 }
 
-test "sdk testing: the phase change's order and a sticky refusal; a receipt's stamps" {
-    try expectPhaseOrder(&.{ .synchronize, .fence, .cache_clear, .cache_limit, .synchronize_freed, .settle, .check_freed, .grow }, false);
-    const Gate = struct {
-        refused: ?anyerror = null,
-        fn request(g: *const @This()) error{PhaseChangeRefused}!void {
-            if (g.refused != null) return error.PhaseChangeRefused;
-        }
-        fn refuse(g: *@This(), e: anyerror) void {
-            if (g.refused == null) g.refused = e;
-        }
-    };
-    try expectStickyRefusal(Gate);
-    const receipt = "{\"lane\":\"draft\",\"arm\":null,\"stream\":{\"misses\":7952}}";
-    try expectStamps(receipt, &.{ "lane", "arm", "stream.misses" });
-    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"head_mode"}));
-    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"stream.bytes"}));
-    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"lane.x"}));
-}
-
-test "sdk testing: the fake's draft lane names itself, arms only greedy clean requests and counts its rounds; a lane-less fake has no rounds" {
+test "sdk testing: the fake's draft lane names itself, arms only greedy clean requests and counts its rounds" {
     const Fake = FakeArch(.{ .block_size = 3 });
     Fake.calls = .{};
     const vt = comptime arch.Arch.of(Fake);
@@ -408,8 +261,6 @@ test "sdk testing: the fake's draft lane names itself, arms only greedy clean re
     try testing.expectEqualSlices(u32, &.{ 40, 41, 42 }, r.tokens);
     try testing.expectEqual(@as(u32, 43), r.next_token);
     try testing.expectEqual(@as(u64, 1), lane.stats(&m).rounds);
-    var none: u32 = 0;
-    try testing.expectError(error.NoDraftLane, expectRoundInvariant(&comptime arch.Arch.of(FakeArch(.{})), &none, 1, &.{1}));
 }
 
 test "sdk testing: an arch's bill bounds its load preflight at the floor rows, or the check names the gap" {
@@ -485,7 +336,7 @@ test "sdk arch: the table's load preflight and bill call the arch's own; a hook 
     try testing.expectEqual(@as(u64, 77), (try vt.bill.?(testing.allocator, testing.io, &req)).per_row);
 }
 
-test "sdk testing: a claims fixture, a group fixture and a phase order that disagree fail the check" {
+test "sdk testing: a claims fixture and a group fixture that disagree fail the check" {
     try testing.expectError(error.TestExpectedEqual, expectClaims(FakeArch(.{}).claims, &.{.{ .config = "{\"model_type\":\"fake_arch\"}", .want = .generic }}));
     const Never = struct {
         fn claims(_: *const peek.GroupPeek, why: ?*peek.Diag) ?peek.Priority {
@@ -495,5 +346,4 @@ test "sdk testing: a claims fixture, a group fixture and a phase order that disa
     };
     try expectGroupClaims(Never.claims, &.{.{ .quantization = "{}", .hidden = 1, .inter = 1, .want = null }});
     try testing.expectError(error.TestExpectedEqual, expectGroupClaims(Never.claims, &.{.{ .quantization = "null", .hidden = 1, .inter = 1, .want = .native }}));
-    try testing.expectError(error.PhaseOrderViolated, expectPhaseOrder(&.{ .fence, .synchronize }, false));
 }

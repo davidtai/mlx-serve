@@ -995,8 +995,8 @@ const CoreOptions = struct {
         // builds its own options with ios=true so the engine swaps the macOS-only
         // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
         o.addOption(bool, "ios", false);
-        // True on every macOS graph: the macOS-only sources (the expert reader's C pool and
-        // event shims, the native module archs) are compiled in. iOS static lib and Linux exe =
+        // True on every macOS graph: the macOS-only sources (a macOS-only plugin's, the native
+        // module archs) are compiled in. iOS static lib and Linux exe =
         // no: they get compile-time stubs (src/*_stub.zig) and src/ane_stub.c on Linux. The stub
         // selection reads this option, NOT `ios` — `ios` keeps its own meaning (low-mem policy,
         // sandboxing assumptions).

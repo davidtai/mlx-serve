@@ -19999,18 +19999,6 @@ pub const Transformer = struct {
         if (a.vt.handover) |f| return f(a.module, h);
     }
 
-    /// The request's end for the module-owned-state archs whose module takes one (dsv41: its reverse phase change, back
-    /// to the prompt configuration); a no-op elsewhere. From the scheduler's `finishSlot`, after the request's last
-    /// token went out.
-    pub fn requestEnd(self: *Transformer) !void {
-        inline for (module_owned_state_fields) |f| {
-            const Ptr = @typeInfo(@FieldType(Transformer, f)).optional.child;
-            if (comptime @hasDecl(@typeInfo(Ptr).pointer.child, "requestEnd")) {
-                if (@field(self, f)) |m| return m.requestEnd();
-            }
-        }
-    }
-
     /// Whether this model's arch takes the handover: read once, at a Generator's construction.
     pub fn decodeHandoverWanted(self: *const Transformer) bool {
         const a = self.arch orelse return false;
@@ -72725,14 +72713,10 @@ test "host seams: the native draft block is upstream's DSpark readiness (deepsee
         m.ds_block = c[1];
         try testing.expectEqual(m.n_mtp > 0, t.nativeDraftBlock() > 0);
         if (m.n_mtp > 0) try testing.expectEqual(@as(u32, @intCast(m.ds_block)), t.nativeDraftBlock());
-        // deepseek_v4 takes no handover and its module has no request end: both calls stay no-ops.
+        // deepseek_v4 takes no handover: the call stays a no-op.
         try testing.expect(!t.decodeHandoverWanted());
         try t.decodeHandover(.{ .prompt_tokens = 1, .reserved_tokens = 2, .native_draft = m.n_mtp > 0 });
-        try t.requestEnd();
     }
-    try testing.expect(!@hasDecl(dsv4_mod.Dsv4Model, "requestEnd"));
-    t.dsv4 = null;
-    try t.requestEnd();
 }
 
 test "host seams: an in-tree model warms up with upstream's passes, each on the default context (the request shape is read by registered archs only)" {

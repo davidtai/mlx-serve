@@ -1,4 +1,4 @@
-//! G4, phase-specific admission: each kind bills its own named terms per phase, the host composes them, fills two row
+//! G4, phase-specific admission: an arch bills its own named terms per phase; the host fills two row
 //! counts and admits both phases before any allocation, and checks the constructed module once against the bill.
 //! Pure host: no MLX, no device query, no global, so bills and fills run in the CPU lane and the preflight never
 //! touches the device.
@@ -77,24 +77,7 @@ pub const MemoryBill = struct {
         return n;
     }
 
-    /// The kinds' parts as one bill, terms in order. One row source: the fill models a single row count, so two
-    /// parts with slot rows are refused by name.
-    pub fn compose(gpa: std.mem.Allocator, parts: []const MemoryBill) error{ TwoRowSources, OutOfMemory }!MemoryBill {
-        var terms: std.ArrayList(Term) = .empty;
-        errdefer terms.deinit(gpa);
-        var per_row: u64 = 0;
-        var row_terms: ?RowTerms = null;
-        for (parts) |p| {
-            if (p.per_row > 0 and per_row > 0) return error.TwoRowSources;
-            if (p.row_terms != null and row_terms != null) return error.TwoRowSources;
-            try terms.appendSlice(gpa, p.terms);
-            per_row += p.per_row;
-            row_terms = row_terms orelse p.row_terms;
-        }
-        return .{ .terms = try terms.toOwnedSlice(gpa), .per_row = per_row, .row_terms = row_terms };
-    }
-
-    /// Frees what `compose` allocated.
+    /// Frees an allocated bill's terms.
     pub fn free(b: MemoryBill, gpa: std.mem.Allocator) void {
         gpa.free(b.terms);
     }
@@ -229,20 +212,6 @@ test "sdk bill: the ceiling and the stop are arguments; an upstream default marg
     try testing.expectError(error.PromptOverTarget, admit(b, 10 * gb, forced, upstream.target()));
 }
 
-test "sdk bill: composition keeps every kind's terms in order and refuses a second row source" {
-    const quant = [_]MemoryBill.Term{.{ .name = "residents", .bytes = .{ 3, 2 }, .at_construction = true }};
-    const source = [_]MemoryBill.Term{.{ .name = "slot_transient", .bytes = .{ 5, 1 }, .at_construction = true }};
-    const arch = [_]MemoryBill.Term{.{ .name = "waves", .bytes = .{ 7, 0 }, .at_construction = false }};
-    const b = try MemoryBill.compose(testing.allocator, &.{ .{ .terms = &quant }, .{ .terms = &source, .per_row = 11 }, .{ .terms = &arch } });
-    defer b.free(testing.allocator);
-    try testing.expectEqual(@as(usize, 3), b.terms.len);
-    try testing.expectEqualStrings("waves", b.terms[2].name);
-    try testing.expectEqual(@as(u64, 15), b.fixed(.prompt));
-    try testing.expectEqual(@as(u64, 3), b.fixed(.decode));
-    try testing.expectEqual(@as(u64, 11), b.per_row);
-    try testing.expectError(error.TwoRowSources, MemoryBill.compose(testing.allocator, &.{ .{ .terms = &source, .per_row = 11 }, .{ .terms = &arch, .per_row = 1 } }));
-}
-
 test "sdk bill: a row-following term counts at the rows asked; the fill steps down to the exact rows" {
     const terms = [_]MemoryBill.Term{
         .{ .name = "residents", .bytes = .{ 10 * gb, 10 * gb }, .at_construction = true },
@@ -262,5 +231,4 @@ test "sdk bill: a row-following term counts at the rows asked; the fill steps do
     const r = try fill(b, 0, target, 64, 1);
     try testing.expectEqual(@as(u32, 39), r.decode);
     try testing.expect(b.total(.decode, 0, r.decode) <= target and b.total(.decode, 0, r.decode + 1) > target);
-    try testing.expectError(error.TwoRowSources, MemoryBill.compose(testing.allocator, &.{ b, .{ .terms = &terms, .row_terms = b.row_terms } }));
 }

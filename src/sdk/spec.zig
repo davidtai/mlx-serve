@@ -1,19 +1,13 @@
-//! G3, speculative decode as an opt-in `arch` capability: `none`, the host-driven `mtp_head`, or the arch's own
-//! `draft_lane` over its module-owned state. A union, so an arch cannot half-claim both.
+//! G3, speculative decode as an opt-in `arch` capability: `none`, or the arch's own `draft_lane` over its
+//! module-owned state.
 
 const std = @import("std");
 const check = @import("check.zig");
 
 pub const Spec = union(enum) {
     none,
-    mtp_head: MtpHeadOps,
     draft_lane: DraftLane,
 };
-
-/// The host drives the rounds (EV planner, acceptance gate, batched verify) over its own KVCache, and the arch
-/// supplies the head's ops. Its fields land with the first arch that claims it: qwen's and qwen4's heads run
-/// in-tree today.
-pub const MtpHeadOps = struct {};
 
 /// What the host knows of a request when it arms a lane: the lane decides which requests it serves.
 pub const ArmRequest = struct {
