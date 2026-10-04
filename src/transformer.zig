@@ -16709,9 +16709,9 @@ pub const Transformer = struct {
     // A registered arch (src/plugins.zig): its module owns the trunk and whatever state its caps say, as dsv4
     // does; the shell stays empty. Reached through its table once per prompt, step, handover or round.
     arch: ?sdk.ArchInstance = null,
-    /// The process's one expert reader, taken at the arch's load claim (`archTakeReader`) and handed to this model by
-    /// its load: given back at deinit, after the arch's module.
-    arch_reader: bool = false,
+    /// The arch's process claim (`sdk.Arch.claim_process`, its expert reader), taken at the load claim
+    /// (`archClaimProcess`) and handed to this model by its load: released at deinit, after the arch's module.
+    arch_claim: ?*const fn () void = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -18281,8 +18281,8 @@ pub const Transformer = struct {
             a.vt.deinit(a.module);
             self.arch = null;
         }
-        if (self.arch_reader) sdk.expert.giveReader();
-        self.arch_reader = false;
+        if (self.arch_claim) |release| release();
+        self.arch_claim = null;
         if (self.rht) |reg| {
             reg.deinit();
             self.allocator.destroy(reg);
@@ -44668,30 +44668,28 @@ pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config
     };
 }
 
-/// The registry's load claim of the process's one expert reader (G6): taken when the config's arch reads through it
-/// (`caps.uses_expert_reader`), before the preflight and the weights; true when taken (the caller owns it until it
-/// hands it to the loaded Transformer's `arch_reader`). A second load that needs it is refused by name (the load
-/// site logs the refusal).
-pub fn archTakeReader(config: *const ModelConfig) error{ExpertReaderInUse}!bool {
-    const vt = config.arch orelse return false;
-    if (!vt.caps.uses_expert_reader) return false;
-    try sdk.expert.takeReader();
-    return true;
+/// The registry's load claim of what the config's arch holds once per process (`sdk.Arch.claim_process`, e.g. its
+/// expert reader), before the preflight and the weights; the release when taken (the caller owns the claim until it
+/// hands it to the loaded Transformer's `arch_claim`), null when the arch claims nothing. A second load that needs it
+/// is refused by the claim's error (the load site logs the refusal).
+pub fn archClaimProcess(config: *const ModelConfig) anyerror!?*const fn () void {
+    const vt = config.arch orelse return null;
+    const claim = vt.claim_process orelse return null;
+    try claim();
+    return vt.release_process.?;
 }
 
 test "dsv41 plugin: the load claim takes the one expert reader; a second load claim is refused by name until it is given back" {
     _ = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
     var config: ModelConfig = .{};
-    try std.testing.expectEqual(false, try archTakeReader(&config)); // no registered arch: nothing taken
+    try std.testing.expectEqual(null, try archClaimProcess(&config)); // no registered arch: nothing taken
     for (&@import("plugins.zig").registry.archs) |*e| {
         if (std.mem.eql(u8, e.kind.name, "deepseek_v41")) config.arch = &e.kind;
     }
-    try std.testing.expect(config.arch.?.caps.uses_expert_reader);
-    try std.testing.expect(try archTakeReader(&config));
-    try std.testing.expectError(error.ExpertReaderInUse, archTakeReader(&config));
-    sdk.expert.giveReader(); // what the loaded Transformer's deinit does after the arch's module
-    try std.testing.expect(try archTakeReader(&config));
-    sdk.expert.giveReader();
+    const release = (try archClaimProcess(&config)).?;
+    try std.testing.expectError(error.ExpertReaderInUse, archClaimProcess(&config));
+    release(); // what the loaded Transformer's deinit does after the arch's module
+    (try archClaimProcess(&config)).?();
 }
 
 /// A registered arch: its module over the loaded residents; the shell is dsv4's (a 0-layer KVCache, empty

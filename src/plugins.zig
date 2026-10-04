@@ -6,17 +6,37 @@ const std = @import("std");
 const sdk = @import("sdk");
 const build_options = @import("build_options");
 
-/// One line per plugin: `@import("<its root file>").plugin`. A plugin left out (`-Dmlx-stream=false`) leaves none
-/// of its files in the build: the host reaches a plugin through this table only.
+/// One line per plugin: `@import("<its module>").plugin`. Each plugin is its own repo, a pinned submodule under lib/
+/// (`-D<name>-dir` builds against a checkout instead); a plugin left out (`-Dmlx-stream=false`) leaves none of its
+/// files in the build: the host reaches a plugin through this table only.
 pub const all = if (registers_mlx_stream) [_]sdk.Plugin{
-    @import("mlx_stream/mlx_stream.zig").plugin,
+    @import("mlx_stream").plugin,
 } else [_]sdk.Plugin{};
-/// Whether this build registers mlx-stream (`-Dmlx-stream`, default on; the unit-test graph follows it).
+/// Whether this build registers mlx-stream (lib/mlx-stream, `-Dmlx-stream`, default on; the unit-test graph follows it).
 pub const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
 
-/// The registered mlx-stream package's test surface (`mlx_stream.zig`'s `testing`), null in a build that leaves the package
-/// out: the host's tests reach the package through the registry only, so such a build analyzes none of its files.
-pub const mlx_stream_testing: ?type = if (registers_mlx_stream) @import("mlx_stream/mlx_stream.zig").testing else null;
+/// The registered mlx-stream plugin's test surface (its root's `testing`), null in a build that leaves the plugin out:
+/// the host's tests reach the plugin through the registry only, so such a build analyzes none of its files.
+pub const mlx_stream_testing: ?type = if (registers_mlx_stream) @import("mlx_stream").testing else null;
+
+/// The model types a known plugin serves, and that plugin: a build that leaves the plugin out refuses such a model by
+/// name at config parse (`unservedPlugin`) instead of reading it as another arch.
+pub const known = [_]struct { model_type: []const u8, plugin: []const u8 }{
+    .{ .model_type = "deepseek_v41", .plugin = "mlx-stream" },
+};
+
+/// The plugin that serves `model_type` when this build does not register it; null when it does, or when no known
+/// plugin serves that model type.
+pub fn unservedPlugin(model_type: []const u8) ?[]const u8 {
+    return unservedIn(registry, model_type);
+}
+
+fn unservedIn(comptime R: type, model_type: []const u8) ?[]const u8 {
+    for (known) |k| {
+        if (std.mem.eql(u8, k.model_type, model_type) and !R.registered(k.plugin)) return k.plugin;
+    }
+    return null;
+}
 
 /// This build's registry. A macOS-only plugin registers nothing on graphs without the macOS-only sources.
 pub const registry = Registry(&all, .{ .macos = build_options.macos_engines });
@@ -43,8 +63,6 @@ pub fn Registry(comptime plugins: []const sdk.Plugin, comptime platform: Platfor
     }
     return struct {
         pub const sources = tableOf(sdk.Source, "source", plugins, platform);
-        pub const quants = tableOf(sdk.Quant, "quant", plugins, platform);
-        pub const expert_sources = tableOf(sdk.ExpertSource, "expert_source", plugins, platform);
         pub const archs = tableOf(sdk.Arch, "arch", plugins, platform);
         pub const engines = tableOf(sdk.Engine, "engine", plugins, platform);
 
@@ -62,9 +80,8 @@ pub fn Registry(comptime plugins: []const sdk.Plugin, comptime platform: Platfor
             return false;
         }
 
-        /// What served a model, as `/v1/models` and `/props` carry it: `,"plugins":[...]`, one object per kind (the
-        /// arch, then the quant and the expert source it binds, `sdk.Binds`), each naming its plugin. Built at compile
-        /// time; "" for a model no registered arch serves (an in-tree arch, an embedded engine), which leaves those
+        /// What served a model, as `/v1/models` and `/props` carry it: `,"plugins":[...]`, the arch's object naming its
+        /// plugin. Built at compile time; "" for a model no registered arch serves (an in-tree arch, an embedded engine), which leaves those
         /// bodies as they were.
         pub fn servedJson(a: ?*const sdk.Arch) []const u8 {
             const want = a orelse return "";
@@ -85,18 +102,6 @@ pub fn Registry(comptime plugins: []const sdk.Plugin, comptime platform: Platfor
         }
         pub fn engine(peek: *const sdk.ConfigPeek, prefer: ?[]const u8) ?*const Entry(sdk.Engine) {
             return route(sdk.Engine, &engines, peek, prefer);
-        }
-        pub fn expertSource(peek: *const sdk.ConfigPeek, prefer: ?[]const u8) ?*const Entry(sdk.ExpertSource) {
-            return route(sdk.ExpertSource, &expert_sources, peek, prefer);
-        }
-        /// The quant that claims a weight group (load, once per group); `why` keeps the last decline.
-        pub fn quant(group: *const sdk.GroupPeek, why: ?*sdk.Diag, prefer: ?[]const u8) ?*const Entry(sdk.Quant) {
-            if (quants.len == 0) return null;
-            var claim: [quants.len]?sdk.Priority = undefined;
-            for (&quants, &claim) |*e, *c| c.* = e.kind.claims(group, why);
-            const names = comptime namesOf(&quants);
-            const i = pick(&names, &claim, prefer) orelse return null;
-            return &quants[i];
         }
     };
 }
@@ -119,8 +124,7 @@ fn tableOf(comptime K: type, comptime field: []const u8, comptime plugins: []con
     return out;
 }
 
-/// Each registered arch's `plugins` fragment, in its table's order. An arch may bind only its own plugin's quant and
-/// expert source: anything else is refused here, by name.
+/// Each registered arch's `plugins` fragment, in its table's order.
 fn servedOf(comptime plugins: []const sdk.Plugin, comptime platform: Platform) [countOf("arch", plugins, platform)][]const u8 {
     comptime {
         var out: [countOf("arch", plugins, platform)][]const u8 = undefined;
@@ -128,16 +132,7 @@ fn servedOf(comptime plugins: []const sdk.Plugin, comptime platform: Platform) [
         for (plugins) |p| {
             if (!registers(p, platform)) continue;
             const A = p.provides.arch orelse continue;
-            const b: sdk.Binds = if (@hasDecl(A, "binds") and @TypeOf(A.binds) != void) A.binds else .{};
-            var s: []const u8 = ",\"plugins\":[" ++ servedItem(p.name, "arch", A.name);
-            for (.{ "quant", "expert_source" }) |kind| {
-                if (@field(b, kind)) |K| {
-                    const own = @field(p.provides, kind);
-                    if (own == null or own.? != K) @compileError("plugin " ++ p.name ++ ": arch " ++ A.name ++ " binds " ++ kind ++ " " ++ @typeName(K) ++ ", which the plugin does not provide");
-                    s = s ++ "," ++ servedItem(p.name, kind, K.name);
-                }
-            }
-            out[i] = s ++ "]";
+            out[i] = ",\"plugins\":[" ++ servedItem(p.name, "arch", A.name) ++ "]";
             i += 1;
         }
         const final = out;
@@ -230,7 +225,7 @@ test "plugins registry: one table per kind in registry order; a macOS-only plugi
     const R = Registry(&.{ fake_a, fake_b, fake_c }, .{ .macos = true });
     try testing.expectEqual(@as(usize, 2), R.archs.len);
     try testing.expectEqual(@as(usize, 3), R.sources.len);
-    try testing.expectEqual(@as(usize, 0), R.quants.len + R.expert_sources.len + R.engines.len);
+    try testing.expectEqual(@as(usize, 0), R.engines.len);
     try testing.expectEqualStrings("fake-b", R.archs[1].plugin);
     const Linux = Registry(&.{ fake_a, fake_b, fake_c }, .{ .macos = false });
     try testing.expectEqual(@as(usize, 1), Linux.archs.len);
@@ -259,9 +254,15 @@ test "plugins registry: a registry without plugins claims nothing (the host buil
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const peek = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
-    try testing.expect(R.arch(&peek, null) == null and R.source(&peek, null) == null and R.engine(&peek, null) == null and R.expertSource(&peek, null) == null);
-    const group: sdk.GroupPeek = .{ .quantization = .null, .hidden = 0, .inter = 0, .n_experts = 0, .n_layers = 0, .layers = &.{} };
-    try testing.expect(R.quant(&group, null, null) == null);
+    try testing.expect(R.arch(&peek, null) == null and R.source(&peek, null) == null and R.engine(&peek, null) == null);
+}
+
+test "plugins registry: a model only a plugin serves is refused by that plugin's name on a build without it" {
+    const none = Registry(&.{}, .{ .macos = true });
+    try testing.expectEqualStrings("mlx-stream", unservedIn(none, "deepseek_v41").?);
+    try testing.expect(unservedIn(none, "qwen3") == null);
+    // This build registers mlx-stream exactly when -Dmlx-stream is on.
+    try testing.expectEqual(!registers_mlx_stream, unservedPlugin("deepseek_v41") != null);
 }
 
 test "plugins registry: the winner of a claims round" {
@@ -273,64 +274,20 @@ test "plugins registry: the winner of a claims round" {
     try testing.expectEqual(@as(?usize, 3), pick(&names, &.{ .generic, null, .generic, .native }, "a"));
 }
 
-test "plugins conformance: every registered plugin's kinds decline what is not theirs" {
-    const near_misses = [_]sdk.testing.ClaimCase{
-        .{ .config = "{}", .want = null },
-        .{ .config = "{\"model_type\":\"__no_such_model__\"}", .want = null },
-    };
-    inline for (registry.archs) |e| try sdk.testing.expectClaims(e.kind.claims, &near_misses);
-    inline for (registry.expert_sources) |e| try sdk.testing.expectClaims(e.kind.claims, &near_misses);
-    // a weight group no quant's format describes
-    const group_near_misses = [_]sdk.testing.GroupClaimCase{
-        .{ .quantization = "{}", .hidden = 5120, .inter = 2304, .want = null },
-        .{ .quantization = "{\"mode\":\"__no_such_format__\",\"bits\":4,\"group_size\":32}", .hidden = 5120, .inter = 2304, .want = null },
-    };
-    inline for (registry.quants) |e| try sdk.testing.expectGroupClaims(e.kind.claims, &group_near_misses);
-}
-
-test "plugins conformance: mlx-stream registers its EXL3 quant, pinned by the kernel registry's manifest" {
-    const pkg = mlx_stream_testing orelse return error.SkipZigTest;
-    const R = Registry(&all, .{ .macos = true });
-    try testing.expectEqual(@as(usize, 1), R.quants.len);
-    try testing.expectEqualStrings("exl3-mul1-k3", R.quants[0].kind.name);
-    try testing.expectEqualStrings(pkg.kernel_manifest_sha256, R.quants[0].kind.kernels.?.manifest_sha256);
-}
-
-test "plugins conformance: mlx-stream registers its EXL3 source, its capabilities and the one reader" {
-    const pkg = mlx_stream_testing orelse return error.SkipZigTest;
-    const R = Registry(&all, .{ .macos = true });
-    try testing.expectEqual(@as(usize, 1), R.expert_sources.len);
-    const k = R.expert_sources[0].kind;
-    try testing.expectEqualStrings("exl3-stream", k.name);
-    try testing.expect(k.caps.two_phase and k.caps.transient_release and k.caps.event_gates and !k.caps.construction_reset);
-    try testing.expect(pkg.stream_uses_reader);
-}
-
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
 test "plugins conformance: the CPU lane created no Metal device" {
     try sdk.testing.expectNoDevice();
 }
 
-// The import boundary's own test runs with the conformance suite ("plugins import probe").
-comptime {
-    if (@import("builtin").is_test and registers_mlx_stream) _ = @import("mlx_stream/mlx_stream_imports.zig");
-}
+const fake_d: sdk.Plugin = .{ .name = "fake-d", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "fake_d" }) } };
 
-const FakeStream = struct {
-    pub const name = "fake-stream";
-    pub fn claims(_: *const sdk.ConfigPeek) ?sdk.Priority {
-        return .native;
-    }
-};
-const fake_d: sdk.Plugin = .{ .name = "fake-d", .api = sdk.api, .mlx = sdk.mlx_pin, .provides = .{ .arch = FakeArch(.{ .model_type = "fake_d", .binds = .{ .expert_source = FakeStream } }), .expert_source = FakeStream } };
-
-test "plugins registry: what served a model names its arch and what the arch binds, each with its plugin; nothing for a model no arch serves" {
+test "plugins registry: what served a model names its arch with its plugin; nothing for a model no arch serves" {
     const R = Registry(&.{ fake_a, fake_d }, .{ .macos = true });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const d = R.arch(&try peekOf(a, "{\"model_type\":\"fake_d\"}"), null).?;
-    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"fake-d\",\"kind\":\"arch\",\"name\":\"fake-arch\"},{\"plugin\":\"fake-d\",\"kind\":\"expert_source\",\"name\":\"fake-stream\"}]", R.servedJson(&d.kind));
+    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"fake-d\",\"kind\":\"arch\",\"name\":\"fake-arch\"}]", R.servedJson(&d.kind));
     const f = R.arch(&try peekOf(a, "{\"model_type\":\"fake_arch\"}"), null).?;
     try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"fake-a\",\"kind\":\"arch\",\"name\":\"fake-arch\"}]", R.servedJson(&f.kind));
     try testing.expectEqualStrings("", R.servedJson(null));
@@ -340,17 +297,4 @@ test "plugins registry: what served a model names its arch and what the arch bin
     // Two archs can tie here, so the host reads the model's plugin setting; a one-arch registry never does.
     try testing.expect(R.arch_ties_possible and R.registered("fake-d") and !R.registered("mlx-stream"));
     try testing.expect(!Registry(&.{ fake_a, fake_c }, .{ .macos = true }).arch_ties_possible);
-}
-
-test "plugins registry: mlx-stream serves deepseek_v41 with the EXL3 quant and stream it binds; one arch, no tie to break" {
-    if (comptime registry.archs.len == 0) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const peek = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
-    const e = registry.arch(&peek, null).?;
-    try testing.expectEqualStrings("mlx-stream", e.plugin);
-    try testing.expectEqualStrings(",\"plugins\":[{\"plugin\":\"mlx-stream\",\"kind\":\"arch\",\"name\":\"deepseek_v41\"},{\"plugin\":\"mlx-stream\",\"kind\":\"quant\",\"name\":\"exl3-mul1-k3\"},{\"plugin\":\"mlx-stream\",\"kind\":\"expert_source\",\"name\":\"exl3-stream\"}]", registry.servedJson(&e.kind));
-    // The served build registers one arch: discovery never reads the plugin setting, and a preference changes nothing.
-    try testing.expect(!registry.arch_ties_possible and registry.registered("mlx-stream"));
-    try testing.expect(registry.arch(&peek, "fake-a").? == e);
 }

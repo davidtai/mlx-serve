@@ -3518,6 +3518,11 @@ pub fn parseConfigFromJsonPrefer(allocator: std.mem.Allocator, content: []const 
         config.num_hidden_layers = sh.num_layers;
         // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
         if (e.kind.caps.residents_past_page_cache) config.nocache_weights = true;
+    } else if (plugins.unservedPlugin(model_type)) |name| {
+        // A model only a plugin serves, on a build that leaves the plugin out: refused here, by name, before any
+        // weight is read (never parsed as another arch).
+        log.err("{s}: served by the {s} plugin, which this build does not register (built with -Dmlx-stream=false, or a Linux / iOS graph); rebuild with lib/{s} checked out\n", .{ model_type, name, name });
+        return error.PluginNotRegistered;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -8164,6 +8169,11 @@ test "dsv41 model: a deepseek_v41 config parses by its own refusals into the mod
     const bad = try std.mem.replaceOwned(u8, testing.allocator, ok, "sqrtsoftplus", "softmax");
     defer testing.allocator.free(bad);
     try testing.expectError(error.NotImplemented, parseConfigFromJson(testing.allocator, bad));
+}
+
+test "plugins model: a build without mlx-stream refuses a deepseek_v41 config by the plugin's name, before any weight" {
+    if (plugins.registers_mlx_stream) return error.SkipZigTest; // `zig build test -Dmlx-stream=false` runs it
+    try testing.expectError(error.PluginNotRegistered, parseConfigFromJson(testing.allocator, "{\"model_type\":\"deepseek_v41\",\"hidden_size\":4096,\"num_hidden_layers\":43,\"vocab_size\":129280}"));
 }
 
 test "parseConfigFromJson rejects invalid field types and ranges" {

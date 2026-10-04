@@ -18,11 +18,9 @@ pub const Plugin = struct {
     provides: Provides,
 };
 
-/// Any subset of the five kinds.
+/// Any subset of the three kinds. A quant or an expert source is its arch's internal (bound at comptime), not a kind.
 pub const Provides = struct {
     source: ?type = null,
-    quant: ?type = null,
-    expert_source: ?type = null,
     arch: ?type = null,
     engine: ?type = null,
 };
@@ -46,11 +44,11 @@ pub fn negotiate(comptime p: Plugin, host: Host) NegotiationError!void {
 const testing = std.testing;
 
 test "sdk negotiation: a major mismatch and another MLX are refused by name; minors are compatible both ways" {
-    const host: Host = .{ .api = .{ .major = 1, .minor = 3 }, .mlx = "v0.32.2" };
-    const ok: Plugin = .{ .name = "ok", .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.32.2", .provides = .{} };
+    const host: Host = .{ .api = .{ .major = 1, .minor = 3 }, .mlx = "v0.32.3" };
+    const ok: Plugin = .{ .name = "ok", .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.32.3", .provides = .{} };
     try negotiate(ok, host);
-    try negotiate(.{ .name = "newer-minor", .api = .{ .major = 1, .minor = 9 }, .mlx = "v0.32.2", .provides = .{} }, host);
-    try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "old", .api = .{ .major = 0, .minor = 7 }, .mlx = "v0.32.2", .provides = .{} }, host));
-    try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "new", .api = .{ .major = 2, .minor = 0 }, .mlx = "v0.32.2", .provides = .{} }, host));
+    try negotiate(.{ .name = "newer-minor", .api = .{ .major = 1, .minor = 9 }, .mlx = "v0.32.3", .provides = .{} }, host);
+    try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "old", .api = .{ .major = 0, .minor = 7 }, .mlx = "v0.32.3", .provides = .{} }, host));
+    try testing.expectError(error.ApiMajorMismatch, negotiate(.{ .name = "new", .api = .{ .major = 2, .minor = 0 }, .mlx = "v0.32.3", .provides = .{} }, host));
     try testing.expectError(error.MlxPinMismatch, negotiate(.{ .name = "mlx", .api = .{ .major = 1, .minor = 0 }, .mlx = "v0.31.2", .provides = .{} }, host));
 }

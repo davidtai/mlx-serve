@@ -29,17 +29,7 @@ pub const Caps = struct {
     batches_decode: bool = false,
     /// The loader reads the resident weights past the page cache unless the model setting says otherwise.
     residents_past_page_cache: bool = false,
-    /// G6: the arch's expert source reads through the process's one expert reader. The host takes it at the load
-    /// claim, before the preflight and the weights (`sdk.expert.takeReader`), and gives it back when the loaded
-    /// model goes (or the load fails).
-    uses_expert_reader: bool = false,
 };
-
-/// The kinds an arch binds at comptime: the quant of its routed experts and the expert source that streams them. The
-/// arch calls them directly (nothing per layer crosses the registry); the registry names them beside the arch where a
-/// user sees what served a model (`/v1/models` and `/props` `plugins`). Each must be its own plugin's: the registry
-/// refuses, at compile time and by name, a binding its plugin does not provide.
-pub const Binds = struct { quant: ?type = null, expert_source: ?type = null };
 
 /// The parsed model's facts the host keeps on its own config.
 pub const Shell = struct { num_experts: u32 = 0, num_layers: u32 = 0 };
@@ -110,11 +100,16 @@ pub const Arch = struct {
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
     /// Pure host: it may read the model's headers through `io`, never the device.
     bill: ?*const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
+    /// A resource the arch holds once per process (an expert reader): the host claims it at the load claim, before
+    /// the preflight and the weights, and releases it when the loaded model goes (or the load fails). A second load
+    /// that needs it is refused by the claim's error. Null = the arch claims nothing.
+    claim_process: ?*const fn () anyerror!void,
+    release_process: ?*const fn () void,
 
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
-    /// draft_lane, bill, binds (a `Binds`, read by the registry).
+    /// draft_lane, bill, and the pair claimProcess / releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -137,7 +132,11 @@ pub const Arch = struct {
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
             if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
-            if (check.has(T, "binds")) check.valueDecl(w, T, "binds", Binds);
+            if (check.has(T, "claimProcess") != check.has(T, "releaseProcess")) @compileError(w ++ ": claimProcess and releaseProcess come as a pair");
+            if (check.has(T, "claimProcess")) {
+                check.fnDecl(w, T, "claimProcess", &.{}, void);
+                check.fnDecl(w, T, "releaseProcess", &.{}, void);
+            }
         }
         const W = struct {
             fn cfgOf(cfg: *anyopaque) *T.Config {
@@ -188,6 +187,12 @@ pub const Arch = struct {
             fn billOf(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
                 return T.bill(gpa, io, req);
             }
+            fn claimProcess() anyerror!void {
+                return T.claimProcess();
+            }
+            fn releaseProcess() void {
+                T.releaseProcess();
+            }
         };
         return .{
             .name = T.name,
@@ -207,6 +212,8 @@ pub const Arch = struct {
             .handover = if (check.has(T, "handover")) W.handover else null,
             .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,
+            .claim_process = if (check.has(T, "claimProcess")) W.claimProcess else null,
+            .release_process = if (check.has(T, "claimProcess")) W.releaseProcess else null,
         };
     }
 };

@@ -1,8 +1,9 @@
-//! The plugin SDK (docs/plugins.md): the one module a plugin imports. One SDK: the hooks a native streaming arch
-//! needs (G1 module-owned decode state, G2 the phase change, G3 spec decode, G4 phase bills, G5 the kernel
-//! registry, G6 the expert source, G7 profile build options) are optional declarations of the kinds below. The
-//! registry (src/plugins.zig) builds each kind's table once, at compile time, and the host resolves a model's
-//! tables once at load: a hook runs per request, step or round, never per layer.
+//! The plugin SDK (docs/plugins.md): the one module a plugin imports. The small SDK: what a module-owned arch needs
+//! from the host (G1 module-owned decode state, G2 the phase change, G3 spec decode, G4 phase bills, the process
+//! claim, the weight loader and the memory ledgers) as optional declarations of the kinds below. A seam only one
+//! plugin consumes (an expert source, a kernel registry, a quant contract) stays in that plugin until a second
+//! consumer exists. The registry (src/plugins.zig) builds each kind's table once, at compile time, and the host
+//! resolves a model's tables once at load: a hook runs per request, step or round, never per layer.
 //!
 //! `KVCache`, `ForwardCtx` and `Linear` (an arch over the host's cache) land with their first consumer: the
 //! archs registered so far own their decode state (G1).
@@ -13,8 +14,11 @@ const std = @import("std");
 /// side is compatible (newer hooks are optional).
 pub const api: Version = .{ .major = 1, .minor = 0 };
 
-/// The MLX this binary links (lib/mlx-src d73eb752: v0.32.2 with the gather_qmm NAX fix). One MLX per process.
-pub const mlx_pin = "v0.32.2";
+/// The MLX this binary links (lib/mlx-src 64ea011cb: v0.32.3). One MLX per process: a plugin tested on another is
+/// refused at compile time, so an MLX bump is one change that moves this pin and every plugin's.
+pub const mlx_pin = "v0.32.3";
+/// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
+pub const plugin_profile: bool = @import("sdk_build").plugin_profile;
 
 pub const mlx = @import("mlx");
 pub const log = @import("log");
@@ -47,7 +51,6 @@ pub const LoadFacts = arch.LoadFacts;
 pub const LoadCtx = arch.LoadCtx;
 pub const RequestShape = arch.RequestShape;
 pub const DecodeHandover = arch.DecodeHandover;
-pub const Binds = arch.Binds;
 
 const spec = @import("sdk/spec.zig");
 pub const Spec = spec.Spec;
@@ -74,30 +77,14 @@ pub const Freed = lifecycle.Freed;
 
 const kinds = @import("sdk/kinds.zig");
 pub const Source = kinds.Source;
-pub const Quant = kinds.Quant;
-pub const ExpertSource = kinds.ExpertSource;
 pub const Engine = kinds.Engine;
 
-/// G6, the expert_source kind's shared surface: the record layout, the source contract and the slot types.
-pub const expert = @import("sdk/expert.zig");
-
-pub const kernels = @import("sdk/kernels.zig");
-/// The `quant` kind's contract (C2): the routed-expert quant a weight group's claim binds, and the generic
-/// gather quant (`GatherQmm` through `FromGatherMatmul`).
-pub const quant = @import("sdk/quant.zig");
-/// G7: a plugin's profile probes, injected by its arch's backend type (`of(Backend)`); off everywhere else.
-pub const profile = @import("sdk/profile.zig");
-/// Host-side helpers more than one plugin needs (a strided copy out of an evaluated array's buffer).
-pub const ops = @import("sdk/ops.zig");
 /// Process and box memory readings (the kernel's ledgers) that bills and construction checks compare against.
 pub const memory = @import("sdk/memory.zig");
-/// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
-pub const kv = @import("sdk/kv.zig");
 const weights = @import("sdk/weights.zig");
 pub const Weights = weights.Weights;
 pub const LoadOpts = weights.LoadOpts;
 pub const WeightLoader = weights.WeightLoader;
-pub const BuildOption = @import("sdk/build_option.zig").BuildOption;
 pub const QuantMode = @import("sdk/quant_mode.zig").QuantMode;
 
 /// Conformance (docs/plugins.md): every check declares its lane.
@@ -112,7 +99,5 @@ test {
     _ = memory_bill;
     _ = lifecycle;
     _ = kinds;
-    _ = expert;
-    _ = profile;
     _ = testing;
 }

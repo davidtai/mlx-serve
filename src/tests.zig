@@ -55,10 +55,9 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
-    // The mlx-stream package's tests: their own root (src/mlx_stream_tests.zig; `zig build mlx-stream-test` runs them
-    // alone), here only when the build registers the package. Host tests reach the package through the registry
+    // The mlx-stream plugin's own tests are its repo's (lib/mlx-stream; `zig build mlx-stream-test` and
+    // `mlx-stream-conformance` run them against this host). Host tests reach the plugin through the registry
     // (`plugins.mlx_stream_testing`), so a build with -Dmlx-stream=false analyzes none of its files.
-    if (@import("plugins.zig").registers_mlx_stream) _ = @import("mlx_stream_tests.zig");
     _ = @import("plugins.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("qwen4_exp.zig");

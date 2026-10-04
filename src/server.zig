@@ -20412,7 +20412,8 @@ test "dsv41 plugins: /props and /v1/models carry the plugins that serve deepseek
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
         defer parsed.deinit();
         const list = (parsed.value.object.get("plugins") orelse return error.MissingPlugins).array.items;
-        const want = [_][3][]const u8{ .{ "mlx-stream", "arch", "deepseek_v41" }, .{ "mlx-stream", "quant", "exl3-mul1-k3" }, .{ "mlx-stream", "expert_source", "exl3-stream" } };
+        // The arch only: its quant and expert source are the plugin's internals (the small SDK registers archs).
+        const want = [_][3][]const u8{.{ "mlx-stream", "arch", "deepseek_v41" }};
         try testing.expectEqual(want.len, list.len);
         for (want, list) |w, got| {
             try testing.expectEqualStrings(w[0], got.object.get("plugin").?.string);
