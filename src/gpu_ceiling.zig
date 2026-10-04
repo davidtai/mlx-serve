@@ -73,7 +73,7 @@ pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
 /// `--wired-margin <size>` (upstream's size syntax: bytes, or KB / MB / GB binary multiples): the margin at byte
-/// granularity, so a stop stated in decimal bytes (a guarded window's 2.0 GB) reaches the plan exactly. 1..32 GiB:
+/// granularity, so a margin stated in decimal bytes (e.g. 2.0 GB) reaches the plan exactly. 1..32 GiB:
 /// `--wired-margin-gib`'s range with its floor at 1 GiB, since a 2.0 GB decimal stop is 1.86 GiB.
 pub fn wiredMarginFromBytes(bytes: u64) error{InvalidWiredMargin}!u64 {
     if (bytes < 1 << 30 or bytes > 32 << 30) return error.InvalidWiredMargin;
@@ -185,7 +185,7 @@ test "gpu ceiling: the wired floor is 0 at the macOS default or with the sysctl 
     try testing.expectEqual(@as(u64, 0), wiredLimitFloor(112 * GiB, ram, 300 * GiB));
 }
 
-test "gpu ceiling: default refuses, pinned admits: the upstream 8 GiB margin refuses a plan a guarded window's 2.0 GB stop admits" {
+test "gpu ceiling: default refuses, pinned admits: the default 8 GiB margin refuses a plan a 2.0 GB margin admits" {
     const ram = 128 * GiB;
     const limit = 112 * GiB; // iogpu.wired_limit_mb 114688
     const need = 108 * GiB;

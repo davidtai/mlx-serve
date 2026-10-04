@@ -73,8 +73,7 @@ TARGETS=(
     "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
     "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
     # DeepSeek-V4.1 over a streamed EXL3 expert bank: sized by the load bill it is admitted on (model_load_gb), one
-    # request per server start. On the dev box it only runs as a chain step inside a guarded window
-    # (MLX_SERVE_MODEL_ROOTS=~/models ./tests/bench.sh --only dsv41); anywhere else it runs as any row.
+    # request per server start, e.g. MLX_SERVE_MODEL_ROOTS=~/models ./tests/bench.sh --only dsv41.
     "dsv41-flash-exl3|DeepSeek-V4.1-Flash-MTPLX-streaming-exl3-3.0bpw"
     "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
     "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
