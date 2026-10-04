@@ -158,3 +158,89 @@ pub fn getMetalBufferLimit() u64 {
     if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
     return mem * 75 / 100;
 }
+
+// ── Tests (pure arithmetic and the static knobs; no device query: the working-set term is overridden) ──
+
+const testing = std.testing;
+const GiB: u64 = 1 << 30;
+
+test "gpu ceiling: the physical ceiling is the smaller of the working set and what MLX can reach now, saturating" {
+    try testing.expectEqual(@as(u64, 100 * GiB), physicalMemoryCeiling(100 * GiB, 60 * GiB, 50 * GiB));
+    try testing.expectEqual(@as(u64, 70 * GiB), physicalMemoryCeiling(100 * GiB, 60 * GiB, 10 * GiB));
+    try testing.expectEqual(@as(u64, 5), physicalMemoryCeiling(5, std.math.maxInt(u64), 1));
+    // No floor: the physical ceiling byte for byte; a floor above it lifts it, one below leaves it.
+    try testing.expectEqual(physicalMemoryCeiling(100 * GiB, 60 * GiB, 10 * GiB), gpuCeilingWithWiredFloor(100 * GiB, 60 * GiB, 10 * GiB, 0));
+    try testing.expectEqual(@as(u64, 90 * GiB), gpuCeilingWithWiredFloor(100 * GiB, 60 * GiB, 10 * GiB, 90 * GiB));
+    try testing.expectEqual(@as(u64, 70 * GiB), gpuCeilingWithWiredFloor(100 * GiB, 60 * GiB, 10 * GiB, 20 * GiB));
+}
+
+test "gpu ceiling: the wired floor is 0 at the macOS default or with the sysctl absent, else the limit less the margin, capped by RAM" {
+    const ram = 128 * GiB;
+    try testing.expectEqual(@as(u64, 0), wiredLimitFloor(0, ram, 8 * GiB));
+    try testing.expectEqual(@as(u64, 0), wiredLimitFloor(112 * GiB, 0, 8 * GiB));
+    try testing.expectEqual(@as(u64, 0), wiredLimitFloor(ram * 75 / 100, ram, 8 * GiB));
+    try testing.expectEqual(@as(u64, 104 * GiB), wiredLimitFloor(112 * GiB, ram, 8 * GiB));
+    // A limit past RAM is capped by RAM; a margin past both saturates at 0.
+    try testing.expectEqual(@as(u64, 120 * GiB), wiredLimitFloor(200 * GiB, ram, 8 * GiB));
+    try testing.expectEqual(@as(u64, 0), wiredLimitFloor(112 * GiB, ram, 300 * GiB));
+}
+
+test "gpu ceiling: default refuses, pinned admits: the upstream 8 GiB margin refuses a plan a guarded window's 2.0 GB stop admits" {
+    const ram = 128 * GiB;
+    const limit = 112 * GiB; // iogpu.wired_limit_mb 114688
+    const need = 108 * GiB;
+    const ceiling = struct {
+        fn at(margin: u64) u64 {
+            return gpuCeilingWithWiredFloor(115 * GiB, 30 * GiB, 20 * GiB, wiredLimitFloor(limit, ram, margin));
+        }
+    }.at;
+    try testing.expect(ceiling(WIRED_LIMIT_MARGIN_BYTES) < need);
+    const pinned = try wiredMarginFromBytes(2_000_000_000);
+    try testing.expect(ceiling(pinned) >= need);
+    try testing.expectEqual(limit - 2_000_000_000, ceiling(pinned));
+}
+
+test "gpu ceiling: margin, reserve and override knobs parse within their ranges and refuse the rest by name" {
+    try testing.expectEqual(@as(u64, 2 * GiB), try parseWiredMarginGib("2"));
+    try testing.expectEqual(@as(u64, 32 * GiB), try parseWiredMarginGib("32"));
+    for ([_][]const u8{ "1", "33", "-2", "", "two", "8.5" }) |bad| try testing.expectError(error.InvalidWiredMargin, parseWiredMarginGib(bad));
+    try testing.expectEqual(@as(u64, GiB), try wiredMarginFromBytes(GiB));
+    try testing.expectEqual(@as(u64, 32 * GiB), try wiredMarginFromBytes(32 * GiB));
+    try testing.expectError(error.InvalidWiredMargin, wiredMarginFromBytes(GiB - 1));
+    try testing.expectError(error.InvalidWiredMargin, wiredMarginFromBytes(32 * GiB + 1));
+    try testing.expectEqual(@as(u64, 0), try parseOsReserveGib("0"));
+    try testing.expectEqual(@as(u64, 64 * GiB), try parseOsReserveGib("64"));
+    for ([_][]const u8{ "65", "-1", "x" }) |bad| try testing.expectError(error.InvalidOsReserve, parseOsReserveGib(bad));
+    // The OS reserve: an eighth of RAM within 2..8 GiB, unless overridden (0 turns it off).
+    const saved = os_reserve_override;
+    defer os_reserve_override = saved;
+    os_reserve_override = null;
+    try testing.expectEqual(@as(u64, 2 * GiB), osReserveBytes(8 * GiB));
+    try testing.expectEqual(@as(u64, 4 * GiB), osReserveBytes(32 * GiB));
+    try testing.expectEqual(@as(u64, 8 * GiB), osReserveBytes(512 * GiB));
+    os_reserve_override = 0;
+    try testing.expectEqual(@as(u64, 0), osReserveBytes(128 * GiB));
+}
+
+test "gpu ceiling: the static term and the wired limit read their overrides, never the device" {
+    const saved_ceiling = static_ceiling_override;
+    const saved_wired = wired_limit_mb_override;
+    defer {
+        static_ceiling_override = saved_ceiling;
+        wired_limit_mb_override = saved_wired;
+    }
+    static_ceiling_override = 7 * GiB;
+    try testing.expectEqual(@as(u64, 7 * GiB), getGpuWorkingSetLimit());
+    try testing.expectEqual(@as(u64, 7 * GiB), staticGpuMemoryCeiling());
+    wired_limit_mb_override = 114688;
+    try testing.expectEqual(@as(u64, 112 * GiB), wiredLimitBytes());
+    wired_limit_mb_override = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), wiredLimitBytes());
+    // The machine's own reads: the wired limit once per process (stable across calls), the buffer limit 75% of RAM.
+    wired_limit_mb_override = null;
+    try testing.expectEqual(wiredLimitBytes(), wiredLimitBytes());
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    try testing.expectEqual(mem * 75 / 100, getMetalBufferLimit());
+}

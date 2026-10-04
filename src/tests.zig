@@ -60,6 +60,7 @@ test {
     // (`plugins.mlx_stream_testing`), so a build with -Dmlx-stream=false analyzes none of its files.
     _ = @import("plugins.zig");
     _ = @import("nocache_reader.zig");
+    _ = @import("gpu_ceiling.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");

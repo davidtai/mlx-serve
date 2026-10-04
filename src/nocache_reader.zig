@@ -454,3 +454,33 @@ test "dsv41 nocache reader: the row gather reads whole aligned pages, each row o
     }
     try testing.expectEqual(@as(u64, 16 * RowGather.stage_len + 1024 * 40), RowGather.persistentBytes(15, 1024));
 }
+
+test "dsv41 nocache reader: MLX's reader handle owns the descriptor and frees it; reads past one staging buffer equal the plain reads" {
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Past one 8 MiB stage: a read crossing it, both ends unaligned.
+    const image = try a.alloc(u8, stage_bytes + 40_000);
+    defer a.free(image);
+    for (image, 0..) |*b, i| b.* = @truncate(i *% 40503 >> 5);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.bin", .data = image });
+    var root: [512]u8 = undefined;
+    var pbuf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/big.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    const d = try Desc.open(path);
+    try testing.expectEqual(@as(u64, image.len), d.size);
+    const out = try a.alloc(u8, stage_bytes + 20_001);
+    defer a.free(out);
+    readAtOffset(d, out.ptr, out.len, 12_345);
+    try testing.expectEqualSlices(u8, image[12_345..][0..out.len], out);
+    // Zero bytes is a no-op; SEEK_CUR moves from the position.
+    d.readAt(out[0..0], 0);
+    seek(d, 100, 0);
+    seek(d, 23, 1);
+    try testing.expectEqual(@as(usize, 123), tell(d));
+    // MLX frees the reader through the vtable (`free` closes and releases it).
+    free(d);
+    const r = try reader(path);
+    try testing.expectEqual(@as(c_int, 0), mlx.mlx_io_reader_free(r));
+    try testing.expectError(error.NoCacheOpen, reader("/nonexistent/cov-d/w.safetensors"));
+}
