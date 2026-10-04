@@ -199,7 +199,7 @@ pub fn vmBytes() VmBytes {
 }
 
 /// vm_stat's wired + active + inactive + compressor-occupied pages: the "physical used" an external
-/// memory guard reads (file cache included; free and speculative pages excluded).
+/// memory monitor reads (file cache included; free and speculative pages excluded).
 pub fn physicalUsedBytes(v: VmBytes) u64 {
     return v.wired + v.active + v.inactive + v.compressor;
 }

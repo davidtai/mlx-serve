@@ -78,7 +78,7 @@ pub const Freed = struct {
     decode_cache_limit: usize,
 };
 
-/// A harness's observer of the phase change (the window's box proofs), set before the first request; the served
+/// A harness's observer of the phase change (its memory proofs), set before the first request; the served
 /// path passes none. A mark records only; it never refuses inside the phase change.
 pub const PhaseObserver = struct {
     ctx: *anyopaque,

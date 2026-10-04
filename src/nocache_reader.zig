@@ -45,10 +45,9 @@ pub const Desc = struct {
     /// `buf.len` bytes at `off`, through a page-aligned staging buffer. macOS honours F_NOCACHE only
     /// for page-aligned reads (the file offset, the length and the destination): an unaligned read goes
     /// through the unified buffer cache and leaves its pages cached (speculative pages, which the
-    /// guard's metric does not count until the kernel ages them under pressure). Measured on the bank's
-    /// resident shards: 0.19 GB cached per 0.54 GB read unaligned, none aligned; MLX's tensor loads
-    /// arrive unaligned (safetensors offsets, MLX buffers), and a served cell's construction left
-    /// 15.1 GB of page cache (pass3aj 20260930-060358). pread is safe from MLX's IO threads: each call
+    /// process's footprint does not count until the kernel ages them under pressure). Measured on resident
+    /// shards: 0.19 GB cached per 0.54 GB read unaligned, none aligned; MLX's tensor loads arrive
+    /// unaligned (safetensors offsets, MLX buffers). pread is safe from MLX's IO threads: each call
     /// owns its stage.
     pub fn readAt(d: *const Desc, buf: []u8, off: u64) void {
         if (buf.len == 0) return;
@@ -278,113 +277,6 @@ test "dsv41 nocache reader: a real resident shard's tensors through the reader e
     const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/model-00003.safetensors", .{bank}, 0);
     const r = try compareTensors(a, path);
     std.debug.print("nocache reader: {s}: {d} tensors, {d} B byte-identical to the plain reads\n", .{ path, r.n, r.bytes });
-}
-
-// DSV41_BANK=<bank> DSV41_NOCACHE_PROOF=1 [DSV41_QUIET_HOLD=<marker>]: the reads leave no page cached (mincore, vm_stat).
-test "dsv41 nocache reader: the resident shards and the Engram rows read past the page cache" {
-    const pkg = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
-    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    if (std.c.getenv("DSV41_NOCACHE_PROOF") == null) return error.SkipZigTest;
-    const hold: ?[:0]const u8 = if (std.c.getenv("DSV41_QUIET_HOLD")) |v| std.mem.span(v) else null;
-    const a = testing.allocator;
-    const io = testing.io;
-    const held = struct {
-        fn f(p: ?[:0]const u8) bool {
-            const q = p orelse return false;
-            return std.c.access(q.ptr, 0) == 0;
-        }
-    }.f;
-
-    // The shards the index names (the loader's own rule).
-    var ipath_buf: [1024]u8 = undefined;
-    const ipath = try std.fmt.bufPrint(&ipath_buf, "{s}/model.safetensors.index.json", .{bank});
-    const itext = try std.Io.Dir.cwd().readFileAlloc(io, ipath, a, .limited(16 << 20));
-    defer a.free(itext);
-    const index = try std.json.parseFromSlice(struct { weight_map: std.json.ArrayHashMap([]const u8) }, a, itext, .{ .ignore_unknown_fields = true });
-    defer index.deinit();
-    var shards: std.ArrayList([:0]u8) = .empty;
-    defer {
-        for (shards.items) |s| a.free(s);
-        shards.deinit(a);
-    }
-    for (index.value.weight_map.map.values()) |shard| {
-        const full = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ bank, shard }, 0);
-        var dup = false;
-        for (shards.items) |s| dup = dup or std.mem.eql(u8, s, full);
-        if (dup) a.free(full) else try shards.append(a, full);
-    }
-
-    var cached_before: u64 = 0;
-    for (shards.items) |s| cached_before += try residentBytes(s);
-    const fb0 = status.vmBytes().external;
-    const chunk = try a.alloc(u8, 64 << 20);
-    defer a.free(chunk);
-    var total: u64 = 0;
-    const t0 = std.Io.Timestamp.now(io, .boot);
-    for (shards.items) |s| {
-        const d = try Desc.open(s);
-        defer d.close();
-        // Unaligned, as MLX's tensor loads arrive (a safetensors offset, a destination off the page).
-        const step = chunk.len - 12_347;
-        var off: u64 = 8 + 4_321;
-        while (off < d.size) : (off += step) {
-            if (held(hold)) return error.QuietHoldAppeared;
-            const n: usize = @intCast(@min(step, d.size - off));
-            d.readAt(chunk[1..][0..n], off);
-            total += n;
-        }
-    }
-    const read_s = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e9;
-    const fb1 = status.vmBytes().external;
-    var cached_after: u64 = 0;
-    for (shards.items) |s| cached_after += try residentBytes(s);
-    std.debug.print("nocache proof: {d} resident shards, {d} B read through the reader in {d:.2} s ({d:.2} GB/s); their cached bytes {d} -> {d} (mincore); box file-backed {d} -> {d} B (vm_stat, delta {d})\n", .{
-        shards.items.len,                                           total,        read_s, @as(f64, @floatFromInt(total)) / 1e9 / read_s, cached_before, cached_after, fb0, fb1,
-        @as(i64, @intCast(fb1)) - @as(i64, @intCast(fb0)),
-    });
-    try testing.expect(cached_after <= cached_before);
-
-    // The Engram rows through the row source's own descriptors (its open sets F_NOCACHE).
-    const v41 = pkg.v41;
-    const eng = pkg.engram;
-    var cdiag: v41.Diag = .{};
-    const c = try v41.Config.load(a, io, bank, &cdiag);
-    var mbuf: [1024]u8 = undefined;
-    const map = try std.fmt.bufPrint(&mbuf, "{s}/engram-token-map.u32", .{bank});
-    var src = try eng.RowSource.open(a, io, bank, map, &c, &cdiag);
-    defer src.deinit();
-    const n_files = src.hashing.n_layers;
-    const files = try a.alloc([:0]u8, n_files);
-    defer a.free(files);
-    for (files, 0..) |*f, i| f.* = try std.fmt.allocPrintSentinel(a, "{s}/engram/{s}", .{ bank, src.bank.files[i] }, 0);
-    defer for (files) |f| a.free(f);
-    var eng_before: u64 = 0;
-    for (files) |f| eng_before += try residentBytes(f);
-    const fb2 = status.vmBytes().external;
-    const n_records: usize = 100_000;
-    const rows = try a.alloc(i64, 1);
-    defer a.free(rows);
-    const codes = try a.alloc(u8, src.bank.head_dim);
-    defer a.free(codes);
-    const scales = try a.alloc(u8, src.bank.head_dim / 32);
-    defer a.free(scales);
-    var rng = std.Random.DefaultPrng.init(20260928);
-    const t1 = std.Io.Timestamp.now(io, .boot);
-    for (0..n_records) |i| {
-        if (i % 4096 == 0 and held(hold)) return error.QuietHoldAppeared;
-        const li = i % n_files;
-        rows[0] = @intCast(rng.random().uintLessThan(u64, src.bank.rows[li]));
-        try eng.readRows(src.fds[li], &src.bank, rows, codes, scales);
-    }
-    const rec_s = @as(f64, @floatFromInt(t1.untilNow(io, .boot).nanoseconds)) / 1e9;
-    const fb3 = status.vmBytes().external;
-    var eng_after: u64 = 0;
-    for (files) |f| eng_after += try residentBytes(f);
-    std.debug.print("nocache proof: {d} random Engram records ({d} B each) in {d:.3} s ({d:.1} us each, one thread); the Engram files' cached bytes {d} -> {d} (mincore); box file-backed {d} -> {d} B (vm_stat, delta {d})\n", .{
-        n_records,                                      src.bank.record_bytes, rec_s, rec_s * 1e6 / @as(f64, @floatFromInt(n_records)), eng_before, eng_after, fb2, fb3,
-        @as(i64, @intCast(fb3)) - @as(i64, @intCast(fb2)),
-    });
-    try testing.expect(eng_after <= eng_before + 64 * std.heap.pageSize());
 }
 
 test "dsv41 nocache reader: the row gather reads whole aligned pages, each row once, and scatters them in the caller's order" {

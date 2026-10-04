@@ -1,14 +1,8 @@
 //! Conformance (docs/plugins.md): the checks a plugin's kinds run against the SDK's contracts, and the
 //! fakes the host's own tests drive. Every check declares its lane:
 //! - `cpu`: `zig build conformance` with no device; the lane fails if a Metal device was created.
-//! - `gpu_small`: fixture shapes on an author's Mac, lock-held on our box.
-//! - `window`: ours only (the real bank at the box ceiling), never in the suite.
-//!
-//! Pending here (they live in the DeepSeek-V4.1 harness, deepseek_v41_ar.zig, until they move): the release proof
-//! with its settle (the pages outside the footprint rise <= 0.5 GB from the phase change's start to the release,
-//! retaken every 50 ms up to 2,000 ms; not applicable with the route off), the grow proof (physical growth <=
-//! footprint growth + 0.5 GB), the stable box mark (the footprint read on both sides of vm_stat within 64 MiB) and
-//! the sentinel (a 2 GB rise outside the footprint stops the process by name, exit 86).
+//! - `gpu_small`: fixture shapes on a Mac with a GPU.
+//! - `window`: a plugin's own full-size checks, never in the suite.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -176,8 +170,8 @@ pub fn expectRoundInvariant(vt: *const arch.Arch, module: *anyopaque, t1: u32, c
 
 // ── Receipts (cpu) ──
 
-/// A receipt carries every stamp the judges read (a JSON null is a stamp: arm 1's `cell_arm`); a dotted name walks
-/// nested objects ("decode_stream.misses").
+/// A receipt carries every stamp its readers need (a JSON null is a stamp); a dotted name walks nested objects
+/// ("stream.misses").
 pub fn expectStamps(receipt_json: []const u8, stamps: []const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -389,11 +383,11 @@ test "sdk testing: the phase change's order and a sticky refusal; a receipt's st
         }
     };
     try expectStickyRefusal(Gate);
-    const receipt = "{\"decode_lane\":\"dspark typical 0.3\",\"cell_arm\":null,\"decode_stream\":{\"misses\":7952}}";
-    try expectStamps(receipt, &.{ "decode_lane", "cell_arm", "decode_stream.misses" });
+    const receipt = "{\"lane\":\"draft\",\"arm\":null,\"stream\":{\"misses\":7952}}";
+    try expectStamps(receipt, &.{ "lane", "arm", "stream.misses" });
     try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"head_mode"}));
-    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"decode_stream.bytes"}));
-    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"decode_lane.x"}));
+    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"stream.bytes"}));
+    try testing.expectError(error.ReceiptStampMissing, expectStamps(receipt, &.{"lane.x"}));
 }
 
 test "sdk testing: the fake's draft lane names itself, arms only greedy clean requests and counts its rounds; a lane-less fake has no rounds" {

@@ -22193,7 +22193,7 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     ac.layer_major_prefill = null;
     try t.expectEqual(@as(u64, 953), bill.chunkRows(16384));
     try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
-    // The served gate's 64-token prompt: a small bill.
+    // A 64-token prompt: a small bill.
     try t.expect(bill.bytes(64, 32, .served) < 5_000_000_000);
     // The module's tier and pass choose the bill.
     ac.numeric_tier = .stock;

@@ -9,10 +9,6 @@ const log = @import("log");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const sdk = @import("sdk");
 
-/// A streamed-expert model's read pool scheduling (`expert_reader_sched`): "off" or a comma list of qos, spin,
-/// demandfirst (`reader_sched.Sched.parse`).
-pub const ReaderSched = @import("sdk").expert.Sched;
-
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,

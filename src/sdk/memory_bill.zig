@@ -118,7 +118,7 @@ pub const BillRequest = struct {
     max_tokens: u64,
     /// The GPU memory ceiling every plan fits under.
     ceiling: u64,
-    /// What the admission keeps free under the ceiling (the guard's stop on our box).
+    /// What the admission keeps free under the ceiling.
     stop: u64,
 
     pub fn target(r: BillRequest) u64 {

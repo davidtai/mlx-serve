@@ -347,7 +347,7 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin <size>
         \\                      --wired-margin-gib at byte granularity (bytes,
         \\                        or KB/MB/GB; 1..32 GiB), e.g. 2000000000 for a
-        \\                        guard's 2.0 GB stop. The last margin flag wins.
+        \\                        2.0 GB margin. The last margin flag wins.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
