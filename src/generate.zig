@@ -2695,14 +2695,29 @@ pub const Generator = struct {
         if (try NativeDraft.of(gpa, xfm, sampling)) |nd| {
             const l = nd.lane;
             const arm = l.arm(nd.module, armRequest(sampling, options.logprobs_n));
+            // deepseek_v4 keeps upstream's engagement lines word for word (docs/gotchas/engine-mlx.md proves A/B arms
+            // by counting them); a registered arch's lane names itself.
+            const dsv4 = xfm.dsv4;
             if (!dspark_env_off and arm != .off) {
                 arming.active = true;
                 arming.stochastic = arm == .stochastic;
                 arming.lane = nd;
-                log.info("  decode lane: {s} ({s} draft head, block={d})\n", .{ l.lane_name(nd.module), nd.name, l.block_size(nd.module) });
+                if (dsv4) |m| {
+                    if (arming.stochastic) {
+                        log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{m.ds_block});
+                    } else {
+                        log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{m.ds_block});
+                    }
+                } else {
+                    log.info("  decode lane: {s} ({s} draft head, block={d})\n", .{ l.lane_name(nd.module), nd.name, l.block_size(nd.module) });
+                }
             } else {
                 nd.release();
-                log.info("  decode lane: serial ({s}: {s})\n", .{ nd.name, if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalties" });
+                if (dsv4 != null) {
+                    log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+                } else {
+                    log.info("  decode lane: serial ({s}: {s})\n", .{ nd.name, if (dspark_env_off) "MLX_SERVE_DSV4_DSPARK=0" else "sampled, logprobs, grammar or penalties" });
+                }
             }
         } else if (xfm.dsv4 != null) {
             log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
@@ -22417,4 +22432,39 @@ test "host seams: deepseek_v4 and every in-tree model take no decode handover (u
         try testing.expect(!clock.fire());
         try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = with_dsv4 });
     }
+}
+
+test "host seams: deepseek_v4's DSpark arming logs upstream's spec=dspark / spec=disabled lines" {
+    // Upstream's engagement lines, word for word (docs/gotchas/engine-mlx.md reads A/B arms off them).
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/arm.log", .{root[0..try td.dir.realPath(testing.io, &root)]});
+    try log.openFile(path, 0);
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    dsv4.n_mtp = 3;
+    dsv4.ds_block = 5;
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    xfm.dsv4 = &dsv4;
+    var o1: Generator.InitOptions = .{ .mtp_enabled = true };
+    const a1 = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.0 }, &o1);
+    if (a1.lane) |nd| nd.release();
+    var o2: Generator.InitOptions = .{ .mtp_enabled = true };
+    const a2 = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.0, .repeat_penalty = 1.1 }, &o2);
+    if (a2.lane) |nd| nd.release();
+    var o3: Generator.InitOptions = .{ .mtp_enabled = true };
+    const a3 = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.6 }, &o3);
+    if (a3.lane) |nd| nd.release();
+    log.closeFile();
+    const text = try td.dir.readFileAlloc(testing.io, "arm.log", testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(text);
+    std.debug.print("logged:\n{s}", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "  spec=dspark (deepseek_v4 native draft stages, block=5)\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  spec=disabled (deepseek_v4 serves serial-only)\n") != null);
+    // A sampled request takes the stochastic arm unless MLX_SERVE_DSV4_DSPARK_STOCH=0 turns it off.
+    if (a3.stochastic) try testing.expect(std.mem.indexOf(u8, text, "  spec=dspark (stochastic; deepseek_v4 native draft stages, block=5)\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "decode lane:") == null);
 }
