@@ -988,7 +988,6 @@ const Shared = struct {
     log: *std.Build.Module,
     io_util: *std.Build.Module,
     sdk: *std.Build.Module,
-    ngram: *std.Build.Module,
     /// lib/mlx-serve-gguf and lib/sushi's EXL3 module, which reach mlx, log and io_util through `mlx_host` (the SDK).
     gguf: *std.Build.Module,
     exl3: *std.Build.Module,
@@ -998,7 +997,6 @@ const Shared = struct {
         m.addImport("log", s.log);
         m.addImport("io_util", s.io_util);
         m.addImport("sdk", s.sdk);
-        m.addImport("ngram", s.ngram);
         m.addImport("mlx_serve_gguf", s.gguf);
         m.addImport("sushi_exl3", s.exl3);
     }
@@ -1023,15 +1021,7 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
         .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util }, .{ .name = "sdk_build", .module = sdk_build.createModule() } },
     });
-    // The hashed n-gram tables of qwen4_exp's PLE (mlx-stream keeps its own copy).
-    const ngram = b.createModule(.{
-        .root_source_file = b.path("src/ngram.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
-    });
-    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk, .ngram = ngram, .gguf = engineModule(b, ggufRoot(b), sdk, target, optimize), .exl3 = engineModule(b, exl3Root(b), sdk, target, optimize) };
+    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk, .gguf = engineModule(b, ggufRoot(b), sdk, target, optimize), .exl3 = engineModule(b, exl3Root(b), sdk, target, optimize) };
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

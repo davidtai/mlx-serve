@@ -7472,7 +7472,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
 
     // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
     // whenever no table is warming, so the object is absent off qwen4_exp.
-    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.ngram.live_warm_bytes.load(.acquire), qwen4_mod.ngram.live_warm_total.load(.acquire));
+    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
     defer allocator.free(ngram_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
     defer allocator.free(batching_json);
@@ -12029,7 +12029,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
     ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
-    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.ngram.live_warm_bytes.load(.monotonic));
+    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);

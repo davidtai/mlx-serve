@@ -262,8 +262,8 @@ pub fn writeFixture(bits: u32, rows: u64, dim: u32, gs: u32, seed: u64) !Fixture
     const root_len = try td.dir.realPath(io, &pbuf);
     var full: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
-    qwen4.ngram.warm_override = false;
-    defer qwen4.ngram.warm_override = null;
+    qwen4.warm_override = false;
+    defer qwen4.warm_override = null;
     return .{ .td = td, .table = try qwen4.NgramTable.open(path) };
 }
 
@@ -456,8 +456,8 @@ test "ple gpu: the real ngram table embeds bit-identical to the CPU gather past 
     const config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |p| a.free(p);
     const h = try qwen4.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, config.ngram_eos);
-    qwen4.ngram.warm_override = false;
-    defer qwen4.ngram.warm_override = null;
+    qwen4.warm_override = false;
+    defer qwen4.warm_override = null;
     var table = try qwen4.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable);
     // Straight to `wrap`: this bar is the bits, not whether this Mac's working set fits the table.
     const tbl = try wrap(&table);
