@@ -77,4 +77,19 @@ final class PackUpdateTargetTests: XCTestCase {
         PackSource(repo: "org/m", subfolder: "4bit").write(dir: dir)
         XCTAssertEqual(PackSource.read(dir: dir), PackSource(repo: "org/m", subfolder: "4bit"))
     }
+
+    func testTheSweepAlertListsOnlyModelsWithAnUpdate() {
+        let a = model("org/a"), b = model("org/b"), c = model("org/c")
+        let checks: [String: UpdateCheck] = [
+            a.id: UpdateCheck(result: .update(PackUpdate(files: 3, bytes: 3_850_000_000)), repo: "org/a"),
+            b.id: UpdateCheck(result: .upToDate, repo: "org/b"),
+            c.id: UpdateCheck(result: .update(PackUpdate(files: 1, bytes: 1_000, replaces: 1)), repo: "org/c"),
+        ]
+        let items = PackUpdateCheck.available(checks, models: [c, b, a])
+        XCTAssertEqual(items.map(\.model.name), ["org/a", "org/c"])
+        let text = PackUpdateCheck.sweepMessage(items)
+        XCTAssertTrue(text.contains("org/a") && text.contains("org/c") && !text.contains("org/b"), text)
+        XCTAssertTrue(text.contains("replace"), "a replacing update is named before Update All: \(text)")
+        XCTAssertTrue(PackUpdateCheck.available([b.id: checks[b.id]!], models: [a, b, c]).isEmpty)
+    }
 }

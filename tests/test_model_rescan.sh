@@ -39,18 +39,20 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 ROOT_DIR="$(mktemp -d)"
+# No providers.json or model-settings from the real home: this test owns every row.
+HOME_DIR="$(mktemp -d)"
 LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    rm -rf "$ROOT_DIR" "$LOG"
+    rm -rf "$ROOT_DIR" "$HOME_DIR" "$LOG"
 }
 trap cleanup EXIT
 
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 0.5
-"$BINARY" --serve --model-dir "$ROOT_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
+HOME="$HOME_DIR" "$BINARY" --serve --model-dir "$ROOT_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 SERVER_PID=$!
 UP=0
 for _ in $(seq 1 60); do

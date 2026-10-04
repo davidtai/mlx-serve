@@ -7,7 +7,7 @@ import Foundation
 /// reads. This lets each download pull EXACTLY what's needed — no more.
 struct FileSelection: Equatable {
     /// Descend into subdirectories (FLUX/TTS). When false, only top-level files
-    /// + the `mtp/` sidecar are kept (the chat-model default).
+    /// + the `mtp/` and `drafter/` sidecars are kept (the chat-model default).
     var recursive: Bool = false
     /// Skip any file whose path contains one of these (belt-and-suspenders for
     /// junk a recursive scan would otherwise grab).
@@ -26,8 +26,11 @@ struct FileSelection: Equatable {
     /// `drafter/` lands at `<model_dir>/drafter/`, where the server finds it.
     var packFolder: String? = nil
 
-    /// Chat-model default: top-level files + `mtp/`, all needed extensions.
+    /// Chat-model default: the whole pack, as `mlx-serve pull` fetches it —
+    /// top-level files + `mtp/` + `drafter/`, all needed extensions.
     static let chatDefault = FileSelection()
+    /// The pack without its `drafter/` (a drafter socket switched off).
+    static let chatWithoutDrafter = FileSelection(excludeSubstrings: [DrafterGems.packFolder + "/"])
 
     static func packFolder(_ folder: String) -> FileSelection {
         FileSelection(packFolder: folder)
@@ -190,6 +193,25 @@ extension MediaBundle {
                     repo: repo,
                     selection: FileSelection(recursive: true),
                     readyMarkers: ["rl_agent_config.json", "encoder/config.json", "model.safetensors", "tokenizer/tokenizer.json"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// Kev typed decisions: a Qwen3.5 trunk plus the pointer head. Markers
+    /// are the head, its config, the trunk's config and weight index, and the
+    /// tokenizer; the weights index covers both one-file and sharded packs.
+    static func kev(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "kev:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["kev_config.json", "kev_head.safetensors", "config.json",
+                                   "model.safetensors.index.json", "tokenizer.json"]
                 ),
             ],
             sizeEstimateGB: sizeGB
@@ -443,6 +465,27 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Audio 3, Stability's own repo as published: `model_config.json`
+    /// (no `config.json`), `model.safetensors`, and T5Gemma in a subdir that
+    /// is also the server's completion marker. The thumbnail stays behind.
+    static func sound(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sound:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: [".png"]),
+                    readyMarkers: [
+                        "model_config.json", "model.safetensors",
+                        "t5gemma-b-b-ul2/model.safetensors", "t5gemma-b-b-ul2/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Mage-Flow (diffusers layout): one repo with weight subdirs
     /// (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`) and NO root
     /// config.json — detection keys on `model_index.json`. Recursive download
@@ -557,6 +600,10 @@ extension MusicModelPreset {
     }
 }
 
+extension SoundModelPreset {
+    var bundle: MediaBundle { .sound(repo: repo, displayName: name, sizeGB: approxDownloadGB) }
+}
+
 // MARK: - Media pane generic surface
 
 /// Common surface every media-gen preset (image/audio/video/music) exposes to
@@ -597,5 +644,6 @@ extension ImageModelPreset: MediaModelPreset {}
 extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
+extension SoundModelPreset: MediaModelPreset {}
 // Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
 extension Model3DModelPreset: MediaModelSizing {}

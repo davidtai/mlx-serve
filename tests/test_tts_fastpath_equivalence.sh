@@ -60,7 +60,7 @@ kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
 
 grep -q "GPU-chained code predictor engaged" "$LOG_A" || { echo "FAIL: GPU predictor never engaged"; exit 1; }
 grep -q "KV-cached predictor steps engaged" "$LOG_A" || { echo "FAIL: KV-cached predictor never engaged"; exit 1; }
-grep -q "fused SwiGLU kernel engaged" "$LOG_A" || { echo "FAIL: fused SwiGLU never engaged"; exit 1; }
+grep -q "fused silu kernel engaged" "$LOG_A" || { echo "FAIL: fused SwiGLU never engaged"; exit 1; }
 grep -q "fused QK-norm+RoPE engaged" "$LOG_A" || { echo "FAIL: fused QK-norm+RoPE never engaged"; exit 1; }
 grep -q "fused residual+RMSNorm kernel engaged" "$LOG_A" || { echo "FAIL: fused residual+RMSNorm never engaged"; exit 1; }
 echo "PASS: [1/4] all levers engaged on the default boot"
@@ -89,7 +89,7 @@ speak "$TMP/req_plain.json" "$TMP/composed_plain.wav"
 speak "$TMP/req_clone.json" "$TMP/composed_clone.wav"
 kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
 
-if grep -qE "GPU-chained code predictor engaged|KV-cached predictor|compiled predictor chain|fused SwiGLU kernel engaged|fused QK-norm\+RoPE engaged|fused residual\+RMSNorm kernel engaged" "$LOG_C"; then
+if grep -qE "GPU-chained code predictor engaged|KV-cached predictor|compiled predictor chain|fused silu kernel engaged|fused QK-norm\+RoPE engaged|fused residual\+RMSNorm kernel engaged" "$LOG_C"; then
   echo "FAIL: a lever engaged on the everything-killed boot"; exit 1
 fi
 echo "PASS: [2/4] kill switches keep every lever off"

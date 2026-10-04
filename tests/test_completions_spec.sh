@@ -130,7 +130,7 @@ check_eq "baseline stream == baseline non-stream" "$BASE_NS" "$BASE_S"
 
 echo "2) PLD server (--pld), enable_pld:true..."
 LOG_B=$(mktemp)
-start_server "$LOG_B" --pld
+start_server "$LOG_B" --pld --no-drafter
 PLD_NS=$(nonstream_text "\"enable_pld\":true,")
 PLD_S=$(stream_text "\"enable_pld\":true,")
 stop_server

@@ -62,7 +62,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
-| `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off) |
+| `--no-mtp` / `--mtp` | on when a head is loaded | Disable the native MTP head; `--mtp` is a no-op kept for old launch lines (dense and MoE both default on) |
 | `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |

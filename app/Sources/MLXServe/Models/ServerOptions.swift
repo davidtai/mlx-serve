@@ -113,16 +113,6 @@ struct ServerOptions: Codable, Equatable {
     /// decode migration below treats a stored TRUE as undecided, never as an
     /// explicit opt-in.
     var decodeAttnQuantChoice: Bool? = nil
-    /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
-    /// request that omits `enable_mtp` (the server's `defaultEnableMtp`, a
-    /// multi-client caution: the MTP slot decodes exclusively, so concurrent
-    /// chats stop batching). This app is one user, and measured on 35B-A3B
-    /// and Flash-Next MTP wins on code and long context and ties on prose —
-    /// so it is ON here and `--mtp` rides every launch. Dense targets are
-    /// unaffected (they already default ON). Renamed from `forceMTPOnMoE`
-    /// when the default flipped: the old stored `false` was the old default
-    /// for nearly everyone, and a tolerant decode would have kept it forever.
-    var mtpOnMoE: Bool = true
     /// `--dspark`. DeepSeek-V4's DSpark draft stages are OPT-IN server-side:
     /// enabling them materializes ~11 GB of stage weights at load (the memory
     /// fit-gate still applies and disables with a log when the box can't hold
@@ -217,7 +207,12 @@ struct ServerOptions: Codable, Equatable {
     /// macOS (an eighth of RAM, 2 to 8 GB) when it plans context and admits requests.
     var osMemoryReserve: Bool = true
 
-    // MARK: GGUF-only (llama.cpp engine)
+    // MARK: Engines
+    /// `--mlx-gguf`. EXPERIMENTAL: lib/mlx-serve-gguf claims the `.gguf` files
+    /// it can serve on MLX itself; the rest still go to ds4 / llama.cpp. Off,
+    /// mirroring main.zig `mlx_gguf_enabled = false`.
+    var mlxGguf: Bool = false
+
     /// KV-cache quantization for the embedded llama.cpp engine. MLX's
     /// `--kv-quant` does NOT apply to the llama path (different kernels);
     /// this is the GGUF-equivalent knob. `off` keeps F16 (libllama
@@ -510,7 +505,6 @@ struct ServerOptions: Codable, Equatable {
         pldKeyLen == other.pldKeyLen &&
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
-        mtpOnMoE == other.mtpOnMoE &&
         enableDSpark == other.enableDSpark &&
         anePrefill == other.anePrefill &&
         aneImage == other.aneImage &&
@@ -531,6 +525,7 @@ struct ServerOptions: Codable, Equatable {
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
         ssdStreaming == other.ssdStreaming &&
+        mlxGguf == other.mlxGguf &&
         tokenizeCacheEntries == other.tokenizeCacheEntries &&
         // Sampling defaults are ALSO launch flags (server-side defaults for
         // clients that omit sampling, e.g. Claude Code) — changing them must
@@ -661,14 +656,10 @@ struct ServerOptions: Codable, Equatable {
         args += [enablePLD ? "--pld" : "--no-pld"]
         args += ["--pld-draft-len", "\(pldDraftLen)"]
         args += ["--pld-key-len", "\(pldKeyLen)"]
-        // MTP: the server auto-loads a checkpoint's `mtp/` head and defaults
-        // depth to auto; `--mtp` is the one deliberate divergence (MoE ON).
+        // MTP: the server auto-loads a checkpoint's head (dense or MoE) and
+        // defaults depth to auto.
         if !enableMTP {
             args += ["--no-mtp"]
-        } else if mtpOnMoE {
-            // `--mtp --no-mtp` would be incoherent, and with the head unloaded
-            // there is nothing to force on — so "off" wins over "force".
-            args += ["--mtp"]
         }
         if mtpDepth > 0 {
             args += ["--mtp-depth", "\(mtpDepth)"]
@@ -777,6 +768,9 @@ struct ServerOptions: Codable, Equatable {
         // across engine switches; omitted by default to keep full residency.
         if ssdStreaming {
             args += ["--ssd-streaming"]
+        }
+        if mlxGguf {
+            args += ["--mlx-gguf"]
         }
         return args
     }
@@ -897,7 +891,6 @@ extension ServerOptions {
             }
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .mtpOnMoE) { mtpOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
@@ -918,6 +911,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .mlxGguf) { mlxGguf = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .defaultMaxTokens) { defaultMaxTokens = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTemperature) { defaultTemperature = v }
@@ -1081,10 +1075,6 @@ extension ServerOptions {
             title: "Tokens guessed ahead",
             explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
             needsRestart: true),
-        "mtpOnMoE": .init(
-            title: "Also use MTP on mixture-of-experts models",
-            explainer: "Mixture-of-experts models (Qwen3.6 35B-A3B, Qwen3.8-Flash-Next) ship an MTP head the server leaves off for multi-user boxes. In this app it is on: measured on an M4 Max, 35B-A3B goes 166 -> 244 tok/s on code and 122 -> 177 at 16k context, with prose a wash. Turn it off if you run several chats at once — the MTP slot decodes alone, so concurrent requests stop batching. Dense models are unaffected.",
-            needsRestart: true),
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",
             explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
@@ -1173,6 +1163,10 @@ extension ServerOptions {
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
             explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight.",
+            needsRestart: true),
+        "mlxGguf": .init(
+            title: "Serve GGUF files on MLX (experimental)",
+            explainer: "Let mlx-serve-gguf serve the .gguf files it supports on MLX itself, with the MLX prefix cache and spec decode, instead of handing every .gguf to llama.cpp. Files it cannot serve still go to llama.cpp or ds4. Experimental: turn it off if a GGUF model misbehaves. Passes --mlx-gguf.",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",

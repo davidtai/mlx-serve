@@ -17,12 +17,12 @@ set -e
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
-CYCLES="${IDLE_EVICT_CYCLES:-6}"
+CYCLES="${IDLE_EVICT_CYCLES:-9}"
 # Resident bytes may not grow across cycles that all end with NOTHING loaded:
 # each reload replaces the previous generation of CPU state and must free it.
-# Measured from cycle 2, not cycle 1 — the first concurrent cycle pays a
-# one-time warm-up (prefix cache, MLX buffer pool, the OS returning freed pages
-# lazily) worth hundreds of MB. Cycles 2..6 are flat to single-digit MB.
+# Measured from cycle 4 — the first concurrent cycles pay a one-time warm-up
+# (prefix cache, MLX buffer pool, the OS returning freed pages lazily) worth
+# hundreds of MB, and on LFM2.5 it takes three to settle. Cycles 4..9 are flat.
 RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-40}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
@@ -139,14 +139,14 @@ for i in $(seq 2 "$CYCLES"); do
     curl -fs "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} cycle $i: server died"; FAIL=1; break; }
     wait_unloaded || { echo -e "${RED}FAIL${NC} cycle $i: never went idle"; FAIL=1; break; }
     CYCLE_RSS=$(server_rss_mb)
-    [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 2 = the warm baseline
+    [ "$i" -lt 4 ] || [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 4 = the warm baseline
     echo "    cycle $i ok — RSS ${CYCLE_RSS} MB"
 done
 
 if [ "$FAIL" = "0" ] && [ -n "$BASE_RSS" ]; then
     END_RSS=$(server_rss_mb)
     GROWTH=$((END_RSS - BASE_RSS))
-    echo "  RSS across cycles 2..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
+    echo "  RSS across cycles 4..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
     if [ "$GROWTH" -gt "$RSS_GROWTH_LIMIT_MB" ]; then
         echo -e "${RED}FAIL${NC} +${GROWTH} MB with nothing resident — a reload is orphaning its CPU state"
         FAIL=1

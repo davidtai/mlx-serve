@@ -14,6 +14,8 @@ class BrowserManager: ObservableObject {
     @Published var canGoForward: Bool = false
     /// Bumped by `requestShow`; the app scene opens the Browser window on change.
     @Published var showRequestTick = 0
+    /// Test seam: ignore the title observer, as when WebKit reports the title after didFinish.
+    var dropsTitleKVOForTest = false
 
     /// Always available — created eagerly so tools work without the Browser window.
     let webView: WKWebView
@@ -43,7 +45,10 @@ class BrowserManager: ObservableObject {
                 MainActor.assumeIsolated { self?.currentURL = wv.url?.absoluteString ?? "" }
             },
             webView.observe(\.title, options: [.initial, .new]) { [weak self] wv, _ in
-                MainActor.assumeIsolated { self?.pageTitle = wv.title ?? "" }
+                MainActor.assumeIsolated {
+                    guard self?.dropsTitleKVOForTest == false else { return }
+                    self?.pageTitle = wv.title ?? ""
+                }
             },
             webView.observe(\.isLoading, options: [.initial, .new]) { [weak self] wv, _ in
                 MainActor.assumeIsolated { self?.isLoading = wv.isLoading }
@@ -87,8 +92,18 @@ class BrowserManager: ObservableObject {
         hostWindow.contentView = webView
     }
 
-    /// Loads `url` and returns once the navigation finished (30 s cap).
+    /// Loads `url` and returns once the navigation finished (30 s cap), with
+    /// `pageTitle` already set: WebKit can report the title after didFinish, and
+    /// callers read it right away.
     func load(_ url: URL) async throws -> String {
+        let nav = try await navigate(url)
+        if let title = try? await evaluateJSWithTimeout("document.title", description: "title") {
+            pageTitle = title
+        }
+        return nav
+    }
+
+    private func navigate(_ url: URL) async throws -> String {
         try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask { @MainActor in
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in

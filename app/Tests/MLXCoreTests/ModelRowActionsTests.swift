@@ -20,6 +20,25 @@ final class ModelRowActionsTests: XCTestCase {
                    quantFile: quantFile, defect: defect)
     }
 
+    /// A row whose folder is still downloading shows that transfer, and never
+    /// a trash: deleting files under a live download breaks it.
+    func testADownloadingRowShowsItsTransferInsteadOfATrash() {
+        var m = LocalModel(id: "mlxServe:ddalcu/Q-4bit", name: "ddalcu/Q-4bit",
+                           path: "/Users/x/.mlx-serve/models/ddalcu/Q-4bit",
+                           sizeFormatted: "4.8 GB", modelType: "qwen3_5", source: .mlxServe, kind: .base)
+        m.isDownloading = true
+        let live = DownloadManager.DownloadState(progress: 0.3, status: .downloading)
+        let other = DownloadManager.DownloadState(progress: 0.9, status: .downloading)
+        let found = ModelRowActions.transfer(for: m, in: ["ddalcu/Q-4bit": live, "ddalcu/Other": other])
+        XCTAssertEqual(found?.repoId, "ddalcu/Q-4bit")
+        XCTAssertEqual(found?.state.progress, 0.3)
+        XCTAssertFalse(ModelRowActions.showsTrash(m, unlocked: true))
+        XCTAssertFalse(ModelRowActions.showsLock(m, unlocked: false), "the slot holds the transfer")
+
+        let done = DownloadManager.DownloadState(progress: 1, status: .completed)
+        XCTAssertNil(ModelRowActions.transfer(for: m, in: ["ddalcu/Q-4bit": done]))
+    }
+
     /// Our own tree: trash from the start, no lock to click.
     func testAnOwnedModelNeedsNoUnlock() {
         let m = model(source: .mlxServe)

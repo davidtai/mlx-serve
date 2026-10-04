@@ -64,6 +64,13 @@ Every streaming surface buffers generated tokens while it might be looking at a 
 - KNOWN GAP: the Ollama surface is still exposed. `Conn.writeAll` feeds `ollama_sink`, whose SSE re-framer DROPS comment lines (`ollama.zig` `if (line[0] == ':') continue;`), and NDJSON has no comment/ping form — so a buffered tool call over `/api/chat` still writes nothing. Fix (if an Ollama client ever reports it): translate the keepalive comment into an empty-content `{"message":{"role":"assistant","content":""},"done":false}` line in the sink.
 - Related but NOT the same bug: pi's `~/.pi/agent/models.json` declared `contextWindow: 32768` for a model whose server advertises `meta.context_length` ≈ 96k, so pi's own `max_tokens` budget collapsed late in the session and its `write` calls truncated mid-argument — surfacing as our (deliberate) truncation salvage: tool name recovered, `arguments: {}`, `finish_reason: "length"`. A client that validates args against the schema instead of honoring `finish_reason: "length"` reads that as a malformed call. Clients should read `context_length` off `/v1/models`.
 
+### A reader that lags the end of a stream got ECONNRESET instead of EOF
+A client that processed a streamed response slower than the server produced it read every byte through `response.completed` and `[DONE]`, then failed with `Connection reset by peer`. Deltas go out one per token, so a client that spends tens of milliseconds per event can sit a minute behind the server's last write; every surface that ends by closing the socket has it.
+- Cause: the SSE head is `Connection: close` with no length or chunking, so the end of the body IS the close. `Conn.close` released the fd at once. A socket the process has closed is orphaned in FIN_WAIT_2, and macOS drops it with an RST after `net.inet.tcp.fin_timeout` (60 s), which replaces the EOF the reader had not reached yet.
+- Fix: for a close-delimited body (SSE, NDJSON: no `Content-Length`), `Conn.close` sends the FIN (`shutdown(SHUT_WR)`) and keeps the socket until the peer hangs up (polling, `CLOSE_WAIT_MS` = 5 min, or server shutdown), so it is never orphaned. The slot is already released by then; only the connection thread waits.
+- A response with a `Content-Length` ends by its length, so it closes at once: the writers (`sendResponseFramed`, `sendUnauthorized`, `sendModelsResponse`, the media `sendBytes*`/`sendError`) set `Conn.length_framed`. Waiting there would pin a thread for 5 minutes per request on a client that ignores `Connection: close`. Any head not marked keeps the wait (the safe default). KNOWN GAP: Ollama's aggregated non-stream JSON (`Sink.sendHttpJson`) and the LAN tunnel relay (`lan.tunnel`) are unmarked, so they still wait; mark them if a keep-alive client there pins threads.
+- Guards: the hermetic `Conn.close keeps the socket until the peer hangs up, after a close-delimited body` and `Conn.close does not wait for the peer after a Content-Length response`; `tests/test_responses_streaming.sh` [G] (a reader that waits out `fin_timeout` after the server is done must still get EOF; takes over a minute).
+
 ### Shutdown race: drain connection threads before `Scheduler.deinit` (SIGSEGV in `complete`)
 Per-connection threads are spawned in `server.serve`'s accept loop. On shutdown the accept loop breaks and `serve` returns, firing `defer scheduler.deinit()` — which frees the slot queues (`pending`/`decoding`/`cleanup_queue`) on the assumption that "all conn threads called `complete` properly". They hadn't: a conn thread still inside `Scheduler.complete` (touching those very lists) raced the free → use-after-free SIGSEGV (crash report `mlx-serve-2026-06-20-141700.ips`: thread 0 in `Scheduler.deinit`/`Thread.join`, thread 13 in `Scheduler.complete`; null-deref at +0x18). Triggered by a shutdown/model-switch while a stream was in flight. Fix (three parts):
 - `server.serve` tracks live conn threads in an atomic `active_conn_threads` (inc before spawn, dec in `handleConnectionThread`'s first-declared `defer`). After the accept loop it calls `scheduler.cancelAllInFlight()` then **waits for the counter to reach 0** (bounded ~30s) before returning — so `deinit` always runs after every `complete()` has finished.
@@ -105,6 +112,11 @@ Found 2026-07-19 by the integration run's SafeAllocator right after adding the `
 
 ### A READY model must never advertise LESS capability than its unloaded stub (empty-caps class, second bite)
 Live 2026-07-21 (two-Mac LAN session): the app tray showed "No models yet" while the user was actively chatting on the peer's DeepSeek-V4-Flash GGUF — the loaded model itself rendered `capabilities:[]` in `/v1/models`. The ready path gated `has_chat` on `chat_config.chat_template.len > 0`, but embedded-engine GGUFs (ds4/llama) can ship NO chat_template in the header and still serve chat via fallback formatting. Ironically the UNLOADED gguf stub path already advertised `["chat","tool_use","streaming","json_schema"]` unconditionally — only loading the model made it vanish from every capability-driven client (the tray's LAN chat count, the "On Your Network" pickers). Same class as the ready-path `.mesh`/"3d" hole the `ReadyCaps` comment documents. Fix: `readyHasChat(is_encoder_only, chat_template_len, has_embedded_lm)` — template presence is NOT the gate for ds4/llama entries; used by BOTH renderModelEntry and the index page. App side: `ModelInfo.lanAdvertises(capability)` treats an empty capabilities array on a `lan_peer` entry as chat (old-peer tolerance — media entries always advertise their modality, so empty == this bug). Guards: `readyHasChat` test (server.zig), `LanModelCapabilityTests` (app).
+
+### The LAN gate must resolve a model name exactly like dispatch (alias bypass)
+Found while adding Model Settings aliases (#520), before release. The keyless LAN gate read the body's `model` and, for any name that was not a registry id, checked the DEFAULT model against the share list. Dispatch then resolved the same name as an alias and served a different model. With the default shared and the aliased model not shared, a LAN client reached the unshared model by its alias (200, and the model cold-loaded).
+Fix: one resolver, `resolveRequestModelId` (exact id, path, then alias, then on `/api/` the untagged alias and Ollama's short-name match), called by dispatch, `lanShareDenial`, `/v1/load-model`, `/v1/unload-model` and `/api/show`. It also closes the older Ollama short-name case on the gate.
+Guard: `tests/test_model_alias.sh` [2] (a shared symlinked twin as the default; red on revert: 200 and the unshared model loaded) + the `resolveRequestModelId` alias unit test.
 
 ### @peer proxying is bounded by the TUNNEL MARKER, not by loopback-ness (sandbox 403 class)
 Live 2026-07-21: pi/hermes running in the Agent Sandbox VM got `403 "Remote (@peer) model ids are host-local"` for the model the host app was happily chatting on. The guest reaches the host over the VM NAT interface (`192.168.64.1`), so it is non-loopback BY CONSTRUCTION — and both the keyless LAN gate (`lanShareDenial`) and the proxy dispatch required loopback to initiate an @peer hop. Worse, with `--api-key` set the gate is skipped but dispatch still required loopback, so a keyed guest request naming @peer fell through to the unknown-id strip and would have been answered by the LOCAL default model silently. The loop/amplification bound never actually needed loopback: `lan.tunnel` has always stamped `X-MLX-LAN: 1` on every request it forwards, and the forwarded body carries the BARE id. New rule: any DIRECT client (loopback app, sandbox guest, phone on the LAN) may initiate exactly ONE hop; a request carrying the tunnel marker is never proxied again (`isTunneledRequest` at the gate AND at dispatch). Access-wise this exposes nothing new — the peer's own share gate still governs its models, and a LAN client could always ask the peer directly. Guards: `lanShareDenial` + `isTunneledRequest` tests (server.zig); `tests/test_lan_share.sh` "tunneled request never hops again" / "direct @peer id proxies" / "non-loopback client of B chats on @peer model".
@@ -2395,3 +2407,39 @@ Fix: `server.listenExclusive` clears SO_REUSEPORT on the bound socket. The kerne
 flag on the socket already bound, so the later bind fails with `AddressInUse` and logs the
 same "Port N is already in use" line. SO_REUSEADDR stays for rebinding over TIME_WAIT.
 Guard: `listenExclusive: a second server cannot bind a port that is already listening`.
+
+## A model that failed to load was answered by the default model (#585)
+
+Defect: after a pack failed to load (`MissingWeight`), a chat request that named it by its
+absolute path got HTTP 200 from the model already resident, with the path echoed as `model`.
+Users read that as "the new pack works".
+
+Cause: `/v1/load-model` registers a path under an `org/name` id, but inference routes only
+`peek`ed the raw string. A path matched no key, so it took the "unknown id -> default model"
+branch meant for SDK names like `gpt-4`.
+
+Fix: `server.resolveRequestModelId` resolves a path through `peekByPath`, so a failed entry
+reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN gate reads
+the same helper. Startup was already loud: a failed `--model` load exits 1.
+Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
+`tests/test_load_failure_no_fallback.sh`.
+
+## A stop string spanning tokens leaked its first bytes on every stream
+
+Defect: `stop: [", 12"]` streamed `…11, 1` where the non-stream reply ended `…11`, on chat, completions, messages and responses. Cause: each streaming loop sent a token as it decoded and the cut could trim only the ARRIVING token, never bytes already sent. Fix: `StopStream` holds a tail that could still begin a stop string until the next token decides it, and flushes it as one last token when generation ends without a match. Guard: `StopStream` unit test (every token split of the text) + `tests/test_api_edges.sh` stream == non-stream on all four surfaces.
+
+## A media job held the inference thread for its whole life (2026-10-03)
+
+Defect: a pi session on GLM-5.3 showed "Operation aborted" on every turn for 10+ minutes while
+its own asset script ran a textured Hunyuan3D job on the same server. Cause: `runGenRequests`
+ran the job to completion on the inference thread, so no chat request was admitted, prefilled
+or decoded until it returned, CPU-only stages (marching cubes, xatlas, bake, PNG/GLB) included.
+Fix: the loop body is `chatPass(.main)`; every backend's per-step poll is `Progress.boundary()`,
+which runs `chatPass(.yield)` for as long as the step took (`GenYield`, equal share) before the
+cancel check; a pure-CPU stage runs on a worker via `gen_sse.offload` while the inference thread
+serves chat; the job's estimated peak is billed to chat admission (`gen_reserve_bytes`), since a
+chat prefill taking a later denoise step's memory is an uncatchable Metal OOM. Chat's decode clocks reset at
+each boundary and at job end (`invalidateDecodeClocks`), or a media step folds into the round-cost table
+as one slow spec round. Loads still run whole.
+Guard: `tests/test_gen_chat_interleave.sh` (chat before gen, same image bytes, `[gen-yield] engaged`,
+cancel frees the server, chat during the mesh job), `admissionFits`, the `offload`/`boundary` tests.

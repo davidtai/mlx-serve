@@ -18,11 +18,12 @@ enum ModelFormat: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// HF API `filter` tags to query. `both` queries each tag and merges results.
+    /// Sushi's EXL3 packs are served on the MLX path but tagged `sushi`, not `mlx`.
     var filterTags: [String] {
         switch self {
-        case .mlx: return ["mlx"]
+        case .mlx: return ["mlx", "sushi"]
         case .gguf: return ["gguf"]
-        case .both: return ["mlx", "gguf"]
+        case .both: return ["mlx", "sushi", "gguf"]
         }
     }
 }

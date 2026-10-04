@@ -78,6 +78,13 @@ final class FirstRunFlowTests: XCTestCase {
 
     // MARK: - ChatGateState
 
+    /// Mid-download the card's own Cancel stops the transfer, so the sheet's
+    /// button (which only closes the window) must not also say Cancel.
+    func testGateDismissNeverSharesTheCardsCancelLabelWhileDownloading() {
+        XCTAssertEqual(ChatGateState.downloading(progress: 0.25).dismissLabel, "Close")
+        XCTAssertEqual(ChatGateState.needsModel.dismissLabel, "Cancel")
+    }
+
     func testGateHiddenWhenAChatModelExists() {
         let state = ChatGateState.resolve(localModels: [model("gemma-4-e4b")], activeDownload: nil)
         XCTAssertEqual(state, .hidden)

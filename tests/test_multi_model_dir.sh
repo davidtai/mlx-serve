@@ -33,7 +33,7 @@ boot() { # boot <logfile> <dir...>
   local log="$1"; shift
   local args=()
   for d in "$@"; do args+=(--model-dir "$d"); done
-  "$BIN" --serve --port "$PORT" "${args[@]}" >"$log" 2>&1 &
+  HOME="$TMP" "$BIN" --serve --port "$PORT" "${args[@]}" >"$log" 2>&1 &
   SRV=$!
   for _ in $(seq 1 60); do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
@@ -96,7 +96,7 @@ stop
 # won't start (the silent-flag-eater class).
 ARGS=()
 for i in $(seq 1 9); do mkdir -p "$TMP/many$i"; ARGS+=(--model-dir "$TMP/many$i"); done
-"$BIN" --serve --port "$PORT" "${ARGS[@]}" >"$TMP/toomany.log" 2>&1
+HOME="$TMP" "$BIN" --serve --port "$PORT" "${ARGS[@]}" >"$TMP/toomany.log" 2>&1
 if [ $? -ne 0 ] && grep -q "at most 8 folders" "$TMP/toomany.log"; then
   echo "PASS: a 9th --model-dir is refused by name"
 else

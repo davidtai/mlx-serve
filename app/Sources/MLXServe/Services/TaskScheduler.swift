@@ -419,7 +419,8 @@ final class TaskScheduler: ObservableObject {
         var run = run
         let approval = makeApproval(runId: run.id, autonomy: task.autonomy,
                                     workDir: resolved.workingDirectory)
-        let config = ChatTurnEngine.TurnConfig.from(resolved)
+        var config = ChatTurnEngine.TurnConfig.from(resolved)
+        config.modelPath = resolved.modelPath
         runEngine.runTurn(sessionId: sessionId, userText: userText,
                           images: nil, audio: nil, config: config, approval: approval)
         if runEngine.isGenerating {
@@ -543,7 +544,7 @@ final class TaskScheduler: ObservableObject {
                 tc, workingDirectory: &wd, repetition: repetition, iteration: 0,
                 agentMemory: appState.agentMemory, mcpRouter: appState.mcpManager,
                 mcpEnabled: task.useMCP,
-                allowedTools: resolved.tools)
+                allowedTools: ChatTurnEngine.TurnConfig.from(resolved).dispatchTools)
             appendToolResult(sessionId: sessionId, id: result.id, name: result.name,
                              display: "**\(result.name)** → \(String(result.output.prefix(500)))",
                              content: AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name))

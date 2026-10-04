@@ -7,6 +7,9 @@ pub const QuantMode = enum {
     nvfp4,
     mxfp4,
     mxfp8,
+    /// Raw ggml blocks (lib/mlx-serve-gguf). Never reaches an MLX quantized op:
+    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
+    gguf,
 
     pub fn fromString(name: []const u8) ?QuantMode {
         return std.meta.stringToEnum(QuantMode, name);
@@ -19,6 +22,7 @@ pub const QuantMode = enum {
             .nvfp4 => "nvfp4",
             .mxfp4 => "mxfp4",
             .mxfp8 => "mxfp8",
+            .gguf => "gguf",
         };
     }
 

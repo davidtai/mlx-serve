@@ -63,6 +63,7 @@ for spec in "${ARCHS[@]}"; do
 
   while IFS= read -r MODEL; do
   NAME="$LABEL/$(basename "$MODEL")"
+  if ! model_fits "$MODEL"; then RESULTS+=("SKIP $NAME ($(model_gb "$MODEL") GB past this box's $(max_model_gb) GB budget)"); continue; fi
   echo "== $NAME =="
   LOG=$(mktemp)
   pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1

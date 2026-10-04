@@ -73,7 +73,6 @@ enum SettingsReset {
                 f("pldKeyLen") { $0.pldKeyLen = $1.pldKeyLen },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 
@@ -108,14 +107,11 @@ enum SettingsReset {
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
             ]
 
-        case .ggufPerformance:
+        case .engines:
             return [
+                f("mlxGguf") { $0.mlxGguf = $1.mlxGguf },
                 f("llamaKvQuant") { $0.llamaKvQuant = $1.llamaKvQuant },
                 f("llamaCacheEntries") { $0.llamaCacheEntries = $1.llamaCacheEntries },
-            ]
-
-        case .ds4:
-            return [
                 f("ssdStreaming") { $0.ssdStreaming = $1.ssdStreaming },
             ]
 

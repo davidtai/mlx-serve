@@ -989,6 +989,8 @@ pub fn quantBits(mode: sdk.QuantMode) u64 {
         .mxfp8 => 8,
         .mxfp4, .nvfp4 => 4,
         .affine => 0,
+        // ggml blocks are the gguf engine's; a bank's quantization parses through sdk.quant, which refuses them.
+        .gguf => unreachable,
     };
 }
 

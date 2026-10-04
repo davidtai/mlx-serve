@@ -2,6 +2,7 @@
 // Run with: zig build test
 
 test {
+    _ = @import("arch/mlx_gguf.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
@@ -21,8 +22,22 @@ test {
     _ = @import("qmv2.zig");
     _ = @import("rowqmv.zig");
     _ = @import("simd_qmm.zig");
+    _ = @import("lane_qmm.zig");
+    _ = @import("lane_attn.zig");
+    _ = @import("add_norm.zig");
+    _ = @import("moe_fp4.zig");
+    _ = @import("mimo_mtp.zig");
+    _ = @import("glm_mtp.zig");
+    _ = @import("dec_attn.zig");
+    _ = @import("nax_attention.zig");
+    _ = @import("glm5_next.zig");
+    _ = @import("kda_recurrence.zig");
+    _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
+    _ = @import("qmv_nax2.zig");
+    _ = @import("gather_qmm_nax.zig");
+    _ = @import("qmm_int8.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -50,6 +65,7 @@ test {
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
+    _ = @import("kev.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
@@ -93,7 +109,9 @@ test {
     _ = @import("hunyuan3d.zig");
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
+    _ = @import("stable_audio.zig");
     _ = @import("uvwrap.zig");
+    _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");
     _ = @import("rasterize.zig");

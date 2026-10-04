@@ -49,7 +49,7 @@ SERVER_PID=$!
 cleanup() {
     kill $SERVER_PID 2>/dev/null || true
     wait $SERVER_PID 2>/dev/null || true
-    cp "$LOGFILE" "$HOME/claude-tmp/pc378/server.log" 2>/dev/null; rm -f "$LOGFILE"
+    rm -f "$LOGFILE"
 }
 trap cleanup EXIT
 

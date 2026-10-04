@@ -122,7 +122,7 @@ fi
 
 echo "2) PLD server (--pld), tools request with enable_pld:true..."
 LOG_B=$(mktemp)
-start_server "$LOG_B" --pld
+start_server "$LOG_B" --pld --no-drafter
 PLD_CALL=$(tool_request "\"enable_pld\":true," | extract_call)
 PLD_ECHO=$(echo_request "\"enable_pld\":true,")
 

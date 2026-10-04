@@ -227,12 +227,12 @@ def expert_widths_note(args, n_layers):
             + (", imatrix-calibrated" if args.imatrix else ""))
 
 
-def width_for(name, shape, nonexpert_bits=8):
+def width_for(name, shape, nonexpert_bits=8, embed_bits=4):
     """(bits, group_size) or None for bf16 pass-through."""
     if len(shape) != 2 or shape[0] < 32 or shape[1] % 64 != 0:
         return None
     if name.endswith("embed_tokens.weight"):
-        return 4, 64
+        return embed_bits, 64
     return nonexpert_bits, 64
 
 
@@ -438,6 +438,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--ngram-bits", type=int, default=4)
     ap.add_argument("--nonexpert-bits", type=int, default=8, help="width for every non-expert 2-D projection (4 = the -all pack)")
+    ap.add_argument("--embed-bits", type=int, default=4, help="width for embed_tokens (a gather-read table; 8 keeps the input exact-ish)")
     ap.add_argument("--ahead", type=int, default=2)
     ap.add_argument("--add-vision", action="store_true", help="append the bf16 vision tower to the pack at --dst (no re-stream)")
     args = ap.parse_args()
@@ -563,7 +564,7 @@ def main():
                 emit_q(nk[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight", arr,
                        *expert_width(nk, "down", args, n_layers), name)
                 continue
-            w = width_for(nk, arr.shape, args.nonexpert_bits) if meta["dtype"] == "BF16" else None
+            w = width_for(nk, arr.shape, args.nonexpert_bits, args.embed_bits) if meta["dtype"] == "BF16" else None
             if w:
                 emit_q(nk, arr, *w, src_name=name)
                 continue

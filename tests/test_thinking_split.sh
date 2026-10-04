@@ -71,7 +71,14 @@ R=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
     -d "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":2000,\"temperature\":0,\"enable_thinking\":true}")
 CONTENT=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message'].get('content') or '')")
 REASONING=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message'].get('reasoning_content') or '')")
-check "answer (391) is in content" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
+FINISH=$(echo "$R" | python3 -c "import json,sys; c=json.load(sys.stdin)['choices'][0]; print((c.get('finish_details') or {}).get('type') or c['finish_reason'])")
+# Greedy thinking can loop on some quants until the cap or the loop guard ends it: a
+# reply that ended inside the thought has no answer to place, so only the split is checked.
+if { [ "$FINISH" = "length" ] || [ "$FINISH" = "repetition_loop" ]; } && [ -z "$CONTENT" ]; then
+    echo "  skip answer (391) is in content — ended inside the thought ($FINISH)"
+else
+    check "answer (391) is in content" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
+fi
 check "content has no think tags" "$(echo "$CONTENT" | grep -q '</think>\|<think>' && echo 0 || echo 1)"
 check "reasoning_content non-empty" "$([ -n "$REASONING" ] && echo 1 || echo 0)"
 

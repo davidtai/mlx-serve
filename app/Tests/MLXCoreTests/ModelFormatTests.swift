@@ -8,10 +8,11 @@ final class ModelFormatTests: XCTestCase {
     // MARK: - Format → HF filter tags
 
     func testFilterTagsPerFormat() {
-        XCTAssertEqual(ModelFormat.mlx.filterTags, ["mlx"])
+        // Sushi's EXL3 packs are MLX-served but tagged `sushi`, not `mlx`.
+        XCTAssertEqual(ModelFormat.mlx.filterTags, ["mlx", "sushi"])
         XCTAssertEqual(ModelFormat.gguf.filterTags, ["gguf"])
         // Both queries each tag and merges client-side.
-        XCTAssertEqual(ModelFormat.both.filterTags, ["mlx", "gguf"])
+        XCTAssertEqual(ModelFormat.both.filterTags, ["mlx", "sushi", "gguf"])
     }
 
     func testAllCasesAndLabels() {

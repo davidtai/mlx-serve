@@ -41,10 +41,25 @@ final class BrowserPublishedStateTests: XCTestCase {
         XCTAssertEqual(m.currentURL, file.absoluteString)
         XCTAssertEqual(m.pageTitle, "Pushy")
         _ = try await m.evaluateJS("history.pushState({}, '', '?tab=2'); document.title = 'Pushy 2'; 1")
-        for _ in 0..<20 where m.currentURL != file.absoluteString + "?tab=2" {
+        // URL and title arrive as separate KVO notifications, in either order.
+        for _ in 0..<100 where m.currentURL != file.absoluteString + "?tab=2" || m.pageTitle != "Pushy 2" {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         XCTAssertEqual(m.currentURL, file.absoluteString + "?tab=2")
         XCTAssertEqual(m.pageTitle, "Pushy 2")
+    }
+
+    func testLoadReturnsTheNewPagesTitleWhenTheTitleObserverIsLate() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let m = BrowserManager.shared
+        m.dropsTitleKVOForTest = true
+        defer { m.dropsTitleKVOForTest = false }
+        for title in ["First", "Second"] {
+            let file = dir.appendingPathComponent("\(title).html")
+            try "<html><head><title>\(title)</title></head><body></body></html>".write(to: file, atomically: true, encoding: .utf8)
+            _ = try await m.load(file)
+            XCTAssertEqual(m.pageTitle, title)
+        }
     }
 }

@@ -32,6 +32,8 @@ final class VideoGenService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var livePreview: NSImage? = nil
+    /// When the current run started; read only while `phase` is `.running`.
+    @Published private(set) var startedAt = Date()
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
     @Published private(set) var residency: Residency? = nil
@@ -91,6 +93,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
 

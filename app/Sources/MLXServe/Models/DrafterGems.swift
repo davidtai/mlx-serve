@@ -133,8 +133,8 @@ extension DrafterGems {
     }
 
     /// The method the server dispatches for this model: DFlash-family drafter >
-    /// MTP > Gemma assistant, and a MoE head stays off unless forced.
-    static func badge(_ o: ModelOverride, modelDir: String, hasMtpHead: Bool, isMoE: Bool, options: ServerOptions,
+    /// MTP > Gemma assistant.
+    static func badge(_ o: ModelOverride, modelDir: String, hasMtpHead: Bool, options: ServerOptions,
                       config: (String) -> [String: Any]? = readConfig) -> SocketBadge {
         let drafterDir: String? = switch o.drafter {
         case "off": nil
@@ -143,8 +143,7 @@ extension DrafterGems {
         }
         let drafter = drafterDir.flatMap(config).flatMap(stone(drafterConfig:))
         if let drafter, drafter != .ruby { return SocketBadge(stone: drafter, skull: false) }
-        let force = o.mtp == true || (options.enableMTP && options.mtpOnMoE)
-        guard hasMtpHead, o.mtp ?? options.enableMTP, !isMoE || force else { return SocketBadge(stone: drafter, skull: false) }
+        guard hasMtpHead, o.mtp ?? options.enableMTP else { return SocketBadge(stone: drafter, skull: false) }
         return SocketBadge(stone: .emerald, skull: o.mtpAcceptance == .typical || o.mtpAcceptance == .tokenv3)
     }
 

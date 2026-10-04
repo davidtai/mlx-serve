@@ -9,8 +9,10 @@
             over slabs; the converter applies the chosen width to the whole bank.
   allocate  Spend an expert byte budget greedily: every group starts at the floor,
             the upgrade with the best error-reduction-per-byte is bought until the
-            budget runs out. The last `--tail-layers` layers are pinned at 4x64
-            (a low-bit tail is the turn-level agent-loop trap). Seconds per run.
+            budget runs out. The floor is `--floor` (default the narrowest measured
+            width); the last `--tail-layers` layers are pinned at `--tail-width`
+            (default 4x64; a low-bit tail is the turn-level agent-loop trap).
+            Seconds per run.
 
 Output of `allocate` is the converter's `--alloc` file:
   {"layers.N.gate_up": {"bits": b, "group_size": g}, "layers.N.down": {...}, ...}
@@ -36,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert_dsv4_weights import bf16_to_f32  # noqa: E402
 from dsv4_imatrix import weighted_affine_quant  # noqa: E402
 
-CANDIDATES = ((2, 64), (2, 128), (3, 64), (3, 128), (4, 64))
+CANDIDATES = ((2, 64), (2, 128), (3, 64), (3, 128), (4, 64), (5, 64), (6, 64), (8, 64))
 PREFIX = "model.language_model.layers."
 
 
@@ -106,13 +108,18 @@ def cmd_allocate(args):
     groups = json.loads(Path(args.errors).read_text())["groups"]
     n_layers = 1 + max(int(k.split(".")[1]) for k in groups)
     pinned = {k for k in groups if int(k.split(".")[1]) >= n_layers - args.tail_layers}
+    def width(spec):
+        b, g = spec.split("x")
+        return int(b), int(g)
     def floor_for(k):
         if k.endswith(".down") and args.down_floor:
-            b, g = args.down_floor.split("x")
-            return int(b), int(g)
+            return width(args.down_floor)
+        if args.floor:
+            return width(args.floor)
         return (2, 128) if ckey(2, 128) in groups[k]["err"] else (2, 64)
 
-    state = {k: ((4, 64) if k in pinned else floor_for(k)) for k in groups}
+    tail = width(args.tail_width)
+    state = {k: (tail if k in pinned else floor_for(k)) for k in groups}
 
     def cost(k, c):
         return groups[k]["params"] * bytes_per_param(*c)
@@ -167,7 +174,9 @@ def main():
     a.add_argument("--errors", required=True)
     a.add_argument("--budget-gb", type=float, required=True, help="expert bytes incl. the pinned tail")
     a.add_argument("--tail-layers", type=int, default=2)
+    a.add_argument("--floor", default=None, help="e.g. 4x64: every group starts here (default: the narrowest measured width)")
     a.add_argument("--down-floor", default=None, help="e.g. 3x128: never below this on the down projections")
+    a.add_argument("--tail-width", default="4x64", help="width the last --tail-layers layers are pinned at")
     a.add_argument("--out", required=True)
     a.set_defaults(fn=cmd_allocate)
     args = ap.parse_args()

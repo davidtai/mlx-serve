@@ -68,7 +68,9 @@ d = json.load(sys.stdin)['data']
 def ok(m):
     caps = m.get('capabilities') or []
     meta = m.get('meta') or {}
-    return 'chat' in caps and (meta.get('bytes_on_disk') or m.get('bytes_on_disk') or 0) < 12e9
+    # Local packs only: a provider or LAN row is someone else's server.
+    local = 'provider' not in m and m.get('state') != 'remote'
+    return local and 'chat' in caps and (meta.get('bytes_on_disk') or m.get('bytes_on_disk') or 0) < 12e9
 picked = [m['id'] for m in sorted(d, key=lambda m: m.get('bytes_on_disk') or 0) if ok(m)]
 print('\n'.join(picked[:3]))
 " 2>/dev/null)

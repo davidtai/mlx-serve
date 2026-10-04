@@ -370,6 +370,8 @@ pub const GatherQmm = struct {
             .mxfp4 => bits == 4 and group == 32,
             .nvfp4 => bits == 4 and group == 16,
             .mxfp8 => bits == 8 and group == 32,
+            // Raw ggml blocks are no MLX quantization.
+            .gguf => false,
         };
     }
 

@@ -13,8 +13,8 @@ import SwiftUI
 /// a message. And it clears itself — `AppState.localModels` is `@Published`
 /// and the card refreshes it when the transfer lands.
 ///
-/// Cancel CLOSES the window. Dismissing to the dead composer underneath is the
-/// state this sheet exists to replace.
+/// Cancel ends the sheet and keeps the window open, so the app can be explored
+/// before any download; the sheet returns when the window next opens.
 struct ChatModelGateSheet: View {
     let pick: RecommendedModelPick
     let onCancel: () -> Void
@@ -49,7 +49,7 @@ struct ChatModelGateSheet: View {
 
             HStack {
                 Spacer()
-                Button(action: onCancel, label: { Text("Cancel")
+                Button(action: onCancel, label: { Text(L10n.text(state.dismissLabel))
                     .font(.app(.body)) })
                     .keyboardShortcut(.cancelAction)
             }

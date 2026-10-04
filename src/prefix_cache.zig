@@ -166,6 +166,9 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// Did a disk restore hand the slot rows it owns outright? The restore copies its chunks
+    /// into slot-held arrays, so those rows are the slot's own without a RAM entry moving.
+    slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
 };
@@ -1005,6 +1008,7 @@ pub const HotPrefixCache = struct {
                 if (shared > p.best_raw) p.best_raw = shared;
             }
 
+            if (!ringRestores(&e.snapshot, shared, prompt_ids.len)) continue;
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
@@ -1020,6 +1024,12 @@ pub const HotPrefixCache = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    /// A sliding ring restores only where it still holds the window behind the match; a full
+    /// match restores one token short.
+    fn ringRestores(snap: *const KVCacheSnapshot, matched: usize, prompt_len: usize) bool {
+        return matched - @intFromBool(matched == prompt_len and matched > 0) >= snap.ringFloor();
     }
 
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
@@ -1191,6 +1201,7 @@ pub const HotPrefixCache = struct {
                     // length, `hm` by restorable checkpoint, so they routinely differ.
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
+                    .slot_owned = true,
                 };
             }
 
@@ -1223,6 +1234,7 @@ pub const HotPrefixCache = struct {
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
                 .mtp_base = disk_mtp,
+                .slot_owned = true,
             };
         }
 
@@ -1351,10 +1363,14 @@ pub const HotPrefixCache = struct {
                 effective_matched = 0;
             }
         }
+        if (effective_matched > 0 and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
+            log.info("  [hot-cache] sliding ring holds rows from {d}; match {d} falls behind them\n", .{ e.snapshot.ringFloor(), effective_matched });
+            effective_matched = 0;
+        }
         target_moe_seq_offset.* = effective_matched;
 
-        // Miss path (hybrid without a usable checkpoint, and the QSA-history
-        // decline that funnels into it): also reset KV.
+        // Miss path (hybrid without a usable checkpoint, the QSA-history decline and a
+        // sliding ring past the match): also reset KV.
         if (effective_matched == 0) {
             try target_cache.truncate(0, s);
             // A 0-token outcome is not a restore: the marker was set above the restore (the hybrid
@@ -3076,6 +3092,43 @@ test "HotPrefixCache: restore clamps an inflated snapshot to the matched length 
     }
 }
 
+test "prefix cache: a sliding ring restores only where it still holds the window behind the match" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [301]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var src = try KVCache.init(testing.allocator, 1);
+    defer src.deinit();
+    for (0..6) |_| {
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 50, 4 }, 4, .bfloat16, s));
+        var view = try src.updateSliding(0, k, k, s, 8 + 50 - 1, 8, 24);
+        view.deinit();
+    }
+    try testing.expect(src.entries[0].base > 0);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    _ = try hc.commit(&src, toks[0..300], false);
+
+    // A prompt that leaves the entry early would need rows the ring dropped: a clean miss.
+    var early: [120]u32 = undefined;
+    @memcpy(early[0..100], toks[0..100]);
+    for (early[100..]) |*t| t.* = 7;
+    var dst = try KVCache.init(testing.allocator, 1);
+    defer dst.deinit();
+    var off: usize = 0;
+    const miss = try hc.lookupAndRestore(&dst, &off, null, s, &early, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+    try testing.expect(!dst.entries[0].initialized);
+
+    // A prompt that extends the entry restores it, positions absolute.
+    toks[300] = 7;
+    const hit = try hc.lookupAndRestore(&dst, &off, null, s, &toks, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 300), hit.matched);
+    try testing.expectEqual(@as(usize, 300), dst.entries[0].offset);
+}
+
 test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's matched length" {
     const s = mlx.gpuStream();
     var toks: [64]u32 = undefined;
@@ -3291,6 +3344,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         // Full match: identical re-issue semantics — truncate to len-1 and
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
+        try testing.expect(res.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 599), res.matched);
         try testing.expectEqual(@as(usize, 599), cache2.step);
         try testing.expectEqual(@as(usize, 599), moe_off);
@@ -3308,6 +3362,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var moe_off3: usize = 0;
         const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, &.{}, null, null);
         try testing.expect(!res3.full_match);
+        try testing.expect(res3.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
         // A diverged short prefix must read ONLY the chunks covering the
@@ -4284,6 +4339,7 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         var moe_off: usize = 0;
         const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
         try testing.expect(!res.full_match);
+        try testing.expect(res.slot_owned); // a hybrid disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
     }

@@ -329,7 +329,9 @@ struct WelcomeView: View {
     /// strength and a Get/Use control. The overall recommended pick (the
     /// app-wide `starterPick`) is marked.
     private var runModelsPanel: some View {
-        let picks = WelcomeModelPicks.forMemory(SystemMemoryInfo.current())
+        let memory = SystemMemoryInfo.current()
+        let picks = WelcomeModelPicks.forMemory(memory)
+        let recommendedId = WelcomeModelPicks.recommendedId(in: picks, memory: memory)
         return VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 8) {
                 panelLabel("THIS MAC")
@@ -340,12 +342,10 @@ struct WelcomeView: View {
             VStack(alignment: .leading, spacing: 8) {
                 panelLabel("BEST MODELS FOR YOUR MAC")
 
-                // The first entry (General) is the everyday default — marked as
-                // the suggested starting point.
-                ForEach(Array(picks.enumerated()), id: \.element.id) { index, entry in
+                ForEach(picks) { entry in
                     WelcomeModelRow(
                         entry: entry,
-                        isRecommended: index == 0,
+                        isRecommended: entry.id == recommendedId,
                         onOpenChat: { leave(.useModel) }
                     )
                 }

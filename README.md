@@ -54,11 +54,10 @@ And because mlx-serve **speaks the Ollama API** (`/api/chat`, `/api/generate`, `
 
 ### Build from source
 
-Needs Xcode 26.2+ with the Metal Toolchain component (if `xcrun -sdk macosx metal --version` fails, run `xcodebuild -downloadComponent MetalToolchain`):
+Needs Xcode 26.2+ and [Homebrew](https://brew.sh). The script downloads the Metal Toolchain component and installs the `Brewfile` (cmake + webp) when they are missing:
 
 ```bash
 git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
-brew bundle install --file=Brewfile   # cmake + webp
 ./app/build.sh                        # app + server, ad-hoc signed
 ```
 
@@ -79,7 +78,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
-| Typed decisions (Laya, `POST /v1/decisions`) | ✅ | ❌ | ❌ | ❌ |
+| Typed decisions (Laya, Kev, `POST /v1/decisions`) | ✅ | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit) | ✅ | ❌ | partial | ✅ |

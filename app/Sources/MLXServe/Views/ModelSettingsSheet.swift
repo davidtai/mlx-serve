@@ -34,6 +34,8 @@ struct ModelSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var override = ModelOverride()
+    @State private var initialOverride = ModelOverride()
+    @State private var settingsFile = ModelSettingsFile()
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
@@ -48,9 +50,23 @@ struct ModelSettingsSheet: View {
     }
 
     private var plan: ModelSettingsApply.Plan {
-        ModelSettingsApply.plan(serverRunning: server.status == .running,
+        if !override.changesLoad(from: initialOverride) && socket == initialSocket { return .saveOnly }
+        return ModelSettingsApply.plan(serverRunning: server.status == .running,
                                 loaded: live?.loaded ?? false,
                                 isStartupModel: server.currentModelPath == request.path)
+    }
+
+    /// Why the typed alias cannot be saved, if it cannot.
+    private var aliasError: String? {
+        guard let a = override.alias else { return nil }
+        if !ModelOverride.isValidAlias(a) { return "An alias has no spaces, @, / or quotes, and is not \"mlx-serve\"." }
+        if let other = settingsFile.pathUsingAlias(a, except: request.path) {
+            return "\"\(a)\" is already the alias of \((other as NSString).lastPathComponent)."
+        }
+        if server.allModels.contains(where: { $0.name == a && $0.name != live?.name }) {
+            return "\"\(a)\" is already the id of another model."
+        }
+        return nil
     }
 
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
@@ -62,6 +78,11 @@ struct ModelSettingsSheet: View {
     /// ds4 and llama.cpp read only the context size from model-settings.json.
     private var isGguf: Bool {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
+    }
+
+    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
+    private var hasInt8PrefillRoute: Bool {
+        appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
@@ -89,7 +110,8 @@ struct ModelSettingsSheet: View {
     }
 
     private var formHeight: CGFloat {
-        var n = isGguf ? 1 : 2
+        var n = isGguf ? 2 : 3
+        if hasInt8PrefillRoute { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
@@ -155,6 +177,11 @@ struct ModelSettingsSheet: View {
             .padding(16)
             Divider()
             Form {
+                TextField(text: Binding(
+                    get: { override.alias ?? "" },
+                    set: { let t = $0.trimmingCharacters(in: .whitespaces); override.alias = t.isEmpty ? nil : t }),
+                          prompt: Text("none")) { Text("Alias").font(.app(.body)) }
+                    .font(.app(.body))
                 Picker("Context size", selection: Binding(
                     get: { override.ctxSize ?? -1 },
                     set: { override.ctxSize = $0 < 0 ? nil : $0 })) {
@@ -187,6 +214,16 @@ struct ModelSettingsSheet: View {
                     Text("Default").tag("").font(.app(.body))
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
+                }
+                if hasInt8PrefillRoute {
+                Picker("Int8 prefill (lossy)", selection: Binding(
+                    get: { override.int8Prefill.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.int8Prefill = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
                 }
                 if !isGguf {
                     Section {
@@ -245,6 +282,9 @@ struct ModelSettingsSheet: View {
             Text(L10n.text(footnote))
                 .font(.app(.caption2)).foregroundStyle(.secondary)
                 .padding(.horizontal, 16)
+            if let aliasError {
+                Text(verbatim: aliasError).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
+            }
             if let error {
                 Text(error).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
@@ -255,13 +295,15 @@ struct ModelSettingsSheet: View {
                 Button { Task { await save() } } label: { Text(L10n.text(plan == .restart ? "Save & Restart" : "Save"))
                     .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(busy)
+                    .disabled(busy || aliasError != nil)
             }
             .padding(16)
         }
         .frame(width: 440)
         .onAppear {
-            override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride()
+            settingsFile = ModelSettingsFile.load()
+            override = settingsFile.override(for: request.path) ?? ModelOverride()
+            initialOverride = override
             let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
                                                  listing: downloads.packListings[repoId])
             socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }

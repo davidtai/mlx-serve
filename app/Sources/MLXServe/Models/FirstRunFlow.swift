@@ -91,4 +91,11 @@ enum ChatGateState: Equatable {
     }
 
     var isBlocking: Bool { self != .hidden }
+
+    /// The sheet's button closes the window and leaves a transfer running;
+    /// mid-download the card already has a Cancel that STOPS it.
+    var dismissLabel: String {
+        if case .downloading = self { return "Close" }
+        return "Cancel"
+    }
 }

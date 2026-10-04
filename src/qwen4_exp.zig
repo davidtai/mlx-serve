@@ -141,6 +141,28 @@ test "ngram table row dequant reads the dense mx.quantize packing at every width
     }
 }
 
+test "ngram table raw BF16 rows do not depend on quantization group size" {
+    for ([_][]const u8{ "0", "1", "32", "1024" }) |group_size| {
+        var header_buf: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &header_buf,
+            "{{\"__metadata__\":{{\"format\":\"mlx-serve-ngram\",\"bits\":\"16\",\"group_size\":\"{s}\"}}," ++
+                "\"weight\":{{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}}}",
+            .{group_size},
+        );
+        const buf = try ngramTestImage(header, 8);
+        defer std.heap.page_allocator.free(buf);
+        const values = [_]u16{ 0x3F80, 0xC000, 0x3F00, 0x4040 };
+        for (values, 0..) |value, i| std.mem.writeInt(u16, buf[520 + i * 2 ..][0..2], value, .little);
+        const table = try NgramTable.parse(buf, buf[8..520], 520);
+        var row: [2]f32 = undefined;
+        table.row(0, &row);
+        try testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, &row);
+        table.row(1, &row);
+        try testing.expectEqualSlices(f32, &.{ 0.5, 3.0 }, &row);
+    }
+}
+
 test "ngram table raw bf16 rows copy out converted without scales" {
     // bits 16: `weight` BF16 [2,4], no scales/biases keys at all.
     const header = "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"16\",\"group_size\":\"32\"},\"weight\":{\"dtype\":\"BF16\",\"shape\":[2,4],\"data_offsets\":[0,16]}}";

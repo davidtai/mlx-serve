@@ -473,7 +473,6 @@ pub const NgramTable = struct {
         const bits: u32 = std.fmt.parseInt(u32, bits_v.string, 10) catch return error.NgramTableHeader;
         const gs: u32 = std.fmt.parseInt(u32, gs_v.string, 10) catch return error.NgramTableHeader;
         if (!bitsSupported(bits)) return error.NgramTableBits;
-        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         // Raw BF16 mode: one `weight` BF16 [rows, dim] region, no
         // scales/biases. `wcols`/`scols` stay 0; only `row`'s raw arm reads it.
@@ -493,6 +492,8 @@ pub const NgramTable = struct {
                 .scols = 0,
             };
         }
+
+        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
         const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);

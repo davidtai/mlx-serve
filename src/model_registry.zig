@@ -240,6 +240,9 @@ pub const LoadedModel = struct {
     /// `LlamaEngine` / `LlamaSession`. Mutually exclusive with the safetensors
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
+    /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
+    /// once, on the first `/v1/models` render.
+    mlx_gguf_claim: ?bool = null,
 
     /// Native media-generation engines, named by MODALITY (not by the FLUX/
     /// Qwen3-TTS/LTX implementations, which are swappable internals). When one
@@ -412,7 +415,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // The Qwen sidecar and the MiMo heads are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -421,6 +424,14 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
+                .mimo => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
             }
             self.mtp = null;
         }
@@ -582,7 +593,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // The Qwen sidecar and the MiMo heads are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -591,6 +602,14 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
+                .mimo => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
             }
             self.mtp = null;
         }

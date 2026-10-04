@@ -138,6 +138,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.videoGen)
                 .environmentObject(appState.audioGen)
                 .environmentObject(appState.musicGen)
+                .environmentObject(appState.soundGen)
                 .environmentObject(appState.model3dGen)
                 // Settings, Tasks and Agents render here as modes too, so their
                 // objects ride this scene (`ChatWorkspace`).
@@ -195,7 +196,7 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 1040, height: 680)
 
-        Window("Laya Decisions", id: "layaDecisions") {
+        Window("Decisions", id: "layaDecisions") {
             LayaDecisionsWindow()
                 .environmentObject(appState)
                 .environmentObject(appState.server)

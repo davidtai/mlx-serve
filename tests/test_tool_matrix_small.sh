@@ -72,6 +72,12 @@ if [ ! -x "$BINARY" ]; then
     echo "FAIL: $BINARY not found — build first: zig build -Doptimize=ReleaseFast"; exit 1
 fi
 
+# A small model can loop inside the file body until max_tokens: the call is then salvaged
+# as NAME + {} by design, so the size bar only applies to a call the model finished.
+big_content_check() { # mode verdict finish_reason
+    if [ "$3" = "length" ]; then echo "  skip [$logical] big-file write ($1): content >=400 bytes — the model ran to max_tokens"; return; fi
+    check "[$logical] big-file write ($1): content >=400 bytes" "$([ "$(echo "$2"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+}
 check() {
     local desc="$1" ok="$2"
     if [ "$ok" = "1" ]; then PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $desc"
@@ -217,7 +223,7 @@ run_model() {
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
     check "[$logical] big-file write (non-stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
     check "[$logical] big-file write (non-stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (non-stream): content >=400 bytes"     "$([ "$(echo "$V"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")"
 
     # ── big-file write, STREAM ──
     ACC=$(curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
@@ -226,7 +232,7 @@ run_model() {
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
     check "[$logical] big-file write (stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
     check "[$logical] big-file write (stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (stream): content >=400 bytes"     "$([ "$(echo "$V"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "stream" "$V" "$(jget "$ACC" "r['finish']")"
 
     # Informational: did the server-side recovery actually engage for this model?
     local recov

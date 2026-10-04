@@ -68,6 +68,8 @@ fn hardFail(comptime what: []const u8, idx: usize, detail: []const u8) void {
 }
 
 test "tool traffic replay: captured agent traffic survives parse + schema coercion" {
+    // 4,911 records, ~31 s in Debug: `zig build test -Dslow-tests` runs it.
+    if (!@import("build_options").slow_tests) return error.SkipZigTest;
     g_fail_count = 0;
     dump_soft = std.c.getenv("REPLAY_DUMP_SOFT") != null;
     var line_it = std.mem.splitScalar(u8, fixture, '\n');

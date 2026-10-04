@@ -174,6 +174,39 @@ fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
     return false;
 }
 
+/// True when the header names a pooling type (`<arch>.pooling_type` > 0), llama.cpp's
+/// mark of an embedding or reranker model: no engine here generates text from one.
+/// Stops at the first `tokenizer.` key; converters write the arch keys before it.
+pub fn declaresPooling(r: *std.Io.Reader) Error!bool {
+    const magic = takeBytes(r, 4) catch return error.Truncated;
+    if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
+    const version = takeIntT(r, u32) catch return error.Truncated;
+    if (version < 2 or version > 3) return error.UnsupportedVersion;
+    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count
+    const kv_count = takeIntT(r, u64) catch return error.Truncated;
+    var i: u64 = 0;
+    while (i < kv_count) : (i += 1) {
+        const key_len = takeIntT(r, u64) catch return error.Truncated;
+        if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const key = takeBytes(r, @intCast(key_len)) catch return error.Truncated;
+        if (std.mem.startsWith(u8, key, "tokenizer.")) return false;
+        const is_pooling = std.mem.endsWith(u8, key, ".pooling_type");
+        const value_type = takeIntT(r, u32) catch return error.Truncated;
+        if (is_pooling and isNumeric(value_type)) return (try takeNumeric(r, value_type)) > 0;
+        try skipValue(r, value_type);
+    }
+    return false;
+}
+
+/// `declaresPooling` for `sub_path` under `dir`; false when it cannot be read.
+pub fn fileDeclaresPooling(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) bool {
+    var file = dir.openFile(io, sub_path, .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    return declaresPooling(&rs.interface) catch false;
+}
+
 /// Open the GGUF file and parse Info via the file's buffered reader.
 /// Caller owns the returned Info (call `.deinit(allocator)`).
 pub fn readFromFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Info {
@@ -270,14 +303,14 @@ fn takeIntT(r: *std.Io.Reader, comptime T: type) !T {
 
 const testing = std.testing;
 
-const Value = union(enum) {
+pub const Value = union(enum) {
     str: []const u8,
     u32_v: u32,
     u64_v: u64,
     str_array: []const []const u8,
 };
 
-const KV = struct { key: []const u8, value: Value };
+pub const KV = struct { key: []const u8, value: Value };
 
 fn appendU32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void {
     var tmp: [4]u8 = undefined;
@@ -299,7 +332,7 @@ fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u
 const TensorInfo = struct { name: []const u8, ggml_type: u32 };
 
 /// Build a minimal but valid GGUF v3 header from a KV list, with no tensors.
-fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
+pub fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
     return buildHeaderWithTensors(allocator, kvs, &.{});
 }
 
@@ -532,4 +565,28 @@ test "parseInfo: truncated mid-KV → Truncated" {
     std.mem.writeInt(u64, bytes[8..16], 0, .little); // tensor_count
     std.mem.writeInt(u64, bytes[16..24], 5, .little); // kv_count
     try testing.expectError(error.Truncated, parseBytes(testing.allocator, &bytes));
+}
+
+test "declaresPooling: an embedding GGUF names a pooling type, a chat GGUF does not" {
+    const cases = [_]struct { kvs: []const KV, want: bool }{
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "gemma-embedding" } },
+            .{ .key = "gemma-embedding.pooling_type", .value = .{ .u32_v = 1 } },
+        }, .want = true },
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "qwen35" } },
+            .{ .key = "qwen35.block_count", .value = .{ .u32_v = 32 } },
+            .{ .key = "tokenizer.ggml.model", .value = .{ .str = "gpt2" } },
+        }, .want = false },
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "llama" } },
+            .{ .key = "llama.pooling_type", .value = .{ .u32_v = 0 } },
+        }, .want = false },
+    };
+    for (cases) |c| {
+        const bytes = try buildHeader(testing.allocator, c.kvs);
+        defer testing.allocator.free(bytes);
+        var r: std.Io.Reader = .fixed(bytes);
+        try testing.expectEqual(c.want, try declaresPooling(&r));
+    }
 }

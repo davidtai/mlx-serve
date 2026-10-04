@@ -127,9 +127,10 @@ struct RecommendedModelPick: Identifiable, Hashable {
             let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
             return "mixed \(bits.joined(separator: "/"))-bit"
         }
-        if let r = name.range(of: "iQ-MLX-[0-9.]+bpw", options: .regularExpression) {
-            let bpw = name[r].dropFirst("iQ-MLX-".count).dropLast("bpw".count)
-            return "iQ-MLX \(bpw) bpw"
+        if let r = name.range(of: "(iQ-MLX|Sushi)-[0-9.]+bpw", options: .regularExpression) {
+            let tag = name[r].dropLast("bpw".count)
+            let dash = tag.lastIndex(of: "-")!
+            return "\(tag[..<dash]) \(tag[tag.index(after: dash)...]) bpw"
         }
         if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
             return name[r].dropLast("bit".count) + "-bit"
@@ -255,22 +256,26 @@ extension RecommendedModelPick {
         activeParamsB: 4.0
     )
 
-    /// Qwen 3.5 9B — the entry-level Qwen pick. Replaces the earlier 0.8B
-    /// entry, which was too small to be a meaningful comparison against the
-    /// Gemma lineup.
-    static let qwen35_9b = RecommendedModelPick(
-        id: "qwen35-9b",
-        name: "Qwen 3.5 (9B)",
-        tagline: "A capable everyday pick",
-        blurb: "A well-rounded Qwen model — good at chatting, coding help, and following instructions, while staying quick to respond. A solid alternative to Gemma if you want to compare styles.",
-        repoId: "mlx-community/Qwen3.5-9B-MLX-4bit",
-        sizeGB: 5.5,
+    /// MiMo-V2.6 distilled to 9B on ddalcu's 4-bit pack — the entry-level
+    /// Qwen pick. A dense 9B with a vision tower (the repo is tagged
+    /// image-text-to-text) and a 256K window, small enough for a 16 GB Mac.
+    ///
+    /// `intelligence` is ESTIMATED: the index has no entry for the distill.
+    /// Placed a notch above the retired Qwen 9B's 35 on the maintainer's
+    /// read. `speed` is the 9B-class rate (no benchmarks.md row yet).
+    static let mimo9b = RecommendedModelPick(
+        id: "mimo-9b",
+        name: "MiMo 9B",
+        tagline: "Small, sharp, and quick",
+        blurb: "A smaller model that punches above its size — good at everyday chat, coding help, and following instructions, and it reads images too. The lightest Qwen here, so it fits Macs with less memory while still replying quickly.",
+        repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+        sizeGB: 7.1,
         family: .qwen,
-        intelligence: 35,
-        intelligenceIsEstimated: false,
+        intelligence: 38,
+        intelligenceIsEstimated: true,
         speed: 28,
         contextTokens: 262_144,
-        activeParamsB: 9.0
+        activeParamsB: 9.7
     )
 
     /// Qwen 3.8 27B, the pick this app leads with on any Mac that can hold it.
@@ -299,6 +304,30 @@ extension RecommendedModelPick {
         contextTokens: 262_144,
         activeParamsB: 27.0
     )
+
+    /// The same Qwen 3.8 27B at 6 and 8 bits: starter picks for 36 GB and
+    /// 48-64 GB Macs, not browser rows. `speed` is the 4-bit cell scaled by
+    /// weight bytes (decode is bandwidth-bound), not measured.
+    static let qwen38_27b6bit = qwen38_27bVariant(bits: 6, sizeGB: 27.0, speed: 23)
+    static let qwen38_27b8bit = qwen38_27bVariant(bits: 8, sizeGB: 35.0, speed: 18)
+
+    private static func qwen38_27bVariant(bits: Int, sizeGB: Double, speed: Int) -> RecommendedModelPick {
+        RecommendedModelPick(
+            id: "qwen38-27b-\(bits)bit",
+            name: "Qwen 3.8 27B \(bits)-bit",
+            tagline: "The strongest 27B, at higher precision",
+            blurb: "The same Qwen 3.8 27B, stored at \(bits) bits per weight instead of 4, so its answers stay closer to the original model's. Excellent at coding and multi-step agent work, reads images, and drafts several words at once for speed.",
+            repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-\(bits)bit",
+            sizeGB: sizeGB,
+            family: .qwen,
+            intelligence: qwen38_27b.intelligence,
+            intelligenceIsEstimated: true,
+            speed: speed,
+            speedIsWithMtp: true,
+            contextTokens: qwen38_27b.contextTokens,
+            activeParamsB: qwen38_27b.activeParamsB
+        )
+    }
 
     /// prism-ml's Bonsai 2: Qwen3.8-27B requantized to ternary 2-bit behind
     /// Hadamard rotations (`prism_hadamard_qwen35`), 8.6 GB, so the 27B fits
@@ -388,7 +417,7 @@ extension RecommendedModelPick {
     /// Max, 26.9.2).
     static let qwen38FlashNext = RecommendedModelPick(
         id: "qwen38-flash-next",
-        name: "Qwen 3.8 Flash-Next",
+        name: "Qwen Flash-Next 4-8bit",
         tagline: "Frontier-class, still quick",
         blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own mixed 4/8-bit build, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
         repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit",
@@ -403,6 +432,32 @@ extension RecommendedModelPick {
         ramOverrideGB: 78.0
     )
 
+    /// Qwen 3.8 Flash-Next in the Sushi project's packs (beamster): routed experts
+    /// in EXL3, served through lib/sushi. Scores are Flash-Next's own (the bars
+    /// describe the original weights), context is the checkpoint's YaRN 1M, and
+    /// the RAM gate is Sushi's README figure for a full 128k context (GiB).
+    static let sushi2bpw = sushi("2", sizeGB: 69.6, ramGB: 41.7, macGB: 48)
+    static let sushi3bpw = sushi("3", sizeGB: 85.0, ramGB: 56.1, macGB: 64)
+
+    private static func sushi(_ bpw: String, sizeGB: Double, ramGB: Double, macGB: Int) -> RecommendedModelPick {
+        RecommendedModelPick(
+            id: "sushi-\(bpw)bpw",
+            name: "Qwen Flash-Next Sushi \(bpw)bpw",
+            tagline: "EXL3 Variant for \(macGB) GB Macs",
+            blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about \(bpw) bits per weight so it fits a Mac with \(macGB) GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
+            repoId: "beamster/Qwen3.8-Flash-Next-Sushi-\(bpw)bpw",
+            sizeGB: sizeGB,
+            family: .largest,
+            intelligence: qwen38FlashNext.intelligence,
+            intelligenceIsEstimated: true,
+            speed: qwen38FlashNext.speed,
+            speedIsWithMtp: true,
+            contextTokens: 1_048_576,
+            activeParamsB: 6.0,
+            ramOverrideGB: ramGB
+        )
+    }
+
 }
 
 extension RecommendedModelPick {
@@ -413,9 +468,11 @@ extension RecommendedModelPick {
     ]
 
     /// Qwen picks, ascending by size — the Recommended pane's other family
-    /// section.
+    /// section. The 6/8-bit and iQ variants of these checkpoints live in
+    /// Discover search instead, and the 3.6 27B MTP pack stays out on the
+    /// maintainer's call (the 3.8 is better for the same RAM).
     static let qwenCatalog: [RecommendedModelPick] = [
-        .qwen35_9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
+        .mimo9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
@@ -423,7 +480,7 @@ extension RecommendedModelPick {
     /// DeepSeek-V4-Flash (~130 GB). Grouped by "needs a very large Mac"
     /// rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .qwen38FlashNext, .deepseekV4Flash,
+        .sushi2bpw, .sushi3bpw, .qwen38FlashNext, .deepseekV4Flash,
     ]
 
     /// Every curated pick, across all three sections — the union the score
@@ -446,20 +503,23 @@ extension RecommendedModelPick {
     ///
     /// | Physical RAM | Pick | Disk | RAM needed |
     /// |---|---|---|---|
-    /// | ≤ 16 GB | Gemma 4 E4B  |  4.8 GB |  5.8 GB |
-    /// | 16–32 GB| Gemma 4 12B  |  6.3 GB |  7.6 GB |
-    /// | 32–96 GB| Qwen 3.8 27B | 18.2 GB | 21.8 GB |
-    /// | 96 GB+  | Qwen 3.8 Flash-Next | 100 GB | 78 GB |
+    /// | ≤ 16 GB  | Gemma 4 E4B         |  4.8 GB |  5.8 GB |
+    /// | 16–32 GB | Gemma 4 12B         |  6.3 GB |  7.6 GB |
+    /// | 32–36 GB | Qwen 3.8 27B 4-bit  | 18.2 GB | 21.8 GB |
+    /// | 36–48 GB | Qwen 3.8 27B 6-bit  | 27.0 GB | 32.4 GB |
+    /// | 48–96 GB | Qwen 3.8 27B 8-bit  | 35.0 GB | 42.0 GB |
+    /// | 96 GB+   | Qwen 3.8 Flash-Next |  100 GB |   78 GB |
     ///
-    /// Bands are upper-INCLUSIVE: a 16 GB Mac gets E4B, not 12B. A boundary
-    /// machine is the one with the least headroom in its band, so it takes the
-    /// smaller side. The one exception is the top: Flash-Next is sized for a
-    /// 96 GB Mac, so 96 GB gets it.
+    /// 16 GB is upper-inclusive (a 16 GB Mac gets E4B); the bands above are
+    /// lower-inclusive, since 32, 36, 48 and 96 GB are the Macs each pick is
+    /// chosen for.
     static func starterPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
         let gib = Double(physicalMemoryBytes) / bytesPerGiB
         if gib <= 16 { return .gemmaE4B }
-        if gib <= 32 { return .gemma12B }
-        if gib < 96 { return .qwen38_27b }
+        if gib < 32 { return .gemma12B }
+        if gib < 36 { return .qwen38_27b }
+        if gib < 48 { return .qwen38_27b6bit }
+        if gib < 96 { return .qwen38_27b8bit }
         return .qwen38FlashNext
     }
 }

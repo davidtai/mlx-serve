@@ -32,6 +32,7 @@ struct ModelBrowserPane: View {
             + readyCount(AudioModelPreset.allIncludingVoiceOnly)
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
+            + readyCount(SoundModelPreset.all)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -746,6 +747,8 @@ private struct MyModelsPane: View {
     @EnvironmentObject var downloads: DownloadManager
 
     @State private var freeDiskSpace: String = ""
+    @State private var sweepItems: [(model: LocalModel, check: UpdateCheck)] = []
+    @State private var showSweepAlert = false
 
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
@@ -829,7 +832,11 @@ private struct MyModelsPane: View {
                         .foregroundStyle(.secondary)
                 } else {
                     Button("Check for Updates") {
-                        Task { await downloads.checkAllForUpdates(models: appState.localModels) }
+                        Task {
+                            await downloads.checkAllForUpdates(models: appState.localModels)
+                            sweepItems = PackUpdateCheck.available(downloads.updateChecks, models: appState.localModels)
+                            showSweepAlert = true
+                        }
                     }
                     .buttonStyle(.link)
                     .font(.app(.caption))
@@ -849,6 +856,23 @@ private struct MyModelsPane: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
+            .alert(sweepItems.isEmpty ? "No Updates" : "Updates Available", isPresented: $showSweepAlert) {
+                if sweepItems.isEmpty {
+                    Button("OK", role: .cancel) {}
+                } else {
+                    Button("Update All") {
+                        for item in sweepItems {
+                            downloads.applyUpdate(item.check, for: item.model) { appState.refreshModels() }
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    Button("Cancel", role: .cancel) {}
+                }
+            } message: {
+                Text(verbatim: sweepItems.isEmpty
+                     ? PackUpdateCheck.summary(downloads.updateChecks.values.map(\.result))
+                     : PackUpdateCheck.sweepMessage(sweepItems))
+            }
         }
         .navigationTitle("My Models")
         .onAppear {
@@ -952,6 +976,14 @@ private struct MediaPane: View {
                     tint: .orange
                 ) {
                     ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Sound Effects",
+                    subtitle: "Text-to-audio: effects and ambiences.",
+                    systemImage: "speaker.wave.3",
+                    tint: .teal
+                ) {
+                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
                 }
             }
             .padding(16)
@@ -1166,10 +1198,9 @@ private struct UseModelButton: View {
                     .controlSize(.small)
                     .frame(width: 30)
             } else {
-                Text("Use")
+                Text("Use").font(.app(.body))
             }
         }
-        .font(.app(.callout))
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")
@@ -1214,7 +1245,7 @@ private struct UseDecisionModelButton: View {
         } label: { Text("Use")
             .font(.app(.body)) }
         .controlSize(.small)
-        .help("Open \(name) in Laya Decisions")
+        .help("Open \(name) in Decisions")
     }
 }
 
@@ -1731,9 +1762,9 @@ private struct GgufQuantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .task {
@@ -1840,9 +1871,9 @@ private struct MlxVariantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .alert("Delete Quantization", isPresented: .init(
@@ -1909,7 +1940,7 @@ private struct LocalModelRow: View {
         hasOverrides = o?.hasSettings ?? false
         guard model.isChatPickable, model.quantFile == nil else { return }
         badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
-                                  isMoE: model.numExperts != nil, options: appState.serverOptions)
+                                  options: appState.serverOptions)
     }
 
     private func revealInFinder() {
@@ -1926,12 +1957,7 @@ private struct LocalModelRow: View {
     }
 
     private func applyUpdate(_ check: UpdateCheck) {
-        downloads.startUpdate(check) {
-            appState.refreshModels()
-            guard downloads.downloads[check.repo]?.status == .completed else { return }
-            downloads.updateChecks[model.id] = nil
-            downloads.packUpdates[model.name] = nil
-        }
+        downloads.applyUpdate(check, for: model) { appState.refreshModels() }
     }
 
     private func performDelete() {
@@ -2060,7 +2086,7 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
-                } else if model.modelType == "laya" {
+                } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
                 } else if let modality = MediaModality(modelType: model.modelType) {
                     // A media checkpoint is a real, loadable, servable model —
@@ -2094,7 +2120,28 @@ private struct LocalModelRow: View {
                     .font(.app(.callout))
                     .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
                 }
-                if ModelRowActions.showsLock(model, unlocked: unlocked) {
+                if model.isDownloading {
+                    // The trash's slot: deleting files under a live transfer
+                    // breaks it, so the row offers the transfer's own Cancel.
+                    if let live = ModelRowActions.transfer(for: model, in: downloads.downloads) {
+                        ProgressView(value: max(0, min(1, live.state.progress)))
+                            .progressViewStyle(.linear)
+                            .frame(width: 60)
+                            .help(live.state.statusText)
+                        Text(verbatim: live.state.percentFormatted)
+                            .font(.app(.caption).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Button { downloads.cancel(live.repoId) } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.app(.callout))
+                        .help("Cancel download")
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                } else if ModelRowActions.showsLock(model, unlocked: unlocked) {
                     // Locked, not read-only. This slot used to hold an `Image`
                     // of an external-drive/cloud glyph nobody could read, which
                     // did nothing when clicked. It is a Button now, and clicking
@@ -2190,10 +2237,13 @@ private struct LocalModelRow: View {
             } label: { Text("Copy Model ID")
                 .font(.app(.body)) }
             Divider()
-            if ModelRowActions.showsTrash(model, unlocked: unlocked) {
+            if let live = ModelRowActions.transfer(for: model, in: downloads.downloads) {
+                Button { downloads.cancel(live.repoId) } label: { Text("Cancel Download")
+                    .font(.app(.body)) }
+            } else if ModelRowActions.showsTrash(model, unlocked: unlocked) {
                 Button(role: .destructive) { confirmDelete = true } label: { Text("Delete\u{2026}")
                     .font(.app(.body)) }
-            } else {
+            } else if !model.isDownloading {
                 // Same two-step as the lock button: the menu never deletes
                 // another app's model on one click.
                 Button { unlocked = true } label: { Text("Unlock to Delete")

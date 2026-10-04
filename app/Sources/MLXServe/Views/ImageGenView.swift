@@ -10,11 +10,10 @@ struct ImageGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
+    @State private var showEnhance = false
     /// Selection and focus are read by the image tiles: a click on one drops
     /// its name where the caret is, or on the end when the editor is not
     /// the one being typed into.
@@ -159,6 +158,10 @@ struct ImageGenView: View {
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
+        .sheet(isPresented: $showEnhance) {
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing)) }, onApply: { prompt = $0 })
+                .environmentObject(appState)
+        }
     }
 
     // MARK: - Sections
@@ -168,6 +171,7 @@ struct ImageGenView: View {
             HStack(spacing: 8) {
                 Text("Prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
+                PromptEnhanceButton(disabled: prompt.isBlank) { showEnhance = true }
                 templatesMenu
             }
             TextEditor(text: $prompt, selection: $promptSelection)
@@ -978,15 +982,6 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
-                // The one bridge from the workshop to a conversation. It opens
-                // a NEW chat and switches to it — see
-                // `AppState.sendGeneratedMediaToNewChat`.
-                Button {
-                    appState.sendGeneratedMediaToNewChat(
-                        path: path, prompt: prompt, kind: .image)
-                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
-                .buttonStyle(.borderless)
-                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)

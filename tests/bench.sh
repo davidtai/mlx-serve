@@ -12,7 +12,7 @@
 #   BENCH_EXTRA_FLAGS="--wired-margin 2000000000" ./tests/bench.sh --only dsv41   # flags appended to every boot
 #
 # Each cell is mlx-serve at its FASTEST: speculation is forced on where the
-# checkpoint carries an MTP head (it is default-off on MoE targets). The mode
+# checkpoint carries an MTP head (older binaries left it off on MoE). The mode
 # that actually engaged is printed beside the number, from the server's own
 # log — a mode that silently stops engaging shows up as a bare cell.
 #
@@ -76,6 +76,8 @@ TARGETS=(
     # request per server start. On the dev box it only runs as a chain step inside a guarded window
     # (MLX_SERVE_MODEL_ROOTS=~/models ./tests/bench.sh --only dsv41); anywhere else it runs as any row.
     "dsv41-flash-exl3|DeepSeek-V4.1-Flash-MTPLX-streaming-exl3-3.0bpw"
+    "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
+    "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )
 # Rows whose server serves one request per start (its phase change is per start): one timed request, not the ladder.
 ONE_REQUEST_ROWS=" dsv41-flash-exl3 "
@@ -126,17 +128,25 @@ json.dump({"bench": bench, "oneRequest": {"promptIds": len(ids), "maxNew": 128}}
 PY
 }
 
-# --mtp is forced wherever the checkpoint ships a head: it is default-OFF on
-# MoE targets, which is exactly where it pays most (35B-A3B reads 157 without
-# and 191 with). On a dense MTP checkpoint it restates the default.
-spec_flags() { # model_path
-    local f=""
-    if ls "$1"/*mtp*.safetensors >/dev/null 2>&1 || [ -d "$1/mtp" ] \
-       || grep -qi '"mtp' "$1/config.json" 2>/dev/null; then
-        f=" --mtp"
+# --mtp is a no-op from 26.9.7 (every loaded head drafts, MoE included), but
+# older binaries left MoE heads off without it, and they are benched here too.
+# A pack's own drafter/ loads on its own; a sidecar that ships separately is named here.
+drafter_for() { # logical
+    case "$1" in
+        qwen38-27b) find_model z-lab/Qwen3.8-27B-DFlash2 ;;
+        *) return 1 ;;
+    esac
+}
+
+spec_flags() { # logical model_path -> FLAGS
+    FLAGS=()
+    if ls "$2"/*mtp*.safetensors >/dev/null 2>&1 || [ -d "$2/mtp" ] \
+       || grep -qi '"mtp' "$2/config.json" 2>/dev/null; then
+        FLAGS+=(--mtp)
     fi
-    [[ "${ANE:-0}" == "1" ]] && f+=" --ane-prefill"
-    echo "$f"
+    local d
+    if d=$(drafter_for "$1"); then FLAGS+=(--drafter "$d"); fi
+    if [[ "${ANE:-0}" == "1" ]]; then FLAGS+=(--ane-prefill); fi
 }
 
 # ── Run ──
@@ -154,10 +164,10 @@ else
         [[ -n "$ONLY" && "$logical" != *"$ONLY"* ]] && continue
         IFS='|' read -r -a cands <<< "$rest"
         path=$(find_fitting_model "${cands[@]}") || { echo "SKIP $logical (no checkpoint within $(max_model_gb) GB on this box)" >&2; continue; }
-        flags="$(spec_flags "$path")"
-        echo; echo ">> $logical$flags"
+        spec_flags "$logical" "$path"
+        echo; echo ">> $logical ${FLAGS[*]+${FLAGS[*]}}"
         # shellcheck disable=SC2086
-        "$BINARY" --serve --model "$path" --port "$PORT" $flags ${BENCH_EXTRA_FLAGS:-} >"$OUT/$logical.log" 2>&1 &
+        "$BINARY" --serve --model "$path" --port "$PORT" ${FLAGS[@]+"${FLAGS[@]}"} ${BENCH_EXTRA_FLAGS:-} >"$OUT/$logical.log" 2>&1 &
         pid=$!
         for _ in $(seq 1 300); do
             curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -202,8 +212,9 @@ for path in sorted(Path(sys.argv[1]).glob("*.json")):
     if decode is None:
         print(f"| {path.stem} | · |  (no bench block)")
         continue
+    pf = "n/a" if prefill is None else f"{prefill:.0f}"
     print(f"| {path.stem} | {decode:.0f}{mode} |"
-          f"  (prefill {prefill:.0f}, {tps:.2f} tok/step)")
+          f"  (prefill {pf}, {tps:.2f} tok/step)")
 PY
 echo
 echo "=== reports $OUT"

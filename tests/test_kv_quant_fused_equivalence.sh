@@ -240,7 +240,7 @@ print(json.dumps({
 sleep 2
 SPEC_DENSE_COMPL=""
 SPEC_DENSE_TOK=""
-run_and_tokenize "spec dense" "--kv-attn-mode dense --pld" SPEC_DENSE_COMPL SPEC_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "spec dense" "--kv-attn-mode dense --pld --no-drafter" SPEC_DENSE_COMPL SPEC_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} spec dense arm never logged '[spec-stats] mode=pld' — speculation did not engage, the arm proves nothing."
     exit 1
@@ -249,7 +249,7 @@ fi
 sleep 2
 SPEC_FUSED_COMPL=""
 SPEC_FUSED_TOK=""
-run_and_tokenize "spec fused" "--kv-attn-mode fused --pld" SPEC_FUSED_COMPL SPEC_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "spec fused" "--kv-attn-mode fused --pld --no-drafter" SPEC_FUSED_COMPL SPEC_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} spec fused arm never logged '[spec-stats] mode=pld' — speculation did not engage, the arm proves nothing."
     exit 1
@@ -316,7 +316,7 @@ MODEL="$VERIFY_MODEL"
 sleep 2
 VER_DENSE_COMPL=""
 VER_DENSE_TOK=""
-run_and_tokenize "verify dense" "--kv-attn-mode dense --pld" VER_DENSE_COMPL VER_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "verify dense" "--kv-attn-mode dense --pld --no-drafter" VER_DENSE_COMPL VER_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm dense boot never engaged PLD — the arm proves nothing."
     exit 1
@@ -325,7 +325,7 @@ sleep 2
 VER_FUSED_COMPL=""
 VER_FUSED_TOK=""
 # =1 keeps every width on the kernel (the default declines past 12 q rows).
-MLX_SERVE_KV_ATTN_VERIFY=1 run_and_tokenize "verify fused" "--kv-attn-mode fused --pld" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+MLX_SERVE_KV_ATTN_VERIFY=1 run_and_tokenize "verify fused" "--kv-attn-mode fused --pld --no-drafter" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
 MODEL="$SAVED_MODEL"
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm fused boot never engaged PLD — the arm proves nothing."

@@ -63,12 +63,10 @@ struct UpdateCheck: Equatable {
 enum PackUpdateCheck {
     static let interval: TimeInterval = 24 * 3600
 
-    /// What a pack's download would fetch: the chat selection, plus its
-    /// `drafter/` unless the socket is switched off.
+    /// What a pack's download would fetch: the whole pack, less its `drafter/`
+    /// when the socket is switched off.
     static func wanted(_ entries: [[String: Any]], withDrafter: Bool) -> [(String, Int64)] {
-        var files = DownloadManager.selectNeededFiles(from: entries)
-        if withDrafter { files += DownloadManager.selectNeededFiles(from: entries, selection: .packFolder(DrafterGems.packFolder)) }
-        return files
+        DownloadManager.selectNeededFiles(from: entries, selection: withDrafter ? .chatDefault : .chatWithoutDrafter)
     }
 
     /// An HF tree listing as path -> size.
@@ -130,6 +128,26 @@ enum PackUpdateCheck {
                 .first(where: { ($0.filename as NSString).lastPathComponent == primary }) else { return [] }
             return quant.allFiles.map { ($0, all[$0] ?? 0) }
         }
+    }
+
+    /// The models a manual check found an update for, in the order they are listed.
+    static func available(_ checks: [String: UpdateCheck], models: [LocalModel]) -> [(model: LocalModel, check: UpdateCheck)] {
+        models.compactMap { m in
+            guard let c = checks[m.id], case .update = c.result else { return nil }
+            return (m, c)
+        }.sorted { $0.model.name < $1.model.name }
+    }
+
+    /// The alert body after a manual check: one line per update, and a warning when any replaces files.
+    static func sweepMessage(_ items: [(model: LocalModel, check: UpdateCheck)]) -> String {
+        var replacing = 0
+        let lines = items.map { item -> String in
+            guard case .update(let u) = item.check.result else { return item.model.name }
+            replacing += u.replaces > 0 ? 1 : 0
+            return "\(item.model.name): \(u.files) \(u.files == 1 ? "file" : "files"), \(SystemMemoryInfo.preciseGB(Double(u.bytes) / 1e9))"
+        }
+        let note = replacing == 0 ? "" : "\n\n\(replacing == 1 ? "One update replaces" : "\(replacing) updates replace") files you already have."
+        return lines.joined(separator: "\n") + note
     }
 
     /// "2 updates, 4 local copies, 3 skipped" for the My Models footer.

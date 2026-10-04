@@ -52,14 +52,31 @@ relaunch_app() {
 if [ "${1:-}" = "ko" ]; then
     trap '[ $? -eq 0 ] && relaunch_app' EXIT
 fi
+# MLX_GGUF_DIR=<checkout> builds mlx-serve against that mlx-serve-gguf tree
+# instead of the lib/ submodule pin (zig `-Dgguf-dir`). `ko` is the local dev
+# loop, so it defaults to the sibling checkout when one exists; MLX_GGUF_DIR=""
+# keeps the pin.
+if [ "${1:-}" = "ko" ] && [ -z "${MLX_GGUF_DIR+x}" ] && [ -f "$PROJECT_ROOT/../mlx-serve-gguf/src/root.zig" ]; then
+    MLX_GGUF_DIR="$(cd "$PROJECT_ROOT/../mlx-serve-gguf" && pwd)"
+fi
+ZIG_GGUF_FLAGS=()
+if [ -n "${MLX_GGUF_DIR:-}" ]; then
+    ZIG_GGUF_FLAGS=(-Dgguf-dir="$MLX_GGUF_DIR")
+    echo "→ mlx-serve-gguf from $MLX_GGUF_DIR (not the lib/ pin)"
+fi
 
-# Signing identity from env (set in ~/.zshrc or CI). Unset = ad-hoc ("-"), so
-# anyone can build without an Apple Developer account; a release sets the real
-# identity (release.yml does).
+# Signing identity from env (set in ~/.zshrc or CI). Unset, or not in this Mac's
+# keychain, = ad-hoc ("-"), so anyone can build without an Apple Developer account;
+# a release sets the real identity (release.yml does).
 IDENTITY="${APPLE_DEVELOPER_ID:--}"
 TEAM_ID="${APPLE_TEAM_ID:--}"
+if [ "$IDENTITY" != "-" ] && ! security find-identity -v -p codesigning 2>/dev/null | grep -qF -- "$IDENTITY"; then
+    echo "→ '$IDENTITY' is not in this Mac's keychain"
+    IDENTITY="-"
+    TEAM_ID="-"
+fi
 if [ "$IDENTITY" = "-" ]; then
-    echo "→ APPLE_DEVELOPER_ID not set — building with ad-hoc signing (dev build, not distributable)"
+    echo "→ Building with ad-hoc signing (dev build, not distributable)"
 fi
 
 cd "$SCRIPT_DIR"
@@ -72,6 +89,42 @@ cd "$SCRIPT_DIR"
 # Runs in fast dev too: it is a no-op on a clean tree, and the failure it
 # catches is exactly the one that wastes an iteration.
 bash "$PROJECT_ROOT/scripts/check-submodules.sh" --fix
+
+# Swift, Metal and xcodebuild need full Xcode, but installing Homebrew points
+# xcode-select at the Command Line Tools. Select Xcode for this build only (no
+# sudo); the Zig step picks its own SDK below.
+if [ -z "${DEVELOPER_DIR:-}" ] && ! xcodebuild -version >/dev/null 2>&1; then
+    XCODE_APP="/Applications/Xcode.app"
+    [ -d "$XCODE_APP" ] || XCODE_APP="$(mdfind "kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'" 2>/dev/null | head -1)"
+    if [ -z "$XCODE_APP" ] || [ ! -d "$XCODE_APP/Contents/Developer" ]; then
+        echo "ERROR: Xcode 26.2+ not found (xcode-select points at $(xcode-select -p 2>/dev/null)). Install Xcode from the App Store."
+        exit 1
+    fi
+    export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+    echo "→ Using Xcode at $XCODE_APP (xcode-select points at the Command Line Tools)"
+fi
+
+# Xcode 26+ ships the Metal compiler as a separate component. SwiftTerm's shader
+# needs it before build-mlx.sh's own check runs, and SwiftPM reports only a
+# missing Shaders.dia, so fetch it here like the submodules above.
+if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+    echo "→ Metal Toolchain missing — downloading (xcodebuild -downloadComponent MetalToolchain)..."
+    xcodebuild -downloadComponent MetalToolchain
+    xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+        || { echo "ERROR: Metal compiler still unavailable after the download"; exit 1; }
+fi
+
+# Brewfile tools (cmake builds mlx, webp links into mlx-serve). Homebrew itself
+# needs an interactive sudo install, so its absence stops the build by name.
+if ! command -v brew >/dev/null 2>&1; then
+    echo "ERROR: Homebrew not found — it provides cmake + webp (Brewfile). Install it, then re-run:"
+    echo '       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    exit 1
+fi
+if ! brew bundle check --file="$PROJECT_ROOT/Brewfile" >/dev/null 2>&1; then
+    echo "→ Installing Brewfile dependencies (cmake, webp)..."
+    brew bundle install --file="$PROJECT_ROOT/Brewfile"
+fi
 
 MAS="${MAS:-0}"
 if [ "$MAS" = "1" ]; then
@@ -142,6 +195,63 @@ else
     echo "=== Building MLX Core v$CALVER ==="
 fi
 
+# ── Phase 2: Build mlx-serve (Zig), in the background while Swift compiles ──
+# Each half spends most of its time in ONE compiler process (Swift's
+# whole-module type-check, Zig's single LLVM module) and neither reads the
+# other's output, so running them side by side makes the build as long as the
+# slower half instead of both. Output goes to a log, shown after Swift finishes.
+ZIG_LOG="$SCRIPT_DIR/.build/zig-build.log"
+mkdir -p "$SCRIPT_DIR/.build"
+# Pinned Zig release, staged by scripts/fetch-zig.sh (see build.zig's version gate).
+ZIG="$PROJECT_ROOT/.zig-toolchain/zig"
+# The zig link resolves the SDK via xcrun. Prefer the CommandLineTools SDK
+# (historical default), but a macOS upgrade can remove the CLT entirely —
+# fall back to the selected Xcode then (same SDK CI links against).
+ZIG_DEVELOPER_DIR=/Library/Developer/CommandLineTools
+[ -d "$ZIG_DEVELOPER_DIR" ] || ZIG_DEVELOPER_DIR="$(xcode-select -p)"
+# ReleaseFast unless ZIG_DEBUG asked otherwise (see the lever's comment at the
+# top). Even under FAST_DEV the default stays ReleaseFast: Zig's cache already
+# makes an unchanged rebuild a few seconds, so the Swift phase is the real cost
+# of an iteration, and the Debug arm buys nothing for Swift-side work.
+ZIG_OPT=(-Doptimize=ReleaseFast)
+if [ "$ZIG_DEBUG" = "1" ]; then
+    ZIG_OPT=(-Doptimize=Debug)
+    echo "  (ZIG_DEBUG=1 — mlx-serve built Debug: 2-4x slower decode, never read a latency off it)"
+fi
+build_engine() {
+    cd "$PROJECT_ROOT"
+    # Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
+    echo "→ Fetching libllama..."
+    bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
+    # Build the pinned mlx + mlx-c submodules into lib/mlx (NAX kernels enabled —
+    # the brew bottle ships without them). Idempotent: no-op when the stage
+    # matches the pinned SHAs. Needs full Xcode (Metal Toolchain), so it runs
+    # BEFORE the CLT-forced zig build below.
+    echo "→ Building mlx + mlx-c (pinned submodules)..."
+    bash "$PROJECT_ROOT/scripts/build-mlx.sh"
+    bash "$PROJECT_ROOT/scripts/fetch-zig.sh"
+    # Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
+    # Settings can show engine versions without booting the server — src/version.zig).
+    # MLX + ggml self-report at runtime; these three have no runtime API:
+    local mlxc_version ds4_commit llama_tag
+    mlxc_version="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
+    ds4_commit="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
+    llama_tag="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
+    echo "→ zig build ${ZIG_OPT[*]}..."
+    local start=$SECONDS
+    DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build "${ZIG_OPT[@]}" -Dversion="$MLX_SERVE_VERSION" \
+      -Dmlx-c-version="${mlxc_version:-unknown}" -Dds4-commit="${ds4_commit:-unknown}" -Dllama-tag="${llama_tag:-unknown}" \
+      ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} ${ZIG_GGUF_FLAGS[@]+"${ZIG_GGUF_FLAGS[@]}"} 2>&1 | tail -3
+    # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
+    DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1
+    echo "  Zig build done in $((SECONDS - start))s"
+}
+echo "→ Building mlx-serve (Zig) in the background — log: $ZIG_LOG"
+build_engine > "$ZIG_LOG" 2>&1 &
+ENGINE_PID=$!
+# A failure in the Swift phase must not leave the engine build running.
+trap 'kill "$ENGINE_PID" 2>/dev/null || true' ERR
+
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
 # SwiftPM owns each target's language mode. MLXCore's 5.9 manifest keeps the app
@@ -171,7 +281,24 @@ bash "$PROJECT_ROOT/scripts/patch-swatex-font-lookup.sh" "$SCRIPT_DIR/.build/che
 # iteration loop (build, look, adjust — about two seconds when nothing
 # changed), and the Swift suite costs ~30s. Run `bash app/test.sh`
 # yourself before landing.
-swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
+echo "  swift build -c $SWIFT_CONFIG — a clean build takes several minutes, please wait..."
+SWIFT_LOG="$SCRIPT_DIR/.build/swift-build.log"
+SWIFT_START=$SECONDS
+# Live [N/M] step counter (in place on a terminal); the full output goes to the
+# log, and a failure prints its tail.
+swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tee "$SWIFT_LOG" \
+    | awk -v tty="$([ -t 1 ] && echo 1)" 'BEGIN { RS = "[\r\n]" }
+        /^\[ *[0-9]+ *\/ *[0-9]+ *\]/ {
+            if (tty) { printf "\r  %-60.60s", $0; fflush() } else print "  " $0
+        }
+        END { if (tty) print "" }' \
+    || {
+        kill "$ENGINE_PID" 2>/dev/null || true
+        echo "ERROR: Swift build failed — last lines of $SWIFT_LOG:"
+        tail -20 "$SWIFT_LOG"
+        exit 1
+    }
+echo "  Swift build done in $((SECONDS - SWIFT_START))s"
 SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
 SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_DIR/SwaTex_SwaTexRender.bundle"
@@ -185,54 +312,21 @@ if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
 fi
 echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
 
-# ── Phase 2: Build mlx-serve (Zig) ──
-echo "→ Building mlx-serve (Zig)..."
-cd "$PROJECT_ROOT"
-# Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
-echo "→ Fetching libllama..."
-bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
-# Build the pinned mlx + mlx-c submodules into lib/mlx (NAX kernels enabled —
-# the brew bottle ships without them). Idempotent: no-op when the stage
-# matches the pinned SHAs. Needs full Xcode (Metal Toolchain), so it runs
-# BEFORE the CLT-forced zig build below.
-echo "→ Building mlx + mlx-c (pinned submodules)..."
-bash "$PROJECT_ROOT/scripts/build-mlx.sh"
-# Pinned Zig nightly (homebrew's `zig` formula still ships 0.16.0, which no
-# longer builds — see build.zig's version-gate comptime block).
-bash "$PROJECT_ROOT/scripts/fetch-zig.sh"
-ZIG="$PROJECT_ROOT/.zig-toolchain/zig"
-# The zig link resolves the SDK via xcrun. Prefer the CommandLineTools SDK
-# (historical default), but a macOS upgrade can remove the CLT entirely —
-# fall back to the selected Xcode then (same SDK CI links against).
-ZIG_DEVELOPER_DIR=/Library/Developer/CommandLineTools
-[ -d "$ZIG_DEVELOPER_DIR" ] || ZIG_DEVELOPER_DIR="$(xcode-select -p)"
-# Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
-# Settings can show engine versions without booting the server — src/version.zig).
-# MLX + ggml self-report at runtime; these three have no runtime API:
-MLXC_VERSION="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
-DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
-LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
-# ReleaseFast unless ZIG_DEBUG asked otherwise (see the lever's comment at the
-# top). Even under FAST_DEV the default stays ReleaseFast: Zig's cache already
-# makes an unchanged rebuild a few seconds, so the Swift phase above is the
-# real cost of an iteration, and the Debug arm buys nothing for Swift-side work.
-ZIG_OPT=(-Doptimize=ReleaseFast)
-if [ "$ZIG_DEBUG" = "1" ]; then
-    ZIG_OPT=(-Doptimize=Debug)
-    echo "  (ZIG_DEBUG=1 — mlx-serve built Debug: 2-4x slower decode, never read a latency off it)"
+# ── Join: wait for the engine build started before Phase 1 ──
+echo "→ Waiting for mlx-serve (Zig)..."
+if ! wait "$ENGINE_PID"; then
+    echo "ERROR: mlx-serve build failed — last lines of $ZIG_LOG:"
+    tail -20 "$ZIG_LOG"
+    exit 1
 fi
-DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build "${ZIG_OPT[@]}" -Dversion="$MLX_SERVE_VERSION" \
-  -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
-  ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
-# The bundled guest agent (static aarch64-linux ELF) rides inside the app.
-DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1
+trap - ERR
+cat "$ZIG_LOG"
 MLX_BIN="zig-out/bin/mlx-serve"
-if [ ! -f "$MLX_BIN" ]; then
+if [ ! -f "$PROJECT_ROOT/$MLX_BIN" ]; then
     echo "ERROR: Zig build failed"
     exit 1
 fi
-echo "  mlx-serve binary: $(du -h "$MLX_BIN" | cut -f1)"
-cd "$SCRIPT_DIR"
+echo "  mlx-serve binary: $(du -h "$PROJECT_ROOT/$MLX_BIN" | cut -f1)"
 
 # ── Phase 3: Generate app icon ──
 APP="$SCRIPT_DIR/$APP_NAME.app"
@@ -369,7 +463,8 @@ if [ "$FAST_DEV" = "1" ] \
    && [ -f "$CONTENTS/Frameworks/libmlxc.dylib" ] \
    && [ -f "$CONTENTS/Frameworks/mlx.metallib" ] \
    && [ ! "$MLX_STAGE_LIB/libmlxc.dylib" -nt "$CONTENTS/Frameworks/libmlxc.dylib" ] \
-   && [ ! "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" -nt "$CONTENTS/Frameworks/libllama.dylib" ]; then
+   && [ ! "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" -nt "$CONTENTS/Frameworks/libllama.dylib" ] \
+   && codesign --verify "$CONTENTS/Frameworks/"*.dylib 2>/dev/null; then
     STAGE_FRAMEWORKS=0
     echo "→ Reusing bundled frameworks (FAST_DEV)"
 fi

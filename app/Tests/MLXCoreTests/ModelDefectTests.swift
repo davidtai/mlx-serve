@@ -124,16 +124,30 @@ final class ModelDefectTests: XCTestCase {
     }
 
     /// A `.partial` under a live transfer is progress, not an interruption:
-    /// the listing drops that defect for the download's destination dir only.
+    /// the destination dir loses the defect but reads as downloading.
     func testALiveDownloadIsNotReportedAsInterrupted() throws {
         let dir = makeDir("live")
         write("live/model.safetensors.partial", bytes: 1024)
         let other = makeDir("stale")
         write("stale/model.safetensors.partial", bytes: 1024)
         let all = models(dir) + models(other)
-        let fixed = DownloadManager.clearingInFlightDefects(all, activeDirs: [dir])
-        XCTAssertNil(fixed.first { $0.path == dir }?.defect)
-        XCTAssertEqual(fixed.first { $0.path == other }?.defect, .interruptedDownload)
+        let marked = DownloadManager.markingInFlight(all, activeDirs: [dir])
+        let live = try XCTUnwrap(marked.first { $0.path == dir })
+        XCTAssertNil(live.defect)
+        XCTAssertTrue(live.isDownloading)
+        XCTAssertEqual(marked.first { $0.path == other }?.defect, .interruptedDownload)
+    }
+
+    /// Between two files a live download has no `.partial` and can look whole;
+    /// it must still never be picked, or a running server restarts onto it.
+    func testALiveDownloadIsNeverChatPickable() throws {
+        let dir = makeDir("between-files")
+        write("between-files/model.safetensors", bytes: 2 * 1024 * 1024)
+        let whole = try XCTUnwrap(models(dir).first)
+        XCTAssertNil(whole.defect)
+        let marked = try XCTUnwrap(DownloadManager.markingInFlight([whole], activeDirs: [dir]).first)
+        XCTAssertTrue(marked.isDownloading)
+        XCTAssertFalse(marked.isChatPickable)
     }
 
     /// A defective folder must never reach a picker, and must always be

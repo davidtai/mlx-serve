@@ -24,14 +24,25 @@ enum ModelRowActions {
     /// True when the trash is offered right now. A broken folder never needs
     /// unlocking: it is junk, not somebody's model (see `ModelDefect`).
     static func showsTrash(_ model: LocalModel, unlocked: Bool) -> Bool {
-        model.isDeletable || unlocked
+        !model.isDownloading && (model.isDeletable || unlocked)
+    }
+
+    /// The live transfer filling this row's folder, keyed the way the pill
+    /// joins a download to a path (`ChatModelPill.isTransfer`).
+    static func transfer(for model: LocalModel,
+                         in downloads: [String: DownloadManager.DownloadState])
+        -> (repoId: String, state: DownloadManager.DownloadState)? {
+        downloads
+            .filter { $0.value.status == .downloading && ChatModelPill.isTransfer(of: $0.key, for: model.path) }
+            .min { $0.key < $1.key }
+            .map { ($0.key, $0.value) }
     }
 
     /// True when the row shows a lock instead. Mutually exclusive with the
     /// trash — they occupy the same slot, and a row showing both is a row where
     /// one of them is lying.
     static func showsLock(_ model: LocalModel, unlocked: Bool) -> Bool {
-        !showsTrash(model, unlocked: unlocked)
+        !model.isDownloading && !showsTrash(model, unlocked: unlocked)
     }
 
     /// Tooltip for the lock. Names the owning app AND says what clicking does —

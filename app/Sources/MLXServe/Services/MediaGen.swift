@@ -1480,6 +1480,20 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "Generates full songs — instrumental or with sung lyrics — from a style description in just 8 steps. One self-contained download."
     )
 
+    /// ACE-Step v1.5 XL Turbo, 4-bit — the same bundle at half the download
+    /// size (4.0 GB of blobs), for Macs that want the music model without
+    /// the 8-bit payload.
+    static let acestepXLTurbo4bit = MusicModelPreset(
+        id: "acestep-v15-xl-turbo-4bit",
+        name: "ACE-Step 1.5 XL Turbo (4-bit)",
+        repo: "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit",
+        approxRAMGB: 6,
+        approxDownloadGB: 4.0,
+        fixedSteps: 8,
+        supportsLyrics: true,
+        description: "The 8-bit ACE-Step bundle above, requantized to 4-bit — same 8-step songs at half the download size, trading a little consistency for a lighter footprint."
+    )
+
     /// MiniMax Music 3, 8-bit — hierarchical AR (8B LLM + depth decoder)
     /// driving a flow-matching DiT; full songs with sung lyrics at 44.1 kHz.
     static let miniMaxMusic3_8bit = MusicModelPreset(
@@ -1495,7 +1509,51 @@ struct MusicModelPreset: Identifiable, Hashable {
     )
 
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit]
+}
+
+/// Text-to-audio checkpoints (Stable Audio 3), served on
+/// `/v1/audio/sound-generations`. The official repo loads as published: no
+/// converter, no `config.json` (the server classifies `model_config.json`).
+struct SoundModelPreset: Identifiable, Hashable {
+    var id: String
+    var name: String
+    var repo: String
+    let approxRAMGB: Int
+    let approxDownloadGB: Double
+    let description: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// The server's bounds: (0, 120] seconds (the small models' longest
+    /// generation), 1–50 sampler steps, 8 by default (the distilled schedule).
+    var durationRange: ClosedRange<Double> { 0.5...120 }
+    var stepsRange: ClosedRange<Int> { 1...50 }
+    var defaultSteps: Int { 8 }
+
+    static let stableAudio3SmallSFX = SoundModelPreset(
+        id: "stable-audio-3-small-sfx",
+        name: "Stable Audio 3 Small SFX",
+        repo: "stabilityai/stable-audio-3-small-sfx",
+        approxRAMGB: 5,
+        approxDownloadGB: 3.5,
+        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Stability AI gates the download: accept its license on Hugging Face and sign in with a token first."
+    )
+
+    static let all: [SoundModelPreset] = [.stableAudio3SmallSFX]
+}
+
+struct SoundGenRequest {
+    var model: SoundModelPreset
+    var prompt: String
+    var durationSeconds: Double = 10
+    /// nil = the server's default schedule.
+    var steps: Int? = nil
+    /// -1 = a fresh random seed, resolved when the body is built.
+    var seed: Int = -1
+    var keepResident: Bool = false
+    var lanModelId: String? = nil
 }
 
 extension MusicGenRequest {

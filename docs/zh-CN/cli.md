@@ -62,7 +62,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--drafter DIR` | 无 | 投机解码的草稿模型检查点：Gemma 4 assistant 或 DFlash 配套草稿模型。自带 `drafter/` 子目录的模型（Muse-Glimmer 构建）会自动加载自己的 |
 | `--no-drafter` | 关闭 | 永不加载草稿模型，包括检查点内自带的那个 |
 | `--draft-block-size N` | 自动 | 草稿模型每轮的草稿数（自动取这台 Mac 的验证路径可用的值） |
-| `--no-mtp` / `--mtp` | 有 sidecar 时开启 | 禁用 / 强制原生 MTP 头（MoE 主干默认关闭） |
+| `--no-mtp` / `--mtp` | 加载了 MTP 头时开启 | 禁用原生 MTP 头；`--mtp` 为兼容旧命令保留，无作用（稠密与 MoE 均默认开启） |
 | `--mtp-depth N` | `3` | 每轮 MTP 最多草拟的 Token 数（自适应控制器在 `[1, N]` 内调节） |
 | `--mtp-history-window N` | `0`（完整） | 超过 16K Token 的提示词只为最后 N 个 Token 构建 MTP 头历史（开窗会在原版 Qwen 头上损失接受率） |
 | `--dspark` | 关闭 | DeepSeek V4 自有的块并行草稿阶段（在模型之上额外约 11 GB） |
