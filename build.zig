@@ -290,6 +290,7 @@ pub fn build(b: *std.Build) void {
     const shared_tests = [_]*std.Build.Step.Compile{
         b.addTest(.{ .name = "log-test", .root_module = shared.log }),
         b.addTest(.{ .name = "io_util-test", .root_module = shared.io_util }),
+        b.addTest(.{ .name = "mtp_acceptance-test", .root_module = shared.mtp_acceptance }),
         b.addTest(.{ .name = "mlx-test", .root_module = mlx_test_mod }),
     };
     for (shared_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
@@ -1019,6 +1020,8 @@ const Shared = struct {
     mlx: *std.Build.Module,
     log: *std.Build.Module,
     io_util: *std.Build.Module,
+    /// The MTP acceptance modes (src/mtp_acceptance.zig), shared so the SDK can export them.
+    mtp_acceptance: *std.Build.Module,
     sdk: *std.Build.Module,
     /// lib/mlx-serve-gguf and lib/sushi's EXL3 module, which reach mlx, log and io_util through `mlx_host` (the SDK).
     gguf: *std.Build.Module,
@@ -1028,6 +1031,7 @@ const Shared = struct {
         m.addImport("mlx", s.mlx);
         m.addImport("log", s.log);
         m.addImport("io_util", s.io_util);
+        m.addImport("mtp_acceptance", s.mtp_acceptance);
         m.addImport("sdk", s.sdk);
         m.addImport("mlx_serve_gguf", s.gguf);
         m.addImport("sushi_exl3", s.exl3);
@@ -1037,6 +1041,7 @@ const Shared = struct {
 fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Shared {
     const log = b.createModule(.{ .root_source_file = b.path("src/log.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const io_util = b.createModule(.{ .root_source_file = b.path("src/io_util.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const mtp_acceptance = b.createModule(.{ .root_source_file = b.path("src/mtp_acceptance.zig"), .target = target, .optimize = optimize });
     const mlx = b.createModule(.{
         .root_source_file = b.path("src/mlx.zig"),
         .target = target,
@@ -1051,9 +1056,9 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util }, .{ .name = "sdk_build", .module = sdk_build.createModule() } },
+        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util }, .{ .name = "mtp_acceptance", .module = mtp_acceptance }, .{ .name = "sdk_build", .module = sdk_build.createModule() } },
     });
-    return .{ .mlx = mlx, .log = log, .io_util = io_util, .sdk = sdk, .gguf = engineModule(b, ggufRoot(b), sdk, target, optimize), .exl3 = engineModule(b, exl3Root(b), sdk, target, optimize) };
+    return .{ .mlx = mlx, .log = log, .io_util = io_util, .mtp_acceptance = mtp_acceptance, .sdk = sdk, .gguf = engineModule(b, ggufRoot(b), sdk, target, optimize), .exl3 = engineModule(b, exl3Root(b), sdk, target, optimize) };
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

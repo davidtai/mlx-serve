@@ -6,7 +6,7 @@
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log");
-const mtp_acceptance = @import("mtp_acceptance.zig");
+const mtp_acceptance = @import("mtp_acceptance");
 const sdk = @import("sdk");
 
 pub const Override = struct {
