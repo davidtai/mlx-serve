@@ -44691,12 +44691,13 @@ fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     return t;
 }
 
-/// What a registered arch's forward runs at this context: its prompt pass, with the request's shape, at a fresh request
-/// (`cache.step == 0`); its step after it (null). A prompt pass without the request's shape is refused by name: every
-/// caller that starts a request states it (Generator.init, each warm-up pass).
+/// What a registered arch's forward runs at this context: its prompt pass, with the request's shape, while the cache is
+/// short of the request's prompt (`cache.step == 0`, or the prefix a `restore_prefix` arch kept); its step after it
+/// (null). A fresh request without its shape is refused by name: every caller that starts a request states it
+/// (Generator.init, each warm-up pass).
 fn archPass(ctx: *const ForwardCtx) error{RequestShapeMissing}!?sdk.RequestShape {
-    if (ctx.cache.step != 0) return null;
-    return ctx.request orelse error.RequestShapeMissing;
+    const req = ctx.request orelse return if (ctx.cache.step == 0) error.RequestShapeMissing else null;
+    return if (ctx.cache.step < req.prompt_tokens) req else null;
 }
 
 /// The prompt at `cache.step == 0` (a fresh request, its shape set by whoever started it), later positions after it;
@@ -64668,7 +64669,11 @@ test "dsv41 warmup: each warm-up pass is a request of its own, so a registered a
     try testing.expectError(error.RequestShapeMissing, archPass(&plain));
     t.cache.step = 1;
     try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&plain));
+    // A request whose first position a `restore_prefix` arch kept: the rest is still its prompt pass; at the prompt's
+    // length its steps follow.
     const later = t.warmupCtx(8);
+    try testing.expectEqual(later.request.?, (try archPass(&later)).?);
+    t.cache.step = 8;
     try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&later));
 }
 

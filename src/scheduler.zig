@@ -4628,7 +4628,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM cache is unaffected.
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
-        const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        // A module-owned arch's state never reaches the disk tier's KV chunks.
+        const disk_ok = (!has_ssm_layers or enable_ssm_cps) and !params.config.moduleOwnsDecodeState();
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprintWithLayout(
                 sch.allocator,
@@ -6968,6 +6969,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             }
         }
     }
+    hot_matched = try archKeptPrefix(xfm_ptr.arch, &slot.cache, &slot.moe_seq_offset, slot.full_prompt, hot_matched, xfm_ptr.s);
+    prefill_tokens = slot.full_prompt[hot_matched..];
 
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
     // LoadedModel so the prefill loop snapshots SSM state at stride-aligned
@@ -7230,6 +7233,21 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .source = "cold",
         });
     }
+}
+
+/// The prefix a hot-cache match leaves the prompt pass. A module-owned arch holds it in its module, not in the slot's
+/// cache: it keeps at most the match (`sdk.Arch.restore_prefix`) and the cache follows what it kept. Every other arch
+/// keeps the match.
+fn archKeptPrefix(arch: ?@import("sdk").ArchInstance, cache: *KVCache, moe_seq_offset: *usize, prompt: []const u32, matched: u32, s: mlx.mlx_stream) !u32 {
+    if (matched == 0) return 0;
+    const a = arch orelse return matched;
+    const restore = a.vt.restore_prefix orelse return matched;
+    const kept: u32 = @intCast(@min(restore(a.module, prompt[0..matched]), matched));
+    if (kept < matched) {
+        try cache.truncate(kept, s);
+        moe_seq_offset.* = kept;
+    }
+    return kept;
 }
 
 /// Sum the in-flight generated tokens over the active slots for the live-tok/s
@@ -10004,6 +10022,86 @@ test "modelExclusiveDecode asks the transformer: a registered arch that owns its
     try testing.expect(!modelExclusiveDecode(&lm));
     lm.transformer = null;
     try testing.expect(!modelExclusiveDecode(&lm));
+}
+
+/// One request of `archKeptPrefix`'s flow on a module arch's shell cache (0 layers, no MLX array): the host's own
+/// lookup over `hc`, the arch keeping what it can, then the request's commit (prompt + generated) as `finishSlot`'s.
+/// Returns the cached tokens the request reports.
+fn testModuleTurn(hc: *prefix_cache_mod.HotPrefixCache, arch: @import("sdk").ArchInstance, prompt: []const u32, generated: []const u32) !u32 {
+    const s: mlx.mlx_stream = .{};
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var moe_off: usize = 0;
+    const lookup = try hc.lookupAndRestore(&cache, &moe_off, null, s, prompt, false, &.{}, null, null);
+    const kept = try archKeptPrefix(arch, &cache, &moe_off, prompt, @intCast(lookup.matched), s);
+    try testing.expectEqual(@as(usize, kept), cache.step);
+    try testing.expectEqual(@as(usize, kept), moe_off);
+    // The prompt pass runs `prompt[kept..]`, then decode appends the generated ids.
+    cache.step = prompt.len + generated.len;
+    const all = try std.mem.concat(testing.allocator, u32, &.{ prompt, generated });
+    defer testing.allocator.free(all);
+    _ = try hc.commit(&cache, all, false);
+    return kept;
+}
+
+test "prefix cache drives a module-owned arch through restore_prefix: the host's match, the arch's kept positions, the cached tokens" {
+    const sdk = @import("sdk");
+    // Turn 1: prompt 1..10, answer 20 21 22. Turn 2 re-renders the answer and adds a user turn.
+    const p1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const gen = [_]u32{ 20, 21, 22 };
+    // Thinking off: turn 1's prompt is a prefix of turn 2's and the answer re-tokenizes alike up to 21 (the host's
+    // match: 12 positions).
+    const off2 = p1 ++ [_]u32{ 20, 21, 99, 30, 31, 32 };
+    // Thinking on: the last prompt id (<think>) re-renders as </think> (77): the match stops one short of turn 1's prompt.
+    const on2 = p1[0..9].* ++ [_]u32{ 77, 99, 30, 31 };
+    const Case = struct { cap: u64, prompt: []const u32, want: u32 };
+    // A module that holds turn 1's prompt boundary (cap 10): it keeps the boundary under a longer match, the match under
+    // a shorter one. A module that restores any prefix: the whole match. One that keeps nothing: the prompt runs whole.
+    inline for (.{
+        Case{ .cap = 10, .prompt = &off2, .want = 10 },
+        Case{ .cap = 10, .prompt = &on2, .want = 9 },
+        Case{ .cap = 1 << 20, .prompt = &off2, .want = 12 },
+        Case{ .cap = 0, .prompt = &off2, .want = 0 },
+    }) |c| {
+        const Fake = sdk.testing.FakeArch(.{ .restore_cap = c.cap });
+        Fake.calls = .{};
+        const vt = comptime sdk.Arch.of(Fake);
+        var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+        var cfg: u8 = 0;
+        const arch: sdk.ArchInstance = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+        var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        defer hc.deinit();
+        // Turn 1 is cold: no match, the arch is not asked.
+        try testing.expectEqual(@as(u32, 0), try testModuleTurn(&hc, arch, &p1, &gen));
+        try testing.expectEqual(@as(u32, 0), Fake.calls.restore);
+        try testing.expectEqual(c.want, try testModuleTurn(&hc, arch, c.prompt, &gen));
+        try testing.expectEqual(@as(u32, 1), Fake.calls.restore);
+        try testing.expectEqual(@as(usize, if (c.prompt.len == off2.len) 12 else 9), m.last_prefix);
+    }
+    // The same prompt again: the host re-runs the last id (its full-reuse rule), so the arch is offered len - 1.
+    {
+        const Fake = sdk.testing.FakeArch(.{ .restore_cap = 10 });
+        Fake.calls = .{};
+        const vt = comptime sdk.Arch.of(Fake);
+        var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+        var cfg: u8 = 0;
+        const arch: sdk.ArchInstance = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+        var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        defer hc.deinit();
+        _ = try testModuleTurn(&hc, arch, &p1, &.{});
+        try testing.expectEqual(@as(u32, 9), try testModuleTurn(&hc, arch, &p1, &.{}));
+        try testing.expectEqual(@as(usize, 9), m.last_prefix);
+    }
+    // An arch without the hook keeps the host's match as every other arch does (its prefix cache is off: `shouldUse`).
+    {
+        const vt = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+        var cfg: u8 = 0;
+        var cache = try KVCache.init(testing.allocator, 0);
+        defer cache.deinit();
+        var moe_off: usize = 0;
+        try testing.expectEqual(@as(u32, 7), try archKeptPrefix(.{ .vt = &vt, .cfg = &cfg, .module = &cfg }, &cache, &moe_off, &p1, 7, .{}));
+        try testing.expectEqual(@as(u32, 7), try archKeptPrefix(null, &cache, &moe_off, &p1, 7, .{}));
+    }
 }
 
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {

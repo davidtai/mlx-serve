@@ -841,6 +841,11 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "deepseek_v4");
     }
 
+    /// A module-owned arch that restores its state to a prefix-cache match (`sdk.Arch.restore_prefix`).
+    pub fn moduleRestoresPrefix(self: *const ModelConfig) bool {
+        return if (self.arch) |a| a.restore_prefix != null else false;
+    }
+
     /// The arch chunks the prompt itself, so it takes the whole prompt in one forward.
     pub fn prefillWholePrompt(self: *const ModelConfig) bool {
         return if (self.arch) |a| a.caps.prefill_whole_prompt else false;

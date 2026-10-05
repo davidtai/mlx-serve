@@ -684,8 +684,8 @@ pub const HotPrefixCache = struct {
         // A module-owned arch (dsv4, dsv41) keeps its per-request state (rings,
         // compressed caches, pending windows) on its module, not in the KVCache —
         // a snapshot restore would advance cache.step without rebuilding that
-        // state. Off until that state rides the ssm-entry machinery.
-        if (config.moduleOwnsDecodeState()) return false;
+        // state. Off unless the arch restores that state to the match itself (`sdk.Arch.restore_prefix`).
+        if (config.moduleOwnsDecodeState() and !config.moduleRestoresPrefix()) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -2966,20 +2966,24 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: shouldUse rejects deepseek_v4 and a registered arch that owns its decode state" {
+test "HotPrefixCache: shouldUse rejects deepseek_v4 and a registered arch that owns its decode state, unless it restores to the match" {
     // dsv4's per-request state (raw-kv rings, compressed caches, compressor
     // pending windows) lives on the Dsv4Model, NOT in the 0-entry KVCache
     // shell — a snapshot restore would set cache.step without rebuilding that
     // state, silently serving a stale ring (or crashing on a null dec_state).
-    // A registered arch (deepseek_v41) says the same through its caps.
+    // A registered arch says the same through its caps; one that restores its own state to the host's match
+    // (`restore_prefix`) takes the cache.
     const sdk = @import("sdk");
     const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const restoring = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .restore_cap = 64 }));
     const dsv4 = model_mod.ModelConfig{ .model_type = "deepseek_v4" };
     const arch = model_mod.ModelConfig{ .model_type = "fake_arch", .arch = &owning };
     for ([_]*const model_mod.ModelConfig{ &dsv4, &arch }) |cfg| {
         try testing.expect(!HotPrefixCache.shouldUse(cfg, false));
         try testing.expect(!HotPrefixCache.shouldUse(cfg, true));
     }
+    const restores = model_mod.ModelConfig{ .model_type = "fake_arch", .arch = &restoring };
+    try testing.expect(HotPrefixCache.shouldUse(&restores, false) and HotPrefixCache.shouldUse(&restores, true));
 }
 
 test "HotPrefixCache: init zero capacity clamps to 1" {

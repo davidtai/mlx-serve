@@ -89,6 +89,8 @@ pub const FakeOptions = struct {
     block_size: u32 = 0,
     /// The prompt admission's bytes; null = the host's estimator.
     prompt_bytes: ?u64 = null,
+    /// `restorePrefix`: the most positions of a prefix-cache match the fake keeps; null = no hook.
+    restore_cap: ?u64 = null,
 };
 
 /// Every call a fake arch's module received.
@@ -99,6 +101,7 @@ pub const FakeCalls = struct {
     step: u32 = 0,
     handover: u32 = 0,
     rounds: u32 = 0,
+    restore: u32 = 0,
 };
 
 /// An arch for host tests: no MLX (its logits are empty handles), caps per test, every call counted.
@@ -113,6 +116,8 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
             position: u64 = 0,
             last_handover: ?arch.DecodeHandover = null,
             last_request: ?arch.RequestShape = null,
+            /// The match the last `restorePrefix` was offered.
+            last_prefix: usize = 0,
         };
         /// The counters every module of this fake writes; reset per test.
         pub var calls: FakeCalls = .{};
@@ -177,6 +182,14 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
                 m.last_handover = h;
             }
         }.f else {};
+        pub const restorePrefix = if (opts.restore_cap) |cap| struct {
+            fn f(m: *Module, prefix: []const u32) u64 {
+                m.calls.restore += 1;
+                m.last_prefix = prefix.len;
+                m.position = @min(prefix.len, cap);
+                return m.position;
+            }
+        }.f else {};
         pub const draft_lane = if (opts.block_size > 0) struct {
             pub fn blockSize(_: *const Module) u32 {
                 return opts.block_size;
@@ -231,8 +244,23 @@ test "sdk testing: the fake arch's table counts every call, and its optional hoo
     const Bare = FakeArch(.{ .handover = false, .caps = .{} });
     const bare = comptime arch.Arch.of(Bare);
     try testing.expect(bare.handover == null and bare.prompt_bytes == null and bare.spec == .none and !bare.caps.owns_decode_state);
+    try testing.expect(vt.restore_prefix == null and bare.restore_prefix == null);
     try testing.expectError(error.FakeArchRefused, vt.parse(testing.allocator, &(try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"fake_arch\",\"refuse\":1}")), &diag));
     try testing.expectEqualStrings("fake arch: refused by the fixture", diag.message());
+}
+
+test "sdk arch: restore_prefix keeps at most the host's match, counted; absent unless declared" {
+    const Fake = FakeArch(.{ .restore_cap = 5 });
+    Fake.calls = .{};
+    const vt = comptime arch.Arch.of(Fake);
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+    const ids = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    // The match past what the module holds: it keeps its own 5; a shorter match: the match.
+    try testing.expectEqual(@as(u64, 5), vt.restore_prefix.?(&m, &ids));
+    try testing.expectEqual(@as(usize, 8), m.last_prefix);
+    try testing.expectEqual(@as(u64, 4), vt.restore_prefix.?(&m, ids[0..4]));
+    try testing.expectEqual(@as(u64, 0), vt.restore_prefix.?(&m, ids[0..0]));
+    try testing.expectEqual(@as(u32, 3), Fake.calls.restore);
 }
 
 test "sdk testing: claims fixtures run on any arch's claim" {

@@ -18,8 +18,8 @@ const Allocator = std.mem.Allocator;
 
 /// Facts the host copies once at load into its own tables.
 pub const Caps = struct {
-    /// G1: per-request decode state lives on the arch's module, not the host's KVCache: no prefix-cache restore,
-    /// no batched decode, single-flight admission, no KVCache snapshot or rewind.
+    /// G1: per-request decode state lives on the arch's module, not the host's KVCache: no batched decode,
+    /// single-flight admission, no KVCache snapshot or rewind; the prefix cache only through `restore_prefix`.
     owns_decode_state: bool = false,
     /// The host sends the whole prompt in one forward; the arch chunks it.
     prefill_whole_prompt: bool = false,
@@ -94,6 +94,11 @@ pub const Arch = struct {
     step: *const fn (m: *anyopaque, ids: []const u32) anyerror!mlx.mlx_array,
     /// The committed length; the host mirrors its cache step from it.
     position: *const fn (m: *const anyopaque) u64,
+    /// An arch that owns its decode state under the host's prefix cache: the host matched `prefix` (its own match and
+    /// policy) and would not run it again; the module keeps at most that many positions of its state and returns how
+    /// many (0: none, the prompt runs whole). The host then sends the rest to `prefill`, its `RequestShape.prompt_tokens`
+    /// counting the kept ones. Once per request, before its prompt pass; null = the host's prefix cache stays off.
+    restore_prefix: ?*const fn (m: *anyopaque, prefix: []const u32) u64,
     /// The phase change; null = the arch has none.
     handover: ?*const fn (m: *anyopaque, h: DecodeHandover) anyerror!void,
     spec: spec.Spec,
@@ -109,7 +114,7 @@ pub const Arch = struct {
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
-    /// draft_lane, bill, and the pair claimProcess / releaseProcess.
+    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, and the pair claimProcess / releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -131,6 +136,10 @@ pub const Arch = struct {
             check.fnDecl(w, T, "step", &.{ *T.Module, []const u32 }, mlx.mlx_array);
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
+            if (check.has(T, "restorePrefix")) {
+                if (!T.caps.owns_decode_state) @compileError(w ++ ": restorePrefix without owns_decode_state");
+                check.fnDecl(w, T, "restorePrefix", &.{ *T.Module, []const u32 }, u64);
+            }
             if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
             if (check.has(T, "claimProcess") != check.has(T, "releaseProcess")) @compileError(w ++ ": claimProcess and releaseProcess come as a pair");
             if (check.has(T, "claimProcess")) {
@@ -184,6 +193,9 @@ pub const Arch = struct {
             fn handover(m: *anyopaque, h: DecodeHandover) anyerror!void {
                 return T.handover(mod(m), h);
             }
+            fn restorePrefix(m: *anyopaque, prefix: []const u32) u64 {
+                return T.restorePrefix(mod(m), prefix);
+            }
             fn billOf(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
                 return T.bill(gpa, io, req);
             }
@@ -210,6 +222,7 @@ pub const Arch = struct {
             .step = W.step,
             .position = W.position,
             .handover = if (check.has(T, "handover")) W.handover else null,
+            .restore_prefix = if (check.has(T, "restorePrefix")) W.restorePrefix else null,
             .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,
             .claim_process = if (check.has(T, "claimProcess")) W.claimProcess else null,
