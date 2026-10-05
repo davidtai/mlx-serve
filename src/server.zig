@@ -22185,11 +22185,12 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     // The arch's own config behind the registry: its settings and its bill.
     const ac: *pkg.Settings = @ptrCast(@alignCast(cfg.arch_cfg.?));
     const bill = ac.dsv41_prefill.?;
-    // The whole prompt reaches the arch (chunk = seq); the bill is the arch's, at the model's own chunk.
-    // The served tier's default pass is K16 layer-major; the chunk-major bill when the setting turns it off.
-    try t.expectEqual(bill.layerMajorBytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    // The per-request guard takes the arch's own number: what a prompt needs beyond the module's construction admission,
+    // which already billed every prompt up to its context (both phases) and frees its decode rows before a prompt: none,
+    // on either pass and at any length (a prompt over the context is the module's refusal by name).
+    for ([_]u64{ 1, 2047, 4096, 16384, 131072 }) |n| try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, n, 1024, 16, n, .{}));
     ac.layer_major_prefill = false;
-    try t.expectEqual(bill.bytes(16384, 1024, .served), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
     ac.layer_major_prefill = null;
     try t.expectEqual(@as(u64, 953), bill.chunkRows(16384));
     try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
@@ -22197,7 +22198,7 @@ test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks a
     try t.expect(bill.bytes(64, 32, .served) < 5_000_000_000);
     // The module's tier and pass choose the bill.
     ac.numeric_tier = .stock;
-    try t.expectEqual(bill.bytes(16384, 1024, .stock), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
     ac.numeric_tier = null;
     try t.expect(!scheduler_mod.configBatchesDecode(&cfg));
 }

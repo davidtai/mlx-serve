@@ -150,8 +150,6 @@ pub fn reader(path: [:0]const u8) !mlx.mlx_io_reader {
     return mlx.mlx_io_reader_new(d, vtable);
 }
 
-/// The aligned reads, the row gather and the residency probe are shared I/O helpers (io_util).
-
 // ── Tests (host: no MLX array; the reader's callbacks driven as MLX drives them) ──
 
 const testing = std.testing;
