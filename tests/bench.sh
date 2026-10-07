@@ -165,8 +165,9 @@ else
         path=$(find_fitting_model "${cands[@]}") || { echo "SKIP $logical (no checkpoint within $(max_model_gb) GB on this box)" >&2; continue; }
         spec_flags "$logical" "$path"
         echo; echo ">> $logical ${FLAGS[*]+${FLAGS[*]}}"
+        # Scratch HOME: a saved model-settings.json outranks these flags (a drafter, a KV scheme).
         # shellcheck disable=SC2086
-        "$BINARY" --serve --model "$path" --port "$PORT" ${FLAGS[@]+"${FLAGS[@]}"} ${BENCH_EXTRA_FLAGS:-} >"$OUT/$logical.log" 2>&1 &
+        HOME="$OUT/home" "$BINARY" --serve --model "$path" --port "$PORT" ${FLAGS[@]+"${FLAGS[@]}"} ${BENCH_EXTRA_FLAGS:-} >"$OUT/$logical.log" 2>&1 &
         pid=$!
         for _ in $(seq 1 300); do
             curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break

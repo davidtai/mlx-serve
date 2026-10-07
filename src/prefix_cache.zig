@@ -3357,6 +3357,7 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
         hc.ssd_first = true;
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
         hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         hc.disk.?.enableBackgroundWriter();
         try testing.expect(hc.disk.?.writer != null);
         defer hc.deinit();
@@ -3381,6 +3382,7 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
         hc.ssd_first = true;
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
         hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         hc.disk.?.enableBackgroundWriter();
         try testing.expect(hc.disk.?.writer != null);
         defer hc.deinit();
@@ -3414,6 +3416,7 @@ test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and res
         hc.ssd_first = true;
         hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
         hc.disk.?.ssd_first = true;
+        hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
         hc.disk.?.enableBackgroundWriter();
         defer hc.deinit();
         try testing.expect(hc.disk.?.writer != null);
