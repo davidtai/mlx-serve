@@ -418,6 +418,25 @@ const corpus = [_]Expect{
         .last_tool_arg_value = "b.txt",
     },
     .{
+        // DeepSeek-V4.1's encoder (encoding.py, its chat_template.jinja) names the DSML tags with a LEADING SPACE:
+        // `<｜DSML｜ calls>`, `<｜DSML｜ invoke name=…>`, `<｜DSML｜ parameter …>`.
+        .family = "dsv41-dsml",
+        .name = "V4.1 leading-space DSML tags parse like V4's",
+        .raw = "I'll read both.\n\n<｜DSML｜ calls>\n" ++
+            "<｜DSML｜ invoke name=\"read_file\">\n" ++
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n" ++
+            "<｜DSML｜ invoke name=\"read_file\">\n" ++
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">b.txt</｜DSML｜ parameter>\n" ++
+            "<｜DSML｜ parameter name=\"limit\" string=\"false\">20</｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .tool_count = 2,
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
         .family = "dsv4-dsml",
         .name = "server-cut DSML value ships completed pairs, never the fragment",
         .raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++

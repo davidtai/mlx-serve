@@ -5096,6 +5096,14 @@ fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
 /// truncation salvages NAME + completed pairs (fragments dropped), keys are
 /// escaped + deduped (last wins) so emitted arguments are ALWAYS valid JSON.
 fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    // DeepSeek-V4.1 names the tags with a leading space (`<｜DSML｜ invoke`, encoding.py): read it as V4's spelling.
+    if (std.mem.indexOf(u8, text, "｜DSML｜ ") == null) return parseDsmlToolCallsV4(allocator, text, calls);
+    const a = try std.mem.replaceOwned(u8, allocator, text, "｜DSML｜ ", "｜DSML｜");
+    defer allocator.free(a);
+    return parseDsmlToolCallsV4(allocator, a, calls);
+}
+
+fn parseDsmlToolCallsV4(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     const Param = struct { key: []const u8, value: []const u8, is_string: bool };
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, DSML_INVOKE_TAG)) |inv| {
@@ -15404,4 +15412,12 @@ test "host seams: the default macOS build embeds the engines upstream's macos_en
     try std.testing.expectEqual(bo.macos_engines, bo.embedded_engines);
     try std.testing.expectEqual(bo.embedded_engines, arch_ds4 == @import("arch/ds4.zig"));
     try std.testing.expectEqual(bo.embedded_engines, arch_llama == @import("arch/llama.zig"));
+}
+
+test "jinja: a namespace attribute named like a dict method is the attribute (DeepSeek-V4.1's sc.items / pr.items)" {
+    const tpl = "{%- set ns = namespace(items = []) -%}{%- for x in ['a', 'b'] -%}{%- set ns.items = ns.items + [x] -%}{%- endfor -%}{{ ns.items | join(',') }}";
+    var len: usize = 0;
+    const out = jinja_c.jinja_render_chat(tpl, "[]", null, "{}", 0, &len) orelse return error.TestUnexpectedResult;
+    defer jinja_c.jinja_str_free(out);
+    try testing.expectEqualStrings("a,b", out[0..len]);
 }
