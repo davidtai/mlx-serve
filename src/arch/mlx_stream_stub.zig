@@ -44,19 +44,10 @@ pub fn position(_: *const Model) u64 {
 pub fn blockSize(_: *const Model) u32 {
     return 0;
 }
-pub const SampledBlock = struct {
-    accept_p: mlx.mlx_array = .{ .ctx = null },
-    corrections: mlx.mlx_array = .{ .ctx = null },
-};
-pub const Sampler = struct {
-    ctx: *anyopaque,
-    graph: *const fn (ctx: *anyopaque, logits: mlx.mlx_array, drafts: []const u32, out: *SampledBlock) anyerror!void,
-    prefix: *const fn (ctx: *anyopaque, p: []const f32) u32,
-};
-pub const Arm = enum { off, greedy, sampled };
-pub fn arm(_: *Model, _: Arm) bool {
+pub const SamplingParams = struct { temperature: f32 = 1.0, top_p: f32 = 1.0, top_k: u32 = 0, min_p: ?f32 = null, seed: u64 = 0 };
+pub fn arm(_: *Model, _: ?SamplingParams) bool {
     return false;
 }
-pub fn round(_: *Model, _: std.mem.Allocator, _: u32, _: u32, _: ?Sampler) !Model.DraftRound {
+pub fn round(_: *Model, _: std.mem.Allocator, _: u32, _: u32) !Model.DraftRound {
     return error.MlxStreamNotBuilt;
 }

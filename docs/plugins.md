@@ -154,9 +154,10 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
   - `begin`: a request's start, what the module's kept state resumes (never the whole prompt) and the shape its
     prompt pass bills; a prompt past the billed context is `PrefillDoesNotFit` (a 400);
   - `forward`: the prompt pass, then the decode handover once and the steps;
-  - `arm` / `round`: the DSpark lane, on requests with nothing shaping the logits: greedy ones at the lane's typical
-    acceptance, sampled ones through the host's sampler, which `round` passes (`Generator.dsparkSampler`: the
-    request's filters and seed, the in-tree stochastic round's math);
+  - `arm` / `round`: the DSpark lane, on requests with nothing shaping the logits. `arm` takes the request's
+    `SamplingParams` (temperature, top_p, top_k, min_p, a seed even when the request sent none) and every `round`
+    passes them: greedy requests at the lane's typical acceptance, sampled ones by the plugin's exact speculative
+    sampling;
   - `contextLength`: the billed prompts plus the generation past them, which the host advertises.
 - **Host arms.** `Transformer.dsv41_ext` (init, forward, deinit; the generator hands it the whole prompt in one
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the

@@ -25,8 +25,9 @@ pub const Model = struct {
     /// The next forward is the request's prompt pass (the generator hands it the whole remaining prompt).
     prompt_due: bool = false,
     handover_due: bool = false,
-    /// The draft lane is armed for this request (`arm`).
+    /// The draft lane is armed for this request (`arm`), under this sampling.
     drafting: bool = false,
+    sampling: sdk.SamplingParams = .{},
 };
 
 /// The plugin's config of the pack, with the model's context and the load's facts.
@@ -145,20 +146,22 @@ pub fn blockSize(m: *const Model) u32 {
     return arch.draft_lane.blockSize(m.module);
 }
 
-pub const Sampler = sdk.Sampler;
-pub const SampledBlock = sdk.SampledBlock;
-pub const Arm = enum { off, greedy, sampled };
+pub const SamplingParams = sdk.SamplingParams;
 
-/// Arms the draft lane for a request with nothing that shapes its logits: a greedy one takes the lane's typical
-/// acceptance, a sampled one the host's sampler (each `round`'s).
-pub fn arm(m: *Model, mode: Arm) bool {
-    m.drafting = blockSize(m) > 0 and mode != .off and arch.draft_lane.arm(m.module, .{ .greedy = mode == .greedy, .clean = true }) != .off;
+/// Arms the draft lane for a request with nothing that shapes its logits (null: serial). The plugin samples a sampled
+/// request itself, from `sampling`, which every `round` of the request receives.
+pub fn arm(m: *Model, sampling: ?SamplingParams) bool {
+    const sp = sampling orelse {
+        m.drafting = false;
+        return false;
+    };
+    m.sampling = sp;
+    m.drafting = blockSize(m) > 0 and arch.draft_lane.arm(m.module, .{ .greedy = sp.greedy(), .clean = true, .sampling = sp }) != .off;
     return m.drafting;
 }
 
-/// One draft round from `t1`: the committed tokens (`t1` first) and the next round's token; a sampled request's
-/// decisions come from `sampler`.
-pub fn round(m: *Model, gpa: std.mem.Allocator, t1: u32, accepted_cap: u32, sampler: ?Sampler) !sdk.DraftRound {
+/// One draft round from `t1`: the committed tokens (`t1` first) and the next round's token.
+pub fn round(m: *Model, gpa: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk.DraftRound {
     try handover(m);
-    return arch.draft_lane.round(m.module, gpa, t1, accepted_cap, sampler);
+    return arch.draft_lane.round(m.module, gpa, t1, accepted_cap, m.sampling);
 }
