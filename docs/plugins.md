@@ -162,8 +162,8 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill.
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
-  C sources against the staged MLX, its suite and its conformance suite (a CPU-lane binary of its own) in `zig build
-  test`. macOS only; the
+  C sources against the staged MLX, its suite in `zig build test`, its conformance suite (a CPU-lane binary of its
+  own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
   Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses the repack by name.
 
 ## Rules for plugin code

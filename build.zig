@@ -324,10 +324,10 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
         b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
-        // Its own binary: the suite's last test checks that nothing in it created a Metal device.
+        // Its own binary (the last test checks that nothing in it created a Metal device), outside `zig build test`:
+        // it recompiles every plugin file's tests.
         const conf = b.addRunArtifact(addMlxStreamTests(b, target, optimize, null, macos_sdk_frameworks, "src/conformance.zig", "mlx-stream-conformance"));
         conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
-        test_step.dependOn(&conf.step);
         b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
     }
 
