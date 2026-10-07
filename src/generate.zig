@@ -4,6 +4,8 @@ const mlx = @import("mlx.zig");
 const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
+const dsv41_mod = @import("deepseek_v41.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -2533,7 +2535,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.dsv41_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2546,19 +2548,26 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const mdl_ds = xfm.dsv4.?;
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
             const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
             const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
-            if (mdl_ds.n_mtp > 0 and !dspark_env_off and arm != .off) {
+            // mlx-stream's lane: greedy requests at its typical acceptance, sampled ones through this generator's sampler.
+            const lane_mode: mlx_stream.Arm = if (dspark_env_off) .off else switch (arm) {
+                .off => .off,
+                .greedy => .greedy,
+                .stochastic => .sampled,
+            };
+            const lane_arms = if (xfm.dsv41_ext) |m| mlx_stream.arm(m, lane_mode) else true;
+            if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
                 if (dspark_stochastic) {
-                    log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                    log.info("  spec=dspark (stochastic; {s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
                 } else {
-                    log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                    log.info("  spec=dspark ({s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
                 }
             } else {
-                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+                log.info("  spec=disabled ({s} serves serial-only)\n", .{xfm.config.model_type});
             }
             options.pld_enabled = false;
             options.drafter_enabled = false;
@@ -2768,7 +2777,7 @@ pub const Generator = struct {
         // where the next turn's prefix match can actually reach it (see
         // ssmSnapshotBackoff), and the final forward covers the held-back
         // tail + the last token in the same weight sweep.
-        var final_start: usize = prompt_ids.len - 1;
+        var final_start: usize = if (xfm.prefillsWholePrompt()) 0 else prompt_ids.len - 1;
         // Chunked vision prefill (issue #197): placeholder rows consumed by
         // completed chunks, fed to ctx.vision_splice_offset per forward
         // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
@@ -2780,7 +2789,7 @@ pub const Generator = struct {
             .width_max = @intCast(PREFILL_CHUNK),
         };
 
-        if (prompt_ids.len > 1) {
+        if (final_start > 0) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
@@ -4071,23 +4080,40 @@ pub const Generator = struct {
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        const mdl = self.xfm.dsv4.?;
+        if (self.xfm.dsv41_ext) |m| {
+            const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+            const r = try mlx_stream.round(m, allocator, self.next_token_id, cap, if (self.dspark_stochastic) self.dsparkSampler() else null);
+            return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
+        }
+        if (self.xfm.dsv41) |mdl| return self.dsparkStep(allocator, dsv41_mod, mdl);
+        return self.dsparkStep(allocator, dsv4_mod, self.xfm.dsv4.?);
+    }
+
+    /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
+    /// share the round API) and its bookkeeping on the Generator.
+    fn dsparkStep(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype) !?DrafterStepResult {
         const t1 = self.next_token_id;
         const accepted_cap = capAcceptedForTokenBudget(
             std.math.maxInt(u32),
             self.completion_tokens,
             self.max_tokens,
         );
-        var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap)
         else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
+            try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
+        return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
+    }
+
+    /// A draft round's bookkeeping; the module stands at `position`.
+    fn commitDsparkRound(self: *Generator, allocator: std.mem.Allocator, round_in: dsv4_mod.DsparkRound, position: usize) !?DrafterStepResult {
+        var round = round_in;
         errdefer round.deinit(allocator);
-        // dsparkRound advanced the module state — mirror it on the shell
+        // The round advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
         // check keying on step==0) sees a consistent position. Generator.step
         // itself moves through advanceStep below (the clear-cadence clock).
-        self.ctx.cache.step = mdl.dec_state.?.n;
+        self.ctx.cache.step = position;
         self.dspark_attempted += 1;
         self.dspark_accepted_tokens += round.accepted;
         try self.generated_ids.appendSlice(allocator, round.tokens);
@@ -4095,6 +4121,69 @@ pub const Generator = struct {
         self.next_token_id = round.next_token;
         // tokens ownership transfers to the caller (scheduler frees).
         return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
+    }
+
+    /// This request's sampling for one more draw: a seeded request keys each draw apart (`seedKey`).
+    fn nextDraw(self: *Generator) SamplingParams {
+        const sp = self.sampling;
+        self.sampling.draw +%= 1;
+        return sp;
+    }
+
+    /// mlx-stream's sampled DSpark decisions, made by this request's own sampler: the in-tree stochastic round's
+    /// math over the plugin's verify block.
+    fn dsparkSampler(self: *Generator) mlx_stream.Sampler {
+        return .{ .ctx = self, .graph = dsparkSampledGraph, .prefix = dsparkSampledPrefix };
+    }
+
+    /// Over a verify block's logits `[1, 1 + m, V]` and its `m` drafts: the filtered target probabilities at every
+    /// row (`probsAllPositions`), each draft's probability and one correction per row (`mtpBatchedAcceptGraph`: the
+    /// residual at a reject, the last row whole), lazily.
+    fn dsparkSampledGraph(ctx: *anyopaque, logits: mlx.mlx_array, drafts: []const u32, out: *mlx_stream.SampledBlock) anyerror!void {
+        const self: *Generator = @ptrCast(@alignCast(ctx));
+        const s = self.xfm.s;
+        const sp = self.nextDraw();
+        const probs = try probsAllPositions(logits, sp, s);
+        defer _ = mlx.mlx_array_free(probs);
+        if (drafts.len == 0) {
+            // t1 alone: its row is the last one, sampled whole.
+            var log_p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_p);
+            try mlx.check(mlx.mlx_log(&log_p, probs, s));
+            const key = seedKey(sp);
+            defer _ = mlx.mlx_array_free(key);
+            var sampled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sampled);
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, key, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, sampled, &[_]c_int{1}, 1, s));
+            try mlx.check(mlx.mlx_astype(&out.corrections, flat, .int32, s));
+            try mlx.check(mlx.mlx_zeros(&out.accept_p, &[_]c_int{0}, 1, .float32, s));
+            return;
+        }
+        var draft_arrs: [MAX_ROUND_DRAFTS]mlx.mlx_array = undefined;
+        if (drafts.len > draft_arrs.len) return error.TooManyDrafts;
+        var n_arrs: usize = 0;
+        defer for (draft_arrs[0..n_arrs]) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for (drafts) |d| {
+            const idv = [_]i32{@intCast(d)};
+            draft_arrs[n_arrs] = mlx.mlx_array_new_data(&idv, &[_]c_int{1}, 1, .int32);
+            n_arrs += 1;
+        }
+        const bg = try mtpBatchedAcceptGraph(probs, draft_arrs[0..drafts.len], null, @intCast(drafts.len), sp, s);
+        if (bg.accept_q.ctx != null) _ = mlx.mlx_array_free(bg.accept_q);
+        if (bg.accept_defer.ctx != null) _ = mlx.mlx_array_free(bg.accept_defer);
+        out.accept_p = bg.accept_p;
+        out.corrections = bg.corr_samples;
+    }
+
+    /// How many drafts are accepted: each with probability `min(1, p)`, in order, from this request's PRNG.
+    fn dsparkSampledPrefix(ctx: *anyopaque, p: []const f32) u32 {
+        const self: *Generator = @ptrCast(@alignCast(ctx));
+        return mtp_acceptance.exactPrefix(p, null, null, &self.prng);
     }
 
     /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
@@ -4108,9 +4197,9 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32, accepted_cap: u32) !dsv4_mod.DsparkRound {
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32) !mod.DsparkRound {
         const s = self.xfm.s;
-        var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
+        var pending = try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
         const b: u32 = @intCast(pending.b);
 
@@ -4119,7 +4208,8 @@ pub const Generator = struct {
         var vl3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(vl3);
         try mlx.check(mlx.mlx_reshape(&vl3, pending.vl_g, &vshape, 3, s));
-        const probs_all = try probsAllPositions(vl3, self.sampling, s);
+        const sp = self.nextDraw();
+        const probs_all = try probsAllPositions(vl3, sp, s);
         defer _ = mlx.mlx_array_free(probs_all);
 
         var accepted: u32 = 0;
@@ -4131,11 +4221,11 @@ pub const Generator = struct {
             var log_p = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_p);
             try mlx.check(mlx.mlx_log(&log_p, probs_all, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
+            const key = seedKey(sp);
+            defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, null_key, s));
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, key, s));
             var samp_i = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(samp_i);
             try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
@@ -4157,7 +4247,7 @@ pub const Generator = struct {
                 draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
                 n_arrs += 1;
             }
-            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, .{}, s);
+            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, sp, s);
             defer bg.deinit();
 
             // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -4186,8 +4276,8 @@ pub const Generator = struct {
         }
         pending.lapVerify(mdl);
 
-        const round = try dsv4_mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
-        dsv4_mod.dsparkObserve(mdl, round.phases);
+        const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
+        mod.dsparkObserve(mdl, round.phases);
         return round;
     }
 
@@ -19031,6 +19121,67 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
         }
         std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
     }
+}
+
+test "mlx-stream sampler: each draft's filtered probability, a correction per row, the drawn prefix" {
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.sampling = .{ .temperature = 1.0, .top_p = 1.0 };
+    gen.prng = std.Random.DefaultPrng.init(7);
+    const sampler = gen.dsparkSampler();
+
+    // Row 0's draft (1) is near certain, row 1's (2) near impossible, row 2 lies past the drafts.
+    const rows = [_]f32{ 0, 30, 0, 0, 30, 0, -30, 0, 0, 0, 0, 30 };
+    const logits = mlx.mlx_array_new_data(&rows, &[_]c_int{ 1, 3, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var out: mlx_stream.SampledBlock = .{};
+    try sampler.graph(sampler.ctx, logits, &.{ 1, 2 }, &out);
+    defer _ = mlx.mlx_array_free(out.accept_p);
+    defer _ = mlx.mlx_array_free(out.corrections);
+    try mlx.check(mlx.mlx_array_eval(out.accept_p));
+    try mlx.check(mlx.mlx_array_eval(out.corrections));
+    const p = mlx.mlx_array_data_float32(out.accept_p).?[0..2];
+    try testing.expect(p[0] > 0.999 and p[1] < 0.001);
+    const c = mlx.mlx_array_data_int32(out.corrections).?[0..3];
+    try testing.expect(c[0] != 1); // a residual never redraws its own draft
+    try testing.expectEqual(@as(i32, 0), c[1]);
+    try testing.expectEqual(@as(i32, 3), c[2]);
+    try testing.expectEqual(@as(u32, 1), sampler.prefix(sampler.ctx, p));
+
+    // A seeded request keys each round apart, and the same seed and round draw the same corrections
+    // (two uniform rows of 64: an unseeded repeat matches by chance 1 in ~4,000).
+    var wide: [2 * 64]f32 = @splat(0);
+    wide[0] = 30;
+    const wl = mlx.mlx_array_new_data(&wide, &[_]c_int{ 1, 2, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(wl);
+    gen.sampling.seed = 42;
+    var seen: [2][2]i32 = undefined;
+    for (&seen) |*row| {
+        gen.sampling.draw = 5;
+        var o: mlx_stream.SampledBlock = .{};
+        try sampler.graph(sampler.ctx, wl, &.{0}, &o);
+        defer _ = mlx.mlx_array_free(o.accept_p);
+        defer _ = mlx.mlx_array_free(o.corrections);
+        try mlx.check(mlx.mlx_array_eval(o.corrections));
+        row.* = mlx.mlx_array_data_int32(o.corrections).?[0..2].*;
+        try testing.expectEqual(@as(u64, 6), gen.sampling.draw);
+    }
+    try testing.expectEqualSlices(i32, &seen[0], &seen[1]);
+    gen.sampling.seed = null;
+
+    // No drafts: row 0 alone, sampled whole.
+    const one = mlx.mlx_array_new_data(rows[8..].ptr, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(one);
+    var bare: mlx_stream.SampledBlock = .{};
+    try sampler.graph(sampler.ctx, one, &.{}, &bare);
+    defer _ = mlx.mlx_array_free(bare.accept_p);
+    defer _ = mlx.mlx_array_free(bare.corrections);
+    try mlx.check(mlx.mlx_array_eval(bare.corrections));
+    try testing.expectEqual(@as(usize, 0), mlx.mlx_array_size(bare.accept_p));
+    try testing.expectEqual(@as(i32, 3), mlx.mlx_array_data_int32(bare.corrections).?[0]);
 }
 
 test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill switch restores greedy-only" {
