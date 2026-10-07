@@ -99,7 +99,8 @@ mlx-serve-gguf works exactly this way:
 - `zig build test`: the kernels on the GPU, through the host's MLX and its staged `lib/mlx`.
 
 To serve, build mlx-serve with `-D<name>-dir=$PWD`. No slim host and no fork are needed. mlx-stream's `build.zig`
-drives the host's own build instead (`zig build test` runs the host's `mlx-stream-test` step).
+drives the host's own build instead (`zig build test` runs the host's `mlx-stream-test` step, `zig build conformance`
+its `mlx-stream-conformance` step).
 
 ## Example: mlx-serve-gguf (format seam)
 
@@ -161,7 +162,8 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill.
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
-  C sources against the staged MLX, its suite as the `mlx-stream-test` artifact of `zig build test`. macOS only; the
+  C sources against the staged MLX, its suite and its conformance suite (a CPU-lane binary of its own) in `zig build
+  test`. macOS only; the
   Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses the repack by name.
 
 ## Rules for plugin code

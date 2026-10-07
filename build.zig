@@ -319,11 +319,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     {
-        const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks);
+        const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks, "src/tests.zig", "mlx-stream-test");
         test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
         b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
+        // Its own binary: the suite's last test checks that nothing in it created a Metal device.
+        const conf = b.addRunArtifact(addMlxStreamTests(b, target, optimize, null, macos_sdk_frameworks, "src/conformance.zig", "mlx-stream-conformance"));
+        conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
+        test_step.dependOn(&conf.step);
+        b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
     }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
@@ -845,15 +850,15 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
     return m;
 }
 
-/// The plugin's own suite (its src/tests.zig) over the host surface plugins import (`src/plugin_host.zig`), with the
-/// read pool's scripted faults.
-fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8) *std.Build.Step.Compile {
+/// One of the plugin's own test roots (src/tests.zig, src/conformance.zig) over the host surface plugins import
+/// (`src/plugin_host.zig`), with the read pool's scripted faults.
+fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
     const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     addMlxLib(b, host);
     if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
     for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
-    const m = mlxStreamPkg(b, host, mlxStreamDir(b), "src/tests.zig", target, optimize, true);
-    return b.addTest(.{ .name = "mlx-stream-test", .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
+    const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
+    return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
 }
 
 /// The plugin checkout: `-Dmlx-stream-dir`, else the `lib/mlx-stream` submodule. `b.option` may be declared
