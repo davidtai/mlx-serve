@@ -847,6 +847,10 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
     m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
     m.addIncludePath(b.path("lib/mlxc-src"));
     m.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+    // The shims make the server load @rpath/libmlx.dylib itself: the app bundle keeps it in Contents/Frameworks/, the
+    // CLI zip in lib/ beside the binary.
+    m.addRPath(.{ .cwd_relative = "@executable_path/../Frameworks" });
+    m.addRPath(.{ .cwd_relative = "@executable_path/lib" });
     return m;
 }
 
