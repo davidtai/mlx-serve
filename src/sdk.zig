@@ -11,8 +11,8 @@
 const std = @import("std");
 
 /// The SDK's version. A plugin built against another major is refused at compile time; a newer minor on either
-/// side is compatible (newer hooks are optional).
-pub const api: Version = .{ .major = 1, .minor = 0 };
+/// side is compatible (newer hooks are optional). 2.0: a draft lane's `round` takes the request's `SamplingParams`.
+pub const api: Version = .{ .major = 2, .minor = 0 };
 
 /// The MLX this binary links (lib/mlx-src 64ea011cb: v0.32.3). One MLX per process: a plugin tested on another is
 /// refused at compile time, so an MLX bump is one change that moves this pin and every plugin's.
@@ -56,6 +56,7 @@ const spec = @import("sdk/spec.zig");
 pub const Spec = spec.Spec;
 pub const DraftLane = spec.DraftLane;
 pub const ArmRequest = spec.ArmRequest;
+pub const SamplingParams = spec.SamplingParams;
 pub const DraftArm = spec.DraftArm;
 pub const DraftRound = spec.DraftRound;
 pub const DraftStats = spec.DraftStats;

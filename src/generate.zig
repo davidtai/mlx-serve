@@ -376,7 +376,8 @@ pub const Dsv4Lane = struct {
         return if (l.stoch_enabled) .stochastic else .off;
     }
 
-    pub fn round(l: *Dsv4Lane, allocator: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk.DraftRound {
+    /// `sampling` is unused: the stochastic round samples with this lane's copy of the Generator's own params and prng.
+    pub fn round(l: *Dsv4Lane, allocator: std.mem.Allocator, t1: u32, accepted_cap: u32, _: sdk.SamplingParams) !sdk.DraftRound {
         const r = if (l.stochastic)
             try l.stochasticRound(allocator, t1, accepted_cap)
         else
@@ -1799,6 +1800,8 @@ pub const Generator = struct {
     dspark_stochastic: bool = false,
     /// The armed lane `nextDspark` runs its rounds on (set with `dspark_enabled`).
     native_draft: ?NativeDraft = null,
+    /// The sampling the native lane armed on (`NativeArming.sampling`): passed to every round.
+    native_sampling: sdk.SamplingParams = .{},
     /// The arch's prefill-to-decode handover (`beginDecode`); no default, so every construction states it.
     handover: HandoverClock,
     dspark_attempted: u64 = 0,
@@ -2614,6 +2617,9 @@ pub const Generator = struct {
         /// consumes nothing but the argmax — a logprobs request reads the
         /// full logit row, which the pruned head does not produce.
         logprobs_n: u32 = 0,
+        /// The seed a module-owned draft lane samples with when the request sent none (`sdk.SamplingParams.seed`);
+        /// `initWithOptions` draws one per request. Null = 0 (tests).
+        lane_seed: ?u64 = null,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -2696,7 +2702,13 @@ pub const Generator = struct {
     }
 
     /// What the spec chokepoint armed for a module-owned arch: its own lane, or serial.
-    pub const NativeArming = struct { active: bool = false, stochastic: bool = false, lane: ?NativeDraft = null };
+    pub const NativeArming = struct {
+        active: bool = false,
+        stochastic: bool = false,
+        lane: ?NativeDraft = null,
+        /// What the lane armed on; every round of the request gets this value.
+        sampling: sdk.SamplingParams = .{},
+    };
 
     /// DeepSeek-V4 hard-off, at the ONE chokepoint every init site
     /// funnels through: dsv4's per-request state lives on the module
@@ -2727,7 +2739,9 @@ pub const Generator = struct {
         const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
         if (try NativeDraft.of(gpa, xfm, sampling)) |nd| {
             const l = nd.lane;
-            const arm = l.arm(nd.module, armRequest(sampling, options.logprobs_n));
+            var req = armRequest(sampling, options.logprobs_n);
+            if (sampling.seed == null) req.sampling.seed = options.lane_seed orelse 0;
+            const arm = l.arm(nd.module, req);
             // deepseek_v4 keeps upstream's engagement lines word for word (docs/gotchas/engine-mlx.md proves A/B arms
             // by counting them); a registered arch's lane names itself.
             const dsv4 = xfm.dsv4;
@@ -2735,6 +2749,7 @@ pub const Generator = struct {
                 arming.active = true;
                 arming.stochastic = arm == .stochastic;
                 arming.lane = nd;
+                arming.sampling = req.sampling;
                 if (dsv4) |m| {
                     if (arming.stochastic) {
                         log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{m.ds_block});
@@ -2769,13 +2784,22 @@ pub const Generator = struct {
 
     /// What a draft lane arms on: clean (no penalties, grammar or logprobs: they consume logits a draft never
     /// shapes) and greedy.
+    /// The request as a lane sees it: the request's own seed, or 0 (`armNativeDraft` fills the per-request one).
     pub fn armRequest(sampling: SamplingParams, logprobs_n: u32) sdk.ArmRequest {
+        const lane: sdk.SamplingParams = .{
+            .temperature = sampling.temperature,
+            .top_p = sampling.top_p,
+            .top_k = sampling.top_k,
+            .min_p = sampling.min_p,
+            .seed = sampling.seed orelse 0,
+        };
         return .{
             .clean = sampling.repeat_penalty == 1.0 and
                 sampling.presence_penalty == 0.0 and
                 sampling.constraint == null and
                 logprobs_n == 0,
-            .greedy = sampling.temperature < 0.01 or sampling.top_k == 1,
+            .greedy = lane.greedy(),
+            .sampling = lane,
         };
     }
 
@@ -2822,6 +2846,10 @@ pub const Generator = struct {
             sampling.seed = prng.random().int(u64);
         }
         var options = options_in;
+        if (sampling.seed == null and options.lane_seed == null) {
+            var lane_prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm) ^ 0x5eed));
+            options.lane_seed = lane_prng.random().int(u64);
+        }
         const arming = try armNativeDraft(allocator, xfm, sampling, &options);
         errdefer if (arming.lane) |nd| nd.release();
         const dspark_active = arming.active;
@@ -3682,6 +3710,7 @@ pub const Generator = struct {
                 .dspark_enabled = dspark_active,
                 .dspark_stochastic = dspark_stochastic,
                 .native_draft = native_draft,
+                .native_sampling = arming.sampling,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
@@ -4361,7 +4390,7 @@ pub const Generator = struct {
             self.max_tokens,
         );
         const nd = self.native_draft.?;
-        const round = try nd.lane.round(nd.module, allocator, t1, accepted_cap);
+        const round = try nd.lane.round(nd.module, allocator, t1, accepted_cap, self.native_sampling);
         errdefer allocator.free(round.tokens);
         // The round advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
@@ -19247,15 +19276,22 @@ test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill swit
 }
 
 test "native draft lane: the request a lane arms on: clean (no penalties, logprobs or grammar), greedy at temperature 0 or top_k 1" {
-    // The deepseek_v41 head arms {greedy, clean} only (its own table, deepseek_v41_plugin.zig).
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = true }, Generator.armRequest(.{ .temperature = 0.0 }, 0));
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = true }, Generator.armRequest(.{ .temperature = 0.6, .top_k = 1 }, 0));
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = false, .clean = true }, Generator.armRequest(.{ .temperature = 0.6, .top_p = 0.95 }, 0));
+    const flags = struct {
+        fn f(r: sdk.ArmRequest) [2]bool {
+            return .{ r.greedy, r.clean };
+        }
+    }.f;
+    try testing.expectEqual([2]bool{ true, true }, flags(Generator.armRequest(.{ .temperature = 0.0 }, 0)));
+    try testing.expectEqual([2]bool{ true, true }, flags(Generator.armRequest(.{ .temperature = 0.6, .top_k = 1 }, 0)));
+    try testing.expectEqual([2]bool{ false, true }, flags(Generator.armRequest(.{ .temperature = 0.6, .top_p = 0.95 }, 0)));
     // Penalties, logprobs and grammar consume logits the draft path never shapes.
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0 }, 5));
+    try testing.expectEqual([2]bool{ true, false }, flags(Generator.armRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0)));
+    try testing.expectEqual([2]bool{ true, false }, flags(Generator.armRequest(.{ .temperature = 0.0 }, 5)));
     var c: Constraint = undefined;
-    try testing.expectEqual(sdk.ArmRequest{ .greedy = true, .clean = false }, Generator.armRequest(.{ .temperature = 0.0, .constraint = &c }, 0));
+    try testing.expectEqual([2]bool{ true, false }, flags(Generator.armRequest(.{ .temperature = 0.0, .constraint = &c }, 0)));
+    // The lane sees the request's sampling: temperature, top_p, top_k, min_p and its seed (0 when it sent none).
+    try testing.expectEqual(sdk.SamplingParams{ .temperature = 0.6, .top_p = 0.95, .top_k = 40, .min_p = 0.05, .seed = 9 }, Generator.armRequest(.{ .temperature = 0.6, .top_p = 0.95, .top_k = 40, .min_p = 0.05, .seed = 9, .repeat_penalty = 1.1 }, 0).sampling);
+    try testing.expectEqual(@as(u64, 0), Generator.armRequest(.{ .temperature = 0.6 }, 0).sampling.seed);
 }
 
 test "native draft lane: the chokepoint arms an arch's own lane for clean greedy requests and forces every other drafter off" {
@@ -19286,6 +19322,42 @@ test "native draft lane: the chokepoint arms an arch's own lane for clean greedy
     xfm.arch = .{ .vt = &sharing, .cfg = &cfg, .module = &m };
     var shared: Generator.InitOptions = .{ .mtp_enabled = true };
     try testing.expect(!(try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.0 }, &shared)).active and shared.mtp_enabled);
+}
+
+test "native draft lane: a sampled clean request reaches a sampling lane with its params and seed; a logprobs request stays serial" {
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    const Lane = sdk.testing.FakeArch(.{ .block_size = 5, .lane_samples = true });
+    Lane.calls = .{};
+    const vt = comptime sdk.Arch.of(Lane);
+    var m: Lane.Module = .{ .gpa = testing.allocator, .calls = &Lane.calls, .position = 7 };
+    var cfg: Lane.Config = .{};
+    xfm.arch = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+    const want: sdk.SamplingParams = .{ .temperature = 0.6, .top_p = 0.95, .top_k = 20, .min_p = 0.05, .seed = 1234 };
+    // No seed in the request: the lane gets the per-request seed `initWithOptions` drew.
+    var opts: Generator.InitOptions = .{ .mtp_enabled = true, .lane_seed = 1234 };
+    Lane.last_arm = null;
+    const armed = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.6, .top_p = 0.95, .top_k = 20, .min_p = 0.05 }, &opts);
+    defer if (armed.lane) |nd| nd.release();
+    try testing.expect(armed.active and !armed.stochastic and !opts.mtp_enabled);
+    try testing.expect(!Lane.last_arm.?.greedy and Lane.last_arm.?.clean);
+    try testing.expectEqual(want, Lane.last_arm.?.sampling);
+    try testing.expectEqual(want, armed.sampling);
+    // The round gets the value the lane armed on (what `nextDspark` passes from `native_sampling`).
+    const nd = armed.lane.?;
+    var round = try nd.lane.round(nd.module, testing.allocator, 100, 2, armed.sampling);
+    defer round.deinit(testing.allocator);
+    try testing.expectEqual(want, m.last_round_sampling.?);
+    // The request's own seed wins over the drawn one.
+    var seeded: Generator.InitOptions = .{ .mtp_enabled = true, .lane_seed = 1234 };
+    const s2 = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.6, .seed = 77 }, &seeded);
+    defer if (s2.lane) |l| l.release();
+    try testing.expectEqual(@as(u64, 77), Lane.last_arm.?.sampling.seed);
+    // logprobs (as penalties and grammar) consume logits the lane never shapes: serial, the other drafters still off.
+    var lp: Generator.InitOptions = .{ .mtp_enabled = true, .logprobs_n = 5, .lane_seed = 1 };
+    const s3 = try Generator.armNativeDraft(testing.allocator, &xfm, .{ .temperature = 0.6, .top_p = 0.95 }, &lp);
+    try testing.expect(!s3.active and s3.lane == null and !lp.mtp_enabled);
+    try testing.expect(!Lane.last_arm.?.clean);
 }
 
 test "native draft lane: deepseek_v4's stochastic accept is the loop nextDspark ran (draws, order, cap)" {
@@ -19352,7 +19424,7 @@ test "native draft lane: a registered arch's lane is the one dispatch: rounds an
     try testing.expect(nd.lane == &vt.spec.draft_lane and nd.owned == null);
     try testing.expectEqualStrings(vt.name, nd.name);
     try testing.expectEqual(@as(usize, 7), nd.position());
-    var round = try nd.lane.round(nd.module, testing.allocator, 100, 2);
+    var round = try nd.lane.round(nd.module, testing.allocator, 100, 2, .{ .temperature = 0.0 });
     defer round.deinit(testing.allocator);
     try testing.expectEqualSlices(u32, &.{ 100, 101, 102 }, round.tokens);
     try testing.expectEqual(@as(u32, 2), round.accepted);

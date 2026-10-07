@@ -893,9 +893,9 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
 /// src/plugins_refusals.zig's cases and the compile error line each must end with. A negotiation refusal ends with the
 /// host's MLX pin, so its line matches up to `/?/` from the registry's refusal site (plugins.zig:55).
 const registry_refusals = [_]struct { case: []const u8, err: []const u8 }{
-    .{ .case = "api_major", .err = "src/plugins.zig:55:50: error: plugin bad-api: ApiMajorMismatch (built against SDK 2.0 on MLX /?/)" },
-    .{ .case = "mlx_pin", .err = "src/plugins.zig:55:50: error: plugin bad-mlx: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1; this host is SDK 1.0 on MLX v/?/)" },
-    .{ .case = "mlx_pin_macos_only", .err = "src/plugins.zig:55:50: error: plugin mac-pin: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1;/?/)" },
+    .{ .case = "api_major", .err = "src/plugins.zig:55:50: error: plugin bad-api: ApiMajorMismatch (built against SDK 3.0 on MLX /?/)" },
+    .{ .case = "mlx_pin", .err = "src/plugins.zig:55:50: error: plugin bad-mlx: MlxPinMismatch (built against SDK 2.0 on MLX v0.0.1; this host is SDK 2.0 on MLX v/?/)" },
+    .{ .case = "mlx_pin_macos_only", .err = "src/plugins.zig:55:50: error: plugin mac-pin: MlxPinMismatch (built against SDK 2.0 on MLX v0.0.1;/?/)" },
     .{ .case = "duplicate", .err = "plugin twin: registered twice" },
     .{ .case = "source_no_claims", .err = "NoClaims: no claims" },
     .{ .case = "engine_wrong_claims", .err = "WrongClaims.claims: parameter *const sdk.peek.GroupPeek where the SDK has *const sdk.peek.ConfigPeek" },
