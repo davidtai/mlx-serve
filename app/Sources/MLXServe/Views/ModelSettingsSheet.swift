@@ -187,7 +187,7 @@ struct ModelSettingsSheet: View {
                     get: { override.ctxSize ?? -1 },
                     set: { override.ctxSize = $0 < 0 ? nil : $0 })) {
                     Text("Default").font(.app(.body)).tag(-1)
-                    ForEach(DeepSeekV41.contextPresets(streamedRepack: DeepSeekV41.isStreamedRepack(atModelPath: request.path)), id: \.self) { n in
+                    ForEach(ContextSizeDisplay.presets, id: \.self) { n in
                         Text(ContextSizeDisplay.formatTokens(n)).font(.app(.body)).tag(n)
                     }
                 }
