@@ -344,10 +344,6 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
-        \\  --memory-ceiling-gb <gb>
-        \\                      The GPU memory ceiling every memory plan fits
-        \\                        under, decimal GB (default: Metal's working set;
-        \\                        MLX_SERVE_GPU_CEILING_MB sets the same ceiling).
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -926,15 +922,6 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--memory-ceiling-gb") and i + 1 < args.len) {
-            i += 1;
-            const gb = std.fmt.parseFloat(f64, args[i]) catch -1;
-            if (!(gb > 4 and gb < 1024)) {
-                log.err("--memory-ceiling-gb: expected decimal GB above 4, got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            }
-            // The static GPU ceiling (what MLX_SERVE_GPU_CEILING_MB sets): every bill reads it.
-            server_mod.static_ceiling_override = @intFromFloat(@round(gb * 1e9));
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
