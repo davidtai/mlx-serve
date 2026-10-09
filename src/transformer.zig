@@ -39232,6 +39232,8 @@ const RESIDUAL_NORM_SOURCE =
 
 var residual_norm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var residual_norm_engaged: bool = false;
+/// Cached MLX_SERVE_ADD_RMSNORM_FUSED=0 kill switch for fusedResidualNorm.
+var residual_norm_disabled: ?bool = null;
 pub var add_rmsnorm_override: ?bool = null;
 var add_rmsnorm_env: ?bool = null;
 
@@ -39293,6 +39295,19 @@ pub const AddNormResult = struct { sum: mlx.mlx_array, normed: mlx.mlx_array, no
 /// `normed2` are null-ctx when their post-norm is off. Null → caller keeps
 /// the composed ops.
 pub fn fusedResidualNorm(s: mlx.mlx_stream, a: mlx.mlx_array, b1: mlx.mlx_array, o: ResidualNormOpts) !?AddNormResult {
+    // MLX_SERVE_ADD_RMSNORM_FUSED=0 disables this kernel (the composed
+    // add -> fast rms_norm chain is bit-equal). Backends without a Metal
+    // runtime — the Linux Vulkan serve graph, where the MSL subset cannot
+    // translate this kernel's `threadgroup T*` helper parameters — set 0
+    // to run the composed path.
+    if (residual_norm_disabled) |d| {
+        if (d) return null;
+    } else {
+        const raw = std.c.getenv("MLX_SERVE_ADD_RMSNORM_FUSED");
+        const disabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        residual_norm_disabled = disabled;
+        if (disabled) return null;
+    }
     const b2 = o.b2.ctx != null;
     const pre1 = o.w1.ctx != null;
     const pre2 = b2 and o.w2.ctx != null;
