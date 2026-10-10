@@ -11,6 +11,8 @@ const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
+/// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
+pub const sushi_exl3 = @import("sushi_exl3");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
