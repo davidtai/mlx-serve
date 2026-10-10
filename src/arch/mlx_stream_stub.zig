@@ -35,6 +35,7 @@ pub fn close(_: *Model) void {}
 pub fn begin(_: *Model, _: []const u32, _: u32, _: u64) !u64 {
     return 0;
 }
+pub fn end(_: *Model) void {}
 pub fn forward(_: *Model, _: []const u32, _: mlx.mlx_stream) !mlx.mlx_array {
     return error.MlxStreamNotBuilt;
 }

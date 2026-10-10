@@ -1997,7 +1997,9 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (manualContext(config) > 0) {
+    if (config.servedByPlugin()) {
+        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
+    } else if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
@@ -3907,8 +3909,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
+        // mlx-stream takes the whole prompt in one forward and chunks it itself.
         if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit)
+            !generate_mod.prefill_chunk_explicit and !config.servedByPlugin())
         {
             log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
         }

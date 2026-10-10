@@ -182,6 +182,12 @@ pub fn forward(m: *Model, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
+/// The request's end (the scheduler's finish, on the inference thread): the arch's `request_end`, if it has one.
+pub fn end(m: *Model) void {
+    // The `lib/mlx-stream` pin predates the hook.
+    if (@hasField(sdk.Arch, "request_end")) if (m.arch.vt.request_end) |f| f(m.arch.module);
+}
+
 fn handover(m: *Model) !void {
     if (!m.handover_due) return;
     m.handover_due = false;

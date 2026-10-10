@@ -4,9 +4,10 @@
 #
 #   GLM53_TEST_MODEL=<pack> GLM53_TEST_FLAGS="--wired-margin-gib 2" ./tests/test_glm53.sh
 #
-#   [0] advertised as glm_moe_dsa     [3] one tool call, no tool markup
-#   [1] short answer, thinking off    [4] tool round-trip uses the result
-#   [2] thinking on by default        [5] mlx-stream serves the pack, no MLX error
+#   [0] advertised as glm_moe_dsa         [3] one tool call, no tool markup
+#   [1] short answer, thinking off        [4] tool round-trip uses the result
+#   [2] thinking on by default            [5] mlx-stream serves the pack, no MLX error
+#   [2b] low effort answers, no think tags
 #
 # Hermetic counterparts: the glm_moe_dsa parse and routing tests in model.zig, the arch dispatch test in
 # arch/mlx_stream.zig, and the GLM effort and tool-history render tests in chat.zig.
@@ -52,10 +53,17 @@ R1=$(chat '{"max_tokens":60,"temperature":0,"enable_thinking":false,"messages":[
 check "[1] answers Paris" "$R1" "Paris"
 check_absent "[1] no reasoning" "$R1" '"reasoning_content"'
 
-R2=$(chat '{"max_tokens":2000,"temperature":0,"reasoning_effort":"low","messages":[{"role":"user","content":"What is 3*7? Answer with just the number."}]}')
+# No reasoning_effort: the template's default effort (max) reasons before it answers.
+R2=$(chat '{"max_tokens":2000,"temperature":0,"messages":[{"role":"user","content":"What is 3*7? Answer with just the number."}]}')
 check "[2] reasoning_content by default" "$R2" '"reasoning_content"'
 check "[2] answer 21" "$R2" "21"
 check_absent "[2] no think tags" "$R2" "</think>"
+
+# Low effort: the template still opens <think>, and the model may close it at once, with no reasoning.
+R2B=$(chat '{"max_tokens":2000,"temperature":0,"reasoning_effort":"low","messages":[{"role":"user","content":"What is 3*7? Answer with just the number."}]}')
+check "[2b] low effort answer 21" "$R2B" "21"
+check_absent "[2b] no think open tag" "$R2B" "<think>"
+check_absent "[2b] no think close tag" "$R2B" "</think>"
 
 T=$(chat '{"max_tokens":2000,"temperature":0,"reasoning_effort":"low","messages":[{"role":"user","content":"What is the weather in Paris right now? Use the tool."}],"tools":'"$TOOLS"'}')
 check "[3] tool call name" "$T" '"name":"get_weather"'
