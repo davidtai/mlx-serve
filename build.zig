@@ -859,6 +859,7 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
 fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
     const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     addMlxLib(b, host);
+    addExl3Module(b, host, target, optimize);
     if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
     for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
     const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
