@@ -2125,6 +2125,10 @@ pub const Generator = struct {
                 "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
                 .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
             );
+            if (self.xfm.dsv41_ext) |m| {
+                var lane_buf: [512]u8 = undefined;
+                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
+            }
             return;
         }
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {

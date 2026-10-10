@@ -248,3 +248,14 @@ pub fn round(m: *Model, gpa: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk
         inline else => |b, k| Side(k).arch.draft_lane.round(b.module, gpa, t1, accepted_cap, m.sampling),
     };
 }
+
+/// The draft lane's receipt line for the request (rounds, accepted/round, misses/round, bytes/round), when the arch's
+/// lane writes one; null otherwise.
+pub fn laneReceipt(m: *Model, buf: []u8) ?[]const u8 {
+    return switch (m.arch) {
+        inline else => |b, k| if (comptime @hasDecl(Side(k).arch.draft_lane, "receipt"))
+            Side(k).arch.draft_lane.receipt(b.module, buf)
+        else
+            null,
+    };
+}
