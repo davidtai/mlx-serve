@@ -1,4 +1,4 @@
-//! The Linux and iOS builds, which have no mlx-stream: the EXL3 repack is refused by name at load.
+//! The Linux and iOS builds, which have no mlx-stream: a pack with an `experts.bin` bank is refused by name at load.
 
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -14,21 +14,21 @@ pub const Model = struct {
     };
 };
 
-fn refuse() error{MlxStreamNotBuilt} {
-    @import("../log.zig").err("deepseek_v41: this EXL3 repack runs on mlx-stream, which only the macOS build includes\n", .{});
+fn refuse(config: *const ModelConfig) error{MlxStreamNotBuilt} {
+    @import("../log.zig").err("{s}: this pack streams its experts on mlx-stream, which only the macOS build includes\n", .{config.model_type});
     return error.MlxStreamNotBuilt;
 }
 
-pub fn loadBytes(_: std.mem.Allocator, _: std.Io, _: *const ModelConfig) !u64 {
-    return refuse();
+pub fn loadBytes(_: std.mem.Allocator, _: std.Io, config: *const ModelConfig) !u64 {
+    return refuse(config);
 }
 
 pub fn contextLength(_: *const ModelConfig) u32 {
     return 0;
 }
 
-pub fn open(_: std.mem.Allocator, _: std.Io, _: mlx.mlx_stream, _: *const ModelConfig) !*Model {
-    return refuse();
+pub fn open(_: std.mem.Allocator, _: std.Io, _: mlx.mlx_stream, config: *const ModelConfig) !*Model {
+    return refuse(config);
 }
 
 pub fn close(_: *Model) void {}

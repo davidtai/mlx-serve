@@ -48,7 +48,7 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 |---|---|---|---|
 | Format | detection, the JSON a model directory would hold, the tensor map, kernels for its encodings | the arch, KV cache, batching, spec decode, prefix cache | mlx-serve-gguf |
 | Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (from sushi) |
-| Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack) |
+| Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack, GLM-5.3) |
 
 Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/arch/ds4.zig`, `src/arch/llama.zig`).
 
@@ -139,33 +139,41 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from our fork, `ddalcu/mlx-stream`) serves
-DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk). It owns the model: the arch, its Metal
-kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
-resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
-holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
+[mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from our fork, `ddalcu/mlx-stream`) serves the packs
+whose routed experts stream from an `experts.bin` bank beside the trunk: DeepSeek-V4.1's EXL3 streaming repack and
+GLM-5.3 (`glm_moe_dsa`). It owns each model: the arch, its Metal kernels, its expert quant, the SSD expert streamer
+(lookahead reads, event gates), the draft lane where the arch has one, the prefix resume of one conversation, its
+weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`) holds the arch contract's types.
+MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
 
-- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`);
-  `loadModelWeights` loads nothing for it.
+- **Dispatch.** `parseConfig` marks a `deepseek_v41` or `glm_moe_dsa` directory with `experts.bin`
+  (`ModelConfig.plugin_dir`); `loadModelWeights` loads nothing for it. A `glm_moe_dsa` directory without the bank is
+  refused by name (`GlmMoeDsaNeedsExpertBank`): no in-tree arch serves it.
 - **Glue** (`src/arch/mlx_stream.zig`):
+  - the arch: the plugin exports `archs` (or one `arch`), the glue builds one `sdk.Arch` table per arch at compile
+    time, and the pack goes to the arch whose `claims` ranks highest (`native` over `generic`, the first registered
+    on a tie). No claim refuses the load by name (`NoMlxStreamArch`). The `Model` holds an `sdk.ArchInstance` and
+    calls through its table;
+  - settings: after the parse, `apply_settings` receives the model's `model-settings.json` entry (`.null` without
+    one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;
   - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
     (sampled first, as the plugin's admission fills rows on top of it);
   - `open` / `close`: the plugin loads its weights and builds the module;
   - `begin`: a request's start, what the module's kept state resumes (never the whole prompt) and the shape its
     prompt pass bills; a prompt past the billed context is `PrefillDoesNotFit` (a 400);
   - `forward`: the prompt pass, then the decode handover once and the steps;
-  - `arm` / `round`: the DSpark lane, on requests with nothing shaping the logits. `arm` takes the request's
-    `SamplingParams` (temperature, top_p, top_k, min_p, a seed even when the request sent none) and every `round`
-    passes them: greedy requests at the lane's typical acceptance, sampled ones by the plugin's exact speculative
-    sampling;
+  - `arm` / `round`: the arch's draft lane (`spec`; `.none` decodes serially), on requests with nothing shaping the
+    logits. `arm` takes the request's `SamplingParams` (temperature, top_p, top_k, min_p, a seed even when the
+    request sent none) and every `round` passes them: DeepSeek-V4.1's DSpark lane takes greedy requests at typical
+    acceptance and sampled ones by exact speculative sampling;
   - `contextLength`: the billed prompts plus the generation past them, which the host advertises.
-- **Host arms.** `Transformer.dsv41_ext` (init, forward, deinit; the generator hands it the whole prompt in one
+- **Host arms.** `Transformer.plugin_model` (init, forward, deinit; the generator hands it the whole prompt in one
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill.
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
   C sources against the staged MLX, its suite in `zig build test`, its conformance suite (a CPU-lane binary of its
   own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
-  Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses the repack by name.
+  Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses these packs by name.
 
 ## Rules for plugin code
 
@@ -187,8 +195,8 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
 
 - **Compile-time API and MLX negotiation.** The compiler already checks every call, and the submodule pin is the
   version. There is one MLX per binary because there is one `mlx_host.mlx`.
-- **`claims(peek) ?Priority`, a registry and tie-breaks in `model-settings.json`.** One plugin serves each
-  `model_type` or file format, so the glue's dispatch arm is the registration.
+- **A registry and tie-breaks in `model-settings.json`.** One plugin serves each `model_type` or file format, so the
+  `parseConfig` arm is the registration; inside the plugin, `claims(peek)` picks the arch.
 - **`source` and `engine` kinds, a slim host, conformance lanes.** None has a consumer. Each lands with its first
   real one, the way the arch seam landed with mlx-stream.
 

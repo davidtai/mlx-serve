@@ -2520,7 +2520,7 @@ pub const Generator = struct {
         // Spec drafts and verify rows share the serial sampler's keys (and
         // mlx-stream's lane draws from the seed), so an unseeded sampled
         // request gets its own random seed.
-        if ((sampling.keyed or xfm.dsv41_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+        if ((sampling.keyed or xfm.plugin_model != null) and sampling.seed == null and sampling.temperature > 0.01) {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
@@ -2536,7 +2536,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.dsv41_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.plugin_model != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2549,7 +2549,7 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.plugin_model.?);
             const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
             const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
             // mlx-stream's lane samples a sampled request itself, from the request's own settings.
@@ -2560,7 +2560,7 @@ pub const Generator = struct {
                 .min_p = sampling.min_p,
                 .seed = sampling.seed orelse 0,
             };
-            const lane_arms = if (xfm.dsv41_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
+            const lane_arms = if (xfm.plugin_model) |m| mlx_stream.arm(m, lane_sampling) else true;
             if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
@@ -4083,7 +4083,7 @@ pub const Generator = struct {
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        if (self.xfm.dsv41_ext) |m| {
+        if (self.xfm.plugin_model) |m| {
             const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
             const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
             return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));

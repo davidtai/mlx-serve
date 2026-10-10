@@ -3333,7 +3333,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (config.dsv41_stream) return mlx_stream.contextLength(config);
+    if (config.servedByPlugin()) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -5876,7 +5876,7 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
-    if (config.dsv41_stream) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    if (config.servedByPlugin()) return 0; // billed at construction (`mlx_stream.loadBytes`)
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +

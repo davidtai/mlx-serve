@@ -10,6 +10,7 @@ pub const log = @import("log.zig");
 test {
     _ = @import("log.zig");
     _ = @import("arch/mlx_gguf.zig");
+    if (@import("build_options").mlx_stream) _ = @import("arch/mlx_stream.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
