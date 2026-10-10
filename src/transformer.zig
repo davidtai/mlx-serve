@@ -17304,6 +17304,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+        if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
@@ -45799,17 +45800,20 @@ fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 /// DeepSeek-V4.1: its pack's Engram tables sit beside the weights; the
 /// DSpark stages load as `deepseek_v41.dsparkWanted` decides.
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
-    if (config.dsv41_stream) {
-        const m = try mlx_stream_mod.open(allocator, io, s, &config);
-        errdefer mlx_stream_mod.close(m);
-        var t = try moduleShell(allocator, config, s);
-        t.dsv41_ext = m;
-        return t;
-    }
+    if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
     const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config) });
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;
+    return t;
+}
+
+/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack or a MiMo stream pack): the plugin's module.
+fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
+    const m = try mlx_stream_mod.open(allocator, io, s, &config);
+    errdefer mlx_stream_mod.close(m);
+    var t = try moduleShell(allocator, config, s);
+    t.dsv41_ext = m;
     return t;
 }
 

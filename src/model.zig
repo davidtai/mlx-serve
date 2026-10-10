@@ -335,7 +335,7 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
     /// deepseek_v41: the pack's directory, where its Engram tables sit beside
-    /// the weights. Set by `parseConfig`.
+    /// the weights; also a MiMo mlx-stream pack's (`mimo_stream`). Set by `parseConfig`.
     dsv41_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
@@ -477,6 +477,9 @@ pub const ModelConfig = struct {
     /// streaming repack): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its
     /// weights. Set by `parseConfig`.
     dsv41_stream: bool = false,
+    /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
+    /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
+    mimo_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1107,6 +1110,11 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack or a MiMo stream pack.
+    pub fn mlxStream(self: *const ModelConfig) bool {
+        return self.dsv41_stream or self.mimo_stream;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
@@ -1561,6 +1569,16 @@ pub const ModelConfig = struct {
     }
 };
 
+/// A MiMo pack prepared for mlx-stream declares its expert bank (`"expert_streaming": {...}`); the plugin's own parse
+/// checks the declaration at load. An upstream MiMo checkpoint declares none and stays on the resident arch.
+fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const v = parsed.value.object.get("expert_streaming") orelse return false;
+    return v == .object;
+}
+
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
         const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
@@ -1582,6 +1600,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
         defer allocator.free(bank);
         config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
+    }
+    if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
+        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.mimo_stream = true;
     }
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
@@ -4546,7 +4568,7 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
-    if (config.dsv41_stream) return Weights.init(allocator); // mlx-stream loads its own
+    if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
     try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
@@ -7046,6 +7068,28 @@ test "deepseek_v41 bills its compressed caches per token, the window per slot" {
     // Every layer reads its 128-token window plus top-512 compressed entries.
     try testing.expectEqual(@as(u64, 128 + 512 + 1), config.prefillAttnKeys(1 << 20));
     try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
+}
+
+test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; an upstream MiMo checkpoint is not" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = mimo_v2_pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var upstream = try parseConfig(io, testing.allocator, dir);
+    defer upstream.deinit(testing.allocator);
+    try testing.expect(upstream.isMimo() and !upstream.mimo_stream and !upstream.mlxStream());
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\",", "\"model_type\": \"mimo_v2_flash\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-mxfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(marked);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
+    try testing.expectEqualStrings(dir, pack.dsv41_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
 }
 
 test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and the host loads none of its weights" {

@@ -3440,7 +3440,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
-    if (config.dsv41_stream) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
     if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
