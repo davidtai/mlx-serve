@@ -6,6 +6,7 @@ pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
+pub const dsa_nax = @import("dsa_nax.zig");
 
 test {
     _ = @import("log.zig");
@@ -45,6 +46,7 @@ test {
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
     _ = @import("glm5_next.zig");
+    _ = @import("dsa_nax.zig");
     _ = @import("kda_recurrence.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
