@@ -140,13 +140,16 @@ share code: each serves a different arch, and their kernels are tuned to it.
 ## Example: mlx-stream (arch seam)
 
 [mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from our fork `ddalcu/mlx-stream`, upstream `main` plus a test fix) serves
-DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk). It owns the model: the arch, its Metal
+DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
+prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
 resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
 holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
 
-- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`);
-  `loadModelWeights` loads nothing for it.
+- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`) and a
+  `mimo_v2` config that declares `expert_streaming` (`ModelConfig.mimo_stream`); `ModelConfig.mlxStream()` is either,
+  and `loadModelWeights` loads nothing for it. The glue holds one arch per model (`plugin.arch` for V4.1,
+  `plugin.mimo.arch` for MiMo) and leaves out at comptime the entry points an arch does not declare.
 - **Glue** (`src/arch/mlx_stream.zig`):
   - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
     (sampled first, as the plugin's admission fills rows on top of it);

@@ -225,7 +225,8 @@ Copyright (c) 2026 David Tai
 Licensed under the MIT License (the permission and warranty terms in LICENSE).
 
 `lib/mlx-stream`, built into the macOS server: DeepSeek-V4.1's EXL3 streaming
-repack (its arch, Metal kernels, EXL3 decoder and SSD expert streamer). Its own
+repack (its arch, Metal kernels, EXL3 decoder and SSD expert streamer) and
+MiMo-V2.6-Flash's prepared MXFP4 pack (its arch, kernels and MTP draft lane). Its own
 NOTICE lists the material it incorporates (MLX's steel headers, ExLlamaV3's
 EXL3 format).
 
