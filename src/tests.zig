@@ -6,6 +6,7 @@ pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
+pub const sushi_exl3 = @import("sushi_exl3");
 
 test {
     _ = @import("log.zig");
