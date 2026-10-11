@@ -201,7 +201,8 @@ pub fn indexerScores(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, 
 /// oMLX `patches/glm_moe_dsa/sparse_mla_nax.py` (Apache-2.0, see NOTICE): the sparse
 /// latent attention on the tensor units. One threadgroup per (query, 32-head half), 8
 /// simdgroups; per 128-slot tile, scores read key rows through the indices (never gathered),
-/// online exp2 softmax in f32, P as fp16 hi + lo pieces against bf16 values, f32 accumulate.
+/// online exp2 softmax in f32, P as fp16 hi + lo pieces (MSV_DSA_TWO_P; the roped form one
+/// piece) against bf16 values, f32 accumulate.
 const SPARSE_NAX_HEADER =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
     \\using namespace mpp::tensor_ops;
@@ -218,14 +219,7 @@ const SPARSE_NAX_SOURCE =
     \\    const int q_off = params[3];
     \\    const float scale_log2 = scale[0] * 1.44269504088896341f;
     \\    const int qi = int(threadgroup_position_in_grid.x);
-    \\#ifdef MSV_DSA_ALL_HEADS
-    \\    // One threadgroup per query over every head: HG groups of 16 heads share each tile's key loads.
-    \\    constexpr int HGN = HG;
-    \\    const int hh = 0;
-    \\#else
-    \\    constexpr int HGN = 2;
     \\    const int hh = int(threadgroup_position_in_grid.y);
-    \\#endif
     \\    const uint sg = simdgroup_index_in_threadgroup;
     \\    const uint lane = thread_index_in_simdgroup;
     \\    const uint tid = sg * 32 + lane;
@@ -243,13 +237,13 @@ const SPARSE_NAX_SOURCE =
     \\
     \\    threadgroup int sel[2][BK];
     \\    threadgroup int live[2][BK / 32];
-    \\    threadgroup float red_max[HGN][4][16];
-    \\    threadgroup float red_sum[HGN][4][16];
+    \\    threadgroup float red_max[2][4][16];
+    \\    threadgroup float red_sum[2][4][16];
     \\    // P pieces per (head group, 16-key step, lane): the 8 values of the
     \\    // lane's fragment slots (rows fm, fm + 8 x keys fn .. fn + 3).
-    \\    threadgroup half p_hi[HGN][BK / 16][32 * 8];
-    \\#ifndef MSV_DSA_ALL_HEADS
-    \\    threadgroup half p_lo[HGN][BK / 16][32 * 8];
+    \\    threadgroup half p_hi[2][BK / 16][32 * 8];
+    \\#ifdef MSV_DSA_TWO_P
+    \\    threadgroup half p_lo[2][BK / 16][32 * 8];
     \\#endif
     \\
     \\    constexpr auto qk_desc = matmul2d_descriptor(
@@ -262,7 +256,7 @@ const SPARSE_NAX_SOURCE =
     \\    matmul2d<pv_desc, execution_simdgroup> pv_op;
     \\
     \\    auto pa = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\    auto pm = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
     \\#endif
     \\    auto pb = pv_op.template get_right_input_cooperative_tensor<half, T, float>();
@@ -426,7 +420,7 @@ const SPARSE_NAX_SOURCE =
     \\        float rs[2] = {0.0f, 0.0f};
     \\        for (short tn = 0; tn < 2; ++tn) {
     \\            vec<half, 8> h;
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\            vec<half, 8> lo;
     \\#endif
     \\            for (short i = 0; i < 2; ++i) {
@@ -436,7 +430,7 @@ const SPARSE_NAX_SOURCE =
     \\                        : 0.0f;
     \\                    const half hi = half(e);
     \\                    h[i * 4 + j] = hi;
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                    lo[i * 4 + j] = half(e - float(hi));
     \\#endif
     \\                    rs[i] += e;
@@ -444,7 +438,7 @@ const SPARSE_NAX_SOURCE =
     \\            }
     \\            const int ks = j4 * 2 + tn;
     \\            *(threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]) = h;
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\            *(threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]) = lo;
     \\#endif
     \\        }
@@ -477,12 +471,12 @@ const SPARSE_NAX_SOURCE =
     \\        const int n_ks = (tile_keys + 15) / 16;
     \\        for (short ks = 0; ks < n_ks; ++ks) {
     \\            const vec<half, 8> h = *(const threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]);
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\            const vec<half, 8> lo = *(const threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]);
     \\#endif
     \\            for (short e = 0; e < 8; ++e) {
     \\                pa[e] = h[e];
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                pm[e] = lo[e];
     \\#endif
     \\            }
@@ -499,22 +493,22 @@ const SPARSE_NAX_SOURCE =
     \\                }
     \\                if (np == 0) {
     \\                    pv_op.run(pa, pb, o0);
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                    pv_op.run(pm, pb, o0);
     \\#endif
     \\                } else if (np == 1) {
     \\                    pv_op.run(pa, pb, o1);
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                    pv_op.run(pm, pb, o1);
     \\#endif
     \\                } else if (np == 2) {
     \\                    pv_op.run(pa, pb, o2);
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                    pv_op.run(pm, pb, o2);
     \\#endif
     \\                } else {
     \\                    pv_op.run(pa, pb, o3);
-    \\#ifndef MSV_DSA_ALL_HEADS
+    \\#ifdef MSV_DSA_TWO_P
     \\                    pv_op.run(pm, pb, o3);
     \\#endif
     \\                }
@@ -552,9 +546,8 @@ pub fn sparseLatent(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_arr
 
 /// `sparseLatent` with a roped part (DeepSeek-V3.2's MLA, GLM-5.3): each score adds the
 /// query's roped part against the selected row's roped key, `q_lat . kv + q_pe . k_pe`, the
-/// values the latent rows. `q_pe` [1, H, L, 64], `k_pe` [1, 1, K, 64]. One threadgroup per
-/// query runs every head (H <= 128), so each tile's selected rows are loaded once for all of
-/// them, and P meets the values as one fp16 piece.
+/// values the latent rows. `q_pe` [1, H, L, 64], `k_pe` [1, 1, K, 64]. P meets the values as
+/// one fp16 piece.
 pub fn sparseLatentRope(s: mlx.mlx_stream, q_lat: mlx.mlx_array, q_pe: mlx.mlx_array, latent: mlx.mlx_array, k_pe: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
     return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale);
 }
@@ -567,8 +560,6 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
     if (qs.len != 4 or ls.len != 4 or is.len != 3) return null;
     if (qs[0] != 1 or ls[0] != 1 or ls[1] != 1 or is[0] != 1) return null;
     if (qs[3] != 512 or ls[3] != 512 or @rem(qs[1], 32) != 0) return null;
-    // The roped form runs every head in one threadgroup (16 heads a group, 4 simdgroups a group).
-    if (q_pe != null and qs[1] > 128) return null;
     const dt = mlx.mlx_array_dtype(q_abs);
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(latent) != dt or mlx.mlx_array_dtype(idx) != .int32) return null;
     const h = qs[1];
@@ -595,9 +586,9 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
         const kn = if (rope)
-            mlx.mlx_fast_metal_kernel_new("msv_dsa_sparse_mla_rope_nax", iv, ov, "#define MSV_DSA_ROPE\n#define MSV_DSA_ALL_HEADS\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
+            mlx.mlx_fast_metal_kernel_new("msv_dsa_sparse_mla_rope_nax", iv, ov, "#define MSV_DSA_ROPE\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
         else
-            mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
+            mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, "#define MSV_DSA_TWO_P\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
         if (kn.ctx == null) return error.MetalKernelCompileFailed;
         slot.* = kn;
         break :blk kn;
@@ -625,16 +616,9 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ h, l, 512 }, 3, dt));
-    if (rope) {
-        const tpg = @divExact(h, 16) * 4 * 32;
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * tpg, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tpg, 1, 1));
-    } else {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * 256, @divExact(h, 32), 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * 256, @divExact(h, 32), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    if (rope) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HG", @divExact(h, 16)));
     const iv = mlx.mlx_vector_array_new_data(&arrays, n);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
