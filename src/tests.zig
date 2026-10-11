@@ -8,6 +8,10 @@ pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
 pub const dsa_nax = @import("dsa_nax.zig");
 pub const sushi_exl3 = @import("sushi_exl3");
+comptime {
+    // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
+    @import("plugin_host_check.zig").reexports(@This());
+}
 
 test {
     _ = @import("log.zig");
