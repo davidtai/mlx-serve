@@ -9,3 +9,5 @@ pub const mtp_acceptance = @import("mtp_acceptance.zig");
 /// Sushi's EXL3 routed experts (`lib/sushi/src/exl3`): a plugin's EXL3 bank multiplies through them.
 pub const sushi_exl3 = @import("sushi_exl3");
 pub const dsa_nax = @import("dsa_nax.zig");
+/// Prompt-lookup drafts (`backedCopy`): a plugin's draft lane proposes a continuation its context backs.
+pub const pld_index = @import("pld_index.zig");

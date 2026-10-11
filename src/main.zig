@@ -14,6 +14,7 @@ pub const mtp_acceptance = @import("mtp_acceptance.zig");
 /// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
 pub const sushi_exl3 = @import("sushi_exl3");
 pub const dsa_nax = @import("dsa_nax.zig");
+pub const pld_index = @import("pld_index.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
