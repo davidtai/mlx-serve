@@ -3385,7 +3385,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     const total = modelDiskBytes(io, model_dir);
-    if (config.dsv41_stream) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.servedByPlugin()) return mlx_stream.loadBytes(allocator, io, config);
     if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
@@ -5045,6 +5045,21 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    closePluginModels(sch);
+}
+
+/// At shutdown, on the inference thread: an mlx-stream module synchronizes and frees on this thread's stream, which
+/// the thread that joins it (`Scheduler.deinit`, where the rest of every model unloads) does not hold.
+fn closePluginModels(sch: *Scheduler) void {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry| {
+        const x = entry.*.transformer orelse continue;
+        const m = x.plugin_model orelse continue;
+        mlx_stream.close(m);
+        x.plugin_model = null;
+    }
 }
 
 /// Cleanup, vision and embed work, drained on the inference thread. Returns
@@ -6191,6 +6206,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    if (slot.model.transformer) |x| if (x.plugin_model) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -7059,7 +7075,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.dsv41_ext != null);
+        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.plugin_model != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -7118,7 +7134,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
         try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
-    else if (xfm_ptr.dsv41_ext) |m|
+    else if (xfm_ptr.plugin_model) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else
         0;
@@ -8217,6 +8233,23 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
     try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
     try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "mlx-stream: models close on the inference thread after its loop; a request ends before its terminator" {
+    // A module freed from `Scheduler.deinit`'s thread fails MLX's stream lookup ("no Stream(gpu, 0) in current thread").
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const loop = std.mem.indexOf(u8, body, "if (chatPass(sch, .main) == .shutdown) break;") orelse return error.MissingLoop;
+    const close = std.mem.indexOf(u8, body, "closePluginModels(sch);") orelse return error.MissingClose;
+    try testing.expect(loop < close);
+    const fin = std.mem.indexOf(u8, source, "fn finishSlot(") orelse return error.MissingFinishSlot;
+    const fin_end = std.mem.indexOfPos(u8, source, fin + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+    const finish = source[fin..fin_end];
+    const ended = std.mem.indexOf(u8, finish, "mlx_stream.end(m);") orelse return error.MissingRequestEnd;
+    const published = std.mem.indexOf(u8, finish, "publishSlotTerminator(slot, reason, latched);") orelse return error.MissingTerminator;
+    try testing.expect(ended < published);
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {

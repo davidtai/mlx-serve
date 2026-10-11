@@ -1997,7 +1997,9 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (manualContext(config) > 0) {
+    if (config.servedByPlugin()) {
+        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
+    } else if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
@@ -3333,7 +3335,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (config.dsv41_stream) return mlx_stream.contextLength(config);
+    if (config.servedByPlugin()) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -3907,8 +3909,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
+        // mlx-stream takes the whole prompt in one forward and chunks it itself.
         if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit)
+            !generate_mod.prefill_chunk_explicit and !config.servedByPlugin())
         {
             log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
         }
@@ -5876,7 +5879,7 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
-    if (config.dsv41_stream) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    if (config.servedByPlugin()) return 0; // billed at construction (`mlx_stream.loadBytes`)
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +

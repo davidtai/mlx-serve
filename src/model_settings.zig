@@ -47,18 +47,18 @@ pub const Settings = struct {
 
     /// The returned Override owns its strings (`deinit`).
     pub fn lookup(self: *const Settings, alloc: std.mem.Allocator, model_path: []const u8) Override {
-        const p = self.parsed orelse return .{};
-        const root = switch (p.value) {
-            .object => |o| o,
-            else => return .{},
-        };
+        return fromValue(alloc, self.entry(model_path) orelse return .{});
+    }
+
+    /// The raw entry of `model_path`, borrowed from the parsed file.
+    pub fn entry(self: *const Settings, model_path: []const u8) ?std.json.Value {
+        const root = self.rootObject() orelse return null;
         const want = trimSlash(model_path);
         var it = root.iterator();
         while (it.next()) |kv| {
-            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
-            return fromValue(alloc, kv.value_ptr.*);
+            if (std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) return kv.value_ptr.*;
         }
-        return .{};
+        return null;
     }
 
     /// The model path whose `alias` is `name`; a name claimed twice goes to the
@@ -78,13 +78,7 @@ pub const Settings = struct {
 
     /// The valid alias set for `model_path`, borrowed from the parsed file.
     pub fn aliasForPath(self: *const Settings, model_path: []const u8) ?[]const u8 {
-        const root = self.rootObject() orelse return null;
-        const want = trimSlash(model_path);
-        var it = root.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) return aliasOf(kv.value_ptr.*);
-        }
-        return null;
+        return aliasOf(self.entry(model_path) orelse return null);
     }
 
     pub const Duplicate = struct { alias: []const u8, a: []const u8, b: []const u8 };
@@ -352,6 +346,16 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(u8, 4), b.kv_quant.?.bits);
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: entry is the model's raw object, keys the Override does not read included" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a/": {"ctx_size": 65536, "numeric_tier": "stock"}, "/m/b": 3}
+    );
+    defer s.deinit();
+    try std.testing.expectEqualStrings("stock", s.entry("/m/a").?.object.get("numeric_tier").?.string);
+    try std.testing.expectEqual(@as(i64, 3), s.entry("/m/b/").?.integer);
+    try std.testing.expect(s.entry("/m/c") == null);
 }
 
 test "model_settings: chat_template_kwargs is an object carried verbatim, anything else is unset" {

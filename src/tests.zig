@@ -6,10 +6,12 @@ pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
+pub const sushi_exl3 = @import("sushi_exl3");
 
 test {
     _ = @import("log.zig");
     _ = @import("arch/mlx_gguf.zig");
+    if (@import("build_options").mlx_stream) _ = @import("arch/mlx_stream.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
