@@ -52,11 +52,13 @@ pub fn build(b: *std.Build) void {
         break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
     };
 
-    // Where webp's headers and libraries are: Homebrew's prefix, or a directory holding a copy of them (a box
-    // without Homebrew). With a directory given, the version check reads the header's presence, not `brew`.
-    const brew_prefix = b.option([]const u8, "brew-prefix", "Prefix holding include/webp and lib/libwebp (default /opt/homebrew)") orelse "/opt/homebrew";
+    // Where webp's headers and libraries are. Unset: Homebrew's prefix, its version read from `brew`. Set: a directory
+    // holding a copy of the formula's include/ and lib/ (a box without Homebrew), its version read from the copy's
+    // lib/pkgconfig.
+    const webp_prefix = b.option([]const u8, "webp-prefix", "Directory holding a copy of webp's include/ and lib/ (unset: Homebrew)");
+    const brew_prefix = webp_prefix orelse "/opt/homebrew";
     if (target.result.os.tag == .macos) {
-        verifyBrewDeps(b, brew_prefix);
+        if (webp_prefix) |dir| verifyCopiedDeps(b, dir) else verifyBrewDeps(b);
         verifyMlxStage(b);
     }
 
@@ -1064,26 +1066,50 @@ fn readMlxcPin(b: *std.Build) ?[]const u8 {
     return null;
 }
 
-const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
+/// A Homebrew formula the macOS graph links: its name, the pkg-config file and header a copied prefix must hold, and
+/// the version floor.
+const BrewDep = struct { name: []const u8, pc: []const u8, header: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
     // mlx + mlx-c are NOT brew deps anymore: they are pinned submodules built
     // by scripts/build-mlx.sh (see addMlxLib) so the NAX kernels ship enabled.
-    .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
+    .{ .name = "webp", .pc = "libwebp", .header = "webp/decode.h", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 
-fn verifyBrewDeps(b: *std.Build, brew_prefix: []const u8) void {
-    if (!std.mem.eql(u8, brew_prefix, "/opt/homebrew")) {
-        // A copied prefix has no `brew`: the headers must be there, the version is the copy's.
-        for (required_brew_deps) |dep| {
-            const header = b.fmt("{s}/include/{s}/decode.h", .{ brew_prefix, dep.name });
-            std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch {
-                std.debug.print("\n[mlx-serve] -Dbrew-prefix={s}: {s} not found\n\n", .{ brew_prefix, header });
-                std.process.exit(1);
-            };
+/// `-Dwebp-prefix=<dir>`: the copy must hold each dependency's header and its pkg-config file, whose `Version:` line
+/// meets the same floor the Homebrew check applies.
+fn verifyCopiedDeps(b: *std.Build, dir: []const u8) void {
+    for (required_brew_deps) |dep| {
+        const header = b.fmt("{s}/include/{s}", .{ dir, dep.header });
+        std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch {
+            std.debug.print("\n[mlx-serve] -Dwebp-prefix={s}: {s} not found\n\n", .{ dir, header });
+            std.process.exit(1);
+        };
+        const pc_path = b.fmt("{s}/lib/pkgconfig/{s}.pc", .{ dir, dep.pc });
+        const pc = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pc_path, b.allocator, .limited(16 * 1024)) catch {
+            std.debug.print("\n[mlx-serve] -Dwebp-prefix={s}: {s} not found (the copy must include lib/pkgconfig)\n\n", .{ dir, pc_path });
+            std.process.exit(1);
+        };
+        var ver_str: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, pc, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "Version:")) ver_str = std.mem.trim(u8, line["Version:".len..], " \t\r");
         }
-        return;
+        const have = std.SemanticVersion.parse(ver_str orelse "") catch {
+            std.debug.print("[mlx-serve] cannot read '{s}' version from {s}\n", .{ dep.name, pc_path });
+            std.process.exit(1);
+        };
+        if (have.order(dep.min) == .lt) {
+            std.debug.print(
+                "\n[mlx-serve] -Dwebp-prefix={s}: '{s}' is {d}.{d}.{d}; need >= {d}.{d}.{d}\n\n",
+                .{ dir, dep.name, have.major, have.minor, have.patch, dep.min.major, dep.min.minor, dep.min.patch },
+            );
+            std.process.exit(1);
+        }
     }
+}
+
+fn verifyBrewDeps(b: *std.Build) void {
     for (required_brew_deps) |dep| {
         var code: u8 = undefined;
         const stdout = b.runAllowFail(
