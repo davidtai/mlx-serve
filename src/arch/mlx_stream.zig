@@ -78,6 +78,8 @@ fn parse(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig) !Parsed
     };
     errdefer vt.free_config(gpa, cfg);
     try applySettings(arena.allocator(), io, vt, cfg, config);
+    // The `lib/mlx-stream` pin predates the hook (SDK 2.1).
+    noteMaxOutput(dir, if (@hasField(sdk.Arch, "max_output")) if (vt.max_output) |f| f(cfg) else null else null);
     return .{ .vt = vt, .cfg = cfg };
 }
 
@@ -111,9 +113,46 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
     return p.vt.load_bytes(gpa, io, p.cfg, &f, server.staticGpuMemoryCeiling());
 }
 
-/// Positions a request may span: the prompts the load bills and the generation past them.
+/// Positions a request may span: the prompts the load bills and the generation past them (the arch's `maxOutput`).
 pub fn contextLength(config: *const ModelConfig) u32 {
-    return @intCast(billedContext(config) + plugin.generation_headroom);
+    return @intCast(billedContext(config) + maxOutputOf(config.plugin_dir.?));
+}
+
+/// The arch's `maxOutput` (SDK 2.1) per pack, as the pack's last parse read it with the model's settings (the load's
+/// preflight and its open), for `contextLength`. A pthread mutex, not `std.Io.Mutex`: `contextLength` runs on
+/// connection threads that carry no `Io` (log.zig's sink mutex, the same reason).
+const max_output_slots = 4;
+var max_output_mu: std.c.pthread_mutex_t = .{};
+var max_output_keys: [max_output_slots]u64 = @splat(0);
+var max_output_values: [max_output_slots]u64 = @splat(0);
+var max_output_next: usize = 0;
+
+fn packKey(dir: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, dir) | 1;
+}
+
+/// Records the arch's `maxOutput` for the pack at `dir` (null: the arch declares none, the plugin's headroom).
+pub fn noteMaxOutput(dir: []const u8, value: ?u64) void {
+    const key = packKey(dir);
+    _ = std.c.pthread_mutex_lock(&max_output_mu);
+    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
+    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse blk: {
+        const at = max_output_next;
+        max_output_next = (max_output_next + 1) % max_output_slots;
+        break :blk at;
+    };
+    max_output_keys[i] = key;
+    max_output_values[i] = value orelse plugin.generation_headroom;
+}
+
+/// The generation past the billed context a request of the pack at `dir` may take: the arch's `maxOutput` its last
+/// parse recorded; the plugin's `generation_headroom` for a pack not parsed yet.
+fn maxOutputOf(dir: []const u8) u64 {
+    const key = packKey(dir);
+    _ = std.c.pthread_mutex_lock(&max_output_mu);
+    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
+    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse return plugin.generation_headroom;
+    return max_output_values[i];
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, config: *const ModelConfig) !*Model {
@@ -236,6 +275,28 @@ pub fn round(m: *Model, gpa: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk
 }
 
 const testing = std.testing;
+
+test "mlx_stream: a request spans the billed context and the arch's maxOutput (GLM-5.3: 131,072), the plugin's headroom only without one" {
+    // GLM-5.3's arch declares its generation (`maxOutput` of its default config).
+    const glm_max: ?u64 = inline for (arch_decls, 0..) |T, i| {
+        if (comptime @hasField(sdk.Arch, "max_output") and @hasDecl(T, "maxOutput")) if (std.mem.eql(u8, tables[i].name, "glm_moe_dsa")) {
+            const cfg: T.Config = .{};
+            break tables[i].max_output.?(&cfg);
+        };
+    } else null;
+    try testing.expectEqual(@as(?u64, 131072), glm_max);
+    noteMaxOutput("/packs/glm-5.3", glm_max);
+    var config: ModelConfig = .{ .model_type = "glm_moe_dsa", .plugin_dir = "/packs/glm-5.3", .ctx_override = 16448 };
+    try testing.expectEqual(@as(u32, 16448 + 131072), contextLength(&config));
+    // The coding workload's 16,387-token prompt and max_tokens 131,072 fit whole.
+    try testing.expect(16387 + 131072 <= contextLength(&config));
+    // An arch without the hook, and a pack not parsed yet: the plugin's headroom.
+    noteMaxOutput("/packs/dsv41", null);
+    config.plugin_dir = "/packs/dsv41";
+    try testing.expectEqual(@as(u32, @intCast(16448 + plugin.generation_headroom)), contextLength(&config));
+    config.plugin_dir = "/packs/unparsed";
+    try testing.expectEqual(@as(u32, @intCast(16448 + plugin.generation_headroom)), contextLength(&config));
+}
 
 test "mlx_stream: every arch of the plugin claims its own model_type, and nothing claims another" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

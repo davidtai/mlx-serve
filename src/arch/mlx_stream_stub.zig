@@ -27,6 +27,8 @@ pub fn contextLength(_: *const ModelConfig) u32 {
     return 0;
 }
 
+pub fn noteMaxOutput(_: []const u8, _: ?u64) void {}
+
 pub fn open(_: std.mem.Allocator, _: std.Io, _: mlx.mlx_stream, config: *const ModelConfig) !*Model {
     return refuse(config);
 }

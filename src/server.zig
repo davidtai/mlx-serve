@@ -19847,6 +19847,15 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
     try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 4000, 0));
 }
 
+test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps all of it: the arch's maxOutput, not the plugin's 8,192" {
+    if (comptime !mlx_stream.built) return error.SkipZigTest;
+    // The pack's parse records its arch's maxOutput (GLM-5.3's default, 131,072) beside its billed context.
+    mlx_stream.noteMaxOutput("/packs/glm-5.3-clamp", 131072);
+    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .plugin_dir = "/packs/glm-5.3-clamp", .ctx_override = 16448 };
+    try testing.expectEqual(@as(u32, 16448 + 131072), getEffectiveContextLength(&config));
+    try testing.expectEqual(@as(u32, 131072), clampMaxTokens(131072, 16387, getEffectiveContextLength(&config)));
+}
+
 test "getEffectiveContextLength uses ctx_size override" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
