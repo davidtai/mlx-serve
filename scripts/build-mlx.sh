@@ -46,7 +46,10 @@ PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
 MLX_SC_PATCH="$REPO_ROOT/patches/mlx-alloc-size-classes.patch"
 MLXC_SC_PATCH="$REPO_ROOT/patches/mlxc-alloc-size-classes.patch"
 SC_SHA="$(cat "$MLX_SC_PATCH" "$MLXC_SC_PATCH" | shasum | cut -c1-12)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA sizeclasses=$SC_SHA target=$DEPLOYMENT_TARGET"
+# qmm_t_nax holds its weight tile in two threadgroup buffers (mlx's Metal kernels).
+MLX_QMM_PATCH="$REPO_ROOT/patches/mlx-qmm-nax-db.patch"
+QMM_SHA="$(shasum "$MLX_QMM_PATCH" | cut -c1-12)"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA sizeclasses=$SC_SHA qmmdb=$QMM_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -74,10 +77,13 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
-# The allocator's size-class switch (off unless a caller sets it). The files the
-# patch touches are reset first, as for the mlx-c patch below.
-git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_SC_PATCH" | cut -f3)
+# The allocator's size-class switch (off unless a caller sets it), then the
+# qmm_t_nax weight tile in two buffers. The files the patches touch are reset
+# first, as for the mlx-c patch below.
+git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_SC_PATCH" | cut -f3) \
+  $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_QMM_PATCH" | cut -f3)
 git -C "$MLX_SRC" apply -p1 "$MLX_SC_PATCH"
+git -C "$MLX_SRC" apply -p1 "$MLX_QMM_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
