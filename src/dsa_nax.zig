@@ -302,16 +302,25 @@ const SPARSE_NAX_SOURCE =
     \\    };
     \\
     \\    const int n_tiles = (TOPK + BK - 1) / BK;
-    \\    stage(0, 0);
+    \\#ifdef MSV_DSA_SPLIT
+    \\    // Split z of the (query, half) takes tiles [t_lo, t_hi); msv_dsa_sparse_merge joins the splits.
+    \\    const int per = (n_tiles + int(threadgroups_per_grid.z) - 1) / int(threadgroups_per_grid.z);
+    \\    const int t_lo = min(n_tiles, int(threadgroup_position_in_grid.z) * per);
+    \\    const int t_hi = min(n_tiles, t_lo + per);
+    \\#else
+    \\    const int t_lo = 0;
+    \\    const int t_hi = n_tiles;
+    \\#endif
+    \\    stage(t_lo, 0);
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (int t = 0; t < n_tiles; ++t) {
-    \\        const int buf = t & 1;
+    \\    for (int t = t_lo; t < t_hi; ++t) {
+    \\        const int buf = (t - t_lo) & 1;
     \\        const int tile_keys = min(BK, TOPK - t * BK);
     \\        // Unused slots sort last in the indexer's top-k rows: skip tiles
     \\        // with no live key (uniform across the threadgroup).
     \\        if ((live[buf][0] | live[buf][1] | live[buf][2] | live[buf][3]) == 0) {
     \\            threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\            if (t + 1 < n_tiles) {
+    \\            if (t + 1 < t_hi) {
     \\                stage(t + 1, buf ^ 1);
     \\            }
     \\            threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -399,7 +408,7 @@ const SPARSE_NAX_SOURCE =
     \\            red_max[hg][j4][fm + 8] = pmx[1];
     \\        }
     \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        if (t + 1 < n_tiles) {
+    \\        if (t + 1 < t_hi) {
     \\            stage(t + 1, buf ^ 1);
     \\        }
     \\
@@ -516,6 +525,26 @@ const SPARSE_NAX_SOURCE =
     \\        }
     \\    }
     \\
+    \\#ifdef MSV_DSA_SPLIT
+    \\    // The split's unnormalized O and its running max and sum, per (head, query, split) row.
+    \\    for (short i = 0; i < 2; ++i) {
+    \\        const ulong row = (ulong(head0 + fm + i * 8) * L + qi) * threadgroups_per_grid.z + threadgroup_position_in_grid.z;
+    \\        device float* orow = pacc + row * D + j4 * 128 + fn;
+    \\        for (short tn = 0; tn < 2; ++tn) {
+    \\            for (short j = 0; j < 4; ++j) {
+    \\                const short e = tn * 8 + i * 4 + j;
+    \\                orow[tn * 16 + j] = o0[e];
+    \\                orow[32 + tn * 16 + j] = o1[e];
+    \\                orow[64 + tn * 16 + j] = o2[e];
+    \\                orow[96 + tn * 16 + j] = o3[e];
+    \\            }
+    \\        }
+    \\        if (j4 == 0 && row_writer) {
+    \\            pm[row] = m_run[i];
+    \\            pl[row] = l_run[i];
+    \\        }
+    \\    }
+    \\#else
     \\    for (short i = 0; i < 2; ++i) {
     \\        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + j4 * 128 + fn;
     \\        const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
@@ -529,30 +558,85 @@ const SPARSE_NAX_SOURCE =
     \\            }
     \\        }
     \\    }
+    \\#endif
+;
+
+/// The splits of `SPARSE_NAX_SOURCE` under MSV_DSA_SPLIT joined: per (head, query) row, the splits' O weighted by
+/// exp2(m - max m) over their weighted sums (a split no live key reached has l = 0); 128 threads of 4 dims a row.
+const SPARSE_MERGE_SOURCE =
+    \\    constexpr int D = 512;
+    \\    const int d4 = int(thread_position_in_threadgroup.x);
+    \\    const ulong row = threadgroup_position_in_grid.y;
+    \\    const int ns = params[0];
+    \\    float M = -FLT_MAX;
+    \\    for (int j = 0; j < ns; ++j) {
+    \\        if (pl[row * ns + j] > 0.0f) {
+    \\            M = max(M, pm[row * ns + j]);
+    \\        }
+    \\    }
+    \\    float Z = 0.0f;
+    \\    float4 acc = float4(0.0f);
+    \\    for (int j = 0; j < ns; ++j) {
+    \\        const float lj = pl[row * ns + j];
+    \\        if (lj > 0.0f) {
+    \\            const float e = fast::exp2(pm[row * ns + j] - M);
+    \\            Z += lj * e;
+    \\            acc += e * ((const device float4*)(pacc + (row * ns + j) * D))[d4];
+    \\        }
+    \\    }
+    \\    const float4 o = Z > 0.0f ? acc / Z : float4(0.0f);
+    \\    ((device vec<T, 4>*)(out + row * D))[d4] = vec<T, 4>(o);
 ;
 
 var sparse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var sparse_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var sparse_rope_split_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var sparse_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var sparse_engaged = false;
 var sparse_rope_engaged = false;
+var sparse_split_engaged = false;
+
+/// Threadgroups a roped call aims for: one whose (query, half) pairs are fewer splits each pair's tiles.
+const SPLIT_TARGET_TGS: c_int = 128;
 
 /// `sparseLatentAttention` (glm5_next) on the tensor units, for queries at the LAST rows of
 /// `latent`: `q_abs` [1, H, L, 512], `latent` [1, 1, K, 512], `idx` int32 [1, L, W]. An unused
 /// slot is -1 and unused pools sort last, so whole tiles skip. Null off the GPU or outside the
 /// shape; the caller checks the device has NAX.
 pub fn sparseLatent(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    return sparse(s, q_abs, null, latent, null, idx, scale);
+    return sparse(s, q_abs, null, latent, null, idx, scale, null);
 }
 
 /// `sparseLatent` with a roped part (DeepSeek-V3.2's MLA, GLM-5.3): each score adds the
 /// query's roped part against the selected row's roped key, `q_lat . kv + q_pe . k_pe`, the
 /// values the latent rows. `q_pe` [1, H, L, 64], `k_pe` [1, 1, K, 64]. P meets the values as
-/// one fp16 piece.
+/// one fp16 piece. A call of few rows splits each row's keys (`sparseSplits`) and merges.
 pub fn sparseLatentRope(s: mlx.mlx_stream, q_lat: mlx.mlx_array, q_pe: mlx.mlx_array, latent: mlx.mlx_array, k_pe: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale);
+    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale, null);
 }
 
-fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+/// Splits of each (query, half)'s 128-key tiles for a roped call of `l` rows, `h` heads and `w` slots: 1 where the
+/// pairs reach `SPLIT_TARGET_TGS`, else enough to reach it, at least one tile each.
+fn sparseSplits(l: c_int, h: c_int, w: c_int) c_int {
+    const pairs = l * @divExact(h, 32);
+    if (pairs >= SPLIT_TARGET_TGS) return 1;
+    return @max(1, @min(@divTrunc(w + 127, 128), @divTrunc(SPLIT_TARGET_TGS + pairs - 1, pairs)));
+}
+
+fn kernelOf(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
+    if (slot.*) |k| return k;
+    const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, header, true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    slot.* = k;
+    return k;
+}
+
+/// `splits_override` (tests): the roped form's splits instead of `sparseSplits`'.
+fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32, splits_override: ?c_int) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     const qs = mlx.getShape(q_abs);
     const ls = mlx.getShape(latent);
@@ -575,24 +659,15 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
         if (ks.len != 4 or ks[0] != 1 or ks[1] != 1 or ks[2] != k or ks[3] != 64) return null;
         if (mlx.mlx_array_dtype(q_pe.?) != dt or mlx.mlx_array_dtype(k_pe.?) != dt) return null;
     }
-    const slot = if (rope) &sparse_rope_kernel else &sparse_kernel;
-    const kern = slot.* orelse blk: {
-        const ins_plain = [_][*:0]const u8{ "q", "kv", "idx", "params", "scale" };
-        const ins_rope = [_][*:0]const u8{ "q", "qpe", "kv", "pe", "idx", "params", "scale" };
-        const ins: []const [*:0]const u8 = if (rope) &ins_rope else &ins_plain;
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = if (rope)
-            mlx.mlx_fast_metal_kernel_new("msv_dsa_sparse_mla_rope_nax", iv, ov, "#define MSV_DSA_ROPE\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
-        else
-            mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, "#define MSV_DSA_TWO_P\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
-        if (kn.ctx == null) return error.MetalKernelCompileFailed;
-        slot.* = kn;
-        break :blk kn;
-    };
+    const ns: c_int = if (rope) (splits_override orelse sparseSplits(l, h, w)) else 1;
+    const ins_plain = [_][*:0]const u8{ "q", "kv", "idx", "params", "scale" };
+    const ins_rope = [_][*:0]const u8{ "q", "qpe", "kv", "pe", "idx", "params", "scale" };
+    const kern = if (!rope)
+        try kernelOf(&sparse_kernel, "msv_glm5_sparse_mla_nax", &ins_plain, &.{"out"}, "#define MSV_DSA_TWO_P\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER)
+    else if (ns == 1)
+        try kernelOf(&sparse_rope_kernel, "msv_dsa_sparse_mla_rope_nax", &ins_rope, &.{"out"}, "#define MSV_DSA_ROPE\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER)
+    else
+        try kernelOf(&sparse_rope_split_kernel, "msv_dsa_sparse_mla_rope_split_nax", &ins_rope, &.{ "pacc", "pm", "pl" }, "#define MSV_DSA_ROPE\n#define MSV_DSA_SPLIT\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER);
     var arrays: [7]mlx.mlx_array = undefined;
     var n: usize = 0;
     defer for (arrays[0..n]) |x| {
@@ -615,8 +690,15 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
 
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ h, l, 512 }, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * 256, @divExact(h, 32), 1));
+    const rows = h * l * ns;
+    if (ns == 1) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ h, l, 512 }, 3, dt));
+    } else {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, 512 }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{rows}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{rows}, 1, .float32));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * 256, @divExact(h, 32), ns));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     const iv = mlx.mlx_vector_array_new_data(&arrays, n);
@@ -624,17 +706,54 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
-    var o3 = mlx.mlx_array_new();
+    const o3 = if (ns == 1) blk: {
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_vector_array_get(&o, ov, 0));
+        break :blk o;
+    } else try merge(s, ov, ns, h * l, dt);
     defer _ = mlx.mlx_array_free(o3);
-    try mlx.check(mlx.mlx_vector_array_get(&o3, ov, 0));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, o3, &[_]c_int{ 1, h, l, 512 }, 4, s));
-    const engaged = if (rope) &sparse_rope_engaged else &sparse_engaged;
+    const engaged = if (!rope) &sparse_engaged else if (ns == 1) &sparse_rope_engaged else &sparse_split_engaged;
     if (!engaged.*) {
         engaged.* = true;
-        log.info("[dsa] NAX sparse latent attention{s} engaged\n", .{if (rope) " (roped part)" else ""});
+        log.info("[dsa] NAX sparse latent attention{s} engaged\n", .{if (!rope) "" else if (ns == 1) " (roped part)" else " (roped part, keys split per row)"});
     }
+    return out;
+}
+
+/// The split form's outputs `parts` (pacc, pm, pl) of `ns` splits per row merged: [rows, 512] in `dt`.
+fn merge(s: mlx.mlx_stream, parts: mlx.mlx_vector_array, ns: c_int, rows: c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
+    const kern = try kernelOf(&sparse_merge_kernel, "msv_dsa_sparse_merge", &.{ "pacc", "pm", "pl", "params" }, &.{"out"}, SPARSE_MERGE_SOURCE, "");
+    var ins: [4]mlx.mlx_array = undefined;
+    var n: usize = 0;
+    defer for (ins[0..n]) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    for (0..3) |i| {
+        ins[n] = mlx.mlx_array_new();
+        n += 1;
+        try mlx.check(mlx.mlx_vector_array_get(&ins[n - 1], parts, i));
+    }
+    const pdata = [1]i32{ns};
+    ins[n] = mlx.mlx_array_new_data(&pdata, &[_]c_int{1}, 1, .int32);
+    n += 1;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, 512 }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128, rows, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const iv = mlx.mlx_vector_array_new_data(&ins, n);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
 }
 
@@ -670,7 +789,65 @@ test "dsa sparse latent attention with a roped part equals the latent attention 
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     // The second shape's 4 index slots are bound as a constant array.
-    for ([_][4]c_int{ .{ 64, 300, 40, 260 }, .{ 32, 5, 1, 4 } }) |dims| try checkSparseRope(dims[0], dims[1], dims[2], dims[3]);
+    // The third: a verify's 4 rows over 2,048 slots, each row's keys split (`sparseSplits`).
+    for ([_][4]c_int{ .{ 64, 300, 40, 260 }, .{ 32, 5, 1, 4 }, .{ 64, 3000, 4, 2048 } }) |dims| try checkSparseRope(dims[0], dims[1], dims[2], dims[3]);
+}
+
+test "dsa sparse latent attention: a call of few rows split per row equals the one-pass form within a bf16 ulp of each row's scale" {
+    if (mlx.noGpuBackend() or !@import("transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(29);
+    const rand = prng.random();
+    // a decode row and a verify's 4 at 2,048 slots over 16,384 keys, and 3 rows over 600 slots (5 splits of a tile)
+    for ([_][3]c_int{ .{ 16384, 1, 2048 }, .{ 16384, 4, 2048 }, .{ 900, 3, 600 } }) |dims| {
+        const k = dims[0];
+        const l = dims[1];
+        const w = dims[2];
+        try testing.expect(sparseSplits(l, 64, w) > 1);
+        const q = try testArray(alloc, rand, &.{ 1, 64, l, 512 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const qp = try testArray(alloc, rand, &.{ 1, 64, l, 64 }, s);
+        defer _ = mlx.mlx_array_free(qp);
+        const lat = try testArray(alloc, rand, &.{ 1, 1, k, 512 }, s);
+        defer _ = mlx.mlx_array_free(lat);
+        const kp = try testArray(alloc, rand, &.{ 1, 1, k, 64 }, s);
+        defer _ = mlx.mlx_array_free(kp);
+        const iv = try alloc.alloc(i32, @intCast(l * w));
+        defer alloc.free(iv);
+        for (0..@intCast(l)) |qi| {
+            const pos: i32 = k - l + @as(i32, @intCast(qi));
+            // the row's last quarter unused (-1, sorted last as the indexer's are): whole tiles, whole splits dead
+            for (0..@intCast(w)) |j| iv[qi * @as(usize, @intCast(w)) + j] = if (j * 4 >= @as(usize, @intCast(w)) * 3) -1 else rand.intRangeAtMost(i32, 0, pos);
+        }
+        const idx = mlx.mlx_array_new_data(iv.ptr, &[_]c_int{ 1, l, w }, 3, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+        const split = (try sparse(s, q, qp, lat, kp, idx, 0.0417, null)) orelse return error.SkipZigTest;
+        defer _ = mlx.mlx_array_free(split);
+        const one = (try sparse(s, q, qp, lat, kp, idx, 0.0417, 1)) orelse return error.SkipZigTest;
+        defer _ = mlx.mlx_array_free(one);
+        const a = try hostF32(split, s, alloc);
+        defer alloc.free(a);
+        const b = try hostF32(one, s, alloc);
+        defer alloc.free(b);
+        // per (head, row) output: the worst difference in bf16 ulps of the output's largest magnitude
+        var worst: f32 = 0;
+        var differ: usize = 0;
+        var r: usize = 0;
+        while (r < a.len) : (r += 512) {
+            var top: f32 = 0;
+            for (b[r..][0..512]) |y| top = @max(top, @abs(y));
+            for (a[r..][0..512], b[r..][0..512]) |x, y| {
+                try testing.expect(std.math.isFinite(x));
+                if (x != y) differ += 1;
+                worst = @max(worst, @abs(x - y) / @max(top / 128.0, 1e-30));
+            }
+        }
+        std.debug.print("[dsa nax split] {d} keys, {d} rows x {d} slots, {d} splits: {d} of {d} values differ, worst {d:.3} bf16 ulp of the row's scale\n", .{ k, l, w, sparseSplits(l, 64, w), differ, a.len, worst });
+        try testing.expect(worst <= 1.0);
+    }
 }
 
 fn checkSparseRope(h: c_int, k: c_int, l: c_int, w: c_int) !void {
