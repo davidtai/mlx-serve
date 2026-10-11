@@ -839,12 +839,14 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
     // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
     // event / alloc shims, which include the staged MLX's private headers and link libmlx.
     const csrc = b.pathJoin(&.{ dir, "csrc" });
-    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" };
     const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" }) }, .flags = c });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_event_shim.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" }) }, .flags = cxx });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" }) }, .flags = cxx });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" }) }, .flags = cxx });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-fno-objc-arc" } });
     m.addIncludePath(.{ .cwd_relative = csrc });
     m.addIncludePath(b.path("lib/mlx/include"));
     m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
