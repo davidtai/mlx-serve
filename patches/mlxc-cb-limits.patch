@@ -1,0 +1,48 @@
+diff --git a/mlx/c/metal.cpp b/mlx/c/metal.cpp
+index 46d8034..120ae66 100644
+--- a/mlx/c/metal.cpp
++++ b/mlx/c/metal.cpp
+@@ -26,6 +26,22 @@ extern "C" int mlx_metal_start_capture(const char* path) {
+   }
+   return 0;
+ }
++extern "C" int mlx_metal_set_command_buffer_limits(
++    int* old_max_ops,
++    int* old_max_mb,
++    int max_ops,
++    int max_mb) {
++  try {
++    auto [ops, mb] =
++        mlx::core::metal::set_command_buffer_limits(max_ops, max_mb);
++    *old_max_ops = ops;
++    *old_max_mb = mb;
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+ extern "C" int mlx_metal_stop_capture(void) {
+   try {
+     mlx::core::metal::stop_capture();
+diff --git a/mlx/c/metal.h b/mlx/c/metal.h
+index 5877b22..a0da86d 100644
+--- a/mlx/c/metal.h
++++ b/mlx/c/metal.h
+@@ -31,6 +31,16 @@ extern "C" {
+ int mlx_metal_is_available(bool* res);
+ int mlx_metal_start_capture(const char* path);
+ int mlx_metal_stop_capture(void);
++/**
++ * Sets the op count and the MB of inputs past which the GPU stream's command
++ * buffer is committed (a value <= 0 keeps that limit); the previous limits in
++ * `old_max_ops` and `old_max_mb`.
++ */
++int mlx_metal_set_command_buffer_limits(
++    int* old_max_ops,
++    int* old_max_mb,
++    int max_ops,
++    int max_mb);
+ 
+ /**@}*/
+ 

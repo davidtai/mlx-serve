@@ -49,7 +49,11 @@ SC_SHA="$(cat "$MLX_SC_PATCH" "$MLXC_SC_PATCH" | shasum | cut -c1-12)"
 # qmm_t_nax holds its weight tile in two threadgroup buffers (mlx's Metal kernels).
 MLX_QMM_PATCH="$REPO_ROOT/patches/mlx-qmm-nax-db.patch"
 QMM_SHA="$(shasum "$MLX_QMM_PATCH" | cut -c1-12)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA sizeclasses=$SC_SHA qmmdb=$QMM_SHA target=$DEPLOYMENT_TARGET"
+# The command buffer limits' setter (mlx_metal_set_command_buffer_limits): mlx and mlx-c.
+MLX_CB_PATCH="$REPO_ROOT/patches/mlx-cb-limits.patch"
+MLXC_CB_PATCH="$REPO_ROOT/patches/mlxc-cb-limits.patch"
+CB_SHA="$(cat "$MLX_CB_PATCH" "$MLXC_CB_PATCH" | shasum | cut -c1-12)"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA sizeclasses=$SC_SHA qmmdb=$QMM_SHA cblimits=$CB_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -77,13 +81,16 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
-# The allocator's size-class switch (off unless a caller sets it), then the
-# qmm_t_nax weight tile in two buffers. The files the patches touch are reset
-# first, as for the mlx-c patch below.
+# The allocator's size-class switch (off unless a caller sets it), the
+# qmm_t_nax weight tile in two buffers, then the command buffer limits' setter
+# (today's limits unless a caller sets them). The files the patches touch are
+# reset first, as for the mlx-c patch below.
 git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_SC_PATCH" | cut -f3) \
-  $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_QMM_PATCH" | cut -f3)
+  $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_QMM_PATCH" | cut -f3) \
+  $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_CB_PATCH" | cut -f3)
 git -C "$MLX_SRC" apply -p1 "$MLX_SC_PATCH"
 git -C "$MLX_SRC" apply -p1 "$MLX_QMM_PATCH"
+git -C "$MLX_SRC" apply -p1 "$MLX_CB_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -100,9 +107,11 @@ cmake --install "$BUILD_ROOT/mlx" >/dev/null
 # the patch touches are reset first, so an edited patch replaces the old one;
 # local edits anywhere else in the submodule are kept.
 git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3) \
-  $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_SC_PATCH" | cut -f3)
+  $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_SC_PATCH" | cut -f3) \
+  $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_CB_PATCH" | cut -f3)
 git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
 git -C "$MLXC_SRC" apply -p1 "$MLXC_SC_PATCH"
+git -C "$MLXC_SRC" apply -p1 "$MLXC_CB_PATCH"
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \

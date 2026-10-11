@@ -1,0 +1,105 @@
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 2d2228335..54635f7e2 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <Metal/Metal.hpp>
+ #include <functional>
+ #include <mutex>
+@@ -162,7 +164,21 @@ class MLX_API Device {
+     return arch_gen_;
+   }
+   std::tuple<int, int> get_max_ops_mb_per_buffer() const {
+-    return std::make_tuple(max_ops_per_buffer_, max_mb_per_buffer_);
++    return std::make_tuple(
++        max_ops_per_buffer_.load(std::memory_order_relaxed),
++        max_mb_per_buffer_.load(std::memory_order_relaxed));
++  }
++  // The limits a command buffer is committed at (`metal::set_command_buffer_limits`);
++  // a value <= 0 keeps that limit. Returns the previous limits.
++  std::tuple<int, int> set_max_ops_mb_per_buffer(int max_ops, int max_mb) {
++    auto prev = get_max_ops_mb_per_buffer();
++    if (max_ops > 0) {
++      max_ops_per_buffer_.store(max_ops, std::memory_order_relaxed);
++    }
++    if (max_mb > 0) {
++      max_mb_per_buffer_.store(max_mb, std::memory_order_relaxed);
++    }
++    return prev;
+   }
+ 
+   MTL::Library* get_library(
+@@ -244,8 +260,8 @@ class MLX_API Device {
+       library_kernels_;
+   std::string arch_;
+   int arch_gen_;
+-  int max_ops_per_buffer_;
+-  int max_mb_per_buffer_;
++  std::atomic<int> max_ops_per_buffer_;
++  std::atomic<int> max_mb_per_buffer_;
+ };
+ 
+ MLX_API Device& device(mlx::core::Device);
+diff --git a/mlx/backend/metal/metal.cpp b/mlx/backend/metal/metal.cpp
+index e95b6f0b9..cf219abe8 100644
+--- a/mlx/backend/metal/metal.cpp
++++ b/mlx/backend/metal/metal.cpp
+@@ -56,6 +56,12 @@ void set_metallib_path(const std::string& path) {
+   g_metallib_path = path;
+ }
+ 
++std::pair<int, int> set_command_buffer_limits(int max_ops, int max_mb) {
++  auto [ops, mb] = metal::device(mlx::core::Device::gpu)
++                       .set_max_ops_mb_per_buffer(max_ops, max_mb);
++  return {ops, mb};
++}
++
+ const std::string& get_metallib_path() {
+   return g_metallib_path;
+ }
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+index d686c2971..b6aa878e8 100644
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -4,6 +4,7 @@
+ 
+ #include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <variant>
+ 
+ #include "mlx/api.h"
+@@ -27,4 +28,13 @@ MLX_API const
+ MLX_API void set_metallib_path(const std::string& path);
+ MLX_API const std::string& get_metallib_path();
+ 
++/* Set the limits at which the GPU stream's command buffer is committed: more
++ * than `max_ops` ops, or more than `max_mb` MB of their inputs (by default 40
++ * to 50 of each, by GPU class, or MLX_MAX_OPS_PER_BUFFER and
++ * MLX_MAX_MB_PER_BUFFER). A value <= 0 keeps that limit. The kernels and their
++ * order are the same at any limit; only the buffers they are committed in
++ * change. Returns the previous limits. Without Metal this is a no-op.
++ * */
++MLX_API std::pair<int, int> set_command_buffer_limits(int max_ops, int max_mb);
++
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+index 3b72ad005..90582c84c 100644
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -23,6 +23,10 @@ device_info() {
+ 
+ void set_metallib_path(const std::string& path) {}
+ 
++std::pair<int, int> set_command_buffer_limits(int, int) {
++  return {0, 0};
++}
++
+ const std::string& get_metallib_path() {
+   throw std::runtime_error(
+       "[metal::get_metallib_path] Cannot get metallib path without metal backend");
