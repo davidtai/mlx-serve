@@ -481,6 +481,8 @@ pub extern "c" fn mlx_clear_cache() c_int;
 pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
+/// The allocator rounds requests of 1 MB or more up to a size class while on (patches/mlx-alloc-size-classes.patch).
+pub extern "c" fn mlx_set_alloc_size_classes(res: *bool, on: bool) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
