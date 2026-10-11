@@ -223,6 +223,9 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     mod.linkSystemLibrary("webp", .{});
+    // A copied prefix's dylibs carry @rpath install names (Homebrew's carry its absolute path): the artifact finds
+    // them in the copy at run time, the bundle in its own lib/.
+    if (webp_prefix) |dir| mod.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{dir}) });
 
     if (macos_sdk_frameworks) |fw_path| {
         mod.addFrameworkPath(.{ .cwd_relative = fw_path });
@@ -290,6 +293,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
     test_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     test_mod.linkSystemLibrary("webp", .{});
+    if (webp_prefix) |dir| test_mod.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{dir}) });
 
     if (macos_sdk_frameworks) |fw_path| {
         test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
