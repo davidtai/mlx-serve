@@ -52,8 +52,11 @@ pub fn build(b: *std.Build) void {
         break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
     };
 
+    // Where webp's headers and libraries are: Homebrew's prefix, or a directory holding a copy of them (a box
+    // without Homebrew). With a directory given, the version check reads the header's presence, not `brew`.
+    const brew_prefix = b.option([]const u8, "brew-prefix", "Prefix holding include/webp and lib/libwebp (default /opt/homebrew)") orelse "/opt/homebrew";
     if (target.result.os.tag == .macos) {
-        verifyBrewDeps(b);
+        verifyBrewDeps(b, brew_prefix);
         verifyMlxStage(b);
     }
 
@@ -164,7 +167,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/include/webp/decode.h", .{brew_prefix}) }, .{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) }, target, optimize, "") },
         },
     });
 
@@ -215,8 +218,8 @@ pub fn build(b: *std.Build) void {
     // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
     addMlxLib(b, mod);
     // webp include/lib paths (homebrew)
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -259,7 +262,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/include/webp/decode.h", .{brew_prefix}) }, .{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) }, target, optimize, "") },
         },
     });
 
@@ -282,8 +285,8 @@ pub fn build(b: *std.Build) void {
     addMlxStreamModule(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
-    test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    test_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
+    test_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     test_mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -353,7 +356,7 @@ pub fn build(b: *std.Build) void {
     //    zig-out/ios/<sdk>/lib. `-Dios-include=<dir>` points at the iOS dist's
     //    include dir for third-party headers (webp); defaults to Homebrew's,
     //    whose versions are pinned identical by verifyBrewDeps.
-    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
+    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse b.fmt("{s}/include", .{brew_prefix});
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
 }
@@ -1069,7 +1072,18 @@ const required_brew_deps = [_]BrewDep{
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 
-fn verifyBrewDeps(b: *std.Build) void {
+fn verifyBrewDeps(b: *std.Build, brew_prefix: []const u8) void {
+    if (!std.mem.eql(u8, brew_prefix, "/opt/homebrew")) {
+        // A copied prefix has no `brew`: the headers must be there, the version is the copy's.
+        for (required_brew_deps) |dep| {
+            const header = b.fmt("{s}/include/{s}/decode.h", .{ brew_prefix, dep.name });
+            std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch {
+                std.debug.print("\n[mlx-serve] -Dbrew-prefix={s}: {s} not found\n\n", .{ brew_prefix, header });
+                std.process.exit(1);
+            };
+        }
+        return;
+    }
     for (required_brew_deps) |dep| {
         var code: u8 = undefined;
         const stdout = b.runAllowFail(
