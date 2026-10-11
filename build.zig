@@ -330,6 +330,19 @@ pub fn build(b: *std.Build) void {
         conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
         b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
     }
+    {
+        // lib/sushi's EXL3 module's own tests over the host surface it imports (`mlx_host`): their binary, outside
+        // `zig build test` (they build GPU banks of their own).
+        const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
+        addMlxLib(b, host);
+        if (macos_sdk_frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
+        for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
+        // The test's root is the module the host imports as `sushi_exl3` (one module, as in the served build).
+        const exl3 = b.createModule(.{ .root_source_file = exl3Root(b), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "mlx_host", .module = host }} });
+        host.addImport("sushi_exl3", exl3);
+        const t = b.addTest(.{ .name = "sushi-exl3-test", .root_module = exl3, .filters = if (test_filter) |f| &.{f} else &.{} });
+        b.step("sushi-exl3-test", "Run lib/sushi's EXL3 module tests").dependOn(&b.addRunArtifact(t).step);
+    }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //

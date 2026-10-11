@@ -12,8 +12,8 @@
 	url = https://github.com/beamivalice/opencode2-mlx-serve
 [submodule "lib/sushi"]
 	path = lib/sushi
-	url = https://github.com/ddalcu/sushi
-	branch = exl3-module
+	url = https://github.com/davidtai/sushi
+	branch = fix/exl3-prefill-host-slots
 [submodule "lib/mlx-serve-gguf"]
 	path = lib/mlx-serve-gguf
 	url = https://github.com/ddalcu/mlx-serve-gguf
