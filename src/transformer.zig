@@ -17305,6 +17305,7 @@ pub const Transformer = struct {
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
         if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
+        if (config.glm_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
@@ -45808,7 +45809,7 @@ fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weig
     return t;
 }
 
-/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack or a MiMo stream pack): the plugin's module.
+/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3 pack): the plugin's module.
 fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const m = try mlx_stream_mod.open(allocator, io, s, &config);
     errdefer mlx_stream_mod.close(m);

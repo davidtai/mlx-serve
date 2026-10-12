@@ -5223,6 +5223,23 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    closeGlmModels(sch);
+}
+
+/// At shutdown, on the inference thread: GLM-5.3's module synchronizes its stream as it frees, and MLX finds that
+/// stream only on this thread, not on the one that joins it (`Scheduler.deinit`, where every other model unloads as
+/// before; "There is no Stream(gpu, 0) in current thread", mlx-c stream.cpp).
+fn closeGlmModels(sch: *Scheduler) void {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry| {
+        const x = entry.*.transformer orelse continue;
+        if (!x.config.glm_stream) continue;
+        const m = x.dsv41_ext orelse continue;
+        mlx_stream.close(m);
+        x.dsv41_ext = null;
+    }
 }
 
 /// Cleanup, vision and embed work, drained on the inference thread. Returns
@@ -6471,6 +6488,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
+    if (slot.model.transformer) |x| if (x.dsv41_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -8548,6 +8567,23 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
     try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
     try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "mlx-stream: GLM-5.3 closes on the inference thread after its loop; a request ends before its terminator" {
+    // A GLM-5.3 module freed from `Scheduler.deinit`'s thread fails MLX's stream lookup ("no Stream(gpu, 0) in current thread").
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const loop = std.mem.indexOf(u8, body, "if (chatPass(sch, .main) == .shutdown) break;") orelse return error.MissingLoop;
+    const close = std.mem.indexOf(u8, body, "closeGlmModels(sch);") orelse return error.MissingClose;
+    try testing.expect(loop < close);
+    const fin = std.mem.indexOf(u8, source, "fn finishSlot(") orelse return error.MissingFinishSlot;
+    const fin_end = std.mem.indexOfPos(u8, source, fin + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
+    const finish = source[fin..fin_end];
+    const ended = std.mem.indexOf(u8, finish, "mlx_stream.end(m);") orelse return error.MissingRequestEnd;
+    const published = std.mem.indexOf(u8, finish, "publishSlotTerminator(slot, reason, latched);") orelse return error.MissingTerminator;
+    try testing.expect(ended < published);
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {

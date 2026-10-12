@@ -335,7 +335,8 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
     /// deepseek_v41: the pack's directory, where its Engram tables sit beside
-    /// the weights; also a MiMo mlx-stream pack's (`mimo_stream`). Set by `parseConfig`.
+    /// the weights; also a MiMo or GLM-5.3 mlx-stream pack's (`mimo_stream`,
+    /// `glm_stream`). Set by `parseConfig`.
     dsv41_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
@@ -480,6 +481,9 @@ pub const ModelConfig = struct {
     /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     mimo_stream: bool = false,
+    /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
+    /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
+    glm_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1110,9 +1114,14 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
-    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack or a MiMo stream pack.
+    pub fn isGlmMoeDsa(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "glm_moe_dsa");
+    }
+
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
+    /// pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream;
+        return self.dsv41_stream or self.mimo_stream or self.glm_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1426,6 +1435,8 @@ pub const ModelConfig = struct {
         if (self.isGlm5()) return true;
         // deepseek_v41: DeepSeek's template defaults `thinking_mode` to thinking.
         if (self.isDsv41()) return true;
+        // glm_moe_dsa: the template opens `<think>` on every assistant turn, as glm5_next.
+        if (self.isGlmMoeDsa()) return true;
 
         return false;
     }
@@ -1604,6 +1615,17 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
         config.dsv41_dir = try allocator.dupe(u8, model_dir);
         config.mimo_stream = true;
+    }
+    if (config.isGlmMoeDsa()) {
+        // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
+        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
+        defer allocator.free(bank);
+        std.Io.Dir.accessAbsolute(io, bank, .{}) catch {
+            log.err("glm_moe_dsa: {s} has no experts.bin; GLM-5.3 runs only from an mlx-stream pack (the trunk beside an experts.bin bank)\n", .{model_dir});
+            return error.GlmMoeDsaNeedsExpertBank;
+        };
+        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.glm_stream = true;
     }
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
@@ -3904,6 +3926,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // Text-only: the vision tower is never loaded.
             config.has_vision = false;
             try parseDsv41Fields(cfg_obj, &config);
+        }
+    } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
+        // Z.ai GLM-5.3 (glm_moe_dsa), served only by mlx-stream (`parseConfig`). The
+        // host reads the shell fields the common block parsed: vocab, hidden, layers,
+        // eos ids, context, untied head.
+        config.model_type = "glm_moe_dsa";
+        config.has_sliding_window = false;
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = try jsonU32(v);
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
@@ -7107,6 +7138,45 @@ test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and th
     defer repack.deinit(testing.allocator);
     try testing.expect(repack.dsv41_stream);
     var w = try loadModelWeights(io, testing.allocator, dir, &repack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+const glm_moe_dsa_config =
+    \\{"architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa", "vocab_size": 154880,
+    \\ "hidden_size": 6144, "num_hidden_layers": 78, "num_attention_heads": 64, "num_key_value_heads": 64,
+    \\ "head_dim": 192, "max_position_embeddings": 1048576, "tie_word_embeddings": false, "n_routed_experts": 256,
+    \\ "eos_token_id": [154820, 154827, 154829],
+    \\ "quantization": {"group_size": 64, "bits": 4, "model.embed_tokens": {"group_size": 64, "bits": 8}}}
+;
+
+test "parseConfigFromJson glm_moe_dsa: the shell fields the host reads, its three eos ids, thinking on" {
+    const config = try parseConfigFromJson(testing.allocator, glm_moe_dsa_config);
+    try testing.expectEqualStrings("glm_moe_dsa", config.model_type);
+    try testing.expectEqual(@as(u32, 154880), config.vocab_size);
+    try testing.expectEqual(@as(u32, 6144), config.hidden_size);
+    try testing.expectEqual(@as(u32, 78), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expect(!config.tie_word_embeddings and !config.has_vision);
+    try testing.expectEqualSlices(u32, &.{ 154820, 154827, 154829 }, config.eos_token_ids[0..config.num_eos_tokens]);
+    try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
+}
+
+test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; without the bank it is refused by name" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm_moe_dsa_config });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try testing.expectError(error.GlmMoeDsaNeedsExpertBank, parseConfig(io, testing.allocator, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
+    try testing.expectEqualStrings(dir, pack.dsv41_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
 }

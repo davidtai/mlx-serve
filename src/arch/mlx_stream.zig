@@ -1,15 +1,18 @@
-//! The streaming packs on mlx-stream (`lib/mlx-stream`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`)
-//! and MiMo-V2.6-Flash's prepared MXFP4 pack (`ModelConfig.mimo_stream`). The plugin owns each arch, its kernels and
-//! the expert streamer, and loads its own weights; the host parses the config, renders the template, samples and
-//! schedules. The plugin exports one glue surface per arch (`arch`, `default_context`, `generation_headroom`): the
-//! root's for DeepSeek-V4.1, `mimo`'s for MiMo. An entry point an arch does not declare (prefix restore, decode
-//! handover) is left out at comptime.
+//! The streaming packs on mlx-stream (`lib/mlx-stream`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
+//! MiMo-V2.6-Flash's prepared MXFP4 pack (`ModelConfig.mimo_stream`) and GLM-5.3's pack (`ModelConfig.glm_stream`).
+//! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the
+//! config, renders the template, samples and schedules. The plugin exports one glue surface per arch (`arch`,
+//! `default_context`, `generation_headroom`): the root's for DeepSeek-V4.1, `mimo`'s for MiMo, `glm`'s for GLM-5.3.
+//! An entry point an arch does not declare (prefix restore, decode handover, request end) is left out at comptime.
+//! GLM-5.3 alone takes the model's model-settings.json entry, and generates past its billed context as far as its
+//! arch's `maxOutput`.
 
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const server = @import("../server.zig");
 const status = @import("../status.zig");
+const model_settings = @import("../model_settings.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const plugin = @import("mlx_stream");
 const sdk = plugin.sdk;
@@ -17,16 +20,18 @@ const sdk = plugin.sdk;
 pub const built = true;
 
 /// The plugin's arches this host serves.
-const Kind = enum { dsv41, mimo };
+const Kind = enum { dsv41, mimo, glm };
 
 fn Side(comptime k: Kind) type {
     return switch (k) {
         .dsv41 => plugin,
         .mimo => plugin.mimo,
+        .glm => plugin.glm,
     };
 }
 
 fn kindOf(config: *const ModelConfig) Kind {
+    if (config.glm_stream) return .glm;
     return if (config.mimo_stream) .mimo else .dsv41;
 }
 
@@ -38,7 +43,7 @@ fn Bound(comptime k: Kind) type {
 pub const Model = struct {
     gpa: std.mem.Allocator,
     /// The arch's config and module (it keeps references into `weights`).
-    arch: union(Kind) { dsv41: Bound(.dsv41), mimo: Bound(.mimo) },
+    arch: union(Kind) { dsv41: Bound(.dsv41), mimo: Bound(.mimo), glm: Bound(.glm) },
     /// The trunk the module binds.
     weights: sdk.Weights,
     /// The request `begin` started: its prompt pass's shape, then its decode handover.
@@ -74,7 +79,11 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         return e;
     };
     errdefer A.freeConfig(gpa, c);
-    if (comptime @hasDecl(A, "applyLoadFacts")) {
+    if (comptime k == .glm) {
+        // The arch takes the load's facts itself (its `loadBytes` and `init`).
+        try applySettings(A, arena.allocator(), io, c, config);
+        noteMaxOutput(dir, A.maxOutput(c));
+    } else if (comptime @hasDecl(A, "applyLoadFacts")) {
         f.effective_context = billedContext(k, config);
         try A.applyLoadFacts(c, f);
     } else {
@@ -83,6 +92,54 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         c.* = c.withFacts(f);
     }
     return c;
+}
+
+/// GLM-5.3's settings: the model's model-settings.json entry (its numeric tier, event gates, `max_output`, ...; `.null`
+/// without one), then the host's manual context, which wins (`server.manualContext`: the entry's `ctx_size`, else
+/// `--ctx-size`).
+fn applySettings(comptime A: type, arena: std.mem.Allocator, io: std.Io, c: *A.Config, config: *const ModelConfig) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const settings = model_settings.load(arena, io, model_settings.defaultPath(&buf));
+    A.applySettings(c, settings.entry(config.dsv41_dir.?) orelse .null);
+    const context = server.manualContext(config);
+    if (context > 0) A.applySettings(c, try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{\"ctx_size\": {d}}}", .{context}), .{}));
+}
+
+/// GLM-5.3's `maxOutput` per pack, as the pack's last parse read it with the model's settings (the load's preflight and
+/// its open), for `contextLength`. A pthread mutex, not `std.Io.Mutex`: `contextLength` runs on connection threads that
+/// carry no `Io` (log.zig's sink mutex, the same reason).
+const max_output_slots = 4;
+var max_output_mu: std.c.pthread_mutex_t = .{};
+var max_output_keys: [max_output_slots]u64 = @splat(0);
+var max_output_values: [max_output_slots]u64 = @splat(0);
+var max_output_next: usize = 0;
+
+fn packKey(dir: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, dir) | 1;
+}
+
+/// Records GLM-5.3's `maxOutput` for the pack at `dir`.
+pub fn noteMaxOutput(dir: []const u8, value: u64) void {
+    const key = packKey(dir);
+    _ = std.c.pthread_mutex_lock(&max_output_mu);
+    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
+    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse blk: {
+        const at = max_output_next;
+        max_output_next = (max_output_next + 1) % max_output_slots;
+        break :blk at;
+    };
+    max_output_keys[i] = key;
+    max_output_values[i] = value;
+}
+
+/// The generation past the billed context a GLM-5.3 request of the pack at `dir` may take: the `maxOutput` its last
+/// parse recorded; the arch's default (`glm.generation_headroom`) for a pack not parsed yet.
+fn maxOutputOf(dir: []const u8) u64 {
+    const key = packKey(dir);
+    _ = std.c.pthread_mutex_lock(&max_output_mu);
+    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
+    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse return plugin.glm.generation_headroom;
+    return max_output_values[i];
 }
 
 /// Sampled before the weights load: the memory already in use, which the plugin's rows fill on top of, and the
@@ -105,9 +162,10 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
 }
 
 /// Positions a request may span: the prompts the load bills (the model's context, else the plugin's standard
-/// request) and the generation past them.
+/// request) and the generation past them (GLM-5.3: its arch's `maxOutput`).
 pub fn contextLength(config: *const ModelConfig) u32 {
     return switch (kindOf(config)) {
+        .glm => @intCast(billedContext(.glm, config) + maxOutputOf(config.dsv41_dir.?)),
         inline else => |k| @intCast(billedContext(k, config) + Side(k).generation_headroom),
     };
 }
@@ -155,7 +213,7 @@ pub fn begin(m: *Model, prompt: []const u32, max_tokens: u32, context: u64) !u64
     switch (m.arch) {
         inline else => |b, k| {
             const A = Side(k).arch;
-            const bound: u64 = if (comptime @hasField(A.Module, "max_context")) b.module.max_context else b.module.context_bound;
+            const bound: u64 = if (comptime @hasDecl(A.Module, "maxContext")) b.module.maxContext() else if (comptime @hasField(A.Module, "max_context")) b.module.max_context else b.module.context_bound;
             if (prompt.len > bound) {
                 log.warn("[mlx-stream] a {d}-token prompt is over the {d} tokens this load billed (raise the model's ctx_size)\n", .{ prompt.len, bound });
                 return error.PrefillDoesNotFit;
@@ -191,6 +249,13 @@ pub fn forward(m: *Model, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, f, &[_]c_int{ 1, 1, @intCast(mlx.mlx_array_size(f)) }, 3, s));
     return out;
+}
+
+/// The request's end (the scheduler's finish, on the inference thread): the arch's `requestEnd`, where it declares one.
+pub fn end(m: *Model) void {
+    switch (m.arch) {
+        inline else => |b, k| if (comptime @hasDecl(Side(k).arch, "requestEnd")) Side(k).arch.requestEnd(b.module),
+    }
 }
 
 fn handover(m: *Model) !void {
@@ -258,4 +323,19 @@ pub fn laneReceipt(m: *Model, buf: []u8) ?[]const u8 {
         else
             null,
     };
+}
+
+const testing = std.testing;
+
+test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxOutput (131,072 by default)" {
+    try testing.expectEqual(@as(u64, 131072), plugin.glm.generation_headroom);
+    var config: ModelConfig = .{ .model_type = "glm_moe_dsa", .dsv41_dir = "/packs/glm-5.3", .glm_stream = true, .ctx_override = 16448 };
+    // A pack not parsed yet: the arch's default.
+    try testing.expectEqual(@as(u32, 16448 + 131072), contextLength(&config));
+    // The model's `max_output`, as its parse records it.
+    noteMaxOutput("/packs/glm-5.3", 4096);
+    try testing.expectEqual(@as(u32, 16448 + 4096), contextLength(&config));
+    // The coding workload's 16,387-token prompt and max_tokens 131,072 fit whole at the default.
+    noteMaxOutput("/packs/glm-5.3", 131072);
+    try testing.expect(16387 + 131072 <= contextLength(&config));
 }
