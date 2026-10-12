@@ -4,7 +4,7 @@ This directory records mlx-serve serving MiMo-V2.6-Flash's streaming pack
 through the mlx-stream plugin (`lib/mlx-stream`, [plugins.md](../../plugins.md))
 across context: one request per context rung, from 1K to 1M prompt tokens, on
 server `746e7da9` (this host, `pr/mimo-host` at `2c041af6`, with mlx-stream
-`feat/mimo-v26-flash` at `8e7d186`, the plugin's MiMo PR), with the plugin's
+at `8e7d186`, from the plugin's MiMo PR, since merged into its `main`), with the plugin's
 attention kernels at every served context. The plugin's `docs/mimo.md` describes
 the arch, and its `scripts/mimo_sweep_charts.py` rebuilds `results.json` from
 the cell receipts and draws the charts here. The 32K route-gate fix is
