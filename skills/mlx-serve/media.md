@@ -70,7 +70,9 @@ Response: `{"created":0,"data":[{"b64_json":"<base64 PNG>"}]}`
 prefer the JSON `mode:"edit"` body above.
 
 Sprite and texture tips: ask for a plain or solid background and cut it out
-yourself unless the model supports `transparent`. Generate at the model's native
+(`node gen.mjs cutout`) unless the model supports `transparent`; `gen.mjs tile`
+and `gen.mjs maps` make a texture seamless and derive its normal, roughness and
+AO maps. Generate at the model's native
 size and downscale; for pixel art, downscale with nearest-neighbour.
 
 ## Speech (TTS): `POST /v1/audio/speech`
@@ -93,14 +95,19 @@ fast enough for on-demand lines; still cache every line you can.
 |---|---|
 | `prompt` | required: genre, mood, instruments, tempo feel |
 | `lyrics` | section-tagged lines (`[verse]`, `[chorus]`, `[bridge]` on their own line) |
-| `instrumental` | `true` = no vocals; do not also send `lyrics` |
-| `duration_seconds` | ACE-Step 10-600 (default 60); MiniMax Music 3 1-360 |
+| `instrumental` | `true` = no vocals; do not also send `lyrics` (not YuE2) |
+| `duration_seconds` | ACE-Step 10-600 (default 60); MiniMax Music 3 1-360; YuE2 5-360, an upper bound (the song ends itself) |
 | `seed` | reproducible track |
 | `bpm`, `keyscale`, `timesignature`, `vocal_language` | ACE-Step only |
 | `task`, `src_audio`, `ref_audio` | ACE-Step only: `cover` / `complete` a base64 WAV, or match a reference's timbre |
 
 MiniMax Music 3 needs `lyrics` unless `instrumental` is true, and rejects the
-ACE-Step-only fields by name. Response: raw `audio/wav` bytes or SSE.
+ACE-Step-only fields by name. YuE2 always needs `lyrics` (`[verse]`-style tags on
+their own lines; for a calm, mostly instrumental feel keep them short and soft) and
+refuses `instrumental` and the ACE-Step fields by name; its own fields are `cot`
+(`full` default, `melody` or `off`: whether it writes a melody score first), `abc`
+(your own or an edited score), `steps` 1-100 (default 32) and `cfg_scale` 0-20. Its
+streaming `complete` event also returns the score as `abc`. Response: raw `audio/wav` bytes or SSE.
 For game loops, generate a track then crossfade the tail yourself; the model does
 not guarantee a seamless loop point.
 
