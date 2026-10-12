@@ -42,6 +42,8 @@ const ane_mod = @import("ane.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
+/// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
+pub const plugin_profile: bool = build_options.plugin_profile;
 
 // ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
 // by the `--version` report, which runs before any engine init.

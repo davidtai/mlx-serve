@@ -128,6 +128,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "embedded_engines", true);
     // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
     build_options.addOption(bool, "mlx_stream", true);
+    // `-Dplugin-profile`: the plugin's profile probes (its sdk reads `mlx_host.plugin_profile`) and their C shims.
+    build_options.addOption(bool, "plugin_profile", pluginProfile(b));
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -418,6 +420,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "embedded_engines", true);
     build_options.addOption(bool, "mlx_stream", false);
+    build_options.addOption(bool, "plugin_profile", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -642,6 +645,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption(bool, "mas", true);
     ios_options.addOption(bool, "embedded_engines", false);
     ios_options.addOption(bool, "mlx_stream", false);
+    ios_options.addOption(bool, "plugin_profile", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
@@ -880,12 +884,26 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
     // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
     // event / alloc shims, which include the staged MLX's private headers and link libmlx.
     const csrc = b.pathJoin(&.{ dir, "csrc" });
-    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    // A profile server build (`-Dplugin-profile=true`, never the tests) also compiles the decode profile's command-buffer
+    // timeline shims and the read pool's event-signal log (`-DQ3LD_EVSIG`), which the plugin's profile probes link.
+    const profile = !inject and pluginProfile(b);
+    const c: []const []const u8 = if (inject)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+    else if (profile)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
     const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" }) }, .flags = c });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_event_shim.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" }) }, .flags = cxx });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" }) }, .flags = cxx });
+    if (profile) {
+        const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" }) }, .flags = objc });
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_newbuffer_count.mm" }) }, .flags = objc });
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" }) }, .flags = cxx });
+    }
     m.addIncludePath(.{ .cwd_relative = csrc });
     m.addIncludePath(b.path("lib/mlx/include"));
     m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
@@ -908,6 +926,14 @@ fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
     const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
     return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
+}
+
+/// `-Dplugin-profile`: compile the plugin's profile probes and their shims in; off in every served build. `b.option`
+/// may be declared once; the graphs share this answer.
+var plugin_profile_opt: ?bool = null;
+fn pluginProfile(b: *std.Build) bool {
+    if (plugin_profile_opt == null) plugin_profile_opt = b.option(bool, "plugin-profile", "Compile the mlx-stream plugin's profile probes in (profile builds only)") orelse false;
+    return plugin_profile_opt.?;
 }
 
 /// The plugin checkout: `-Dmlx-stream-dir`, else the `lib/mlx-stream` submodule. `b.option` may be declared
