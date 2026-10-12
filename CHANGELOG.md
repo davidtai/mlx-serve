@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
+
 ## v26.10.2 — Songs, Films & Sound Effects - The Newest Frontier Models - Linux - Rock Solid Under Load
 
 ### Highlights
