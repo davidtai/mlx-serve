@@ -39,14 +39,10 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-# The patches below are part of the build: an edited patch must rebuild.
+# The mlx-c patch below is part of the build: an edited patch must rebuild.
 MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
 PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
-# The allocator's size classes (mlx_set_alloc_size_classes): mlx and mlx-c.
-MLX_SC_PATCH="$REPO_ROOT/patches/mlx-alloc-size-classes.patch"
-MLXC_SC_PATCH="$REPO_ROOT/patches/mlxc-alloc-size-classes.patch"
-SC_SHA="$(cat "$MLX_SC_PATCH" "$MLXC_SC_PATCH" | shasum | cut -c1-12)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA sizeclasses=$SC_SHA target=$DEPLOYMENT_TARGET"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -74,10 +70,6 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
-# The allocator's size-class switch (off unless a caller sets it). The files the
-# patch touches are reset first, as for the mlx-c patch below.
-git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_SC_PATCH" | cut -f3)
-git -C "$MLX_SRC" apply -p1 "$MLX_SC_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -93,10 +85,8 @@ cmake --install "$BUILD_ROOT/mlx" >/dev/null
 # pinned mlx-c predates it (the same patch the Linux build applies). The files
 # the patch touches are reset first, so an edited patch replaces the old one;
 # local edits anywhere else in the submodule are kept.
-git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3) \
-  $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_SC_PATCH" | cut -f3)
+git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
 git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
-git -C "$MLXC_SRC" apply -p1 "$MLXC_SC_PATCH"
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
