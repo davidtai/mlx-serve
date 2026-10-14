@@ -61,7 +61,7 @@ fn billedContext(comptime k: Kind, config: *const ModelConfig) u64 {
 /// gets the context stamped on the facts, which its init reads again).
 fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig, f: *sdk.LoadFacts) !*Side(k).arch.Config {
     const A = Side(k).arch;
-    const dir = config.dsv41_dir.?;
+    const dir = config.pack_dir.?;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
@@ -125,7 +125,7 @@ fn openArch(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_str
     var f = facts();
     const c = try parse(k, gpa, io, config, &f);
     errdefer A.freeConfig(gpa, c);
-    const dir = config.dsv41_dir.?;
+    const dir = config.pack_dir.?;
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
     m.* = .{ .gpa = gpa, .arch = @unionInit(@FieldType(Model, "arch"), @tagName(k), .{ .cfg = c, .module = undefined }), .weights = try sdk.loader.dir(io, gpa, dir, .{ .nocache = A.caps.residents_past_page_cache }) };

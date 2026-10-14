@@ -162,7 +162,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
     passes them: greedy requests at the lane's typical acceptance, sampled ones by the plugin's exact speculative
     sampling;
   - `contextLength`: the billed prompts plus the generation past them, which the host advertises.
-- **Host arms.** `Transformer.dsv41_ext` (init, forward, deinit; the generator hands it the whole prompt in one
+- **Host arms.** `Transformer.mlx_stream_ext` (init, forward, deinit; the generator hands it the whole prompt in one
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill.
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its

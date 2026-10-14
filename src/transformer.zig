@@ -11928,7 +11928,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.dsv4 = null;
     p_xfm.dsv41 = null;
-    p_xfm.dsv41_ext = null;
+    p_xfm.mlx_stream_ext = null;
     p_xfm.bert_layers = null;
     p_xfm.hybrid_layers = null;
     p_xfm.qwen4 = null;
@@ -17152,8 +17152,8 @@ pub const Transformer = struct {
     /// DeepSeek-V4.1 (deepseek_v41): its own module (src/deepseek_v41.zig)
     /// in the same shell, request state on the module.
     dsv41: ?*dsv41_mod.Dsv41Model = null,
-    /// DeepSeek-V4.1's EXL3 repack on mlx-stream (`arch/mlx_stream.zig`): the plugin's module.
-    dsv41_ext: ?*mlx_stream_mod.Model = null,
+    /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
+    mlx_stream_ext: ?*mlx_stream_mod.Model = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -18774,9 +18774,9 @@ pub const Transformer = struct {
             mdl.deinit();
             self.dsv41 = null;
         }
-        if (self.dsv41_ext) |m| {
+        if (self.mlx_stream_ext) |m| {
             mlx_stream_mod.close(m);
-            self.dsv41_ext = null;
+            self.mlx_stream_ext = null;
         }
         if (self.rht) |reg| {
             reg.deinit();
@@ -20464,7 +20464,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "dsv41_ext" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20508,14 +20508,14 @@ pub const Transformer = struct {
     /// has DSpark for drafting anyway.
     /// mlx-stream runs its own prompt pass: the generator hands it the whole prompt in one forward.
     pub fn prefillsWholePrompt(self: *const Transformer) bool {
-        return self.dsv41_ext != null;
+        return self.mlx_stream_ext != null;
     }
 
     /// DeepSeek's own DSpark draft stages (V4 or V4.1) loaded on this model.
     pub fn dsparkStages(self: *const Transformer) usize {
         if (self.dsv4) |m| return m.n_mtp;
         if (self.dsv41) |m| return m.n_mtp;
-        if (self.dsv41_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
+        if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
         return 0;
     }
 
@@ -20546,7 +20546,7 @@ pub const Transformer = struct {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
-        if (self.dsv41_ext) |m| return forwardDsv41Stream(self, ctx, token_ids, m);
+        if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
         if (self.config.isEmbeddingGemma2()) return self.forwardEmbeddingGemma2With(ctx, token_ids);
@@ -20561,7 +20561,7 @@ pub const Transformer = struct {
     /// Does `forwardWith` route this model through `forwardStandardWith`?
     /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.dsv41_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
@@ -20574,7 +20574,7 @@ pub const Transformer = struct {
     /// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
     /// above IN ORDER.
     pub fn supportsLayerCapture(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.dsv41_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention;
     }
@@ -20710,7 +20710,7 @@ pub const Transformer = struct {
     /// then resets the cache so the first real request starts from clean state.
     /// Idempotent — calling twice is wasted work but not incorrect.
     pub fn warmup(self: *Transformer) !void {
-        if (self.dsv41_ext != null) return; // mlx-stream warms its own kernels at construction
+        if (self.mlx_stream_ext != null) return; // mlx-stream warms its own kernels at construction
         const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
         const decode_shape = [_]c_int{ 1, 1 };
         const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
@@ -22767,7 +22767,7 @@ pub const Transformer = struct {
         // Built-state question: this path reads `moe_layers` and the GDN
         // ssm entries, so the trunk must actually be that shape.
         if (self.moe_layers == null) return false;
-        if (self.hybrid_layers != null or self.dsv4 != null or self.dsv41 != null or self.dsv41_ext != null) return false;
+        if (self.hybrid_layers != null or self.dsv4 != null or self.dsv41 != null or self.mlx_stream_ext != null) return false;
         // Every layer must be one of the two shapes this path handles.
         for (self.moe_layers.?) |*lw| {
             switch (lw.mlp) {
@@ -45759,8 +45759,8 @@ fn hostIds(self: *Transformer, token_ids: mlx.mlx_array) ![]u32 {
     return ids;
 }
 
-/// DeepSeek-V4.1 on mlx-stream: the plugin runs the request's prompt pass, then decode (`mlx_stream.forward`).
-fn forwardDsv41Stream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, m: *mlx_stream_mod.Model) !mlx.mlx_array {
+/// An mlx-stream pack: the plugin runs the request's prompt pass, then decode (`mlx_stream.forward`).
+fn forwardMlxStream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, m: *mlx_stream_mod.Model) !mlx.mlx_array {
     const ids = try hostIds(self, token_ids);
     defer self.allocator.free(ids);
     const logits = try mlx_stream_mod.forward(m, ids, self.s);
@@ -45813,7 +45813,7 @@ fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, 
     const m = try mlx_stream_mod.open(allocator, io, s, &config);
     errdefer mlx_stream_mod.close(m);
     var t = try moduleShell(allocator, config, s);
-    t.dsv41_ext = m;
+    t.mlx_stream_ext = m;
     return t;
 }
 
@@ -66108,7 +66108,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.rht = null;
     t.dsv4 = null;
     t.dsv41 = null;
-    t.dsv41_ext = null;
+    t.mlx_stream_ext = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
@@ -66121,7 +66121,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     try testing.expect(t.ownsModuleDecodeState());
     t.dsv41 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
-    t.dsv41_ext = &fake_ext;
+    t.mlx_stream_ext = &fake_ext;
     try testing.expect(t.ownsModuleDecodeState());
 }
 
