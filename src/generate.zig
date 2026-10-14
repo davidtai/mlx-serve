@@ -276,6 +276,17 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
 }
 
+/// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
+fn laneMode(lane: []const u8) []const u8 {
+    return lane[0 .. std.mem.indexOfScalar(u8, lane, ' ') orelse lane.len];
+}
+
+test "laneMode: the spec-stats mode is the first word of the lane name" {
+    try std.testing.expectEqualStrings("dspark", laneMode("dspark typical 0.3"));
+    try std.testing.expectEqualStrings("mtp", laneMode("mtp typical 0.5 depth 2"));
+    try std.testing.expectEqualStrings("serial", laneMode("serial"));
+}
+
 /// Read an unsigned integer from an environment variable, falling back to
 /// `default` when unset, empty, or unparseable. Uses libc getenv to stay
 /// allocator-free at call sites.
@@ -2121,14 +2132,21 @@ pub const Generator = struct {
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
+            if (self.xfm.mlx_stream_ext) |m| {
+                // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
+                const lane = mlx_stream.laneName(m);
+                log.info(
+                    "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} plugin=mlx-stream lane=\"{s}\"\n",
+                    .{ laneMode(lane), self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, lane },
+                );
+                var lane_buf: [512]u8 = undefined;
+                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
+                return;
+            }
             log.info(
                 "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
                 .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
             );
-            if (self.xfm.mlx_stream_ext) |m| {
-                var lane_buf: [512]u8 = undefined;
-                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
-            }
             return;
         }
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
