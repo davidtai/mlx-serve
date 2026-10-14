@@ -40,6 +40,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
+const diarization_mod = @import("nemotron_diarization.zig");
 const gen_sse = @import("gen_sse.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -2312,6 +2313,15 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
+    /// The least recently used resident model nobody is holding, other than `keep`; its id
+    /// outlives the unload (the entry stays registered as a stub).
+    pub fn idleModelToUnload(self: *Scheduler, keep: []const u8) ?[]const u8 {
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        const entry = self.registry.pickLruEvictable(keep, false) orelse return null;
+        return entry.id;
+    }
+
     /// Synchronously compute embeddings for `req.token_seqs` using the
     /// batched encoder forward pass on the inference thread. Same lifecycle
     /// as `encodeVision`: post + block + return results. Caller frees the
@@ -2877,7 +2887,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);
-    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
+    tok.* = try tokenizer_mod.loadTokenizerAny(io, allocator, model_dir);
     errdefer tok.deinit();
 
     const cc = try allocator.create(ChatConfig);
@@ -3319,6 +3329,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
         .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
         .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
+        .diarization => entry.diarization_engine = try diarization_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
@@ -4905,8 +4916,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
         // Every failure mode is caught: persistence silently stays off, the
         // RAM cache is unaffected.
-        const has_ssm_layers = params.config.has_hybrid_layers or
-            params.config.full_attention_interval > 0;
+        const has_ssm_layers = params.config.hasSsmLayers();
         entry.prefix_cache.?.hybrid = has_ssm_layers;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
@@ -5649,6 +5659,7 @@ fn encodeVisionItem(req: *VisionEncodeRequest, vision_enc: anytype, item: Vision
             return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
         },
         .audio => |clip| {
+            if (vision_enc.qwen_audio) |*qa| return qa.forward(clip);
             const cfg = req.model.config orelse return error.NoConfig;
             const spt: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
             const n_frames = (clip.len / 4 + spt - 1) / spt;
@@ -5933,7 +5944,7 @@ fn runGenJobs(reqs: []*GenRequest) void {
 /// in-flight work (whose graphs pin their inputs) once active memory passes this
 /// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
 fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
-    return if (cuda) @intCast(est_peak) else null;
+    return if (cuda and est_peak > 0) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -6010,7 +6021,9 @@ fn appendDecodeEndCheckpoint(
     const xfm = slot.model.transformer orelse return cps;
     const a = gen.ssm_checkpoint_alloc orelse return cps;
     const newest: ?usize = if (cps.len > 0) cps[cps.len - 1].pos else null;
-    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest, slot.media.len > 0)) {
+    // A plain pipelined step that met its stop already forwarded the stop token and a lookahead.
+    if (slot.moe_seq_offset > total_len) _ = gen.rollbackSsmTo(total_len);
+    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest)) {
         if (slot.moe_seq_offset != total_len) log.debug("[hot-cache] decode-end checkpoint skipped: live position {d}, committed {d}\n", .{ slot.moe_seq_offset, total_len });
         return cps;
     }
@@ -6027,10 +6040,10 @@ fn appendDecodeEndCheckpoint(
     return out;
 }
 
-/// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot;
-/// media slots are excluded because M-RoPE positions are not token counts.
-fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usize, newest_cp: ?usize, has_media: bool) bool {
-    if (has_media or total_len <= prompt_len or live_pos != total_len) return false;
+/// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot.
+/// `live_pos` counts tokens on media slots too: the M-RoPE shift is `mrope_delta`, kept apart.
+fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usize, newest_cp: ?usize) bool {
+    if (total_len <= prompt_len or live_pos != total_len) return false;
     if (newest_cp) |pos| return pos < total_len;
     return true;
 }
@@ -8723,7 +8736,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
             std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
     }
-    try testing.expectEqual(@as(usize, 4), calls);
+    try testing.expectEqual(@as(usize, 5), calls);
 }
 
 /// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
@@ -11220,13 +11233,12 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
 
 test "decode-end checkpoint: taken only where the live state is the committed prefix" {
     // Bar: a turn that generated past its prompt-end snapshot gets one at its committed end, nothing else does.
-    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, 970, false));
-    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, null, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1000, 1000, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 970, true));
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, 970));
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, null));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1000, 1000, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200));
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {
@@ -11656,7 +11668,8 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
 
 test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
     try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
-    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    // No estimate (the forced aligner's pass) keeps MLX's limit: 0 would throttle every allocation.
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(true, 0));
     try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
 }
 

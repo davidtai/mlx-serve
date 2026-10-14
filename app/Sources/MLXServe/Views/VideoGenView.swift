@@ -117,10 +117,6 @@ struct VideoGenView: View {
     /// wells to share a row. False until its first `onGeometryChange`, which
     /// stacks them for one frame — the narrow answer either way.
     @State private var keyframesSideBySide: Bool = false
-    /// Whether the form is wide enough for the Quality tiers as segments.
-    /// Measured on the section, never judged by `ViewThatFits`: a segmented
-    /// picker accepts any width and squeezes, so it always "fits".
-    @State private var qualityFitsSegments: Bool = true
 
     /// Set when `hydrate` dropped a reference whose file is gone: the tiles
     /// after it renumbered, so a prompt that names them now points elsewhere.
@@ -308,6 +304,7 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
                         .padding(.vertical, 8)
+                        .clearOfEditorScroller()
                         .allowsHitTesting(false)
                 }
             }
@@ -464,11 +461,6 @@ struct VideoGenView: View {
             chainWindows: chainWindows, preferring: quality)
     }
 
-    /// What five segments need: the four tier names plus Custom, at the
-    /// segmented control's own per-segment padding. "Super Quality" is the
-    /// wide one, and shortening it is not on the table — the tiers are named
-    /// the same in every Create pane.
-    private static let qualitySegmentsMinWidth: CGFloat = 380
 
     /// Reads the DERIVED tier and writes by applying one. Custom is unwritable
     /// by construction, so the guard is a formality rather than a policy.
@@ -486,24 +478,18 @@ struct VideoGenView: View {
     private var qualitySection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Quality").font(.app(.headline).weight(.semibold))
-            // Measured, not `ViewThatFits`: see `qualityFitsSegments`. Five
-            // segments degrade to a menu rather than shortening the tier names
+            // Segments degrade to a menu rather than shortening the tier names
             // this pane shares with every other Create pane.
-            qualityPicker(segmented: qualityFitsSegments)
+            SegmentedOrMenu(qualityPicker)
             Text(qualityHint)
                 .font(.app(.caption))
                 .foregroundStyle(.secondary)
         }
-        // Measure the SECTION at the column's width, never the picker: the
-        // menu variant is `fixedSize` and would never re-fit.
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onGeometryChange(for: Bool.self) { $0.size.width >= Self.qualitySegmentsMinWidth }
-            action: { qualityFitsSegments = $0 }
     }
 
-    @ViewBuilder
-    private func qualityPicker(segmented: Bool) -> some View {
-        let picker = Picker("", selection: qualitySelection) {
+    private var qualityPicker: some View {
+        Picker("", selection: qualitySelection) {
             ForEach(QualityPreset.allCases) { q in
                 Text(L10n.text(q.label)).font(.app(.body)).tag(QualitySelection.preset(q))
             }
@@ -512,11 +498,6 @@ struct VideoGenView: View {
             }
         }
         .labelsHidden().font(.app(.body))
-        if segmented {
-            picker.pickerStyle(.segmented)
-        } else {
-            picker.pickerStyle(.menu).fixedSize()
-        }
     }
 
     /// The pipeline the request will RUN: audio-to-video is two-stage only, so
@@ -938,6 +919,7 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                 Button {
                     shots.removeAll { $0.id == id }
+                    settleFinalShot()
                 } label: {
                     Image(systemName: "trash")
                 }
@@ -950,13 +932,33 @@ struct VideoGenView: View {
                        in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
                     .help("How long this shot runs. Longer shots mean fewer joins.")
             }
-            TextEditor(text: shot.prompt)
-                .font(.app(.body))
-                .frame(height: 90)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            // `.center`: the well's drop outline adds 6pt round it, so centring
+            // lines its surface up with the editor.
+            HStack(alignment: .center, spacing: 2) {
+                TextEditor(text: shot.prompt)
+                    .font(.app(.body))
+                    .frame(height: 90)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+                    // The well's room, so a card with no well is as tall as one with it.
+                    .padding(.vertical, 6)
+                // The final shot lands on the pane's Last frame.
+                if index < shots.count - 1 {
+                    let endFrame = Binding<URL?>(get: { shot.wrappedValue.endFramePath.map { URL(fileURLWithPath: $0) } },
+                                                 set: { shot.wrappedValue.endFramePath = $0?.path })
+                    ShotEndFrameWell(url: endFrame, height: 90) { chooseKeyframeImage(into: endFrame) }
+                }
+            }
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// A picture left on the final shot moves to the pane's Last frame when that
+    /// is empty, and is dropped otherwise (`Storyboard.settlingFinalShot`).
+    private func settleFinalShot() {
+        let settled = Storyboard.settlingFinalShot(shots, lastFrame: lastFrameImageURL?.path)
+        shots = settled.shots
+        lastFrameImageURL = settled.lastFrame.map { URL(fileURLWithPath: $0) }
     }
 
     /// Enhance's text: a storyboard plan fills the shots (the story stays),
@@ -967,6 +969,8 @@ struct VideoGenView: View {
             prompt = text
             return
         }
+        // New shots, no join pictures: the planner never saw them, and a picture
+        // its shots do not describe would only fight them.
         shots = planned
         storyboardMode = true
     }
@@ -2288,7 +2292,8 @@ struct VideoGenView: View {
             .contains { Self.existingFile($0) == nil }
         refImageSize = s.refImageSize
         storyboardMode = s.storyboardMode
-        shots = s.storyboard
+        shots = Storyboard.withoutMissingEndFrames(s.storyboard)
+        settleFinalShot()
     }
 
     private static func existingFile(_ path: String?) -> URL? {
@@ -2500,7 +2505,8 @@ struct VideoGenView: View {
     /// A storyboard runs its shots; anything else is one request.
     private func run(_ req: VideoGenRequest) {
         guard storyboardOn else { return service.generate(req, server: server) }
-        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1) }, server: server)
+        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath) },
+                                   server: server)
     }
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.
