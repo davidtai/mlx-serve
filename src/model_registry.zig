@@ -1185,7 +1185,7 @@ pub const ModelRegistry = struct {
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state != .ready) continue;
-            if (entry.config) |c| if (c.dsv41_stream) continue;
+            if (entry.config) |c| if (c.mlxStream()) continue;
             sum +|= entry.bytes_resident;
         }
         return sum;
