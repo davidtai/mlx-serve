@@ -2081,7 +2081,7 @@ pub fn serve(
     const pinned = pinAutoContext(@constCast(config));
     if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.dsv41_stream) {
+    } else if (config.mlxStream()) {
         log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
