@@ -71,7 +71,7 @@ fn billedContext(comptime k: Kind, config: *const ModelConfig) u64 {
 /// gets the context stamped on the facts, which its init reads again).
 fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig, f: *sdk.LoadFacts) !*Side(k).arch.Config {
     const A = Side(k).arch;
-    const dir = config.dsv41_dir.?;
+    const dir = config.pack_dir.?;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
@@ -105,7 +105,7 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
 fn applySettings(comptime A: type, arena: std.mem.Allocator, io: std.Io, c: *A.Config, config: *const ModelConfig) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const settings = model_settings.load(arena, io, model_settings.defaultPath(&buf));
-    A.applySettings(c, settings.entry(config.dsv41_dir.?) orelse .null);
+    A.applySettings(c, settings.entry(config.pack_dir.?) orelse .null);
     const context = server.manualContext(config);
     if (context > 0) A.applySettings(c, try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{\"ctx_size\": {d}}}", .{context}), .{}));
 }
@@ -170,7 +170,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
 /// request) and the generation past them (GLM-5.3: its arch's `maxOutput`).
 pub fn contextLength(config: *const ModelConfig) u32 {
     return switch (kindOf(config)) {
-        .glm => @intCast(billedContext(.glm, config) + maxOutputOf(config.dsv41_dir.?)),
+        .glm => @intCast(billedContext(.glm, config) + maxOutputOf(config.pack_dir.?)),
         inline else => |k| @intCast(billedContext(k, config) + Side(k).generation_headroom),
     };
 }
@@ -188,7 +188,7 @@ fn openArch(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_str
     var f = facts();
     const c = try parse(k, gpa, io, config, &f);
     errdefer A.freeConfig(gpa, c);
-    const dir = config.dsv41_dir.?;
+    const dir = config.pack_dir.?;
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
     m.* = .{ .gpa = gpa, .arch = @unionInit(@FieldType(Model, "arch"), @tagName(k), .{ .cfg = c, .module = undefined }), .weights = try sdk.loader.dir(io, gpa, dir, .{ .nocache = A.caps.residents_past_page_cache }) };
@@ -334,7 +334,7 @@ const testing = std.testing;
 
 test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxOutput (131,072 by default)" {
     try testing.expectEqual(@as(u64, 131072), plugin.glm.generation_headroom);
-    var config: ModelConfig = .{ .model_type = "glm_moe_dsa", .dsv41_dir = "/packs/glm-5.3", .glm_stream = true, .ctx_override = 16448 };
+    var config: ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-5.3", .glm_stream = true, .ctx_override = 16448 };
     // A pack not parsed yet: the arch's default.
     try testing.expectEqual(@as(u32, 16448 + 131072), contextLength(&config));
     // The model's `max_output`, as its parse records it.

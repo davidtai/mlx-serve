@@ -361,10 +361,10 @@ pub const ModelConfig = struct {
     /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
     /// config does.
     ngram_table_path: ?[]const u8 = null,
-    /// deepseek_v41: the pack's directory, where its Engram tables sit beside
-    /// the weights; also a MiMo or GLM-5.3 mlx-stream pack's (`mimo_stream`,
-    /// `glm_stream`). Set by `parseConfig`.
-    dsv41_dir: ?[]const u8 = null,
+    /// The pack's directory: deepseek_v41's Engram tables sit beside the
+    /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream` or
+    /// `glm_stream`) loads from it. Set by `parseConfig`.
+    pack_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
@@ -1655,8 +1655,8 @@ pub const ModelConfig = struct {
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
-        if (self.dsv41_dir) |p| allocator.free(p);
-        self.dsv41_dir = null;
+        if (self.pack_dir) |p| allocator.free(p);
+        self.pack_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
@@ -1689,13 +1689,13 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
     if (config.isDsv41()) {
-        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.pack_dir = try allocator.dupe(u8, model_dir);
         const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
         defer allocator.free(bank);
         config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
     }
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
-        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.pack_dir = try allocator.dupe(u8, model_dir);
         config.mimo_stream = true;
     }
     if (config.isGlmMoeDsa()) {
@@ -1706,7 +1706,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             log.err("glm_moe_dsa: {s} has no experts.bin; GLM-5.3 runs only from an mlx-stream pack (the trunk beside an experts.bin bank)\n", .{model_dir});
             return error.GlmMoeDsaNeedsExpertBank;
         };
-        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.pack_dir = try allocator.dupe(u8, model_dir);
         config.glm_stream = true;
     }
     if (config.isQwen4()) {
@@ -7390,7 +7390,7 @@ test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; a
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
     try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
-    try testing.expectEqualStrings(dir, pack.dsv41_dir.?);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
@@ -7448,7 +7448,7 @@ test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; 
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
     try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
-    try testing.expectEqualStrings(dir, pack.dsv41_dir.?);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());

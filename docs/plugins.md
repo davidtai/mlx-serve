@@ -139,7 +139,7 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule, pinned to a commit on its `main`) serves
+[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`, pinned to a commit on upstream `main`) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
 GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
@@ -169,7 +169,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
   - `end`: the request's end on the inference thread, before its terminator (the arch's `requestEnd`, GLM-5.3's);
   - `contextLength`: the billed prompts plus the generation past them, which the host advertises (GLM-5.3: its
     arch's `maxOutput` with the model's settings, as the pack's last parse read it).
-- **Host arms.** `Transformer.dsv41_ext` (init, forward, deinit; the generator hands it the whole prompt in one
+- **Host arms.** `Transformer.mlx_stream_ext` (init, forward, deinit; the generator hands it the whole prompt in one
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill. GLM-5.3's module closes on the inference thread at shutdown (it synchronizes its
   stream as it frees), and the hot prefix cache stays off for it.

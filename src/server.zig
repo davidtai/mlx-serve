@@ -8304,7 +8304,7 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
-    const native = if (lm.transformer) |x| x.dsv41_ext else null;
+    const native = if (lm.transformer) |x| x.mlx_stream_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
@@ -21315,7 +21315,7 @@ test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps 
     if (comptime !mlx_stream.built) return error.SkipZigTest;
     // The pack's parse records its arch's maxOutput (GLM-5.3's default, 131,072) beside its billed context.
     mlx_stream.noteMaxOutput("/packs/glm-5.3-clamp", 131072);
-    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .dsv41_dir = "/packs/glm-5.3-clamp", .glm_stream = true, .ctx_override = 16448 };
+    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-5.3-clamp", .glm_stream = true, .ctx_override = 16448 };
     try testing.expectEqual(@as(u32, 16448 + 131072), getEffectiveContextLength(&config));
     try testing.expectEqual(@as(u32, 131072), clampMaxTokens(131072, 16387, getEffectiveContextLength(&config)));
 }
@@ -24962,7 +24962,7 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     xfm.config = cfg;
     xfm.dsv4 = null;
     xfm.dsv41 = &native;
-    xfm.dsv41_ext = null;
+    xfm.mlx_stream_ext = null;
     xfm.dense_attn_proj = false;
     var lm: LoadedModel = undefined;
     lm.config = &cfg;
