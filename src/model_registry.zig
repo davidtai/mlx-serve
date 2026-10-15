@@ -1177,19 +1177,43 @@ pub const ModelRegistry = struct {
         mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
     }
 
+    /// A stream pack whose plugin module reads the process's foreign-bytes value (`mlx_stream.setForeignBytes`):
+    /// DeepSeek-V4.1's and GLM-5.3's. The value is one number for the process, so it is correct for one such pack at a
+    /// time; `foreignReaderLoadedLocked` refuses a second.
+    pub fn readsForeignBytes(c: *const ModelConfig) bool {
+        return c.dsv41_stream or c.glm_stream;
+    }
+
     /// What every ready model except a stream pack whose module reads the value holds: the plugin bills only its own
     /// bytes, and its footprint reads are the whole process's. DeepSeek-V4.1's and GLM-5.3's modules read it, so their
-    /// packs are left out; a MiMo or GLM-5.3-Flash stream pack's bytes are foreign to them. Caller holds `mutex`.
+    /// packs are left out; a MiMo or GLM-5.3-Flash stream pack's bytes are foreign to them. One reader pack at a time
+    /// (`foreignReaderLoadedLocked`): with two, each one's bound would leave out the other's residents. Caller holds
+    /// `mutex`.
     pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
         var sum: u64 = 0;
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state != .ready) continue;
-            if (entry.config) |c| if (c.dsv41_stream or c.glm_stream) continue;
+            if (entry.config) |c| if (readsForeignBytes(c)) continue;
             sum +|= entry.bytes_resident;
         }
         return sum;
+    }
+
+    /// The id of a ready, loading or evicting entry (other than `exclude_id`) whose stream pack reads the foreign-bytes
+    /// value, when `incoming` reads it too; else null. The load of `incoming` is then refused
+    /// (`error.ForeignBytesReaderLoaded`). Caller holds `mutex`.
+    pub fn foreignReaderLoadedLocked(self: *ModelRegistry, exclude_id: []const u8, incoming: *const ModelConfig) ?[]const u8 {
+        if (!readsForeignBytes(incoming)) return null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
+            if (entry.config) |c| if (readsForeignBytes(c)) return entry.id;
+        }
+        return null;
     }
 
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
@@ -2438,4 +2462,29 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
     try testing.expect(reg.peek("org/name") != null);
     try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: a second stream pack that reads the foreign bytes is refused while one is loaded" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    var dsv41_cfg = ModelConfig{};
+    dsv41_cfg.dsv41_stream = true;
+    const dsv41 = try makeReadyStub(reg, "deepseek", 180_000_000_000);
+    dsv41.config = &dsv41_cfg;
+    defer dsv41.config = null;
+    var glm_cfg = ModelConfig{};
+    glm_cfg.glm_stream = true;
+    var mimo_cfg = ModelConfig{};
+    mimo_cfg.mimo_stream = true;
+    const plain = ModelConfig{};
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    // GLM-5.3 reads the value too: refused, and the refusal names the loaded pack.
+    try testing.expectEqualStrings("deepseek", reg.foreignReaderLoadedLocked("glm", &glm_cfg).?);
+    // MiMo and a model without a stream pack do not read it.
+    try testing.expect(reg.foreignReaderLoadedLocked("mimo", &mimo_cfg) == null);
+    try testing.expect(reg.foreignReaderLoadedLocked("plain", &plain) == null);
+    // The loaded pack itself (a reload of the same id) is not a second reader.
+    try testing.expect(reg.foreignReaderLoadedLocked("deepseek", &dsv41_cfg) == null);
 }

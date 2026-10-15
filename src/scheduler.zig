@@ -2080,6 +2080,12 @@ pub const Scheduler = struct {
                 }
             }
 
+            // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
+            if (self.registry.foreignReaderLoadedLocked(entry.id, owned.config)) |other| {
+                log.err("{s}: refused: {s} is loaded, and both stream packs read the one process foreign-bytes value; unload it first\n", .{ entry.id, other });
+                return error.ForeignBytesReaderLoaded;
+            }
+
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
             _ = entry.refcount.fetchAdd(1, .acq_rel);
