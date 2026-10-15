@@ -362,8 +362,8 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
     /// The pack's directory: deepseek_v41's Engram tables sit beside the
-    /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream` or
-    /// `glm_stream`) loads from it. Set by `parseConfig`.
+    /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream`,
+    /// `glm_stream` or `glm5_stream`) loads from it. Set by `parseConfig`.
     pack_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
@@ -511,6 +511,10 @@ pub const ModelConfig = struct {
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     glm_stream: bool = false,
+    /// A GLM-5.3-Flash pack prepared for mlx-stream (`glm5_next`, its config declares `expert_streaming`: the NVFP4
+    /// bank): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights; a `glm5_next` config without the
+    /// block is the host's resident arch. Set by `parseConfig`.
+    glm5_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1190,7 +1194,7 @@ pub const ModelConfig = struct {
     /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
     /// pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream or self.glm_stream;
+        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1697,6 +1701,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.mimo_stream = true;
+    }
+    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.glm5_stream = true;
     }
     if (config.isGlmMoeDsa()) {
         // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
@@ -7390,6 +7398,29 @@ test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; a
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
     try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream's; a resident glm5_next config is the host's" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm5_next_pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var resident = try parseConfig(io, testing.allocator, dir);
+    defer resident.deinit(testing.allocator);
+    try testing.expect(resident.isGlm5() and !resident.glm5_stream and !resident.mlxStream());
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, glm5_next_pack_json, "\"model_type\": \"glm5_next\",", "\"model_type\": \"glm5_next\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(marked);
+    try testing.expect(!std.mem.eql(u8, marked, glm5_next_pack_json));
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.mimo_stream and !pack.glm_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();

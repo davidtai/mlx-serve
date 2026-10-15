@@ -17305,6 +17305,7 @@ pub const Transformer = struct {
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
         if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
         if (config.glm_stream) return initMlxStream(io, allocator, config, s);
+        if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
