@@ -87,9 +87,15 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         return e;
     };
     errdefer A.freeConfig(gpa, c);
+    // Every arch that declares `applySettings` gets the model's model-settings.json entry (`.null` without one).
+    if (comptime @hasDecl(A, "applySettings")) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const settings = model_settings.load(arena.allocator(), io, model_settings.defaultPath(&buf));
+        try applyEntry(A, c, settings.entry(dir) orelse .null);
+    }
     if (comptime k == .glm) {
-        // The arch takes the load's facts itself (its `loadBytes` and `init`).
-        try applySettings(A, arena.allocator(), io, c, config);
+        // The arch takes the load's facts itself (its `loadBytes` and `init`). The manual context wins over the entry.
+        try applyManualContext(A, arena.allocator(), c, config);
         noteMaxOutput(dir, A.maxOutput(c));
     } else if (comptime @hasDecl(A, "applyLoadFacts")) {
         f.effective_context = billedContext(k, config);
@@ -102,15 +108,19 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
     return c;
 }
 
-/// GLM-5.3's settings: the model's model-settings.json entry (its numeric tier, event gates, `max_output`, ...; `.null`
-/// without one), then the host's manual context, which wins (`server.manualContext`: the entry's `ctx_size`, else
-/// `--ctx-size`).
-fn applySettings(comptime A: type, arena: std.mem.Allocator, io: std.Io, c: *A.Config, config: *const ModelConfig) !void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const settings = model_settings.load(arena, io, model_settings.defaultPath(&buf));
-    A.applySettings(c, settings.entry(config.pack_dir.?) orelse .null);
+/// The model's model-settings.json entry on an arch's config, when the arch declares `applySettings` (a `void` or an
+/// error union result). An arch without it is not touched.
+fn applyEntry(comptime A: type, c: *A.Config, entry: std.json.Value) !void {
+    if (comptime !@hasDecl(A, "applySettings")) return;
+    const R = @typeInfo(@TypeOf(A.applySettings)).@"fn".return_type.?;
+    if (comptime @typeInfo(R) == .error_union) try A.applySettings(c, entry) else A.applySettings(c, entry);
+}
+
+/// GLM-5.3: the host's manual context after the entry, which it wins over (`server.manualContext`: the entry's
+/// `ctx_size`, else `--ctx-size`).
+fn applyManualContext(comptime A: type, arena: std.mem.Allocator, c: *A.Config, config: *const ModelConfig) !void {
     const context = server.manualContext(config);
-    if (context > 0) A.applySettings(c, try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{\"ctx_size\": {d}}}", .{context}), .{}));
+    if (context > 0) try applyEntry(A, c, try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{\"ctx_size\": {d}}}", .{context}), .{}));
 }
 
 /// GLM-5.3's `maxOutput` per pack, as the pack's last parse read it with the model's settings (the load's preflight and
@@ -355,4 +365,38 @@ test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxO
     // The coding workload's 16,387-token prompt and max_tokens 131,072 fit whole at the default.
     noteMaxOutput("/packs/glm-5.3", 131072);
     try testing.expect(16387 + 131072 <= contextLength(&config));
+}
+
+test "mlx_stream: an arch that declares applySettings receives the model's entry; an arch without it is not touched" {
+    const With = struct {
+        pub const Config = struct { seen: i64 = 0 };
+        pub fn applySettings(c: *Config, entry: std.json.Value) void {
+            if (entry == .object) if (entry.object.get("probe")) |v| {
+                c.seen = v.integer;
+            };
+        }
+    };
+    const WithError = struct {
+        pub const Config = struct { seen: i64 = 0 };
+        pub fn applySettings(c: *Config, entry: std.json.Value) !void {
+            if (entry != .object) return error.NotAnObject;
+            c.seen = entry.object.get("probe").?.integer;
+        }
+    };
+    const Without = struct {
+        pub const Config = struct { seen: i64 = 0 };
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const entry = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"probe\": 7}", .{});
+    var a: With.Config = .{};
+    try applyEntry(With, &a, entry);
+    try std.testing.expectEqual(@as(i64, 7), a.seen);
+    var b: WithError.Config = .{};
+    try applyEntry(WithError, &b, entry);
+    try std.testing.expectEqual(@as(i64, 7), b.seen);
+    try std.testing.expectError(error.NotAnObject, applyEntry(WithError, &b, .null));
+    var n: Without.Config = .{};
+    try applyEntry(Without, &n, entry);
+    try std.testing.expectEqual(@as(i64, 0), n.seen);
 }
