@@ -139,7 +139,7 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`; the pin, a29d85b, lives at davidtai/mlx-stream on branch `feat/mimo-foreign-bytes`) serves
+[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`; the pin, 2bd050c, is on the `main` branch of davidtai/mlx-stream) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
