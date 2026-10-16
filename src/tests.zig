@@ -15,6 +15,9 @@ comptime {
 
 test {
     _ = @import("log.zig");
+    _ = @import("os_mutex.zig");
+    _ = @import("crt.zig");
+    _ = @import("win_io.zig");
     _ = @import("arch/mlx_gguf.zig");
     if (@import("build_options").mlx_stream) _ = @import("arch/mlx_stream.zig");
     _ = @import("version.zig");
@@ -77,6 +80,7 @@ test {
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
+    _ = @import("load_progress.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
@@ -109,10 +113,14 @@ test {
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
-    _ = @import("ds4_ffi.zig");
-    _ = @import("arch/ds4.zig");
-    _ = @import("llama_ffi.zig");
-    _ = @import("arch/llama.zig");
+    if (@import("build_options").ds4_engine) {
+        _ = @import("ds4_ffi.zig");
+        _ = @import("arch/ds4.zig");
+    }
+    if (@import("build_options").llama_engine) {
+        _ = @import("llama_ffi.zig");
+        _ = @import("arch/llama.zig");
+    }
     _ = @import("wav.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");
@@ -122,6 +130,13 @@ test {
     _ = @import("qwen_image_edit.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
+    _ = @import("arch/ane_dflash.zig");
+    _ = @import("arch/ane_lm.zig");
+    _ = @import("arch/ane_mil.zig");
+    _ = @import("arch/ane_pack.zig");
+    _ = @import("arch/ane_prefix.zig");
+    _ = @import("arch/ane_qwen35.zig");
+    _ = @import("arch/ane_rt.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
     _ = @import("ltx_diffvae_kernel.zig");

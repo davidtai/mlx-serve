@@ -1,4 +1,5 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
@@ -5228,16 +5229,12 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
     if (path.len == 0 or path.len >= path_z.len) return;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&path_z), .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = true,
-    }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(@ptrCast(&path_z), false);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var hdr: [128]u8 = undefined;
     const header = std.fmt.bufPrint(&hdr, "layer={d} row0={d} rows={d} kb={d}\n", .{ layer, row0, rows, kb }) catch return;
-    _ = std.c.write(fd, header.ptr, header.len);
+    _ = crt.write(fd, header);
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -5245,9 +5242,9 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
             std.fmt.bufPrint(&buf, "{d}", .{data[i]}) catch return
         else
             std.fmt.bufPrint(&buf, " {d}", .{data[i]}) catch return;
-        _ = std.c.write(fd, piece.ptr, piece.len);
+        _ = crt.write(fd, piece);
     }
-    _ = std.c.write(fd, "\n", 1);
+    _ = crt.write(fd, "\n");
 }
 
 // ── The composed selection arm (the kernel's reference) ──
@@ -9598,7 +9595,7 @@ pub const QsaHeadMarkSet = struct {
         self.dropAbove(pos);
         if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
         if (self.len == QSA_HEAD_MARKS_MAX) {
-            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null));
+            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null, 0));
         }
         self.items[self.len] = .{ .pos = pos, .rows = rows };
         self.len += 1;
@@ -13939,19 +13936,31 @@ pub fn spanPreservingDropIndex(
     /// selected. When it is the only candidate the oldest goes instead — that one sits below
     /// it, so the protected position survives either way.
     protect: ?usize,
+    /// How many LOW positions are anchored as well (#794: thinning must not
+    /// migrate the grid floor upward). 0 = the plain policy; a caller that
+    /// wants the legacy drop-oldest behaviour also passes 0.
+    low_anchors: usize,
 ) usize {
     std.debug.assert(items.len > 0);
-    if (policy == .oldest) return 0;
-    if (items.len < 3) return 0;
+    const last = items.len - 1;
+    // The cap outranks the anchors: the newest position is never a drop candidate,
+    // so if every remaining index is anchored the lowest anchor gives way.
+    if (items.len <= low_anchors + 1) return @min(low_anchors, last);
+    if (policy == .oldest) return @min(low_anchors, last);
+    if (items.len < 3) return @min(low_anchors, last);
     // Recency bias: the newest quarter stays at capture density (a warm turn that edits near
     // the end restores from there); everything below it is thinned span-preservingly.
     const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
         items.len - items.len / 4
     else
         items.len;
-    var best_at: usize = 1;
+    // Index 0 is never a candidate (the span is measured across k-1), so the scan
+    // starts one past the last anchor — and at 1 when nothing is anchored, which
+    // is the position the plain policies have always started from.
+    const scan_start = @max(low_anchors, 1);
+    var best_at: usize = scan_start;
     var best_span: usize = std.math.maxInt(usize);
-    var k: usize = 1;
+    var k: usize = scan_start;
     while (k + 1 < items.len and k < scan_end) : (k += 1) {
         if (protect) |p| if (k == p) continue;
         const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
@@ -13960,8 +13969,16 @@ pub fn spanPreservingDropIndex(
             best_at = k;
         }
     }
+    // Nothing scannable (recency-protected or anchored): the oldest goes, which
+    // sits below every anchor, so the anchors still survive.
     if (best_span == std.math.maxInt(usize)) return 0;
     return best_at;
+}
+
+/// `spanPreservingDropIndex` over a bare ascending position list, with the first
+/// `low_anchors` positions protected from thinning.
+pub fn positionDropIndexLowAnchored(positions: []const u32, policy: ThinPolicy, low_anchors: usize) usize {
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, low_anchors);
 }
 
 /// Shortest list that reserves a dense newest quarter.
@@ -13981,16 +13998,29 @@ fn usizePosOf(p: *const usize) usize {
 
 /// `spanPreservingDropIndex` over a checkpoint list.
 pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
-    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, 0);
+}
+
+/// `ssmCheckpointDropIndex` with the first `low_anchors` positions protected
+/// from thinning: generation-side retention must let the dense low grid anchors
+/// (#794) survive the per-prefill cap, or the persist-side `ssm_low_anchors`
+/// has nothing left to protect. 0 = the plain policy, byte-identical to before.
+pub fn ssmCheckpointDropIndexLowAnchored(
+    cps: []const SSMCheckpoint,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors);
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null);
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);
 }
 
 pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null);
+    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null, 0);
 }
 
 /// QSA indexer key history lives on full-attention layers: `aux_state` is
@@ -31105,7 +31135,7 @@ pub const Transformer = struct {
             const reg = self.rht.?;
             const signs = reg.get(la.out_w) orelse break :fast;
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, .{
+            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, reg.block, .{
                 .qkv = qkv,
                 .z = z_proj,
                 .a = a_proj,
@@ -64857,7 +64887,8 @@ test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
     // bf16 everywhere, a Hadamard pack's f16 activations over an f32 state, and qwen4_exp's bf16 over f32.
-    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts| try gdnDecodeParityCase(s, dts[0], dts[1]);
+    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts|
+        for ([_]c_int{ 512, 1024, 2048, 4096 }) |block| try gdnDecodeParityCase(s, dts[0], dts[1], block);
 }
 
 test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at verify widths" {
@@ -65668,13 +65699,13 @@ fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(seq_ref_head, seq_got_head, s));
 }
 
-fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
+fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, block: c_int) !void {
     var prng = std.Random.DefaultPrng.init(0xB0B5A1);
     const rnd = prng.random();
     const hk: c_int = 2;
-    const hv: c_int = 8;
     const dk: c_int = 128;
     const dv: c_int = 128;
+    const hv: c_int = @divExact(2 * block, dv);
     const c_dim: c_int = hk * dk * 2 + hv * dv;
     const value_dim: c_int = hv * dv;
 
@@ -65704,9 +65735,10 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     defer _ = mlx.mlx_array_free(norm_w);
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
-    var sg: [1024]f32 = undefined;
-    for (&sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
-    const signs = mlx.mlx_array_new_data(&sg, &[_]c_int{value_dim}, 1, .float32);
+    const sg = try testing.allocator.alloc(f32, @intCast(value_dim));
+    defer testing.allocator.free(sg);
+    for (sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+    const signs = mlx.mlx_array_new_data(sg.ptr, &[_]c_int{value_dim}, 1, .float32);
     defer _ = mlx.mlx_array_free(signs);
 
     // Composed chain: the three production kernels + the input rotation.
@@ -65769,7 +65801,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     try mlx.check(mlx.mlx_vector_array_get(&state_ref, outputs_vec, 1));
     const flat_ref = (try gdnNormGateFused(s, y_ref, z, 0, value_dim, norm_w, eps_arr, true, hv, dv, 1, 1)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat_ref);
-    const rot_ref = try rht.transform(flat_ref, signs, 1024, false, s);
+    const rot_ref = try rht.transform(flat_ref, signs, block, false, s);
     defer _ = mlx.mlx_array_free(rot_ref);
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
@@ -65789,7 +65821,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
         .eps = eps_arr,
         .signs = signs,
     };
-    const got = (try gdn_decode.step(geo, in, s)) orelse return error.FusedDeclined;
+    const got = (try gdn_decode.step(geo, block, in, s)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got.rot);
     defer _ = mlx.mlx_array_free(got.conv_state);
     defer _ = mlx.mlx_array_free(got.ssm_state);
@@ -73552,7 +73584,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
     }
-    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
+    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true, false));
 }
 
 test "hc prefill: incompatible read writes immediately" {
