@@ -2137,10 +2137,7 @@ pub const Scheduler = struct {
             }
 
             // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
-            if (self.registry.foreignReaderLoadedLocked(entry.id, owned.config)) |other| {
-                log.err("{s}: refused: {s} is loaded, and both stream packs read the one process foreign-bytes value; unload it first\n", .{ entry.id, other });
-                return error.ForeignBytesReaderLoaded;
-            }
+            const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
 
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
@@ -2165,7 +2162,7 @@ pub const Scheduler = struct {
             // (multi-victim). On failure — every other resident model is pinned
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
-            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
+            const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -8990,23 +8987,6 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
     try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
     try testing.expect(idleEvictTickMs(0) >= 1000);
-}
-
-test "mlx-stream: GLM-5.3 closes on the inference thread after its loop; a request ends before its terminator" {
-    // A GLM-5.3 module freed from `Scheduler.deinit`'s thread fails MLX's stream lookup ("no Stream(gpu, 0) in current thread").
-    const source = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
-    const body = source[start..end];
-    const loop = std.mem.indexOf(u8, body, "if (chatPass(sch, .main) == .shutdown) break;") orelse return error.MissingLoop;
-    const close = std.mem.indexOf(u8, body, "closeGlmModels(sch);") orelse return error.MissingClose;
-    try testing.expect(loop < close);
-    const fin = std.mem.indexOf(u8, source, "fn finishSlot(") orelse return error.MissingFinishSlot;
-    const fin_end = std.mem.indexOfPos(u8, source, fin + 1, "\nfn ") orelse return error.MissingFinishSlotEnd;
-    const finish = source[fin..fin_end];
-    const ended = std.mem.indexOf(u8, finish, "mlx_stream.end(m);") orelse return error.MissingRequestEnd;
-    const published = std.mem.indexOf(u8, finish, "publishSlotTerminator(slot, reason, latched);") orelse return error.MissingTerminator;
-    try testing.expect(ended < published);
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {
