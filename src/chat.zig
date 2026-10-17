@@ -1422,6 +1422,23 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     return "xhigh";
 }
 
+/// Beam's Harmony template: the one family whose tool calls carry `rfl:parameter` bodies.
+fn isBeamEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "rfl:parameter") != null;
+}
+
+/// OpenAI's effort vocabulary -> Beam's minimal|low|medium|high|xhigh|max (the template's default is max; it raises
+/// on any other string). Harmony has no thinking-off: off is the smallest effort the model was trained on.
+fn beamEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "minimal";
+    const e = effort orelse return "max";
+    if (std.mem.eql(u8, e, "none")) return "minimal";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh" }) |w| {
+        if (std.mem.eql(u8, e, w)) return w;
+    }
+    return "max";
+}
+
 /// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
 /// raises on anything else; each word picks a different think opener.
 fn k2EffortFor(effort: ?[]const u8) []const u8 {
@@ -1555,6 +1572,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
+        try buf.append(allocator, '"');
+    } else if (isBeamEffortTemplate(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, beamEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -10579,6 +10600,57 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
         var want: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
     }
+}
+
+test "serializeExtraContext: beam maps effort onto its six labels, default max, thinking-off minimal" {
+    const allocator = testing.allocator;
+    var beam = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const cases = [_]struct { in: ?[]const u8, thinking: bool, out: []const u8 }{
+        .{ .in = null, .thinking = true, .out = "max" },
+        .{ .in = "banana", .thinking = true, .out = "max" },
+        .{ .in = "none", .thinking = true, .out = "minimal" },
+        .{ .in = "minimal", .thinking = true, .out = "minimal" },
+        .{ .in = "low", .thinking = true, .out = "low" },
+        .{ .in = "medium", .thinking = true, .out = "medium" },
+        .{ .in = "high", .thinking = true, .out = "high" },
+        .{ .in = "xhigh", .thinking = true, .out = "xhigh" },
+        .{ .in = "max", .thinking = true, .out = "max" },
+        .{ .in = "high", .thinking = false, .out = "minimal" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(allocator, &beam, c.thinking, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
+}
+
+test "renderChatTemplate: beam's shipped template renders byte-identical to transformers (two turns, and a tool round trip)" {
+    // The references are transformers' render of the same messages with the kwargs the host passes.
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = "<|return|>", .add_bos_token = false, .allocator = allocator };
+    const two_turn = [_]Message{
+        .{ .role = "system", .content = "Be brief." },
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "Add two and two." },
+        .{ .role = "user", .content = "And 3+3?" },
+    };
+    const plain = try renderChatTemplate(allocator, &two_turn, &config, null, null, true, null, false);
+    defer allocator.free(plain);
+    try testing.expectEqualStrings(@embedFile("fixtures/beam_render_reference.txt"), plain);
+
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "get_weather", "description": "Get the weather", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"unit\": \"c\"}" }};
+    const tool_turn = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+    };
+    const tools = try renderChatTemplate(allocator, &tool_turn, &config, tools_json, null, true, null, false);
+    defer allocator.free(tools);
+    try testing.expectEqualStrings(@embedFile("fixtures/beam_tools_render_reference.txt"), tools);
 }
 
 test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
