@@ -1222,6 +1222,12 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "beam");
     }
 
+    /// The model speaks Harmony (gpt_oss, Beam): every turn opens `<|channel|>analysis`, so it always thinks and its
+    /// stream goes through the channel gate.
+    pub fn harmonyChannels(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "gpt_oss") or self.isBeam();
+    }
+
     /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo, GLM-5.3, GLM-5.3-Flash
     /// or Beam stream pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
@@ -1518,7 +1524,7 @@ pub const ModelConfig = struct {
         // delivered rather than paid-and-dropped). A plain chat request
         // defaults to the prompt-committed to=user channel instead
         // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
-        // gpt_oss: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
+        // gpt_oss and beam: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
         // template's `Reasoning: low|medium|high` sets depth, not presence, and
         // the model opens `<|channel|>analysis<|message|>` on every turn no
         // matter what we ask. Defaulting a silent request to off did not stop
@@ -1527,7 +1533,7 @@ pub const ModelConfig = struct {
         // the reasoning itself into visible content (live 2026-08-12).
         // Thinking-off here would have to be enforced in the PROMPT, and
         // harmony offers no way to do it.
-        if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
+        if (self.harmonyChannels()) return true;
         if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
         // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
         // checkpoint's own template normalizes an undefined `enable_thinking`
@@ -1548,8 +1554,6 @@ pub const ModelConfig = struct {
         if (self.isDsv41()) return true;
         // glm_moe_dsa: the template opens `<think>` on every assistant turn, as glm5_next.
         if (self.isGlmMoeDsa()) return true;
-        // beam: Harmony again (as gpt_oss): every turn opens an analysis channel and `reasoning_effort` sets its depth.
-        if (self.isBeam()) return true;
 
         return false;
     }
