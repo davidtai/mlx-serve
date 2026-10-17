@@ -7759,7 +7759,7 @@ test "parseConfigFromJson beam: the shell fields the host reads, thinking on" {
     try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
 }
 
-test "parseConfig: a beam pack that declares expert_streaming is mlx-stream's; a beam checkpoint without it is refused by name" {
+test "parseConfig: a beam release config (ModelOpt, no expert_streaming) is refused by name, never loaded resident" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7767,14 +7767,28 @@ test "parseConfig: a beam pack that declares expert_streaming is mlx-stream's; a
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = beam_config });
     try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = "{\"eos_token_id\": [151674, 151675], \"pad_token_id\": 151643}" });
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try testing.expect((try parseConfigFromJson(testing.allocator, beam_config)).modelopt);
     try testing.expectError(error.BeamNeedsStreamPack, parseConfig(io, testing.allocator, dir));
-    const marked = try std.mem.replaceOwned(u8, testing.allocator, beam_config, "\"model_type\": \"beam\",", "\"model_type\": \"beam\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
-    defer testing.allocator.free(marked);
-    try testing.expect(!std.mem.eql(u8, marked, beam_config));
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+}
+
+test "parseConfig: a beam pack that declares expert_streaming is mlx-stream's, its eos ids from its config.json" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    // The converter's config: the block added, eos filled from generation_config.json, quantization_config removed.
+    const with_block = try std.mem.replaceOwned(u8, testing.allocator, beam_config, "\"model_type\": \"beam\",", "\"model_type\": \"beam\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(with_block);
+    const with_eos = try std.mem.replaceOwned(u8, testing.allocator, with_block, "\"eos_token_id\": null,", "\"eos_token_id\": [151674, 151675], \"pad_token_id\": 151643,");
+    defer testing.allocator.free(with_eos);
+    const pack_json = try std.mem.replaceOwned(u8, testing.allocator, with_eos, ",\n \"quantization_config\": {\"quant_algo\": \"NVFP4\", \"quant_method\": \"modelopt\"}", "");
+    defer testing.allocator.free(pack_json);
+    try testing.expect(std.mem.indexOf(u8, pack_json, "expert_streaming") != null and std.mem.indexOf(u8, pack_json, "151675") != null and std.mem.indexOf(u8, pack_json, "modelopt") == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isBeam() and pack.beam_stream and pack.mlxStream() and !pack.glm5_stream and !pack.mimo_stream);
+    try testing.expect(pack.isBeam() and pack.beam_stream and pack.mlxStream() and !pack.modelopt and !pack.glm5_stream and !pack.mimo_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     try testing.expectEqualSlices(u32, &.{ 151674, 151675 }, pack.eos_token_ids[0..pack.num_eos_tokens]);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
