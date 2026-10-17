@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Beam 1.0.** Reflection's 501B-A23B MoE runs from an mlx-stream pack on a 256 GB Mac, with its NVFP4 experts streamed from SSD; text and thinking, with `reasoning_effort` from minimal to max.
+- **Beam 1.0.** Reflection's 501B-A23B MoE runs from an mlx-stream pack on a 256 GB Mac, with its NVFP4 experts streamed from SSD; text, thinking (with `reasoning_effort` from minimal to max) and tool calls, parallel ones included.
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
 - **NVIDIA's Qwen3.8-Flash-Next FP4 pack runs as published.** `nvidia/Qwen3.8-Flash-Next-FP4-Local` loads straight from Hugging Face (NVFP4 experts with their compressed scales, MXFP8 linears, the NVFP4 n-gram table read from SSD) and decodes and prefills within about 1% of our own Flash Next pack, MTP drafts and images included.
@@ -11,7 +11,7 @@
 - **GLM-5.3 runs its clamped SwiGLU everywhere.** On the MLX packs (limit 10) the 2-8 row MoE kernel skipped the clamp, so concurrent streams and MTP or DFlash verify rows ran an unclamped activation; they now take the composed chain.
 - **Faster VAEs.** Krea and Qwen-Image decode their pictures in half precision.
 - **Model Browser.** My Models shows what each model overrides (engine, speculation, KV cache, sampling, template kwargs) in a Settings column, and Discover offers Use on decision models and, for a repo with one build on disk, a Use button beside its quant menu.
-- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs. A download, in the app and with `mlx-serve pull`, now fetches every file a model's shard index names, so OptiQ packs that keep weights in a subfolder no longer show "Missing shards".
+- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs. A download, in the app and with `mlx-serve pull`, now fetches every file a model's shard index names, so OptiQ packs that keep weights in a subfolder no longer show "Missing shards". A chat template that repeats a string (`" " * n`) or lists a mapping's keys (`mapping | list`) now renders as written instead of falling back to a generic prompt format.
 
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 
