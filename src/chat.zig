@@ -10116,6 +10116,18 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: `string * int` repeats as Python does, and `mapping | list` is its keys in order" {
+    const allocator = testing.allocator;
+    const tpl =
+        \\[{{ "ab" * 3 }}|{{ 2 * "-" }}|{{ "x" * 0 }}|{{ "x" * -1 }}|{{ {"b": 1, "a": 2} | list | join(",") }}|{{ ({"k": 1} | list) == ["k"] }}]
+    ;
+    var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("[ababab|--|||b,a|True]", rendered);
+}
+
 test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
     // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
     const allocator = testing.allocator;
@@ -10638,6 +10650,28 @@ test "renderChatTemplate: beam's shipped template renders two turns byte-identic
     const plain = try renderChatTemplate(allocator, &two_turn, &config, null, null, true, null, false);
     defer allocator.free(plain);
     try testing.expectEqualStrings(@embedFile("fixtures/beam_render_reference.txt"), plain);
+}
+
+test "renderChatTemplate: beam's shipped template renders a two-tool parallel round trip byte-identical to transformers" {
+    // A trained-shape `bash` (system block, `mapping | list`) beside a tool with a nested object (`" " * indent`).
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = "<|return|>", .add_bos_token = false, .allocator = allocator };
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "bash", "description": "Run a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command"}}, "required": ["command"]}}}, {"type": "function", "function": {"name": "get_weather", "description": "Get the weather", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}, "days": {"type": "integer"}, "options": {"type": "object", "description": "Display options", "properties": {"unit": {"type": "string", "enum": ["c", "f"]}, "hourly": {"type": "boolean"}}}}, "required": ["city"]}}}]
+    ;
+    const tc = [_]ToolCall{
+        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"days\": 2, \"options\": {\"unit\": \"c\", \"hourly\": false}}" },
+        .{ .id = "call_2", .name = "bash", .arguments = "{\"command\": \"ls -la\"}" },
+    };
+    const tool_turn = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris, and list the files?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need both tools." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+        .{ .role = "tool", .content = "a.txt", .tool_call_id = "call_2" },
+    };
+    const rendered = try renderChatTemplate(allocator, &tool_turn, &config, tools_json, null, true, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings(@embedFile("fixtures/beam_tools_render_reference.txt"), rendered);
 }
 
 test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
