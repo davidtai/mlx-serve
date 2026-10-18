@@ -62,7 +62,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
-| `--no-mtp` / `--mtp` | on when a head is loaded | Disable the native MTP head; `--mtp` is a no-op kept for old launch lines (dense and MoE both default on) |
+| `--no-mtp` / `--mtp` | on when a head is loaded (Metal, CUDA) | Disable the native MTP head; `--mtp` turns it on where it is off by default (Vulkan). Dense and MoE alike |
 | `--mtp-min-depth N` | `1` | Minimum MTP draft depth (1..8); lifts the automatic cap if needed |
 | `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. `--mtp-depth` is the old spelling of this flag. Native head count and remaining tokens can shorten a round. |
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
@@ -76,6 +76,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8}` | off | KV-cache quantization scheme (MLX path) |
 | `--kv-attn-mode {auto,dense,fused}` | auto | Decode read path for quantized KV: `fused` reads the packed cache in place, `auto` engages it from 8K prompt tokens (only at `--kv-quant 4/8`; per-request `kv_attn_mode` overrides) |
+| `--int8-qk` | off | Lossy, NAX GPUs (M5-class and later) only: the causal head-dim-256 prefill attention of dense Qwen 3.5/3.6/3.8 models multiplies int8 Q and K (K with its per-head mean removed), P and V stay half. Flat at 8k tokens, +3% at 32k, +7% at 64k, +14% at 128k on an M5 Ultra (256 GB). Env `MLX_SERVE_INT8_QK=1` is the same switch; details in [performance.md](performance.md#int8-qk-prefill-attention-nax-gpus) |
 | `--llama-kv-quant {off,q8,q4}` | off | KV-cache quantization for GGUF (llama.cpp path) |
 | `--llama-cache-entries N` | `4` | llama.cpp sequences per model: requests decoded together in one batch, each keeping its prompt KV warm; each holds a full `--ctx-size` of KV from load |
 | `--llama-mtp-drafts N` | `2` | Draft tokens per MTP round for a GGUF with an MTP head (its own, or an `mtp-*.gguf` beside it); drafts only while one request decodes; `0` = off |
@@ -92,6 +93,11 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
 | `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
 | `--lan-name NAME` | hostname | The Bonjour name other Macs see |
+| `--dist pipeline\|tensor` | off | Serve `--dist-model` across this Mac and a second one over Thunderbolt 5 RDMA: `pipeline` gives each Mac a run of layers (Qwen3.8-Flash-Next, DeepSeek-V4.1), `tensor` gives each half of every MoE expert (Flash Next); with a MiniMax-H3 pack each video step's rows are split instead, when that is faster. The other Mac runs `mlx-serve worker --coordinator IP:PORT --device rdma_enX` and finds the same model in its own library |
+| `--dist-model PATH` | `--model` | The model the two Macs serve together |
+| `--dist-coordinator IP:PORT` | none | This Mac's address the worker dials |
+| `--dist-device rdma_enX` | none | The RDMA port facing the worker (`ibv_devinfo`) |
+| `--dist-split N` | by free memory | Pipeline: layers kept on this Mac, on a full-attention boundary |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set). Repeatable — folders merge first-wins |
 | `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |

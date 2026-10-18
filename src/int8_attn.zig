@@ -20,42 +20,52 @@ const BK: c_int = 32;
 const SM: c_int = 16;
 const NSG: c_int = 4;
 
-/// One simdgroup per (head, row) of q [1, H, L, 128]: int8 codes + one scale.
-const QPREP_SOURCE =
-    \\const int rows = q_shape[1] * q_shape[2];
-    \\const int r = int(thread_position_in_grid.x) / 32;
-    \\if (r >= rows) return;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const float4 x = float4(*(const device vec<T, 4>*)(q + (size_t)r * 128 + lane * 4));
-    \\const float a = simd_max(max(max(fabs(x.x), fabs(x.y)), max(fabs(x.z), fabs(x.w))));
-    \\const float sc = max(a, 1e-20f) / 127.0f;
-    \\*(device char4*)(qi + (size_t)r * 128 + lane * 4) = char4(rint(x / sc));
-    \\if (lane == 0) qs[r] = sc;
-;
-
-/// One simdgroup per (kv head, 32-key block) of k [1, KV, L, 128] minus `mu`.
-const KPREP_SOURCE =
-    \\const int KVH = k_shape[1];
-    \\const int L = k_shape[2];
-    \\const int NB = (L + 31) / 32;
-    \\const int id = int(thread_position_in_grid.x) / 32;
-    \\if (id >= KVH * NB) return;
-    \\const int h = id / NB, b = id % NB;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const float4 m = float4(*(const device vec<T, 4>*)(mu + h * 128 + lane * 4));
-    \\float4 x[32];
-    \\float a = 0.0f;
-    \\for (int t = 0; t < 32; t++) {
-    \\  const int row = b * 32 + t;
-    \\  x[t] = row < L ? float4(*(const device vec<T, 4>*)(k + ((size_t)h * L + row) * 128 + lane * 4)) - m : float4(0.0f);
-    \\  a = max(a, max(max(fabs(x[t].x), fabs(x[t].y)), max(fabs(x[t].z), fabs(x[t].w))));
-    \\}
-    \\const float sc = max(simd_max(a), 1e-20f) / 127.0f;
-    \\for (int t = 0; t < 32; t++) {
-    \\  const int row = b * 32 + t;
-    \\  if (row < L) *(device char4*)(ki + ((size_t)h * L + row) * 128 + lane * 4) = char4(rint(x[t] / sc));
-    \\}
-    \\if (lane == 0) ks[id] = sc;
+/// One simdgroup per ROWS-row block of a [B, H, L, D] view, SG blocks per threadgroup: int8 codes,
+/// row-contiguous, and one fp32 scale (absmax / 127, at least `eps` / 127) per block, less `mean`
+/// [B, H, D] when given; DIVIDE rounds x / scale, else x * (1 / scale). Each lane owns D / 32
+/// adjacent columns as float4s and stores them as char4. CONTIG (MLX made x row-contiguous, < 2^32
+/// elements) loads them as vectors with 32-bit offsets, which per-row Q prep needs to stay at the
+/// bandwidth bound; otherwise scalar reads through x's strides.
+const QUANT_SOURCE =
+    \\  constexpr int C4 = D / 128;
+    \\  constexpr bool KEEP = ROWS * C4 <= 32;
+    \\  const int L = x_shape[2];
+    \\  const int Hx = x_shape[1];
+    \\  const uint nb = (L + ROWS - 1) / ROWS;
+    \\  const uint id = threadgroup_position_in_grid.x * SG + simdgroup_index_in_threadgroup;
+    \\  if (id >= x_shape[0] * Hx * nb) return;
+    \\  const uint bh = id / nb, blk = id % nb;
+    \\  const uint lane = thread_index_in_simdgroup;
+    \\  const int r0 = blk * ROWS;
+    \\  const int nr = ROWS == 1 ? 1 : min(L - r0, ROWS);
+    \\  const device T* base = CONTIG ? x + (bh * L + r0) * D + lane * 4 * C4
+    \\      : x + (bh / Hx) * x_strides[0] + (bh % Hx) * x_strides[1] + r0 * x_strides[2] + lane * 4 * C4 * x_strides[3];
+    \\  const int64_t rs = x_strides[2], cs = x_strides[3];
+    \\  #define LD(t, u) (CONTIG ? float4(*(const device vec<T, 4>*)(base + (t) * D + 4 * (u))) \
+    \\      : cs == 1 ? float4(base[(t) * rs + 4 * (u)], base[(t) * rs + 4 * (u) + 1], base[(t) * rs + 4 * (u) + 2], base[(t) * rs + 4 * (u) + 3]) \
+    \\      : float4(base[(t) * rs + (4 * (u)) * cs], base[(t) * rs + (4 * (u) + 1) * cs], base[(t) * rs + (4 * (u) + 2) * cs], base[(t) * rs + (4 * (u) + 3) * cs]))
+    \\  float4 m[C4];
+    \\  for (int u = 0; u < C4; u++)
+    \\    for (int e = 0; e < 4; e++) m[u][e] = HAS_MEAN ? float(mean[bh * D + lane * 4 * C4 + 4 * u + e]) : 0.0f;
+    \\  float4 y[KEEP ? ROWS * C4 : 1];
+    \\  float amax = 0.0f;
+    \\  for (int t = 0; t < nr; t++)
+    \\    for (int u = 0; u < C4; u++) {
+    \\      const float4 v = LD(t, u) - m[u];
+    \\      if (KEEP) y[t * C4 + u] = v;
+    \\      amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+    \\    }
+    \\  amax = simd_max(amax);
+    \\  const float sc = max(amax, eps) / 127.0f;
+    \\  const float inv = 1.0f / sc;
+    \\  device int8_t* ob = q + (CONTIG ? size_t((bh * L + r0) * D) : (size_t(bh) * L + r0) * D) + lane * 4 * C4;
+    \\  for (int t = 0; t < nr; t++)
+    \\    for (int u = 0; u < C4; u++) {
+    \\      const float4 v = KEEP ? y[t * C4 + u] : LD(t, u) - m[u];
+    \\      *(device char4*)(ob + t * D + 4 * u) = char4(rint(DIVIDE ? v / sc : v * inv));
+    \\    }
+    \\  #undef LD
+    \\  if (lane == 0) scales[id] = sc;
 ;
 
 /// One simdgroup per (kv head, row) of v [1, KV, L, 128], over its per-channel |max| `vm`.
@@ -76,10 +86,10 @@ const VPREP_SOURCE =
 /// and P's left operand share that layout, so P never leaves registers.
 const ATTN_SOURCE =
     \\constexpr int BK = 32, SM = 16, NSG = 4;
-    \\const int H = qi_shape[0];
-    \\const int LQ = qi_shape[1];
-    \\const int L = ki_shape[1];
-    \\const int KVH = ki_shape[0];
+    \\const int H = qi_shape[1];
+    \\const int LQ = qi_shape[2];
+    \\const int L = ki_shape[2];
+    \\const int KVH = ki_shape[1];
     \\const int NB = (L + BK - 1) / BK;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int head = int(threadgroup_position_in_grid.y);
@@ -179,8 +189,10 @@ const ATTN_SOURCE =
     \\}
 ;
 
-var qprep_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var kprep_kernel: ?mlx.mlx_fast_metal_kernel = null;
+/// Blocks (one simdgroup each) per threadgroup of `QUANT_SOURCE` when CONTIG; the strided arm
+/// keeps one, its long-K prep ran slower in wide threadgroups.
+const QUANT_SG: c_int = 8;
+var quant_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var vprep_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged_logged = false;
@@ -221,6 +233,65 @@ fn simdGrid(items: c_int) c_int {
     return 256 * @divTrunc(items + 7, 8);
 }
 
+/// Int8 codes of x [B, H, L, D] and its scales [B * H * blocks] per `QUANT_SOURCE`; `contig` lets
+/// MLX copy a strided x into rows first, else the kernel reads x's strides. The caller frees both.
+pub fn quantRows(x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array, eps: f32, divide: bool, contig_ok: bool, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    const contig = contig_ok and mlx.mlx_array_size(x) <= std.math.maxInt(u32);
+    const slot = &quant_kernels[@intFromBool(contig)];
+    if (slot.* == null) {
+        const iv = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "x", "mean", "eps" }, 3);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "q", "scales" }, 2);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const name = if (contig) "msv_int8_quant_rows_contig" else "msv_int8_quant_rows";
+        const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, QUANT_SOURCE, "", contig, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        slot.* = k;
+    }
+    const sh = mlx.getShape(x);
+    const blocks = sh[0] * sh[1] * @divTrunc(sh[2] + rows - 1, rows);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 4, .int8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{blocks}, 1, .float32));
+    const sg: c_int = if (contig) QUANT_SG else 1;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divTrunc(blocks + sg - 1, sg) * 32 * sg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * sg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SG", sg));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "D", sh[3]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "HAS_MEAN", mean != null));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "DIVIDE", divide));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "CONTIG", contig));
+    const e = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(e);
+    const iv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ x, mean orelse x, e }, 3);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, slot.*.?, iv, c, s));
+    var out: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*r, i| try mlx.check(mlx.mlx_vector_array_get(r, ov, i));
+    return out;
+}
+
+/// q [1, H, L, 128]: int8 codes and one scale per row.
+pub fn prepQ(q: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    return quantRows(q, 1, null, 1e-20, true, true, s);
+}
+
+/// k [1, KV, L, 128] less its per-channel mean: int8 codes and one scale per 32-key block.
+pub fn prepK(k: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    var mu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mu);
+    try mlx.check(mlx.mlx_mean_axis(&mu, k, 2, false, s));
+    return quantRows(k, BK, mu, 1e-20, true, true, s);
+}
+
 /// Softmax(q k^T * scale) v for heads-major q [1, H, Lq, 128] and k, v
 /// [1, KV, L, 128] (H a multiple of KV), unmasked, returned token-major
 /// [Lq, H*128] in q's dtype; null when the shape is outside the kernel.
@@ -236,25 +307,15 @@ pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f3
     if (@rem(h, kv) != 0 or l < BK) return null;
     const dt = mlx.mlx_array_dtype(q);
     if (dt != .bfloat16 and dt != .float16) return null;
-    if (qprep_kernel == null) {
-        qprep_kernel = try newKernel("msv_i8attn_qprep", &.{"q"}, &.{ "qi", "qs" }, QPREP_SOURCE, "");
-        kprep_kernel = try newKernel("msv_i8attn_kprep", &.{ "k", "mu" }, &.{ "ki", "ks" }, KPREP_SOURCE, "");
+    if (vprep_kernel == null) {
         vprep_kernel = try newKernel("msv_i8attn_vprep", &.{ "v", "vm" }, &.{"vi"}, VPREP_SOURCE, "");
         attn_kernel = try newKernel("msv_i8attn", &.{ "qi", "qs", "ki", "ks", "vi", "vm", "scale" }, &.{"o"}, ATTN_SOURCE, HEADER);
     }
-    const nb = @divTrunc(l + BK - 1, BK);
-
-    var qp: [2]mlx.mlx_array = undefined;
-    try launch(qprep_kernel.?, &.{q}, &.{ .{ .shape = &.{ h, lq, 128 }, .dtype = .int8 }, .{ .shape = &.{ h, lq }, .dtype = .float32 } }, simdGrid(h * lq), 1, 256, dt, &qp, s);
+    const qp = try prepQ(q, s);
     defer for (qp) |a| {
         _ = mlx.mlx_array_free(a);
     };
-
-    var mu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mu);
-    try mlx.check(mlx.mlx_mean_axis(&mu, k, 2, false, s));
-    var kp: [2]mlx.mlx_array = undefined;
-    try launch(kprep_kernel.?, &.{ k, mu }, &.{ .{ .shape = &.{ kv, l, 128 }, .dtype = .int8 }, .{ .shape = &.{ kv, nb }, .dtype = .float32 } }, simdGrid(kv * nb), 1, 256, dt, &kp, s);
+    const kp = try prepK(k, s);
     defer for (kp) |a| {
         _ = mlx.mlx_array_free(a);
     };

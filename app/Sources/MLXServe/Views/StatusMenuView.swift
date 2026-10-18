@@ -499,7 +499,8 @@ struct StatusMenuView: View {
             TraySectionHeader(title: "In Memory",
                               detail: loadedModels.count > 1 ? L10n.format("%lld models", loadedModels.count) : nil)
             TrayCard {
-                if loadedModels.isEmpty {
+                let helping = ClusterWorker.part(of: appState.clusterWorker.state) != nil
+                if loadedModels.isEmpty && !helping {
                     Text("None loaded — models load on demand")
                         .font(.app(.caption))
                         .foregroundStyle(.secondary)
@@ -507,6 +508,7 @@ struct StatusMenuView: View {
                 ForEach(loadedModels, id: \.name) { info in
                     modelSlotRow(info)
                 }
+                WorkerPartRow(worker: appState.clusterWorker)
 
                 if let mem = server.memoryInfo {
                     if !loadedModels.isEmpty {
@@ -514,8 +516,9 @@ struct StatusMenuView: View {
                     }
                     // Shared meter — the same bar the Recommended pane and
                     // welcome screen show.
+                    // A Thunderbolt worker's part lives in its own process, beside the server's.
                     MemoryMeter(
-                        gpuBytes: mem.activeBytes,
+                        gpuBytes: mem.activeBytes + appState.clusterWorker.residentBytes,
                         gpuLabel: mem.gpuMemoryLabel,
                         availableBytes: mem.availableBytes,
                         totalBytes: Int64(ProcessInfo.processInfo.physicalMemory),
@@ -736,6 +739,11 @@ struct StatusMenuView: View {
                     .help(info.slotKind == .chat
                           ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
                           : info.slotKind.label)
+                let paired = server.cluster.map { $0.joined && $0.serves(info.name) } ?? false
+                if paired {
+                    ThunderboltBadge()
+                        .help(L10n.text("Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both."))
+                }
                 Spacer(minLength: 4)
                 // Copy the model's full name/id to the clipboard (paste into a curl,
                 // a config file, etc.).
@@ -1395,3 +1403,51 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
+/// "Thunderbolt" on a model the two Macs of a pair run together.
+struct ThunderboltBadge: View {
+    var body: some View {
+        Label("Thunderbolt", systemImage: "bolt.fill")
+            .font(.app(.caption2))
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .foregroundStyle(Color.accentColor)
+            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+            .fixedSize()
+            .help(L10n.text("Runs across the two Macs of a Thunderbolt pair."))
+    }
+}
+
+/// The part of a pair's model this Mac holds for the Mac that leads, while it helps one.
+private struct WorkerPartRow: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        if let part = ClusterWorker.part(of: worker.state) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "bolt.horizontal")
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                    Text(verbatim: part.model)
+                        .font(.app(.caption).monospaced())
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    ThunderboltBadge()
+                    Spacer(minLength: 4)
+                    if worker.residentBytes > 0 {
+                        Text(verbatim: MemoryInfo.format(worker.residentBytes)).font(.app(.caption2)).foregroundStyle(.secondary)
+                    }
+                    if !part.ready { ProgressView().controlSize(.mini) }
+                }
+                Text(part.detail.isEmpty
+                     ? L10n.text("This Mac's part, for the Mac that leads")
+                     : L10n.format("This Mac's part (%@), for the Mac that leads", part.detail))
+                    .font(.app(.caption2))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 22)
+            }
+        }
+    }
+}

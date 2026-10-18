@@ -10,6 +10,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transcription = @import("transcription.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
+const distributed = @import("distributed.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
@@ -339,6 +340,12 @@ pub const ModelConfig = struct {
     // ragged tail after the last WHOLE group never gets linear attention.
     // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
     linear_attn_tail_from: u32 = 0,
+    /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
+    dist_span: ?distributed.LayerSpan = null,
+    /// DeepSeek-V4.1 on a two-Mac pair: the worker's layers, kept under their own numbers.
+    dist_dsv41: ?@import("deepseek_v41.zig").Pair = null,
+    /// Tensor-parallel rank: its slice of each MoE expert (`applyShard`).
+    dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
@@ -916,6 +923,41 @@ pub const ModelConfig = struct {
             return self.num_global_key_value_heads;
         }
         return self.num_key_value_heads;
+    }
+
+    /// Turn this config into the short model one pipeline rank serves: layers
+    /// `[span.start, span.end)` renumbered from 0, every per-layer table shifted with them.
+    pub fn applyLayerSpan(self: *ModelConfig, span: distributed.LayerSpan) !void {
+        if (span.total != self.num_hidden_layers or span.end > span.total or span.start >= span.end) return error.DistLayerSpanMismatch;
+        // The interval rule `(i + 1) % interval` stays true only for a seam on a group boundary.
+        if (self.full_attention_interval != 0 and span.start % self.full_attention_interval != 0) return error.DistSplitOffInterval;
+        const st = span.start;
+        inline for (.{ "num_attention_heads_per_layer", "layer_no_rope", "dsv4_compress_ratios", "layer_is_global", "layer_block_types" }) |f| {
+            const arr = &@field(self, f);
+            if (st < arr.len) std.mem.copyForwards(@TypeOf(arr[0]), arr[0 .. arr.len - st], arr[st..]);
+        }
+        if (self.linear_attn_tail_from != 0) self.linear_attn_tail_from -|= st;
+        self.num_hidden_layers = span.len();
+        self.dist_span = span;
+    }
+
+    /// The expert widths one tensor-parallel rank holds.
+    pub fn applyShard(self: *ModelConfig, sh: distributed.Shard) !void {
+        const quantum = sh.size * 64; // every shipped group size divides a 64-aligned part
+        if (self.moe_intermediate_size % quantum != 0 or self.shared_expert_intermediate_size % quantum != 0) return error.DistShardOffGroup;
+        self.moe_intermediate_size /= sh.size;
+        self.shared_expert_intermediate_size /= sh.size;
+        self.dist_shard = sh;
+    }
+
+    /// The PLE's layer among this process's layers; null when another pipeline rank holds it.
+    /// `ple_layer_idx` stays the checkpoint's absolute index (it names the n-gram shards).
+    pub fn pleLocalLayer(self: *const ModelConfig) ?u32 {
+        if (self.ple_layer_idx < 0) return null;
+        const abs: u32 = @intCast(self.ple_layer_idx);
+        const st: u32 = if (self.dist_span) |sp| sp.start else 0;
+        if (abs < st or abs - st >= self.num_hidden_layers) return null;
+        return abs - st;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -2150,7 +2192,8 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
         if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
         if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
     }
-    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i64, config.num_hidden_layers)) {
+    const layers: i64 = if (config.dist_span) |sp| sp.total else config.num_hidden_layers;
+    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= layers) {
         return error.InvalidQwen4PleLayer;
     }
 }
@@ -5029,6 +5072,97 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
     return error.Exl3NeedsMetal;
 }
 
+/// A tensor worker never runs the MTP head or the towers.
+const TensorWorker = struct {
+    fn remap(_: TensorWorker, key: []const u8, _: []u8) ?[]const u8 {
+        return if (distributed.headOnly(key)) null else key;
+    }
+};
+
+/// Keeps the tensors one rank holds, under the names `keep.remap` gives them
+/// (`LayerSpan`: its layers renumbered; `TensorWorker`: all but the head-only towers).
+/// DeepSeek-V4.1 on a pair: each Mac's trunk layers under their own numbers (the model reads
+/// sources and Engram layers by absolute index); the worker keeps nothing else, and neither
+/// keeps the DSpark stages, which stay off on a pair.
+const Dsv41Keep = struct {
+    pair: @import("deepseek_v41.zig").Pair,
+
+    pub fn remap(self: Dsv41Keep, key: []const u8, _: []u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, key, "layers.")) {
+            const end = std.mem.indexOfScalarPos(u8, key, 7, '.') orelse return null;
+            const li = std.fmt.parseInt(usize, key[7..end], 10) catch return null;
+            return if (self.pair.holds(li)) key else null;
+        }
+        return if (self.pair.worker) null else key;
+    }
+};
+
+test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {
+    var buf: [512]u8 = undefined;
+    const worker: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = true } };
+    const host: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = false } };
+    try std.testing.expectEqualStrings("layers.20.attn.wkv.weight", worker.remap("layers.20.attn.wkv.weight", &buf).?);
+    try std.testing.expect(worker.remap("layers.19.attn.wkv.weight", &buf) == null);
+    try std.testing.expect(worker.remap("embed.weight", &buf) == null);
+    try std.testing.expect(host.remap("layers.25.ffn.gate.weight", &buf) == null);
+    try std.testing.expectEqualStrings("layers.1.engram.wkv.weight", host.remap("layers.1.engram.wkv.weight", &buf).?);
+    try std.testing.expectEqualStrings("head.weight", host.remap("head.weight", &buf).?);
+    // DSpark drafts on the host.
+    try std.testing.expectEqualStrings("mtp.0.main_proj.weight", host.remap("mtp.0.main_proj.weight", &buf).?);
+    try std.testing.expect(worker.remap("mtp.0.main_proj.weight", &buf) == null);
+}
+
+fn retainPart(weights: *Weights, keep: anytype) !void {
+    const a = weights.allocator;
+    var kept = std.StringHashMap(mlx.mlx_array).init(a);
+    errdefer kept.deinit();
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        var buf: [512]u8 = undefined;
+        const name = keep.remap(kv.key_ptr.*, &buf) orelse {
+            _ = mlx.mlx_array_free(kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+            continue;
+        };
+        if (name.ptr == kv.key_ptr.*.ptr) {
+            try kept.put(kv.key_ptr.*, kv.value_ptr.*);
+        } else {
+            try kept.put(try a.dupe(u8, name), kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+        }
+    }
+    weights.map.deinit();
+    weights.map = kept;
+}
+
+/// Keeps this tensor-parallel rank's slice of every expert projection (still lazy, so a
+/// tensor is read once and only its part survives the batch eval). ModelOpt's routed
+/// banks arrive already sliced (`modelopt_pack.buildBanks`).
+fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !void {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const axis = distributed.Shard.expertAxis(kv.key_ptr.*) orelse continue;
+        if (banks_sliced and std.mem.indexOf(u8, kv.key_ptr.*, ".switch_mlp.") != null) continue;
+        const shape = mlx.getShape(kv.value_ptr.*);
+        const ax: usize = if (axis == .rows) shape.len - 2 else shape.len - 1;
+        const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(sh.size)));
+        var start: [4]c_int = @splat(0);
+        var stop: [4]c_int = undefined;
+        const strides: [4]c_int = @splat(1);
+        @memcpy(stop[0..shape.len], shape);
+        start[ax] = part * @as(c_int, @intCast(sh.rank));
+        stop[ax] = start[ax] + part;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, kv.value_ptr.*, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
+        const owned = try @import("transformer.zig").materializedOwnedCopy(s, view);
+        _ = mlx.mlx_array_free(kv.value_ptr.*);
+        kv.value_ptr.* = owned;
+    }
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
@@ -5040,14 +5174,24 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
+    if (config.dist_span == null and config.dist_shard == null and config.dist_dsv41 == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
+        .span => |sp| try config.applyLayerSpan(sp),
+        .shard => |sh| try config.applyShard(sh),
+        .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
+    };
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
+    // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
+    if (config.dist_span) |sp| try retainPart(&weights, sp);
+    if (config.dist_dsv41) |p| try retainPart(&weights, Dsv41Keep{ .pair = p });
+    if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s, config.swiglu_limit > 0.0);
+        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     }
-    if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
+    if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
+    if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
         resolveWeightPrefix(config, &weights);
@@ -10803,4 +10947,21 @@ test "Weights.dropPrefix drops one block's tensors and nothing that merely start
     try std.testing.expect(w.get("blocks.10.attn.q.weight") != null and w.get("blocks.2.attn.q.weight") != null and w.get("norm.weight") != null);
     w.dropPrefix("absent.");
     try std.testing.expectEqual(@as(u32, 3), w.count());
+}
+
+test "applyLayerSpan: the PLE stays at its absolute layer and is local only to the rank holding it" {
+    var c: ModelConfig = std.mem.zeroes(ModelConfig);
+    c.num_hidden_layers = 48;
+    c.full_attention_interval = 4;
+    c.ple_layer_idx = 1;
+    var tail = c;
+    try tail.applyLayerSpan(.{ .start = 32, .end = 48, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 16), tail.num_hidden_layers);
+    try std.testing.expectEqual(@as(i32, 1), tail.ple_layer_idx);
+    try std.testing.expect(tail.pleLocalLayer() == null);
+    try std.testing.expect(tail.isLinearLayer(0) and !tail.isLinearLayer(3));
+    var head = c;
+    try head.applyLayerSpan(.{ .start = 0, .end = 32, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
+    try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }

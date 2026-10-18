@@ -168,6 +168,8 @@ Apple M4 Max, identical weights per engine, every engine on its shipping default
 
 Speculative decoding comes in four flavors (PLD, model-shipped draft companions, the Gemma 4 drafter, native Qwen MTP), all greedy-equivalent, with adaptive gates that keep novel-content workloads at parity. Details in [docs/performance.md](docs/performance.md).
 
+On Macs with neural accelerators (M5-class and later), `--int8-qk` (or `MLX_SERVE_INT8_QK=1`) turns on an opt-in, lossy int8 prefill attention for dense Qwen models: flat at 8k tokens, +7% at 64k and +14% at 128k on an M5 Ultra (256 GB). Numbers, quality and scope are in [docs/performance.md](docs/performance.md#int8-qk-prefill-attention-nax-gpus).
+
 ## Docs
 
 - [docs/cli.md](docs/cli.md) — CLI commands and every server flag

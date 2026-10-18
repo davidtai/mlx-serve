@@ -666,10 +666,10 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
-/// MTP verify rounds cost more than they save without the Metal verify
-/// kernels: plain decode is faster on CUDA and Vulkan unless `--mtp` asks for it.
-pub fn mtpAllowedByDefault(mtp_forced: bool) bool {
-    return mtp_forced or mlx.metalKernelsAvailable();
+/// Where an MTP head drafts without `--mtp`. CUDA's multi-row matmuls make a verify round pay;
+/// Vulkan has none and decodes plain.
+pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
+    return mtp_forced or metal or cuda;
 }
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
@@ -5180,6 +5180,20 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     try t.expect(new_needed <= ceiling);
 }
 
+test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request width" {
+    // Flash Next on CUDA chose 8192 past the 2048 cap and MLX's expert gather failed at that width.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const saved = generate_mod.machine_prefill_chunk_cap;
+    defer generate_mod.machine_prefill_chunk_cap = saved;
+    generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
+    const cfg = qwen4RequestTestConfig();
+    const available: u64 = 28_909 << 20;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 8192, .{}));
+}
+
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
     // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
@@ -7593,17 +7607,66 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
-    // Keyed peers we hold no working key for, so the app can ask for one.
-    var locked = std.ArrayList(u8).empty;
-    defer locked.deinit(allocator);
-    if (!lan_filtered) if (g_lan) |l| try l.appendPeersNeedingKey(allocator, &locked);
-    if (locked.items.len > 0) return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}],"lan_needs_key":[{s}]}}
-    , .{ entries_buf.items, locked.items });
-
+    // What this machine is; keyed peers we hold no working key for, so the app can ask for
+    // one; and every peer with what it said about itself.
+    var extras = std.ArrayList(u8).empty;
+    defer extras.deinit(allocator);
+    const machine = try machineJson(allocator);
+    defer allocator.free(machine);
+    try extras.appendSlice(allocator, machine);
+    if (!lan_filtered) if (g_lan) |l| {
+        var list = std.ArrayList(u8).empty;
+        defer list.deinit(allocator);
+        try l.appendPeersNeedingKey(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_needs_key\":[{s}]", .{list.items});
+        list.clearRetainingCapacity();
+        try l.appendPeerAddresses(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_peers\":[{s}]", .{list.items});
+    };
     return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}]}}
-    , .{entries_buf.items});
+        \\{{"object":"list","data":[{s}]{s}}}
+    , .{ entries_buf.items, extras.items });
+}
+
+/// `/v1/models`' "machine" (behind the API key, unlike `/health`): the OS, the device model
+/// id the app draws its icon from, its memory (the pair card's split estimate), and the
+/// Thunderbolt pair this server leads, if any.
+fn machineJson(allocator: std.mem.Allocator) ![]u8 {
+    const pair = try @import("distributed.zig").pairFields(allocator);
+    defer allocator.free(pair);
+    var model_buf: [64]u8 = undefined;
+    const status_mod = @import("status.zig");
+    return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f},\"free_mib\":{d},\"total_mib\":{d}{s}}}", .{
+        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}),
+        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20, pair,
+    });
+}
+
+/// The device model id ("Mac16,5", "iPhone17,1"); empty off Apple platforms. iOS keeps it
+/// in `hw.machine`, where macOS has the CPU architecture.
+fn machineModel(buf: *[64]u8) []const u8 {
+    const key = switch (comptime builtin.os.tag) {
+        .macos => "hw.model",
+        .ios, .visionos => "hw.machine",
+        else => return "",
+    };
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname(key, buf, &len, null, 0) != 0) return "";
+    return std.mem.sliceTo(buf[0..len], 0);
+}
+
+test "machineJson names the OS and the device model, as valid JSON" {
+    const a = std.testing.allocator;
+    const field = try machineJson(a);
+    defer a.free(field);
+    const j = try std.fmt.allocPrint(a, "{{\"data\":[]{s}}}", .{field});
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    const m = parsed.value.object.get("machine").?.object;
+    try std.testing.expectEqualStrings(@tagName(builtin.os.tag), m.get("os").?.string);
+    if (builtin.os.tag == .macos) try std.testing.expect(m.get("model").?.string.len > 0);
+    try std.testing.expect(m.get("total_mib").?.integer >= m.get("free_mib").?.integer);
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
@@ -8652,7 +8715,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, registryGeneration() });
+    const cluster_json = try @import("distributed.zig").propsJson(allocator);
+    defer allocator.free(cluster_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, cluster_json, registryGeneration() });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -8666,9 +8731,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
 
 /// `ModelRegistry.generation`: moves with every model added and every load state change (not with
 /// provider or LAN rows).
+/// Moves whenever `/v1/models` would list something else: the registry or a LAN peer.
 fn registryGeneration() u64 {
-    const reg = global_registry orelse return 0;
-    return reg.generation.load(.monotonic);
+    const reg: u64 = if (global_registry) |r| r.generation.load(.monotonic) else 0;
+    const lan: u64 = if (g_lan) |l| l.changes.load(.monotonic) else 0;
+    return reg +% lan;
 }
 
 /// The registry's residency bill: the weights of every ready model, media ones included.
@@ -8689,9 +8756,11 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
+    const cluster_json = try @import("distributed.zig").propsJson(allocator);
+    defer allocator.free(cluster_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}},"registry_generation":{d}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, registryGeneration() });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, registryGeneration() });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -25486,9 +25555,11 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
-test "MTP is off by default where the Metal verify kernels cannot run" {
-    try std.testing.expectEqual(mlx.metalKernelsAvailable(), mtpAllowedByDefault(false));
-    try std.testing.expect(mtpAllowedByDefault(true));
+test "MTP drafts by default on Metal and CUDA, and only when asked elsewhere" {
+    try std.testing.expect(mtpAllowedByDefault(false, true, false));
+    try std.testing.expect(mtpAllowedByDefault(false, false, true));
+    try std.testing.expect(!mtpAllowedByDefault(false, false, false));
+    try std.testing.expect(mtpAllowedByDefault(true, false, false));
 }
 
 test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {

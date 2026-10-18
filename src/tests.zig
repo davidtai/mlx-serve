@@ -135,6 +135,7 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("qwen_image.zig");
     _ = @import("qwen_image_edit.zig");
+    _ = @import("moss_image.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
     _ = @import("arch/ane_dflash.zig");
@@ -150,6 +151,8 @@ test {
     _ = @import("ltx_diffvae_forward.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("minimax_h3.zig");
+    _ = @import("h3_split.zig");
+    _ = @import("distributed.zig");
     _ = @import("minimax_h3_vision.zig");
     _ = @import("minimax_h3_vae.zig");
     _ = @import("minimax_h3_audio.zig");

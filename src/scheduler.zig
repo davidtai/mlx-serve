@@ -1732,6 +1732,8 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+        // Past the join: the cluster's last message is this process's last MLX call on the link.
+        @import("distributed.zig").shutdown();
         // A build in flight still writes its entry and request.
         while (self.ane_builds.load(.acquire) > 0) std.Io.sleep(self.io, .fromMilliseconds(10), .real) catch {};
 
@@ -3832,7 +3834,8 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 /// A ModelOpt pack also bills the banks' decoded scales, which are smaller on disk.
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     const shards = try shardResidentBytes(allocator, io, model_dir, config);
-    return if (config.modelopt) shards +| modelopt_pack.bankExpansionBytes(model_dir) else shards;
+    const whole = if (config.modelopt) shards +| modelopt_pack.bankExpansionBytes(model_dir) else shards;
+    return @import("distributed.zig").hostShare(model_dir, config, whole);
 }
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {

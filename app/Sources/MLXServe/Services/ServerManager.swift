@@ -18,6 +18,8 @@ class ServerManager: ObservableObject {
     private var loadProgressPoll: Task<Void, Never>?
     /// LAN peers running with --api-key that we hold no working key for.
     @Published var lanPeersNeedingKey: [String] = []
+    /// Every LAN peer, with what it says about itself (its kind, a Thunderbolt pair it leads).
+    @Published var lanPeers: [String: LanPeer] = [:]
     /// Chat target when the user picked a LAN model in the tray: the remote
     /// routing id (`<model>@<peer>`). nil = the local server's default model.
     /// Persisted so the choice survives relaunch; cleared by picking a local
@@ -70,6 +72,8 @@ class ServerManager: ObservableObject {
     /// resident model. nil = the per-silicon tables applied.
     @Published var specCost: SpecCostInfo?
     @Published var batching: BatchingInfo?
+    /// The Thunderbolt cluster this server hosts, from `/props`; nil when it hosts none.
+    @Published var cluster: ClusterInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -232,14 +236,7 @@ class ServerManager: ObservableObject {
         proc.arguments = args
         lastLaunchedOptions = options
 
-        // Inherit environment + add framework paths for dylib loading
-        var env = ProcessInfo.processInfo.environment
-        if let frameworksPath = Bundle.main.privateFrameworksPath {
-            let existing = env["DYLD_LIBRARY_PATH"] ?? ""
-            env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
-            env["MLX_METAL_PATH"] = frameworksPath
-        }
-        proc.environment = env
+        proc.environment = Self.launchEnvironment()
 
         // Echo the launch command at the top of the log (the buffer was just
         // cleared, so this lands above the server's own first line). Lets the
@@ -641,9 +638,8 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
-            let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: props.registryGeneration)
-            seenRegistryGeneration = props.registryGeneration ?? seenRegistryGeneration
-            if moved { await refreshModels() }
+            cluster = props.cluster
+            await noteRegistryGeneration(props.registryGeneration)
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -657,6 +653,21 @@ class ServerManager: ObservableObject {
         // client) has changed it.
     }
 
+    private func noteRegistryGeneration(_ reported: UInt64?) async {
+        let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: reported)
+        seenRegistryGeneration = reported ?? seenRegistryGeneration
+        if moved { await refreshModels() }
+    }
+
+    /// The Thunderbolt pair's state from `/props`, and `/v1/models` only when it moved (a load,
+    /// or a network machine coming, going or changing): cheap enough to run in the background,
+    /// where the tray's `/props` ticker does not.
+    func refreshPairState() async {
+        guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
+        cluster = props.cluster
+        await noteRegistryGeneration(props.registryGeneration)
+    }
+
     /// Whether the registry changed since the last `/props`: the first reading only records it
     /// (opening the tray re-reads the list anyway).
     nonisolated static func modelListMoved(seen: UInt64?, reported: UInt64?) -> Bool {
@@ -665,9 +676,10 @@ class ServerManager: ObservableObject {
     }
 
     func refreshModels() async {
-        if let (all, needsKey) = try? await api.fetchModelList(port: port) {
+        if let (all, needsKey, peers) = try? await api.fetchModelList(port: port) {
             allModels = all
             lanPeersNeedingKey = needsKey
+            lanPeers = peers
             // Headless servers sort no default first, so the head row can be an unloaded stub.
             modelInfo = all.first { $0.loaded && $0.lanPeer == nil }
         }
@@ -945,6 +957,17 @@ class ServerManager: ObservableObject {
     /// executable, else the dev `zig-out/bin/mlx-serve`, else the bare name.
     /// `nonisolated static` so version probing (`EngineVersions.probe`) can find
     /// it without touching `@MainActor` server state.
+    /// The app's environment plus the bundled frameworks the engine loads its dylibs from.
+    nonisolated static func launchEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        if let frameworksPath = Bundle.main.privateFrameworksPath {
+            let existing = env["DYLD_LIBRARY_PATH"] ?? ""
+            env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
+            env["MLX_METAL_PATH"] = frameworksPath
+        }
+        return env
+    }
+
     nonisolated static func resolveBinaryPath() -> String {
         // 1. Bundled: Contents/MacOS/mlx-serve (same dir as the Swift binary)
         if let execURL = Bundle.main.executableURL {

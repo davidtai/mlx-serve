@@ -99,6 +99,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
     // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
     if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
+    // MOSS-Image: no root config.json, so model_index.json lands first; every pack names its VAE weights so.
+    if (std.mem.eql(u8, model_type, "moss_image")) return "vae/diffusion_pytorch_model.safetensors";
     return null;
 }
 
@@ -114,6 +116,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
         std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -198,6 +201,8 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // (the 2.0 family's "QwenImagePipeline" is a different architecture).
         if (peekQwenImage21Index(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
+        if (peekMossImageIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "moss_image") catch return .missing_or_unparseable };
         // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
         if (peekStableAudio3Config(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
@@ -322,6 +327,16 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
 /// family spells "QwenImagePipeline" — a different architecture, never matched.
 /// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
 pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "QwenImage21Pipeline");
+}
+
+/// True when `sub/model_index.json` names the MOSS-Image pipeline (the release's
+/// diffusers tree, as published and as the mlx-community mirror ships it).
+pub fn peekMossImageIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "MOSSImagePipeline");
+}
+
+fn modelIndexClassIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, class_name: []const u8) bool {
     var file = sub.openFile(io, "model_index.json", .{}) catch return false;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -332,7 +347,7 @@ pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.I
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
+    return cn == .string and std.mem.eql(u8, cn.string, class_name);
 }
 
 /// True when `sub/model_config.json` is a stable-audio-tools inpainting
@@ -653,7 +668,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+        std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
@@ -1044,6 +1060,7 @@ fn tryAddModel(
             !peekMfluxFlux2(io, allocator, sub) and
             !peekLayaCheckpoint(io, sub) and
             !peekQwenImage21Index(io, allocator, sub) and
+            !peekMossImageIndex(io, allocator, sub) and
             !peekStableAudio3Config(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
@@ -1772,6 +1789,30 @@ test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root conf
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
     try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
+}
+
+test "discoverModels finds a MOSS-Image repo by its model_index.json alone" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until its VAE weights land.
+    try tmp.dir.createDirPath(io, "me/MOSS-Image-half/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("moss_image", result.models[0].model_type);
+    try testing.expect(isMediaModelType("moss_image"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("moss_image"));
 }
 
 test "discoverModels finds a Stable Audio 3 repo (model_config.json, no root config.json)" {

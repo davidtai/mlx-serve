@@ -5,6 +5,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+const distributed_mod = @import("distributed.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
@@ -3165,6 +3166,8 @@ pub fn fusedSdpa256Prefill(
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
+        // Opt-in int8 Q/K causal arm on NAX (lossy); null when off or ineligible.
+        if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
         if (fused256CausalMode() == .off) return null;
         // The band arm stays ours (mlx's NAX kernel takes no band); the
         // causal arm yields to the stock fused kernel on NAX.
@@ -15580,6 +15583,8 @@ pub const CaptureLayers = struct {
 
 pub const ForwardCtx = struct {
     cache: *KVCache,
+    /// A later pipeline rank's input: the previous rank's hyper-connection stream, in place of tokens.
+    stream_in: ?mlx.mlx_array = null,
     moe_seq_offset: *usize,
     ssm_entries: ?[]SSMCacheEntry,
     ssm_member_gen: u64 = 0,
@@ -17194,6 +17199,11 @@ pub const Transformer = struct {
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
     // read that replaces model.norm.
     qwen4: ?*qwen4_mod.Qwen4State = null,
+    /// Pipeline rank 0: the worker holding the trunk's later layers (`distributed.Peer`).
+    dist_peer: ?*distributed_mod.Peer = null,
+    /// Tensor-parallel rank 0: the worker holding the other slice of every expert. Its
+    /// part is stateless, so nothing about scheduling or caching changes.
+    dist_tp: ?*distributed_mod.Peer = null,
     /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
@@ -17950,13 +17960,17 @@ pub const Transformer = struct {
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
-            st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
-            if (st.gpu == null) st.table.calibrateArm();
-            // The weights load just evicted the table from page cache; an embedded pack's GPU
-            // arm holds its own copy.
-            if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
+            // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
+            if (config.pleLocalLayer() != null and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
+                st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
+                if (st.gpu == null) st.table.calibrateArm();
+                // The weights load just evicted the table from page cache; an embedded pack's GPU
+                // arm holds its own copy.
+                if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
+            }
             qwen4_state = st;
-            qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
+            // A pipeline split's head would read the last layer's stream, which lives on the worker.
+            qwen4_mtp = if (config.dist_span != null) null else try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
@@ -18039,6 +18053,8 @@ pub const Transformer = struct {
             .emb_scale = emb_scale,
             .final_norm = final_norm,
             .qwen4 = qwen4_state,
+            .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed_mod.peer() else null else null,
+            .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed_mod.peer() else null else null,
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
             .lm_head_w = lm_head_w,
@@ -20473,7 +20489,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20481,7 +20497,7 @@ pub const Transformer = struct {
     /// pooled blocks), so slots interleave AND batch freely. The one
     /// module-owned piece on this arch is the MTP head's cache, and the
     /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-    pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
+    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "dist_tp" };
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {
@@ -24653,6 +24669,12 @@ pub const Transformer = struct {
         else
             return null;
         var mcfg = config;
+        // The head's experts stay whole on a tensor-parallel rank 0 (`distributed.headOnly`).
+        if (mcfg.dist_shard) |sh| {
+            mcfg.moe_intermediate_size *= sh.size;
+            mcfg.shared_expert_intermediate_size *= sh.size;
+            mcfg.dist_shard = null;
+        }
         mcfg.weight_prefix = mtp_prefix;
         mcfg.num_hidden_layers = 1;
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
@@ -25674,6 +25696,9 @@ pub const Transformer = struct {
     pub var qwen4_trace: ?*Qwen4Trace = null;
 
     fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
+        // A tensor shard's MoE is half of each expert until `moeTensorParallel` adds the
+        // peer's half; the grouped arm calls `moeVerifyRows` directly and would skip it.
+        if (self.dist_tp != null) return false;
         if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
             token_rows.len < 2 or token_rows.len > 8 or token_rows.len != ctxs.len or
             self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32)
@@ -25949,7 +25974,17 @@ pub const Transformer = struct {
     /// streams; every block reads a gated mix of the streams and writes back
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
+
+    /// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
+    /// stream the previous rank handed over, returning the stream for the next one.
+    pub fn forwardQwen4Stream(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
+        ctx.stream_in = stream;
+        defer ctx.stream_in = null;
+        return self.forwardQwen4With(ctx, .{ .ctx = null });
+    }
+
     fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const stream_in = ctx.stream_in;
         self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
         const cfg = &self.config;
@@ -25960,23 +25995,27 @@ pub const Transformer = struct {
         self.spec_capture_ssm = ctx.capture_ssm_seq;
         defer self.spec_capture_ssm = false;
 
-        // Vision rows splice into the `hidden`-wide embeddings BEFORE the
-        // hyper-connection tile (the reference masked_scatters, then repeats).
-        var emb = try self.embedding(token_ids);
-        {
-            errdefer _ = mlx.mlx_array_free(emb);
-            emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        var h = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(h);
+        if (stream_in) |st| {
+            try mlx.check(mlx.mlx_array_set(&h, st));
+        } else {
+            // Vision rows splice into the `hidden`-wide embeddings BEFORE the
+            // hyper-connection tile (the reference masked_scatters, then repeats).
+            var emb = try self.embedding(token_ids);
+            {
+                errdefer _ = mlx.mlx_array_free(emb);
+                emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+            }
+            defer _ = mlx.mlx_array_free(emb);
+            const reps = [_]c_int{ 1, 1, hc };
+            try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
         }
-        defer _ = mlx.mlx_array_free(emb);
-        const x_shape = mlx.getShape(emb);
+        const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
-        const reps = [_]c_int{ 1, 1, hc };
-        var h = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
-        errdefer _ = mlx.mlx_array_free(h);
         if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
@@ -26046,7 +26085,7 @@ pub const Transformer = struct {
             defer pre2.deinit();
             try prof.lap(pre2.mixed, .hc_read);
             const mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
-                .moe => |*mw| try self.moeMLP(pre2.mixed, mw),
+                .moe => |*mw| if (self.dist_tp) |tp| try self.moeTensorParallel(tp, pre2.mixed, mw, li) else try self.moeMLP(pre2.mixed, mw),
                 .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
             };
             defer _ = mlx.mlx_array_free(mlp_out);
@@ -26085,6 +26124,18 @@ pub const Transformer = struct {
             dt.layer(h, layer_idx);
         }
 
+        if (stream_in != null or self.dist_peer != null) try self.hcFlush(&h, batch, seq_len, &pending);
+        if (stream_in != null) {
+            ctx.moe_seq_offset.* += @intCast(seq_len);
+            return h;
+        }
+        if (self.dist_peer) |peer| {
+            // The hop's sends are queued before its receive, so the PLE leaf must be filled now.
+            if (ctx.ple_pending != null) try self.flushDeferredPle(ctx);
+            const back = try peer.hop(h, offset);
+            _ = mlx.mlx_array_free(h);
+            h = back;
+        }
         if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) try self.hcFlush(&h, batch, seq_len, &pending);
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
@@ -33108,6 +33159,27 @@ pub const Transformer = struct {
         return self.moeMLP2(x, x, mw);
     }
 
+    /// Tensor-parallel MoE: this rank's slice of every expert plus the worker's, both
+    /// routed by the logits computed here so the two halves pick the same experts.
+    fn moeTensorParallel(self: *Transformer, tp: *distributed_mod.Peer, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u32) !mlx.mlx_array {
+        const logits = try self.moeRouterLogits(x, mw);
+        defer _ = mlx.mlx_array_free(logits);
+        try tp.sendMoe(x, logits, layer);
+        const mine = try self.moeMLP2WithRouter(x, x, mw, logits, false);
+        defer _ = mlx.mlx_array_free(mine);
+        const theirs = try tp.recvLike(x);
+        defer _ = mlx.mlx_array_free(theirs);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&out, mine, theirs, self.s));
+        return out;
+    }
+
+    /// The worker's half of `moeTensorParallel`: its expert slices under rank 0's routing.
+    pub fn moeExpertsRouted(self: *Transformer, x: mlx.mlx_array, layer: u32, logits: mlx.mlx_array) !mlx.mlx_array {
+        const mw = &self.moe_layers.?[layer].mlp.moe;
+        return self.moeMLP2WithRouter(x, x, mw, logits, false);
+    }
+
     /// GLM-5-Next one-token MoE (`glm5.moeDecode`): routed and shared experts in two dispatches.
     fn glmMoeDecode(self: *Transformer, x: mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, mw: *const MoeMlpWeights, gate_qp: QuantParams, up_qp: QuantParams, down_qp: QuantParams) !?mlx.mlx_array {
         const inter: ?u32 = if (self.config.shared_expert_intermediate_size > 0) self.config.shared_expert_intermediate_size else null;
@@ -34726,7 +34798,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             var hb: [96]u8 = undefined;
             lw.hc_attn = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             lw.hc_mlp = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.mlp_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
-            if (config.ple_layer_idx == @as(i32, @intCast(li))) {
+            if (config.pleLocalLayer() == li) {
                 lw.ple = try loadPleWeights(weights, name_buf, prefix, li, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             }
         }
@@ -35806,7 +35878,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         const has_ple = try allocator.alloc(bool, moe_layers.len);
         defer allocator.free(has_ple);
         for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;
-        if (!model_mod.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
+        if (!model_mod.qwen4PleInstalledAt(has_ple, if (config.pleLocalLayer()) |l| @intCast(l) else -1)) {
             log.err("[qwen4] the PLE was not installed at layer {d} ({d} layers carry PLE weights)\n", .{ config.ple_layer_idx, std.mem.count(bool, has_ple, &.{true}) });
             return error.Qwen4PleNotInstalled;
         }
@@ -43161,6 +43233,68 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     }
 }
 
+test "gatherExpertMm: a sorted nvfp4 gather past 65,535 rows matches the dequantized experts" {
+    // A Flash Next chunk of 8192 rows routes 81,920 rows; MLX's CUDA gather put one block per row on
+    // grid z (at most 65,535) and the launch failed. Bar: bf16 rounding of an fp32 dequant reference.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var sc = @import("mlx_scope.zig").Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x65536);
+    const E: c_int = 4;
+    const N: c_int = 128; // qmm_sm80's tile: narrower falls to MLX's naive gather, same limit
+    const K: c_int = 64;
+    const R: c_int = 65_600;
+    const wb = try testRandWeightBf16(prng.random(), &[_]c_int{ E, N, K }, s);
+    defer _ = mlx.mlx_array_free(wb);
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, wb, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var wq = mlx.mlx_array_new();
+    var wsc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq);
+    defer _ = mlx.mlx_array_free(wsc);
+    try mlx.check(mlx.mlx_vector_array_get(&wq, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&wsc, pair, 1));
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, wq, wsc, .{ .ctx = null }, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+
+    const xs = try testRandWeightBf16(prng.random(), &[_]c_int{ R, 1, K }, s);
+    defer _ = mlx.mlx_array_free(xs);
+    const ids = try testing.allocator.alloc(i32, @intCast(R));
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(i * @as(usize, @intCast(E)) / @as(usize, @intCast(R)));
+    const rhs = try sc.astype(try sc.fromI32(ids, &.{R}), .uint32);
+
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try gatherExpertMm(&out, xs, wq, wsc, .{ .ctx = null }, .{ .ctx = null }, rhs, 4, 16, .nvfp4, true, s);
+
+    // Reference: each expert's contiguous rows against its fp32 weights.
+    const x2 = try sc.astype(try sc.reshape(xs, &.{ R, K }), .float32);
+    var parts: [4]mlx.mlx_array = undefined;
+    for (0..4) |e| {
+        const lo: c_int = @intCast(e * @as(usize, @intCast(R)) / 4);
+        const hi: c_int = @intCast((e + 1) * @as(usize, @intCast(R)) / 4);
+        const w_e = try sc.reshape(try sc.slice(deq, 0, @intCast(e), @intCast(e + 1)), &.{ N, K });
+        parts[e] = try sc.matmul(try sc.slice(x2, 0, lo, hi), try sc.transpose(w_e, &.{ 1, 0 }));
+    }
+    const ref = try sc.concat(&parts, 0);
+    const got = try sc.astype(try sc.reshape(out, &.{ R, N }), .float32);
+    const d = try sc.sub(got, ref);
+    const err = try sc.sumAxis(try sc.sumAxis(try sc.mul(d, d), 1), 0);
+    const nrm = try sc.sumAxis(try sc.sumAxis(try sc.mul(ref, ref), 1), 0);
+    const both = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ err, nrm }, 2);
+    defer _ = mlx.mlx_vector_array_free(both);
+    try mlx.check(mlx.mlx_eval(both));
+    var e2: f32 = 0;
+    var n2: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&e2, err));
+    try mlx.check(mlx.mlx_array_item_float32(&n2, nrm));
+    try testing.expect(n2 > 0 and @sqrt(e2 / n2) < 0.01);
+}
+
 /// DiffusionGemma packs each expert's gate and up projections in one tensor
 /// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
 /// the projected output in halves: gate = [..., :M], up = [..., M:]).
@@ -45548,7 +45682,7 @@ fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 /// DSpark stages load as `deepseek_v41.dsparkWanted` decides.
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
-    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config) });
+    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config), .pair = config.dist_dsv41 });
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;
@@ -65949,6 +66083,8 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv41 = null;
     t.mlx_stream_ext = null;
     t.qwen4 = null;
+    t.dist_peer = null;
+    t.dist_tp = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_dsv4: dsv4_mod.Dsv4Model = undefined;
@@ -65961,6 +66097,10 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv41 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
+    try testing.expect(t.ownsModuleDecodeState());
+    t.mlx_stream_ext = null;
+    var fake_peer: distributed_mod.Peer = undefined;
+    t.dist_peer = &fake_peer;
     try testing.expect(t.ownsModuleDecodeState());
 }
 
@@ -71800,6 +71940,41 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expect(try qsaArraysAllEqual(ref_all[0], all[i], s));
     }
     std.debug.print("[mtp verify] deferred PLE: row 1 failure cleared both claims and preserved history; recovered logits and hidden equal solo\n", .{});
+}
+
+test "a tensor-parallel rank 0 never takes the grouped verify, whose MoE skips the exchange" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    xfm.compileMoeRouting();
+
+    var ids: [256]i32 = undefined;
+    for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
+    const prompts = [2][]const i32{ ids[0..96], ids[64..160] };
+    var slots = try L10VerifySlots.init(allocator, &xfm, config.num_hidden_layers, prompts);
+    defer slots.deinit(allocator);
+    var rows: [2]mlx.mlx_array = undefined;
+    defer for (rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    const shape = [_]c_int{ 1, 1 };
+    for (0..2) |i| rows[i] = mlx.mlx_array_new_data(@ptrCast(ids[200 + i * 8 ..][0..1].ptr), &shape, 2, .int32);
+    const ctxs = [_]*ForwardCtx{ &slots.group[0].ctx, &slots.group[1].ctx };
+
+    if (!xfm.qwen4VerifyRowsEligible(&rows, &ctxs)) return error.SkipZigTest;
+    var peer: distributed_mod.Peer = undefined;
+    xfm.dist_tp = &peer;
+    defer xfm.dist_tp = null;
+    try testing.expect(!xfm.qwen4VerifyRowsEligible(&rows, &ctxs));
 }
 
 test "deferred PLE at N rows: every row's capacity is checked against its OWN width" {
