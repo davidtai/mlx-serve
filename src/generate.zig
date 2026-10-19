@@ -961,6 +961,12 @@ pub const SamplingParams = struct {
     /// Absolute position of generated token 0 (the prompt length): a keyed
     /// draw's position is `position_base + draw`.
     position_base: u64 = 0,
+    /// The plugin draws every token of this request (mlx-stream: `mlx_stream.arm`
+    /// bound its sampler, the SDK's `DraftLane.arm` contract): each row the model
+    /// returns is the drawn token's one-hot (0 there, -inf elsewhere). The lazy
+    /// sampler takes the row's argmax (one launch: the plugin's token), not a
+    /// second draw from it (the tempered top-p sort, softmax and draw).
+    plugin_drawn: bool = false,
 
     /// Penalties read the realized history, so they keep a request off the
     /// pipelined fast path, spec verify and batched decode.
@@ -2732,6 +2738,8 @@ pub const Generator = struct {
                 .seed = sampling.seed orelse 0,
             };
             const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
+            // The plugin draws every token of the request it armed: its rows are one-hots, the sampler takes the argmax.
+            if (xfm.mlx_stream_ext) |m| sampling.plugin_drawn = mlx_stream.pluginDraws(m);
             if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
@@ -13727,7 +13735,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     // which downstream (resolvePendingToken / lazyForward / async_eval vector)
     // treats identically to `[1]`. Skipping the otherwise-needed reshape +
     // argmax-on-2D combo cuts ~one FFI call per decode step.
-    if (seq_len == 1 and sampling.temperature < 0.01) {
+    if (seq_len == 1 and (sampling.temperature < 0.01 or sampling.plugin_drawn)) {
         var result = mlx.mlx_array_new();
         _ = mlx.mlx_argmax_axis(&result, logits, -1, false, s);
         return result;
@@ -13752,8 +13760,8 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         _ = mlx.mlx_reshape(&current, sliced, &sq_shape, 2, s);
     }
 
-    // Greedy: argmax (no temperature)
-    if (sampling.temperature < 0.01) {
+    // Greedy, or the plugin's one-hot row: argmax (no temperature)
+    if (sampling.temperature < 0.01 or sampling.plugin_drawn) {
         var result = mlx.mlx_array_new();
         _ = mlx.mlx_argmax_axis(&result, current, -1, false, s);
         _ = mlx.mlx_array_free(current);
@@ -16075,6 +16083,25 @@ test "sampleToken with temperature produces valid token" {
     const result = try sampleToken(allocator, logits, params, null, 0, s);
     // Token should be in valid range
     try testing.expect(result.token_id < 3);
+}
+
+test "sampleTokenLazy: a plugin-drawn row gives the plugin's token (its argmax) under the request's sampling" {
+    const s = mlx.gpuStream();
+    // The plugin's row: 0 at its token, -inf elsewhere ([1, 1, V], as mlx_stream.forward returns it).
+    var row: [16]f32 = @splat(-std.math.inf(f32));
+    row[11] = 0;
+    const hot = mlx.mlx_array_new_data(&row, &[_]c_int{ 1, 1, 16 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(hot);
+    for ([_]SamplingParams{
+        .{ .temperature = 0.7, .top_p = 0.99, .seed = 1, .plugin_drawn = true },
+        .{ .temperature = 1.3, .top_p = 0.5, .top_k = 4, .seed = 7, .plugin_drawn = true },
+        .{ .temperature = 0.7, .top_p = 0.99, .seed = 3, .keyed = true, .plugin_drawn = true },
+    }) |sp| try testing.expectEqual(@as(u32, 11), try evalLazyToken(sampleTokenLazy(hot, sp, s)));
+    // A drawn request's row is the argmax path whatever its values (the same op as a greedy request's).
+    const raw = [_]f32{ 0.5, 3, -1, 2.5 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    try testing.expectEqual(@as(u32, 1), try evalLazyToken(sampleTokenLazy(logits, .{ .temperature = 0.7, .top_p = 0.9, .seed = 5, .plugin_drawn = true }, s)));
 }
 
 test "min_p keeps only eligible tokens in scalar, lazy and batched sampling" {

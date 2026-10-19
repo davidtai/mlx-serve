@@ -64,6 +64,9 @@ pub const Model = struct {
     handover_due: bool = false,
     /// The draft lane is armed for this request (`arm`), under this sampling.
     drafting: bool = false,
+    /// `arm` bound the plugin's sampler (a clean sampled request on a lane-ready module, the SDK's `DraftLane.arm`
+    /// contract): the plugin draws every token, each row it returns is its token's one-hot.
+    plugin_draws: bool = false,
     sampling: sdk.SamplingParams = .{},
 };
 
@@ -318,13 +321,22 @@ pub const SamplingParams = sdk.SamplingParams;
 pub fn arm(m: *Model, sampling: ?SamplingParams) bool {
     const sp = sampling orelse {
         m.drafting = false;
+        m.plugin_draws = false;
         return false;
     };
     m.sampling = sp;
+    // The arch arms (and binds its sampler) only on a lane-ready module.
+    const ready = blockSize(m) > 0;
+    m.plugin_draws = ready and !sp.greedy();
     m.drafting = switch (m.arch) {
-        inline else => |b, k| blockSize(m) > 0 and Side(k).arch.draft_lane.arm(b.module, .{ .greedy = sp.greedy(), .clean = true, .sampling = sp }) != .off,
+        inline else => |b, k| ready and Side(k).arch.draft_lane.arm(b.module, .{ .greedy = sp.greedy(), .clean = true, .sampling = sp }) != .off,
     };
     return m.drafting;
+}
+
+/// The plugin draws every token of the request `arm` armed last (its sampler bound): the host takes each row's argmax.
+pub fn pluginDraws(m: *const Model) bool {
+    return m.plugin_draws;
 }
 
 /// One draft round from `t1`: the committed tokens (`t1` first) and the next round's token.

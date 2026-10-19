@@ -56,6 +56,9 @@ pub const SamplingParams = struct { temperature: f32 = 1.0, top_p: f32 = 1.0, to
 pub fn arm(_: *Model, _: ?SamplingParams) bool {
     return false;
 }
+pub fn pluginDraws(_: *const Model) bool {
+    return false;
+}
 pub fn round(_: *Model, _: std.mem.Allocator, _: u32, _: u32) !Model.DraftRound {
     return error.MlxStreamNotBuilt;
 }
