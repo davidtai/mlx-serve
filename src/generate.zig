@@ -6039,12 +6039,34 @@ pub const Generator = struct {
         // Per-position SSM capture on a GDN trunk so partial accept can roll
         // back the recurrent state without re-forwarding (mirrors nextMtp).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-        var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        // The verify forward is built the way the MTP verify (`nextMtp`) and the
+        // tree round build theirs: the graph goes to the GPU every
+        // VERIFY_PIPELINE_LAYERS layers while the host builds the rest, and on
+        // qwen4_exp the n-gram PLE gather at layer 1 is deferred so the build
+        // does not stop at the layer-1 host read; the leaf is filled once,
+        // after the build and before anything downstream is evaluated. The
+        // tree round measured 52.8 -> 50.3 ms a round from the pipelining alone.
+        self.ctx.ple_defer = true;
+        self.ctx.pipeline_build = VERIFY_PIPELINE_LAYERS;
+        defer self.ctx.pipeline_build = 0;
+        var verify_logits = xfm.forwardWith(&self.ctx, verify_input) catch |e| {
+            self.ctx.ple_defer = false;
+            self.ctx.capture_ssm_seq = false;
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
         errdefer _ = mlx.mlx_array_free(verify_logits);
+        self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
+        // Fill the deferred PLE leaf: the ids are host values here (the draft
+        // ids were read for the verify input), so this is a gather, not a sync.
+        // Must precede the first eval of anything downstream of the leaf and
+        // `rollbackSsmFromCapture`. The GPU PLE arm has no leaf to fill.
+        errdefer xfm.discardDeferredPle(&self.ctx);
+        if (!Transformer.deferredPleOnGpu(&self.ctx)) try xfm.flushDeferredPle(&self.ctx);
         self.dflash_attempted += 1;
         if (tracing) {
             // Captures ride the same forward — eval them here or their cost
