@@ -12080,10 +12080,15 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         const w = specInitWiring(true, false, false, true, true, true, false, true, true);
         try testing.expect(!w.use_dflash and !w.use_mtp);
     }
-    // Rollback capability alone never arms a head that is not loaded.
+    // Rollback capability alone never arms a head that is not loaded; the bound sidecar still runs.
     {
         const w = specInitWiring(true, true, false, true, false, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+        try testing.expect(!w.use_mtp and !w.use_drafter and w.use_dflash and !w.use_pld);
+    }
+    // No head and no sidecar: nothing arms, and no intent bit.
+    {
+        const w = specInitWiring(true, true, false, true, false, true, true, false, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     // ...nor one the request opted out of.
     {
