@@ -2128,12 +2128,24 @@ pub const Generator = struct {
     }
 
     /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
-    /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
+    /// (GLM-5.3, and Qwen3.8-Flash-Next: both route every extra verify row to more distinct experts); every
+    /// other arch keeps the fixed block until it is A/B'd on its own.
     /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
     pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
-        if (!config.isGlm5()) return false;
-        const raw = std.c.getenv("MLX_SERVE_DFLASH_POLICY") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(raw), "0");
+        return dflashPolicyWanted(config.isGlm5() or config.isQwen4(), if (std.c.getenv("MLX_SERVE_DFLASH_POLICY")) |raw| std.mem.span(raw) else null);
+    }
+
+    pub fn dflashPolicyWanted(sparse_target: bool, raw: ?[]const u8) bool {
+        if (!sparse_target) return false;
+        const r = raw orelse return true;
+        return !std.mem.eql(u8, r, "0");
+    }
+
+    test "dflashPolicyWanted: the round policy drives the sparse targets (GLM-5.3, Flash-Next) unless MLX_SERVE_DFLASH_POLICY=0; dense targets keep the fixed block" {
+        try std.testing.expect(dflashPolicyWanted(true, null));
+        try std.testing.expect(dflashPolicyWanted(true, "1"));
+        try std.testing.expect(!dflashPolicyWanted(true, "0"));
+        try std.testing.expect(!dflashPolicyWanted(false, null));
     }
 
     pub fn dflashGateWarmup() u64 {
@@ -2998,7 +3010,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf, .hc_mean = true };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -6021,7 +6033,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -6363,7 +6375,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
         const forward = xfm.forwardWith(&self.ctx, t1_arr);
@@ -6433,7 +6445,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
@@ -6681,7 +6693,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
