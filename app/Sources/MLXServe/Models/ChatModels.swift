@@ -1313,6 +1313,15 @@ let gemmaModelOptions: [GemmaModelOption] = [
         sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
+    // DeepSeek-V4.1-Flash-1017 (the refreshed weights) as the same streaming repack at 2.9 bpw: layers 18-22's
+    // experts are 2-bit (mlx-stream's K=2 texts), the rest 3-bit; the Engram tables ship in the pack.
+    GemmaModelOption(
+        id: "deepseek-v41-flash-1017-exl3",
+        displayName: "DeepSeek-V4.1-Flash-1017 (streaming repack, EXL3 2.9 bpw)",
+        repoId: "OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3-2.9bpw",
+        sizeEstimate: "~418 GB on disk (experts stream from SSD), needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
     // GLM-5.3-Flash (glm5_next) as a Sushi pack: EXL3 routed experts, loads resident on a 128 GB Mac,
     // its DFlash2 drafter attaches with no flags. (The mlx-stream streaming repack answered wrong on
     // non-NAX Macs in the 26.10.3 validation; it stays installable by repo id.)
