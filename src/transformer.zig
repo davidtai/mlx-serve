@@ -75798,3 +75798,16 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
 }
+
+test "Exl3TrunkRegistry: registered weight arrays are found by pointer, others are not, probes stay bounded" {
+    var reg: Exl3TrunkRegistry = .{};
+    var slots: [300]u32 = undefined;
+    for (&slots) |*v| try std.testing.expect(reg.put(@ptrCast(v)));
+    try std.testing.expectEqual(@as(u32, 300), reg.count);
+    for (&slots) |*v| try std.testing.expect(reg.has(@ptrCast(v)));
+    var other: u32 = 0;
+    try std.testing.expect(!reg.has(@ptrCast(&other)));
+    // re-registering the same key does not grow the count
+    try std.testing.expect(reg.put(@ptrCast(&slots[7])));
+    try std.testing.expectEqual(@as(u32, 300), reg.count);
+}

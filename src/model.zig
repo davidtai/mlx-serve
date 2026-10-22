@@ -10366,6 +10366,23 @@ test "parseConfigFromJson: a Sushi qwen4_exp pack's expert_quant selects EXL3 ba
     try testing.expectError(error.ExpertLayoutUnsupported, parseConfigFromJson(testing.allocator, bad ++ QWEN4_SHIPPED[1..]));
 }
 
+test "parseConfigFromJson: a fully EXL3 qwen4_exp pack's trunk_quant and exl3_ngram_trellis table are recognised" {
+    const tq = "{\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16},\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6,\"row_dim\":160},";
+    const c = try parseConfigFromJson(testing.allocator, tq ++ QWEN4_SHIPPED[1..]);
+    try testing.expect(c.exl3_trunk != null);
+    try testing.expectEqual(sushi_exl3.format.Codebook.mul1, c.exl3_trunk.?.codebook);
+    try testing.expectEqual(@as(u32, 16), c.exl3_trunk.?.window.bits());
+    try testing.expectEqual(@as(u32, 6), c.ngram_table_trellis_k);
+    try testing.expectEqualStrings("ngram_embedding.safetensors", c.ngram_table_file_buf[0..c.ngram_table_file_len]);
+    // the shipped pack: affine trunk, the default table file
+    const d = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(d.exl3_trunk == null);
+    try testing.expectEqual(@as(u32, 0), d.ngram_table_trellis_k);
+    try testing.expectEqual(@as(u8, 0), d.ngram_table_file_len);
+    const bad = "{\"trunk_quant\":{\"format\":\"affine\"},";
+    try testing.expectError(error.Exl3TrunkQuantFormat, parseConfigFromJson(testing.allocator, bad ++ QWEN4_SHIPPED[1..]));
+}
+
 test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {
     // The regression guard for every checkpoint that predates the extension:
     // no YaRN, and `contextCap` is just max_position_embeddings, so no server
