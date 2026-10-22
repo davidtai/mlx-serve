@@ -62,3 +62,7 @@ pub fn round(_: *Model, _: std.mem.Allocator, _: u32, _: u32) !Model.DraftRound 
 pub fn laneReceipt(_: *Model, _: []u8) ?[]const u8 {
     return null;
 }
+
+pub fn exl3Moe(_: mlx.mlx_stream, _: mlx.mlx_array, _: [9]mlx.mlx_array, _: mlx.mlx_array, _: mlx.mlx_array, _: []const u8, _: u8) !mlx.mlx_array {
+    return error.Exl3EngineUnavailable;
+}

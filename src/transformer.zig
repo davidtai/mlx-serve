@@ -26327,7 +26327,6 @@ pub const Transformer = struct {
     /// streams; every block reads a gated mix of the streams and writes back
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
-
     /// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
     /// stream the previous rank handed over, returning the stream for the next one.
     pub fn forwardQwen4Stream(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
@@ -34090,6 +34089,15 @@ pub const Transformer = struct {
             const clamp = swigluClampLimit(cfg) orelse return error.Exl3SwigluLimitUnsupported;
             const y = if (clamp > 0)
                 try sushi_exl3.moeClamped(self.s, expert_x, bank, inds, norm_scores, dec, @intCast(clamp))
+            else if (exl3EngineIsLib() and sushi_exl3.kernels.rowsOfShape(mlx.getShape(expert_x)) <= sushi_exl3.kernels.DECODE_ROWS_MAX)
+                mlx_stream_mod.exl3Moe(self.s, expert_x, .{
+                    mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b,
+                    mw.switch_up_w,   mw.switch_up_s,   mw.switch_up_b,
+                    mw.switch_down_w, mw.switch_down_s, mw.switch_down_b,
+                }, inds, norm_scores, @tagName(spec.codebook), windowBitsOf(spec.window)) catch |err| blk: {
+                    exl3LibFellBack(err);
+                    break :blk try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
+                }
             else
                 try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
             if (skip_shared) return y;
@@ -38273,7 +38281,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
+        ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
@@ -39023,6 +39031,31 @@ pub fn gatherDecodeForcedStock() bool {
 /// fused kernel, which also drops this predicate back to false.
 /// The `swiglu_limit` the fused SwiGLU epilogues clamp at: 0 for none, the limit when it is a
 /// whole-number clamp (GLM-5-Next's 10), null for any other limited activation (gpt_oss).
+/// `MLX_SERVE_EXL3_ENGINE=exl3lib` routes EXL3 decode rows through mlx-stream's exl3lib engine (its prefill arm is
+/// Sushi's until the library's lands); unset or any other value keeps Sushi's chain. Read once.
+var exl3_engine_lib: ?bool = null;
+fn exl3EngineIsLib() bool {
+    if (exl3_engine_lib) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_EXL3_ENGINE");
+    const v = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "exl3lib");
+    exl3_engine_lib = v;
+    if (v) std.log.info("[exl3] engine: mlx-stream exl3lib (decode rows); Sushi keeps prefill", .{});
+    return v;
+}
+
+var exl3_lib_fallback_logged: bool = false;
+fn exl3LibFellBack(err: anyerror) void {
+    if (exl3_lib_fallback_logged) return;
+    exl3_lib_fallback_logged = true;
+    std.log.warn("[exl3] exl3lib refused ({s}); this and later calls at that shape take Sushi's chain", .{@errorName(err)});
+}
+
+/// Sushi's window tag ("w16", "w12", ...) as its bit count.
+fn windowBitsOf(w: sushi_exl3.format.Window) u8 {
+    const name = @tagName(w);
+    return std.fmt.parseInt(u8, name[1..], 10) catch 16;
+}
+
 fn swigluClampLimit(cfg: *const ModelConfig) ?u32 {
     if (cfg.swiglu_limit <= 0.0) return 0;
     if (!cfg.swiglu_clamp or @round(cfg.swiglu_limit) != cfg.swiglu_limit or cfg.swiglu_limit > 1 << 16) return null;
@@ -65453,8 +65486,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -75175,35 +75208,35 @@ test "glm5_next verify windows of 2..16 rows track the same rows decoded one at 
     };
     // A short tail chunk of a prefix-cache restore is a prefill, not a verify: both modes ride the same rows.
     for ([_]bool{ true, false }) |mode_verify| {
-    var w: usize = 2;
-    while (w <= 16) : (w += 1) {
-        const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
-        // The window in one forward.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
-        defer _ = mlx.mlx_array_free(got_arr);
-        const got = try qwen4ReadF32(allocator, got_arr, s);
-        defer allocator.free(got);
-        // The same rows one at a time.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        var worst: f64 = 1.0;
-        var misses: usize = 0;
-        for (0..w) |r| {
-            const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
-            defer _ = mlx.mlx_array_free(one);
-            const want = try qwen4ReadF32(allocator, one, s);
-            defer allocator.free(want);
-            const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
-            worst = @min(worst, cmp.min_cos);
-            misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+        var w: usize = 2;
+        while (w <= 16) : (w += 1) {
+            const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
+            // The window in one forward.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
+            defer _ = mlx.mlx_array_free(got_arr);
+            const got = try qwen4ReadF32(allocator, got_arr, s);
+            defer allocator.free(got);
+            // The same rows one at a time.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            var worst: f64 = 1.0;
+            var misses: usize = 0;
+            for (0..w) |r| {
+                const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
+                defer _ = mlx.mlx_array_free(one);
+                const want = try qwen4ReadF32(allocator, one, s);
+                defer allocator.free(want);
+                const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+                worst = @min(worst, cmp.min_cos);
+                misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+            }
+            std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
+            // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
+            // rows before the wide windows existed): a broken row path lands far below this.
+            try testing.expect(worst > 0.94);
         }
-        std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
-        // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
-        // rows before the wide windows existed): a broken row path lands far below this.
-        try testing.expect(worst > 0.94);
-    }
     }
 }
 

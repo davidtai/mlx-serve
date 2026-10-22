@@ -484,3 +484,16 @@ test "mlx_stream: an arch that declares applySettings receives the model's entry
     try applyEntry(Without, &n, entry);
     try std.testing.expectEqual(@as(i64, 0), n.seen);
 }
+
+/// EXL3 routed experts through the plugin's exl3lib engine (decode rows): the stacked bank as the host holds it
+/// (gate, up, down: trellis, suh, svh), the codebook by name and the window in bits. Errors fall back to Sushi's arm.
+pub fn exl3Moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: [9]mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, codebook: []const u8, window_bits: u8) !mlx.mlx_array {
+    const lib = plugin.exl3lib;
+    const cb = lib.format.Codebook.fromName(codebook) orelse return error.ExpertLayoutUnsupported;
+    const win = lib.format.Window.fromBits(window_bits) orelse return error.Exl3WindowUnsupported;
+    return lib.moe(s, x, .{
+        .gate = .{ .trellis = bank[0], .suh = bank[1], .svh = bank[2] },
+        .up = .{ .trellis = bank[3], .suh = bank[4], .svh = bank[5] },
+        .down = .{ .trellis = bank[6], .suh = bank[7], .svh = bank[8] },
+    }, inds, scores, .{ .codebook = cb, .window = win }, false);
+}
