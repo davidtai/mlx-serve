@@ -5612,7 +5612,8 @@ pub fn loadSafetensorsFile(
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
         // an EXL3 trunk's suh/svh (`.scales` / `.biases`, 1-D f16) are kernel operands in f16, never narrowed
-        const exl3_vec = ndim == 1 and (std.mem.endsWith(u8, key_str, ".scales") or std.mem.endsWith(u8, key_str, ".biases"));
+        const exl3_vec = (ndim == 1 and (std.mem.endsWith(u8, key_str, ".scales") or std.mem.endsWith(u8, key_str, ".biases"))) or
+            std.mem.endsWith(u8, key_str, ".ple_embedding.head_bias"); // the trellis table's per-head bias, added in f16
         if (!exl3_vec and !(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
             !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or (opts.modelopt and narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value)))) and
             (ndim != 1 or narrow1dEnabled()))

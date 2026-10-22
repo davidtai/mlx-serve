@@ -18359,7 +18359,7 @@ pub const Transformer = struct {
                 // turboderp's rings carry a per-hash-head bias vector ([heads, dim] f16) beside the table
                 var it = weights.map.iterator();
                 var found = false;
-                while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".ple.ple_embedding.ngram_embedding.head_bias")) {
+                while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".ple.ple_embedding.head_bias")) {
                     const hb = e.value_ptr.*;
                     try mlx.check(mlx.mlx_array_eval(hb));
                     const n = mlx.mlx_array_size(hb);
