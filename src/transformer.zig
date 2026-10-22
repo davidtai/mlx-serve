@@ -15887,6 +15887,69 @@ const QuantParamsCache = struct {
 // Backwards-compatibility alias — keeps existing field names readable.
 const BitsCache = QuantParamsCache;
 
+/// The trellis linears of a fully EXL3 trunk, keyed by the weight array (the loader registers every 3-D U16 `.weight` with
+/// 1-D f16 `.scales`/`.biases` once; `qmatmul` probes it first). One model per process, filled before generation.
+const Exl3TrunkRegistry = struct {
+    const CAP: usize = 2048;
+    keys: [CAP]?*anyopaque = @splat(null),
+    count: u32 = 0,
+    codebook: sushi_exl3.format.Codebook = .mul1,
+    window_bits: u8 = 16,
+
+    inline fn slot(key: *anyopaque) usize {
+        return (@intFromPtr(key) *% 0x9E3779B97F4A7C15) >> @as(u6, @intCast(@bitSizeOf(usize) - 11));
+    }
+    fn put(self: *Exl3TrunkRegistry, key: *anyopaque) bool {
+        const start = slot(key);
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const idx = (start + i) & (CAP - 1);
+            if (self.keys[idx] == null or self.keys[idx] == key) {
+                if (self.keys[idx] == null) self.count += 1;
+                self.keys[idx] = key;
+                return true;
+            }
+        }
+        return false;
+    }
+    inline fn has(self: *const Exl3TrunkRegistry, key: *anyopaque) bool {
+        const start = slot(key);
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const idx = (start + i) & (CAP - 1);
+            const k = self.keys[idx];
+            if (k == key) return true;
+            if (k == null) return false;
+        }
+        return false;
+    }
+};
+var exl3_trunk_registry: ?*Exl3TrunkRegistry = null;
+
+/// Register the trunk's trellis linears: a 3-D U16/I16 `.weight` whose `.scales` and `.biases` siblings are 1-D (suh, svh).
+fn registerExl3Trunk(allocator: std.mem.Allocator, weights: *const Weights, dec: sushi_exl3.format.Decode) !void {
+    const reg = try allocator.create(Exl3TrunkRegistry);
+    reg.* = .{ .codebook = dec.codebook, .window_bits = windowBitsOf(dec.window) };
+    var nb: [256]u8 = undefined;
+    var it = weights.map.iterator();
+    while (it.next()) |e| {
+        const name = e.key_ptr.*;
+        if (!std.mem.endsWith(u8, name, ".weight")) continue;
+        const w = e.value_ptr.*;
+        if (w.ctx == null or mlx.mlx_array_ndim(w) != 3) continue;
+        const dt = mlx.mlx_array_dtype(w);
+        if (dt != .uint16 and dt != .int16) continue;
+        const base = name[0 .. name.len - ".weight".len];
+        if (base.len + 8 > nb.len) continue;
+        const sc = weights.get(std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch continue) orelse continue;
+        const bi = weights.get(std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch continue) orelse continue;
+        if (mlx.mlx_array_ndim(sc) != 1 or mlx.mlx_array_ndim(bi) != 1) continue;
+        if (!reg.put(w.ctx.?)) return error.Exl3TrunkRegistryFull;
+    }
+    log.info("[load] exl3 trunk: {d} trellis linears registered (codebook {s}, window {d}) -> exl3lib\n", .{ reg.count, @tagName(dec.codebook), reg.window_bits });
+    exl3_trunk_registry = reg;
+}
+
 // ── Forward context ──
 //
 // Routes per-request mutable state (KV cache, MoE seq offset, SSM entries,
@@ -17899,6 +17962,7 @@ pub const Transformer = struct {
         }
         if (fused_row_groups > 0) log.info("[load] row-joined projection groups: {d}\n", .{fused_row_groups});
         fused_row_groups = 0;
+        if (config.exl3_trunk) |dec| try registerExl3Trunk(allocator, weights, dec);
 
         const bits_cache: BitsCache = .{};
 
@@ -18291,6 +18355,31 @@ pub const Transformer = struct {
                     try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
             };
             errdefer st.deinit();
+            if (st.table.trellis_k != 0) {
+                // turboderp's rings carry a per-hash-head bias vector ([heads, dim] f16) beside the table
+                var it = weights.map.iterator();
+                var found = false;
+                while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".ple.ple_embedding.ngram_embedding.head_bias")) {
+                    const hb = e.value_ptr.*;
+                    try mlx.check(mlx.mlx_array_eval(hb));
+                    const n = mlx.mlx_array_size(hb);
+                    const bits: []const u16 = switch (mlx.mlx_array_dtype(hb)) {
+                        .float16 => @as([*]const u16, @ptrCast(mlx.mlx_array_data_float16(hb) orelse return error.MissingWeight))[0..n],
+                        .bfloat16 => blk: {
+                            // bf16 bias -> f16 bits (the table adds f16 bias values)
+                            const src = (mlx.mlx_array_data_bfloat16(hb) orelse return error.MissingWeight)[0..n];
+                            const tmp = try allocator.alloc(u16, n);
+                            for (src, tmp) |b, *t| t.* = @bitCast(@as(f16, @floatCast(@as(f32, @bitCast(@as(u32, b) << 16)))));
+                            break :blk tmp;
+                        },
+                        else => return error.NgramTableHeader,
+                    };
+                    try st.table.setHeadBias(bits, st.hash.n_heads);
+                    found = true;
+                    break;
+                };
+                if (!found) log.warn("[qwen4] exl3 ngram trellis table without head_bias: rows are decoded without the per-head bias\n", .{});
+            }
             if (config.embedded_ple_payload_bytes) |bytes| {
                 if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
             }
@@ -19309,6 +19398,7 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        if (exl3_trunk_registry) |reg| if (w.ctx) |p| if (reg.has(p)) return mlx_stream_mod.exl3Linear(self.s, x, w, sc, bi, @tagName(reg.codebook), reg.window_bits);
         if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, self.s);
         if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the

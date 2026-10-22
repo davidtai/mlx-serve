@@ -17,6 +17,7 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("qwen4_ple.zig");
+const sushi_exl3 = @import("sushi_exl3");
 pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
 pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
 pub const inspectEmbedded = embedded_ple.inspectEmbedded;
@@ -212,6 +213,11 @@ pub const NgramTable = struct {
     gpu_owns_map: bool = false,
     embedded: ?*embedded_ple.EmbeddedTable = null,
     fmt: embedded_ple.Format = .affine,
+    /// exl3_ngram_trellis rows (turboderp): K-bit mul1 trellis rings, `wcols` halfwords per row (1 f16 scale + dim*K/16);
+    /// 0 = the affine / bf16 formats above
+    trellis_k: u32 = 0,
+    n_heads: u32 = 0,
+    head_bias: ?[]u16 = null,
 
     pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
         var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
@@ -307,6 +313,7 @@ pub const NgramTable = struct {
         const meta_v = obj.get("__metadata__") orelse return error.NgramTableHeader;
         if (meta_v != .object) return error.NgramTableHeader;
         const meta = meta_v.object;
+        if (meta.get("format")) |f| if (f == .string and std.mem.eql(u8, f.string, "exl3_ngram_trellis")) return parseTrellis(map, obj, meta, data_off);
         if (meta.get("format")) |f| {
             if (f != .string or !std.mem.eql(u8, f.string, "mlx-serve-ngram")) return error.NgramTableHeader;
         } else if (!stamp_warned) {
@@ -366,6 +373,87 @@ pub const NgramTable = struct {
         };
     }
 
+    /// turboderp's `exl3_ngram_trellis`: one I16 tensor [rows, 1 + dim*K/16]; word 0 of a row is the ring's f16 scale, the
+    /// rest the dim*K-bit stream (stream bits [i*K, (i+1)*K) = position i's symbol). Metadata: K, row_dim, rows, codebook mul1.
+    fn parseTrellis(map: []align(std.heap.page_size_min) const u8, obj: std.json.ObjectMap, meta: std.json.ObjectMap, data_off: usize) !NgramTable {
+        const k_str = (meta.get("K") orelse return error.NgramTableHeader);
+        if (k_str != .string) return error.NgramTableHeader;
+        const K = std.fmt.parseInt(u32, k_str.string, 10) catch return error.NgramTableHeader;
+        if (K < 2 or K > 8) return error.NgramTableBits;
+        const dim_str = (meta.get("row_dim") orelse return error.NgramTableHeader);
+        if (dim_str != .string) return error.NgramTableHeader;
+        const dim = std.fmt.parseInt(u32, dim_str.string, 10) catch return error.NgramTableHeader;
+        if (dim == 0 or dim > 1024 or (dim * K) % 16 != 0) return error.NgramTableHeader;
+        if (meta.get("codebook")) |c| if (c != .string or !std.mem.eql(u8, c.string, "mul1")) return error.NgramTableHeader;
+        var key: ?[]const u8 = null;
+        var it = obj.iterator();
+        while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".trellis")) {
+            key = e.key_ptr.*;
+        };
+        const r = embedded_ple.headerRegion(obj, key orelse return error.NgramTableHeader, "I16", 2, map.len, data_off, .matrix) catch |err| return switch (err) {
+            error.TensorHeader, error.TensorDtype => error.NgramTableHeader,
+            error.TensorRegion => error.NgramTableRegion,
+            error.TensorTruncated => error.NgramTableTruncated,
+        };
+        if (r.cols != 1 + (dim * K) / 16) return error.NgramTableHeader;
+        return .{
+            .map = map,
+            .rows = r.rows,
+            .dim = dim,
+            .bits = K,
+            .group_size = 0,
+            .w_off = data_off + @as(usize, @intCast(r.start)),
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = @intCast(r.cols),
+            .scols = 0,
+            .trellis_k = K,
+        };
+    }
+
+    /// The per-head bias ([n_heads, dim] f16 bits) turboderp's rings add after the scale; copied, owned by the table.
+    pub fn setHeadBias(self: *NgramTable, bias_bits: []const u16, n_heads: u32) !void {
+        if (bias_bits.len != @as(usize, n_heads) * self.dim) return error.NgramTableHeader;
+        const copy = try std.heap.page_allocator.alloc(u16, bias_bits.len);
+        @memcpy(copy, bias_bits);
+        if (self.head_bias) |old| std.heap.page_allocator.free(old);
+        self.head_bias = copy;
+        self.n_heads = n_heads;
+    }
+
+    /// One ring: value_i = mul1(state_i) * scale + head_bias[head][i]; state_i stacks the symbols of positions i, i-1, ...
+    /// (K bits each, circular over dim) from bit 0 up, 16 bits wide.
+    fn trellisRow(self: *const NgramTable, r: u64, head: u32, out: []f32) void {
+        const words: usize = self.wcols;
+        const K: u5 = @intCast(self.trellis_k);
+        const raw = self.map[self.w_off + r * words * 2 ..][0 .. words * 2];
+        const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[0..2], .little))));
+        const nstream: u32 = @intCast(words - 1);
+        const kmask: u32 = (@as(u32, 1) << K) - 1;
+        const dim = self.dim;
+        var syms: [1024]u16 = undefined;
+        var i: u32 = 0;
+        while (i < dim) : (i += 1) {
+            const bit = i * self.trellis_k;
+            const w = bit >> 4;
+            const lo: u32 = std.mem.readInt(u16, raw[2 + 2 * w ..][0..2], .little);
+            const hi: u32 = std.mem.readInt(u16, raw[2 + 2 * ((w + 1) % nstream) ..][0..2], .little);
+            syms[i] = @intCast(((lo | (hi << 16)) >> @intCast(bit & 15)) & kmask);
+        }
+        const stack: u32 = (15 + self.trellis_k) / self.trellis_k;
+        const bias: ?[]const u16 = if (self.head_bias) |hb| hb[@as(usize, head) * dim ..][0..dim] else null;
+        i = 0;
+        while (i < dim) : (i += 1) {
+            var state: u32 = 0;
+            var j: u32 = 0;
+            while (j < stack) : (j += 1) state |= @as(u32, syms[(i + dim - j) % dim]) << @intCast(j * self.trellis_k);
+            const code: u16 = @truncate(state);
+            var v: f32 = @as(f32, @floatCast(@as(f16, @bitCast(sushi_exl3.format.decodeMul1(code))))) * scale;
+            if (bias) |b| v += @floatCast(@as(f16, @bitCast(b[i])));
+            out[i] = v;
+        }
+    }
+
     pub fn close(self: *NgramTable) void {
         if (self.warm_thread) |th| {
             self.warm_stop.store(true, .release);
@@ -376,6 +464,8 @@ pub const NgramTable = struct {
         live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
+        if (self.head_bias) |hb| std.heap.page_allocator.free(hb);
+        self.head_bias = null;
         if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
         if (self.embedded) |source| {
@@ -398,7 +488,7 @@ pub const NgramTable = struct {
     }
 
     fn calibrate(self: *const NgramTable, phase: CalibrationPhase) void {
-        if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
+        if (self.trellis_k != 0 or self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
         const p = self.pool orelse return;
         if ((self.fd < 0 and self.embedded == null) or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
         if (self.wcols * 4 + self.scols * 4 > PrefetchPool.ROW_BUF) return;
@@ -521,6 +611,7 @@ pub const NgramTable = struct {
     /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
+        if (self.trellis_k != 0) return self.trellisRow(r, 0, out);
         if (self.embedded) |source| {
             const parts = source.rowParts(r);
             self.dequantRow(parts.weight, parts.scales, parts.biases, out);
@@ -565,6 +656,11 @@ pub const NgramTable = struct {
     /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the context position this
     /// gather runs at and picks the wide arm; the output is byte-identical either way.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
+        if (self.trellis_k != 0) {
+            // rows arrive token-major, head-minor (NgramHash.rowIds): row i belongs to head i % n_heads
+            for (row_ids, 0..) |r, i| self.trellisRow(@intCast(r), @intCast(i % @max(self.n_heads, 1)), out[i * self.dim ..][0..self.dim]);
+            return;
+        }
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
         const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
@@ -1600,4 +1696,42 @@ test "WarmProgress emits on the byte step, on the silence timeout, and never twi
     try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
     try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
     try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
+}
+
+test "qwen4 ngram trellis row: packed K=6 ring decodes to mul1(state) * scale + head bias (turboderp's codec)" {
+    const K: u32 = 6;
+    const dim: u32 = 160;
+    const words: u32 = 1 + dim * K / 16;
+    var prng = std.Random.DefaultPrng.init(0x5A17);
+    const rnd = prng.random();
+    var syms: [160]u16 = undefined;
+    for (&syms) |*v| v.* = rnd.int(u16) & 0x3F;
+    const scale: f16 = 0.75;
+    // pack as pack_rows does: stream bit i*K + b = bit b of symbol i; word w holds stream bits [16w, 16w+16)
+    var row: [61]u16 = @splat(0);
+    row[0] = @bitCast(scale);
+    for (syms, 0..) |sym, i| {
+        var b: u32 = 0;
+        while (b < K) : (b += 1) {
+            const bit = @as(u32, @intCast(i)) * K + b;
+            if ((sym >> @intCast(b)) & 1 != 0) row[1 + bit / 16] |= @as(u16, 1) << @intCast(bit % 16);
+        }
+    }
+    // a one-row table over the packed bytes (page-aligned map)
+    const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 4096);
+    defer std.heap.page_allocator.free(buf);
+    for (row, 0..) |w, i| std.mem.writeInt(u16, buf[2 * i ..][0..2], w, .little);
+    var t: NgramTable = .{ .map = buf, .rows = 1, .dim = dim, .bits = K, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = words, .scols = 0, .trellis_k = K };
+    var bias: [16 * 160]u16 = undefined;
+    for (&bias, 0..) |*b, i| b.* = @bitCast(@as(f16, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)));
+    try t.setHeadBias(&bias, 16);
+    defer t.close();
+    var out: [160]f32 = undefined;
+    t.trellisRow(0, 3, &out);
+    for (0..dim) |i| {
+        var state: u32 = 0;
+        for (0..3) |j| state |= @as(u32, syms[(i + dim - j) % dim]) << @intCast(j * K);
+        const expect: f32 = @as(f32, @floatCast(@as(f16, @bitCast(sushi_exl3.format.decodeMul1(@truncate(state)))))) * 0.75 + @as(f32, @floatCast(@as(f16, @bitCast(bias[3 * 160 + i]))));
+        try std.testing.expectApproxEqAbs(expect, out[i], 1e-6);
+    }
 }

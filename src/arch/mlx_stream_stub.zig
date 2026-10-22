@@ -66,3 +66,7 @@ pub fn laneReceipt(_: *Model, _: []u8) ?[]const u8 {
 pub fn exl3Moe(_: mlx.mlx_stream, _: mlx.mlx_array, _: [9]mlx.mlx_array, _: mlx.mlx_array, _: mlx.mlx_array, _: []const u8, _: u8) !mlx.mlx_array {
     return error.Exl3EngineUnavailable;
 }
+
+pub fn exl3Linear(_: mlx.mlx_stream, _: mlx.mlx_array, _: mlx.mlx_array, _: mlx.mlx_array, _: mlx.mlx_array, _: []const u8, _: u8) !mlx.mlx_array {
+    return error.Exl3EngineUnavailable;
+}

@@ -373,6 +373,14 @@ pub const ModelConfig = struct {
     /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
     /// served by lib/sushi; null = the pack's own affine banks.
     exl3: ?sushi_exl3.Spec = null,
+    /// A fully EXL3 pack's trunk (`trunk_quant` in config.json): every 3-D U16 `.weight` with 1-D f16 `.scales` (suh) and
+    /// `.biases` (svh) is a trellis linear served by the plugin's exl3lib; null = affine trunk.
+    exl3_trunk: ?sushi_exl3.format.Decode = null,
+    /// `ngram_table {format: exl3_ngram_trellis, k}`: the PLE table's rows are K-bit mul1 trellis rings (turboderp's
+    /// exl3_ngram_trellis); 0 = the affine ngram_table.bin.
+    ngram_table_trellis_k: u32 = 0,
+    ngram_table_file_buf: [96]u8 = @splat(0),
+    ngram_table_file_len: u8 = 0,
     /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
     modelopt: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
@@ -1806,7 +1814,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.glm_stream = true;
     }
     if (config.isQwen4()) {
-        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+        const ngram_file: []const u8 = if (config.ngram_table_file_len > 0) config.ngram_table_file_buf[0..config.ngram_table_file_len] else "ngram_table.bin";
+        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, ngram_file });
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
@@ -2507,9 +2516,33 @@ fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
 
 /// A Sushi pack's `expert_quant` makes its routed experts EXL3 banks.
 fn parseSushiExperts(root: std.json.ObjectMap, config: *ModelConfig) !void {
+    try parseExl3Trunk(root, config);
     if (jsonField(root, "expert_quant") == null) return;
     config.exl3 = try sushi_exl3.parseExpertQuant(root);
     try sushi_exl3.admitTopK(config.num_experts_per_tok);
+}
+
+/// A fully EXL3 pack: `trunk_quant {format: exl3, codebook, window}` makes the trunk's trellis triples exl3lib linears, and
+/// `ngram_table {file, format, k}` names the PLE table's file and row format (exl3_ngram_trellis = turboderp's K-bit rings).
+fn parseExl3Trunk(root: std.json.ObjectMap, config: *ModelConfig) !void {
+    if (jsonField(root, "trunk_quant")) |tq| if (tq == .object) {
+        const fmt = tq.object.get("format") orelse return error.Exl3TrunkQuantFormat;
+        if (fmt != .string or !std.mem.eql(u8, fmt.string, "exl3")) return error.Exl3TrunkQuantFormat;
+        const cb_name: []const u8 = if (tq.object.get("codebook")) |c| (if (c == .string) c.string else "mul1") else "mul1";
+        const cb = sushi_exl3.format.Codebook.fromName(cb_name) orelse return error.ExpertLayoutUnsupported;
+        const win_bits: i64 = if (tq.object.get("window")) |w| (if (w == .integer) w.integer else 16) else 16;
+        const win = sushi_exl3.format.Window.fromBits(win_bits) orelse return error.Exl3WindowUnsupported;
+        config.exl3_trunk = .{ .codebook = cb, .window = win };
+    };
+    if (jsonField(root, "ngram_table")) |nt| if (nt == .object) {
+        if (nt.object.get("file")) |f| if (f == .string and f.string.len > 0 and f.string.len < config.ngram_table_file_buf.len) {
+            @memcpy(config.ngram_table_file_buf[0..f.string.len], f.string);
+            config.ngram_table_file_len = @intCast(f.string.len);
+        };
+        if (nt.object.get("format")) |f| if (f == .string and std.mem.eql(u8, f.string, "exl3_ngram_trellis")) {
+            config.ngram_table_trellis_k = if (nt.object.get("k")) |k| (if (k == .integer and k.integer > 0 and k.integer <= 8) @intCast(k.integer) else 6) else 6;
+        };
+    };
 }
 
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {

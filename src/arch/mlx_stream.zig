@@ -497,3 +497,12 @@ pub fn exl3Moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: [9]mlx.mlx_array, inds
         .down = .{ .trellis = bank[6], .suh = bank[7], .svh = bank[8] },
     }, inds, scores, .{ .codebook = cb, .window = win }, false);
 }
+
+/// A dense EXL3 linear (a fully EXL3 trunk's attention / GDN / shared-expert / head projection) through the plugin's
+/// exl3lib: trellis U16 [in/16, out/16, n], suh [in], svh [out]; y in x's dtype, any row count.
+pub fn exl3Linear(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, codebook: []const u8, window_bits: u8) !mlx.mlx_array {
+    const lib = plugin.exl3lib;
+    const cb = lib.format.Codebook.fromName(codebook) orelse return error.ExpertLayoutUnsupported;
+    const win = lib.format.Window.fromBits(window_bits) orelse return error.Exl3WindowUnsupported;
+    return lib.linear(s, x, trellis, suh, svh, .{ .codebook = cb, .window = win });
+}
