@@ -1725,6 +1725,7 @@ test "qwen4 ngram trellis row: packed K=6 ring decodes to mul1(state) * scale + 
     var bias: [16 * 160]u16 = undefined;
     for (&bias, 0..) |*b, i| b.* = @bitCast(@as(f16, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)));
     try t.setHeadBias(&bias, 16);
+    t.gpu_owns_map = true; // the map is the test's own buffer, not an mmap: close() must not munmap it
     defer t.close();
     var out: [160]f32 = undefined;
     t.trellisRow(0, 3, &out);

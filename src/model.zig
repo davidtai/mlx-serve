@@ -3282,6 +3282,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (try qwen4ConfigU32(cfg_obj, "ple_conv_kernel_size")) |v| config.ple_conv_kernel = v;
         if (try qwen4ConfigU32(cfg_obj, "ngram_size")) |v| config.ngram_size = v;
         if (try qwen4ConfigU32(cfg_obj, "heads_per_ngram")) |v| config.heads_per_ngram = v;
+        // a fully EXL3 pack: trunk_quant and the trellis n-gram table (top-level keys, beside expert_quant)
+        try parseExl3Trunk(root, &config);
         if (try qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
         if (try qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
         if (try qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
@@ -5609,7 +5611,9 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
+        // an EXL3 trunk's suh/svh (`.scales` / `.biases`, 1-D f16) are kernel operands in f16, never narrowed
+        const exl3_vec = ndim == 1 and (std.mem.endsWith(u8, key_str, ".scales") or std.mem.endsWith(u8, key_str, ".biases"));
+        if (!exl3_vec and !(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
             !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or (opts.modelopt and narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value)))) and
             (ndim != 1 or narrow1dEnabled()))
         {
@@ -11156,4 +11160,14 @@ test "applyLayerSpan: the PLE stays at its absolute layer and is local only to t
     try head.applyLayerSpan(.{ .start = 0, .end = 32, .total = 48 });
     try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
     try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
+}
+
+// MLX_SERVE_TEST_CONFIG_JSON=<the config.json text>: parse a real pack's config and print the EXL3 fields (a diagnostic,
+// skipped otherwise).
+test "parseConfigFromJson: a real config's EXL3 trunk fields (MLX_SERVE_TEST_CONFIG_JSON)" {
+    const raw = std.c.getenv("MLX_SERVE_TEST_CONFIG_JSON") orelse return error.SkipZigTest;
+    const c = try parseConfigFromJson(testing.allocator, std.mem.span(raw));
+    std.debug.print("CONFIG_PROBE model_type_qwen4={} exl3={} exl3_trunk={} ngram_trellis_k={d} ngram_file={s}\n", .{
+        c.isQwen4(), c.exl3 != null, c.exl3_trunk != null, c.ngram_table_trellis_k, c.ngram_table_file_buf[0..c.ngram_table_file_len],
+    });
 }
