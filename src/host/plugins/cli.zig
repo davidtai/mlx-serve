@@ -12,6 +12,8 @@ const log = @import("../../sdk/util/log.zig");
 const common = @import("../../abi/common.zig");
 const model_abi = @import("../../abi/plugin.zig");
 const sdk_plugin = @import("../../sdk/plugin.zig");
+const quant_abi = @import("../../abi/quant.zig");
+const quant_block = @import("../../sdk/quant/block.zig");
 const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;
@@ -244,6 +246,7 @@ pub fn checkPack(io: std.Io, a: Allocator, p: loader.Plugin, dir: []const u8) ![
     const cfg = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(4 << 20)) catch "";
     const mt = try sdk_plugin.modelTypeOf(a, cfg);
     const e = p.entry();
+    if (e.quant) |q| return quantClaims(a, q, cfg, &pd);
     var claim: [1]common.Claim = undefined;
     if (sdk_plugin.claimsOf(&.{e}, mt, cfg, &pd, &claim)[0] == .no) return error.NotClaimed;
     const t = e.model orelse return std.fmt.allocPrint(a, "claimed ({t})", .{claim[0]});
@@ -263,10 +266,28 @@ pub fn checkPack(io: std.Io, a: Allocator, p: loader.Plugin, dir: []const u8) ![
     unreachable;
 }
 
+/// A quant plugin on a pack: the quantization blocks of its config it claims, each validated.
+fn quantClaims(a: Allocator, q: *const quant_abi.QuantTable, cfg: []const u8, pd: *const common.PackDir) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    for (try quant_block.blocksOf(a, cfg)) |b| {
+        const c = q.claims(.of(b.json), .of(cfg));
+        if (c == .no) continue;
+        const v = q.validate(.of(b.json), .of(cfg), pd);
+        if (!v.isOk()) {
+            log.err("validate {s}: {s}\n", .{ b.key, v.why.slice() });
+            return error.ValidateRefused;
+        }
+        try parts.append(a, try std.fmt.allocPrint(a, "{s} ({t})", .{ b.key, c }));
+    }
+    if (parts.items.len == 0) return error.NotClaimed;
+    return std.fmt.allocPrint(a, "claims {s}", .{try std.mem.join(a, ", ", parts.items)});
+}
+
 fn packError(e: anyerror) []const u8 {
     return switch (e) {
         error.NoPack => "not a readable folder",
         error.NotClaimed => "it does not claim the pack",
+        error.ValidateRefused => "it refuses to validate a block it claims (above)",
         error.ParseRefused => "it refuses to parse the pack (above)",
         else => @errorName(e),
     };
@@ -419,4 +440,24 @@ test "plugin install: a quarantined file the user declines is refused before it 
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "plugins", .{}));
     // Confirmed, it goes on to be opened (and this one is not a plugin).
     try testing.expect(std.mem.startsWith(u8, (try install(testing.io, a, src, dir, &confirmed)).refused, "does not load: "));
+}
+
+test "plugin check: a quant plugin claims a pack by its quantization blocks, each validated" {
+    const T = struct {
+        fn claims(b: common.Str, _: common.Str) callconv(.c) common.Claim {
+            return if (std.mem.indexOf(u8, b.slice(), "\"fmt\"") != null) .by_marker else .no;
+        }
+        fn validate(b: common.Str, _: common.Str, _: *const common.PackDir) callconv(.c) common.Verdict {
+            return if (std.mem.indexOf(u8, b.slice(), "\"bad\"") != null) common.Verdict.refuse(.unsupported, "bad") else .ok;
+        }
+    };
+    const q: quant_abi.QuantTable = .{ .name = .of("fmt"), .claims = &T.claims, .validate = &T.validate, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pd: common.PackDir = undefined;
+    const full = "{\"trunk_quant\":{\"format\":\"fmt\"},\"expert_quant\":{\"format\":\"fmt\",\"k\":5},\"quantization\":{\"bits\":4}}";
+    try testing.expectEqualStrings("claims expert_quant (by_marker), trunk_quant (by_marker)", try quantClaims(a, &q, full, &pd));
+    try testing.expectError(error.NotClaimed, quantClaims(a, &q, "{\"quantization\":{\"bits\":4}}", &pd));
+    try testing.expectError(error.ValidateRefused, quantClaims(a, &q, "{\"trunk_quant\":{\"format\":\"fmt\",\"x\":\"bad\"}}", &pd));
 }

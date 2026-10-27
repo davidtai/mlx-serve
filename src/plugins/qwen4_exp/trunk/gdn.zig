@@ -1,6 +1,8 @@
 //! The trunk's GatedDeltaNet layer over a slot's recurrent entry: the joined or split projections, the fused decode
-//! and verify recurrences (with the per-row state capture a partial accept rolls back to), the fused or composed
-//! prefill prework, the recurrence kernels, and the sigmoid-gated norm (qwen4_exp's `output_gate_type`).
+//! and verify recurrences (with the per-row state capture, or the rows' recurrence inputs, a partial accept rolls back
+//! from), the fused or composed prefill prework, the recurrence kernels, and the sigmoid-gated norm (qwen4_exp's
+//! `output_gate_type`). Prefill chunks take the GDN core kernels (`gdn_core.zig`), the joined a | b GEMM (`gdn_ab.zig`)
+//! and on the trunk format's linears the fused tail and the overlap (`gdn_tail.zig`).
 //! copied_from: sdk/blocks/gdn/{gated_delta_net,gate}.zig, sdk/blocks/conv/conv1d_cache.zig (the qwen4_exp arms: no
 //! combined projection, KDA, low-rank gates, Hadamard, ANE or spec-tree paths).
 
@@ -48,6 +50,12 @@ const gdnRecurOps = kernels.gdnRecurOps;
 const gdnRouteKernel = kernels.gdnRouteKernel;
 const gdnSetGrid = kernels.gdnSetGrid;
 const getGdnKernelSeq = kernels.getGdnKernelSeq;
+const gdn_ab = @import("gdn_ab.zig");
+const gdn_core = @import("gdn_core.zig");
+const gdn_tail = @import("gdn_tail.zig");
+const sliceQkvPart = @import("../../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
+
+var replay_said = false;
 
 pub fn gatedDeltaNet(
     self: *Trunk,
@@ -93,12 +101,36 @@ pub fn gatedDeltaNetProjected(
     defer if (in_all.ctx != null) {
         _ = mlx.mlx_array_free(in_all);
     };
+    // [a | 0 | b] from one matmul (`gdn_ab.parts`): a_proj / b_proj are its views, the packed prework reads it in place.
+    var ab_all: mlx.mlx_array = .{ .ctx = null };
+    defer if (ab_all.ctx != null) {
+        _ = mlx.mlx_array_free(ab_all);
+    };
+    // GDN-OUT: in_proj_z stops at its inner product, which the fused tail finishes; `z_proj` holds the chain's finish of
+    // it, built lazily, so MLX runs it only if something reads it.
+    var z_inner: ?mlx.mlx_array = null;
+    defer if (z_inner) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    // The un-rotated trunk: [B, S, qkv | z] from one matmul over the joined weight, which the prework reads qkv from and
+    // the norm-gate z from, in place; `qkv` and `z_proj` are its views for any other reader.
+    var unrot_all: mlx.mlx_array = .{ .ctx = null };
+    defer if (unrot_all.ctx != null) {
+        _ = mlx.mlx_array_free(unrot_all);
+    };
     var a_proj: mlx.mlx_array = undefined;
     var b_proj: mlx.mlx_array = undefined;
     defer _ = mlx.mlx_array_free(qkv);
     defer _ = mlx.mlx_array_free(z_proj);
     defer _ = mlx.mlx_array_free(a_proj);
     defer _ = mlx.mlx_array_free(b_proj);
+    const gdn_out = is_prefill and blk: {
+        const why = gdn_tail.outPlan(gdn_tail.outFacts(self, x, la, batch, seq_len, is_prefill, projected != null, skip_output)) orelse break :blk true;
+        gdn_tail.outDeclined(why, seq_len, batch);
+        break :blk false;
+    };
+    // a prefill chunk the overlap could split into pieces
+    const overlap = is_prefill and batch == 1 and projected == null and !skip_output and seq_len >= 2 * gdn_tail.MIN_PIECE;
     if (projected) |values| {
         qkv = values.qkv;
         z_proj = values.z;
@@ -193,12 +225,23 @@ pub fn gatedDeltaNetProjected(
         try la.in.part(&z_proj, all, 1, self.s);
         try la.in.part(&a_proj, all, 2, self.s);
         try la.in.part(&b_proj, all, 3, self.s);
+    } else if (if (is_prefill and !gdn_out and la.qkv_w.ctx != null) try self.formats.joined(&.{ la.qkv_w, la.z_w }, x, self.s) else null) |all| {
+        unrot_all = all;
+        qkv = mlx.mlx_array_new();
+        z_proj = mlx.mlx_array_new();
+        try sliceQkvPart(&qkv, all, 0, conv_dim, self.s);
+        try sliceQkvPart(&z_proj, all, conv_dim, value_dim, self.s);
+        try gdn_ab.parts(self, x, la, &ab_all, &a_proj, &b_proj);
+    } else if (if (gdn_out) try gdn_tail.outProj(self, x, la, batch, seq_len) else null) |proj| {
+        qkv = proj.qkv;
+        z_proj = proj.z;
+        z_inner = proj.z_inner;
+        try gdn_ab.parts(self, x, la, &ab_all, &a_proj, &b_proj);
     } else {
         const proj = try self.gdnProjGpu(x, la);
         qkv = proj.qkv;
         z_proj = proj.z;
-        a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
-        b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
+        try gdn_ab.parts(self, x, la, &ab_all, &a_proj, &b_proj);
     }
     // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
     // requires a non-empty weight) are cached on the Trunk — they
@@ -277,6 +320,32 @@ pub fn gatedDeltaNetProjected(
         };
         // A chain in one dispatch: recurrence, norm-gate and the rollback conv input.
         if (gdnVerifyFoldEnabled()) fold: {
+            // The fold that writes the rows' recurrence inputs instead of the per-step states: the layer keeps the
+            // round's input state, and a partial accept replays the accepted rows from it (`ssmRollbackFromCapture`).
+            // Null: the capturing fold below.
+            if (try gdn_decode.recurSeqFoldReplay(geo, seq_len, ins, false, self.s)) |f| {
+                defer _ = mlx.mlx_array_free(f.gated);
+                // a second handle to the input state the fold reads: the replay's starting point
+                var state_in = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&state_in, ssm.ssm_state));
+                inline for (.{ &ssm.spec_state_seq, &ssm.spec_conv_input, &ssm.spec_state_in, &ssm.spec_prework.k, &ssm.spec_prework.v, &ssm.spec_prework.gb }) |h| if (h.ctx != null) {
+                    _ = mlx.mlx_array_free(h.*);
+                    h.* = .{ .ctx = null };
+                };
+                ssm.spec_conv_input = f.conv_input;
+                ssm.spec_state_in = state_in;
+                ssm.spec_prework = f.prework;
+                ssm.spec_replay = true;
+                _ = mlx.mlx_array_free(ssm.conv_state);
+                ssm.conv_state = f.conv_state;
+                _ = mlx.mlx_array_free(ssm.ssm_state);
+                ssm.ssm_state = f.ssm_state;
+                if (!replay_said) {
+                    replay_said = true;
+                    log.info("[gdn-replay] engaged: S={d} Hk={d} Hv={d} (a partial accept replays the kept rows)\n", .{ seq_len, num_k_heads, num_v_heads });
+                }
+                return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
+            }
             const f = (try gdn_decode.recurSeqFold(geo, seq_len, ins, false, self.s)) orelse break :fold;
             defer _ = mlx.mlx_array_free(f.gated);
             if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
@@ -335,9 +404,17 @@ pub fn gatedDeltaNetProjected(
     var fused_prework = false;
     var g_fused: ?mlx.mlx_array = null;
     var beta_fused: ?mlx.mlx_array = null;
+    // The un-rotated trunk's joined product: the columns the prework reads qkv from and the norm-gate z from, in place;
+    // otherwise the projections' own arrays.
+    const qkv_cols: gdn_tail.Cols = if (unrot_all.ctx != null) .{ .a = unrot_all, .off = 0, .stride = conv_dim + value_dim } else .{ .a = qkv, .off = 0, .stride = conv_dim };
+    const z_cols: gdn_tail.Cols = if (unrot_all.ctx != null) .{ .a = unrot_all, .off = conv_dim, .stride = conv_dim + value_dim } else .{ .a = z_proj, .off = 0, .stride = value_dim };
 
     // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
     const prefill_fused = is_prefill and gdnPrefillFusedFor(seq_len, batch);
+    // The GDN core kernels take a prefill chunk's prework below and its recurrence (the whole chunk's or the overlap's
+    // pieces); `core_pw_ran`: the row stream took the prework.
+    const core = is_prefill and !self.spec_capture_ssm;
+    var core_pw_ran = false;
     if ((batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (ssm.initialized or prefill_fused))
     blk: {
@@ -351,16 +428,18 @@ pub fn gatedDeltaNetProjected(
             try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, mlx.mlx_array_dtype(qkv), self.s));
         }
         const incoming_conv = if (cold) zero_conv else ssm.conv_state;
-        const pre = (gdnPreworkFused(self.s, .{
-            .qkv = qkv,
-            .qkv_off = 0,
-            .qkv_stride = conv_dim,
-            .b = b_proj,
-            .b_off = 0,
-            .b_stride = num_v_heads,
-            .a = a_proj,
+        // a and b read in place from the joined product (columns 0 and b_off of rows n wide), not its views
+        const ab_in = ab_all.ctx != null;
+        const pw_args: decode_fused.GdnPreworkArgs = .{
+            .qkv = qkv_cols.a,
+            .qkv_off = qkv_cols.off,
+            .qkv_stride = qkv_cols.stride,
+            .b = if (ab_in) ab_all else b_proj,
+            .b_off = if (ab_in) la.ab.b_off else 0,
+            .b_stride = if (ab_in) la.ab.n else num_v_heads,
+            .a = if (ab_in) ab_all else a_proj,
             .a_off = 0,
-            .a_stride = num_v_heads,
+            .a_stride = if (ab_in) la.ab.n else num_v_heads,
             .A_log = la.A_log,
             .dt_bias = la.dt_bias,
             .conv_state = incoming_conv,
@@ -376,7 +455,11 @@ pub fn gatedDeltaNetProjected(
             .batch = batch,
             .gate = true,
             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), self.ssmStateDtype()),
-        }) catch null) orelse break :blk;
+        };
+        // the packed prework's bytes from the row stream; where it declines, the packed kernel
+        const core_pre: ?GdnPrework = if (core) (gdn_core.prework(self.s, pw_args) catch null) else null;
+        core_pw_ran = core_pre != null;
+        const pre = core_pre orelse ((gdnPreworkFused(self.s, pw_args) catch null) orelse break :blk);
         // Spec-capture rollback slices the conv INPUT; build the concat
         // the composed path would have stashed (lazy, one launch).
         if (self.spec_capture_ssm) {
@@ -619,6 +702,15 @@ pub fn gatedDeltaNetProjected(
         else
             null;
         const route: GdnRoute = if (blocked_tb == null) .stock else if (gdnPipelinedEnabled(cfg.model_type)) .pipelined else .blocked;
+        // the pipelined route's calls take the GDN core recurrence (the pipelined kernel's bytes), the whole chunk below
+        // and the overlap's pieces
+        const core_rec = core and route == .pipelined and !qwen4Standin().gdn_recur and gdn_core.recurServes(dv, gdn_in_dtype, gdn_out_dtype);
+        gdn_core.say(seq_len, core_pw_ran, core_rec);
+        // the recurrence and the norm-gate + out_proj tail over row pieces of the chunk, each piece's tail on the side
+        // stream beside the next piece's recurrence; null (declined, nothing built): the whole chunk as below
+        if (overlap and route == .pipelined and fused_prework and !qwen4Standin().gdn_recur) {
+            if (try gdn_tail.overlap(self, la, ssm, z_cols, z_inner, mlx.mlx_array_dtype(x), q_scaled, k_scaled, v_heads, g, beta, gdn_out_dtype, num_k_heads, num_v_heads, dk, dv, seq_len, core_rec)) |out| return out;
+        }
         try gdnSetGrid(config, route, dv, num_v_heads, batch);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
@@ -638,6 +730,13 @@ pub fn gatedDeltaNetProjected(
         if (qwen4Standin().gdn_recur) {
             _ = mlx.mlx_array_free(y_bthd);
             y_bthd = try standinRef(v_heads);
+        } else if (core_rec) {
+            // the same outputs from the GDN core recurrence (the config above stays unused)
+            const r = try gdn_core.recur(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, num_k_heads, num_v_heads, dk, dv, gdn_out_dtype);
+            _ = mlx.mlx_array_free(y_bthd);
+            y_bthd = r.y;
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = r.state;
         } else {
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
             if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
@@ -654,7 +753,10 @@ pub fn gatedDeltaNetProjected(
     // out_proj input (decode/verify widths, per-head swish gate archs).
     if (fused_prework) {
         if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-        if (try gdnNormGateFused(self.s, y_bthd, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, false, num_v_heads, dv, batch, seq_len)) |flat| {
+        // GDN-OUT: z's finish, the norm-gate and out_proj's prepare in one launch, then out_proj from the prepared rows;
+        // where it declines, the norm-gate below reads the lazy z (the chain's bytes)
+        if (z_inner) |zi| if (try gdn_tail.outFused(self, y_bthd, zi, la, mlx.mlx_array_dtype(x), num_v_heads, dv, batch, seq_len)) |out| return out;
+        if (try gdnNormGateFused(self.s, y_bthd, z_cols.a, z_cols.off, z_cols.stride, la.norm_w, self.gdn_eps.?, false, num_v_heads, dv, batch, seq_len)) |flat| {
             defer _ = mlx.mlx_array_free(flat);
             return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
         }
@@ -775,6 +877,8 @@ pub fn gdnProjGpu(self: *Trunk, x: mlx.mlx_array, la: *const LinearAttnWeights) 
 pub fn gdnProjArrays(self: *Trunk, x: mlx.mlx_array, qkv_w: mlx.mlx_array, qkv_s: mlx.mlx_array, qkv_b: mlx.mlx_array, z_w: mlx.mlx_array, z_s: mlx.mlx_array, z_b: mlx.mlx_array) !GdnProj {
     const qkv = try self.qmatmul(x, qkv_w, qkv_s, qkv_b);
     errdefer _ = mlx.mlx_array_free(qkv);
+    // the side stream's `gdnz`: z after its prepare on the side stream, beside the prework and the recurrence
+    if (try gdn_tail.projZSide(self, x, z_w, z_s, z_b)) |z| return .{ .qkv = qkv, .z = z };
     const z = try self.qmatmul(x, z_w, z_s, z_b);
     return .{ .qkv = qkv, .z = z };
 }

@@ -46,6 +46,9 @@ const modelDiskBytes = @import("runtime/preflight.zig").modelDiskBytes;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
 const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
 const committedTextBytes = @import("runtime/preflight.zig").committedTextBytes;
+const prefill_chunk = @import("admission/prefill_chunk.zig");
+const bills = @import("admission/bills.zig");
+const memory_ceiling = @import("../../host/registry/memory_ceiling.zig");
 const availForLoad = @import("runtime/preflight.zig").availForLoad;
 const mtpSidecarDiskBytes = @import("runtime/preflight.zig").mtpSidecarDiskBytes;
 const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentBytes;
@@ -658,6 +661,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         _ = modules.call("qwen4_build_draft_rerank", .{t});
     };
 
+    // The resident trunk (`MLX_SERVE_EXL3_TRUNK`): armed with everything the load keeps already resident, so the room is
+    // read honestly, and before the warm-ups and the hot-cache plan, which then bill it. The MTP head's linears join only
+    // when the head serves.
+    if (xfm_ptr.qwen4Trunk()) |t| if (t.formats.trunk != null)
+        modules.call("qwen4_arm_trunk_resident", .{ t, trunkResidentRoom(params.config), mtp_ptr == null and mtp_enabled and t.qwen4_mtp != null });
+
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
     // MLX caller), with the chunk width resolved through the server's own
@@ -882,8 +891,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         );
     }
     // Commit the same validated weight estimate used by the eviction gate
-    // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
-    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
+    // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table
+    // and the resident trunk's matrices.
+    const trunk_resident: u64 = if (xfm_ptr.qwen4Trunk()) |t| t.formats.resident_bytes else 0;
+    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config) + trunk_resident;
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
@@ -902,6 +913,18 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
     }
     publishHotCacheResidency(sch);
+}
+
+
+/// The bytes the resident trunk may keep beside what the load holds: the live GPU ceiling less MLX's active bytes (the
+/// weights and everything the load keeps), the configured context's KV and the pinned prefill chunk's transient reserve,
+/// so a kept matrix never takes what a request at that context needs. Pins the chunk first: the set takes the residual.
+fn trunkResidentRoom(config: *model_mod.ModelConfig) u64 {
+    const chunk: u64 = prefill_chunk.pinPrefillChunk(config);
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    const kv_bits = bills.defaultKvBits(config);
+    return memory_ceiling.currentGpuMemoryCeiling(config, active) -| active -| prefill_chunk.sizerCtxKvBytes(config, kv_bits) -| bills.prefillTransientReserve(config, kv_bits, chunk);
 }
 
 // ── tests ──

@@ -14,8 +14,8 @@ them in.
 
 ## Claim and validate
 
-A quant plugin claims a pack by its quantization block (`quantization`, `quantization_config` or `expert_quant`,
-passed as JSON), not by `model_type`:
+A quant plugin claims a pack by its quantization block (`quantization`, `quantization_config`, `expert_quant` or
+`trunk_quant`, passed as JSON), not by `model_type`:
 
 ```zig
 pub fn claims(block_json: abi.Str, config_json: abi.Str) callconv(.c) abi.Claim {

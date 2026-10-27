@@ -5,6 +5,7 @@
 - **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
 - **DiffusionGemma is no longer supported.**
 - **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
+- **Qwen3.8 Flash Next packs in full EXL3.** Packs with the trunk and the drafter in EXL3, not only the experts, serve once an EXL3 quant plugin such as turboexl3 is installed with `mlx-serve plugin install`; `MLX_SERVE_NOCACHE_LOAD=1` loads one near the RAM size.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 

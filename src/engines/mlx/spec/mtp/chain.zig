@@ -202,6 +202,10 @@ pub const MtpPreDraft = struct {
     lookup: bool = false,
     /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
     place: ?HeadPlace = null,
+    /// The normalized embedding of draft `en_step` (owned), built by that step's fused pick; the next step's head
+    /// forward reads it instead of `embedding` + `rmsNorm`, and only while it is that step's predecessor's.
+    en_next: ?mlx.mlx_array = null,
+    en_step: u32 = 0,
 
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.t1_arr);
@@ -217,7 +221,21 @@ pub const MtpPreDraft = struct {
             allocator.free(slots);
         }
         if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
+        if (self.en_next) |e| _ = mlx.mlx_array_free(e);
         allocator.free(self.drafts);
+    }
+
+    /// Hand draft `step`'s normalized embedding (or none) to the next step, dropping the previous one.
+    pub fn setEnNext(self: *MtpPreDraft, step: u32, en: ?mlx.mlx_array) void {
+        if (self.en_next) |e| _ = mlx.mlx_array_free(e);
+        self.en_next = en;
+        self.en_step = step;
+    }
+
+    /// The front step `step` may read: draft `step - 1`'s pick output, else none.
+    pub fn frontFor(self: *const MtpPreDraft, step: u32) ?mlx.mlx_array {
+        if (step == 0 or self.n_drafted != step or self.en_step + 1 != step) return null;
+        return self.en_next;
     }
 };
 

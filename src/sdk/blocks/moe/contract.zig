@@ -1228,21 +1228,26 @@ const RouterMode = rk.RouterMode;
 fn routerInputs(mode: RouterMode) []const [*:0]const u8 {
     return switch (mode) {
         .softmax => &.{"logits"},
-        .softmax_gate => &.{ "logits", "gx", "gw" },
+        .softmax_gate, .softmax_gate_gemv => &.{ "logits", "gx", "gw" },
         .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &.{ "logits", "bias", "scale" },
     };
+}
+
+/// The modes that write the shared-expert gate's logit too.
+fn gated(mode: RouterMode) bool {
+    return mode == .softmax_gate or mode == .softmax_gate_gemv;
 }
 
 /// rk[NE] and (sigmoid arms) rw[NE] f32 at the largest expert count, gs[NG], sel[NK], gp[TG / 32].
 const router_tg: u32 = 2 * 2048 * 4 + 32 * 4 + 32 * 4 + 8 * 4;
 const router_launches = blk: {
-    var out: [5]metal.Launch = undefined;
+    var out: [@typeInfo(RouterMode).@"enum".field_names.len]metal.Launch = undefined;
     for (&out, 0..) |*l, i| {
         const mode: RouterMode = @fromBackingInt(@intCast(i));
         l.* = .{
             .name = std.fmt.comptimePrint("mlxserve_moe_router_{t}", .{mode}),
             .inputs = routerInputs(mode),
-            .outputs = if (mode == .softmax_gate) &.{ "inds", "scores", "glogit" } else &.{ "inds", "scores" },
+            .outputs = if (gated(mode)) &.{ "inds", "scores", "glogit" } else &.{ "inds", "scores" },
             .source = rk.ROUTER_SOURCES[i],
             .tg_bytes = router_tg,
             // M1/M2 compiled limits (`offline.zig`): 928 for the gate, grouped and logit-select arms.
@@ -1293,18 +1298,28 @@ const Router = struct {
         return self.mode == .sigmoid_bias or self.mode == .sigmoid_bias_grouped or self.mode == .logit_bias;
     }
 
-    pub fn geometry(self: *const Router, shape: Shape) ?metal.Geometry {
+    /// The shape a launch runs: the gemv-order logit serves 2..4 rows, so a gate's 5..8-row small shape runs at 4 (the
+    /// planted rows fit).
+    fn launchShape(self: *const Router, shape: Shape) Shape {
+        var x = shape;
+        if (self.mode == .softmax_gate_gemv) x.rows = std.math.clamp(x.rows, 2, 4);
+        return x;
+    }
+
+    pub fn geometry(self: *const Router, shape_in: Shape) ?metal.Geometry {
+        const shape = self.launchShape(shape_in);
         const e: c_int = @intCast(shape.k);
         const k: c_int = @intCast(shape.n);
         if (shape.rows == 0 or k < 1 or k > 32 or e < k or e > 2048) return null;
         if (self.mode == .sigmoid_bias_grouped and (shape.k % self.ng != 0 or shape.k / self.ng < 2)) return null;
-        const tg = rk.moeRouterThreadGroup(e);
-        if (self.mode == .softmax_gate and tg < 64) return null;
         const rows: c_int = @intCast(shape.rows);
+        if (self.mode == .softmax_gate_gemv and !rk.gateGemvShape(rows, @intCast(self.gk), .bfloat16, .bfloat16, self.out_dt)) return null;
+        const tg: c_int = if (self.mode == .softmax_gate_gemv) 32 * 9 else rk.moeRouterThreadGroup(e);
+        if (self.mode == .softmax_gate and tg < 64) return null;
         var g = metal.Geometry{ .grid = .{ tg, rows, 1 }, .tg = .{ tg, 1, 1 } };
         g.out(&.{ rows, k }, .uint32);
         g.out(&.{ rows, k }, self.out_dt);
-        if (self.mode == .softmax_gate) {
+        if (gated(self.mode)) {
             g.out(&.{rows}, self.out_dt);
             g.int("GK", self.gk);
         }
@@ -1321,7 +1336,8 @@ const Router = struct {
         return g;
     }
 
-    pub fn prepare(self: *Router, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+    pub fn prepare(self: *Router, shape_in: Shape, fill: spec.Fill, seed: u64) !bool {
+        const shape = self.launchShape(shape_in);
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
@@ -1337,7 +1353,7 @@ const Router = struct {
         for (self.logits, 0..) |*v, i| v.* = host.rt(self.dt, (rng.float(f64) - 0.5) * 8 + @as(f64, @floatFromInt(i % 7)) * 0.011);
         self.bias = try a.alloc(f64, e);
         for (self.bias) |*v| v.* = host.rt(.float32, (rng.float(f64) - 0.5) * 0.2);
-        if (self.mode == .softmax_gate) {
+        if (gated(self.mode)) {
             self.gx = try a.alloc(f64, shape.rows * self.gk);
             self.gw = try a.alloc(f64, self.gk);
             host.uniformInto(rng, self.gx, -2, 2, .bfloat16);
@@ -1357,7 +1373,7 @@ const Router = struct {
         const rows: c_int = @intCast(shape.rows);
         self.args[0] = try rig.input(self.dt, &.{ rows, @intCast(e) }, self.logits);
         self.n_args = 1;
-        if (self.mode == .softmax_gate) {
+        if (gated(self.mode)) {
             self.args[1] = try rig.input(.bfloat16, &.{ rows, @intCast(self.gk) }, self.gx);
             self.args[2] = try rig.input(.bfloat16, &.{@intCast(self.gk)}, self.gw);
             self.n_args = 3;
@@ -1391,7 +1407,7 @@ const Router = struct {
         rk.moe_router_fused_override = false;
         defer rk.moe_router_fused_override = outer;
         const r = switch (self.mode) {
-            .softmax, .softmax_gate => try routing.moeRoutingChain(x[0], k, s),
+            .softmax, .softmax_gate, .softmax_gate_gemv => try routing.moeRoutingChain(x[0], k, s),
             .sigmoid_bias => try routing.hy3RoutingChain(x[0], x[1], k, self.norm, self.scale, s),
             .sigmoid_bias_grouped => try routing.groupLimitedRouting(x[0], x[1], k, @intCast(self.ng), @intCast(self.topkg), self.norm, self.scale, s),
             .logit_bias => try routing.kolibriRoutingChain(x[0], x[1], k, s),
@@ -1475,7 +1491,7 @@ const Router = struct {
                 // An +Inf key is the first pick (softmax and the raw-logit keys of kolibri1).
                 if ((softmax or self.mode == .logit_bias) and r == 1 and self.idAt(out, r * k) != e / 2) return self.fail("row 1 did not pick its +Inf expert first", .{});
             }
-            if (self.mode == .softmax_gate) for (0..self.shape.rows) |r| {
+            if (gated(self.mode)) for (0..self.shape.rows) |r| {
                 const g = spec.read(host.elemOf(self.out_dt), out[(4 + spec.size(host.elemOf(self.out_dt))) * self.count() ..], r);
                 if (!std.math.isFinite(g)) return self.fail("row {d}: gate logit {e} from finite x", .{ r, g });
             };
@@ -1493,6 +1509,15 @@ const Router = struct {
             if (@as(u64, @bitCast(got)) != @as(u64, @bitCast(want))) return self.fail("row {d} id {d}: weight {e} where the chain gives {e}", .{ r, id, got, want });
         };
         const gl = out[(4 + spec.size(host.elemOf(self.out_dt))) * self.count() ..];
+        if (self.mode == .softmax_gate_gemv) {
+            // the gate's matmul as the shared expert computes it (x [rows, K] @ w [K, 1]): the same bytes
+            var g = ops.Graph.init(a, self.rig.stream());
+            defer g.deinit();
+            const want = try a.dupe(u8, try self.rig.bytesOf(&.{try g.matmul(self.args[1], try g.reshape(self.args[2], &.{ @intCast(self.gk), 1 }))}));
+            defer a.free(want);
+            if (!std.mem.eql(u8, want, gl[0..want.len])) return self.fail("the gate logit differs from MLX's matmul bytes", .{});
+            return null;
+        }
         const tg: usize = @intCast(rk.moeRouterThreadGroup(@intCast(e)));
         // A thread's strided chain over the gate width, the 32-lane sum, the simdgroups' sum.
         const depth = (self.gk + tg - 33) / (tg - 32) + 5 + tg / 32;
@@ -1514,7 +1539,7 @@ const Router = struct {
         rk.moe_router_fused_override = true;
         defer rk.moe_router_fused_override = outer;
         const mode: RouterMode = if (self.mode == .softmax_gate) .softmax else self.mode;
-        const gate: ?rk.RouterGate = if (self.mode == .softmax_gate) .{ .x = x[1], .w = x[2] } else null;
+        const gate: ?rk.RouterGate = if (gated(self.mode)) .{ .x = x[1], .w = x[2] } else null;
         const bias = if (self.sigmoidArm()) x[1] else mlx.mlx_array{ .ctx = null };
         const r = (try rk.moeRouterTopK(s, x[0], bias, @intCast(self.shape.n), mode, self.norm, self.scale, self.out_dt, @intCast(self.ng), @intCast(self.topkg), gate)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(r.inds);
@@ -1566,6 +1591,10 @@ fn registerRouter(set: *kc.Set) !void {
         var r = Router.init(a, .softmax_gate);
         r.gk = 2048;
         try addRouter(set, r, "router bf16 (softmax, shared-expert gate logit)", &.{ .{ .rows = 1, .n = 10, .k = 512 }, .{ .rows = 64, .n = 10, .k = 512 } }, null);
+        // Qwen3.8 at verify rows: the logit in MLX's gemv order over a 2560 hidden.
+        r = Router.init(a, .softmax_gate_gemv);
+        r.gk = 2560;
+        try addRouter(set, r, "router bf16 (softmax, shared-expert gate logit in MLX's gemv order)", &.{ .{ .rows = 2, .n = 10, .k = 512 }, .{ .rows = 4, .n = 10, .k = 512 } }, null);
         r = Router.init(a, .sigmoid_bias);
         r.scale = 2.5;
         try addRouter(set, r, "router bf16 (hy3 sigmoid + bias, normed, scale 2.5)", &.{ .{ .rows = 1, .n = 8, .k = 192 }, .{ .rows = 256, .n = 8, .k = 192 } }, "hy3RoutingChain" ++ by_id);

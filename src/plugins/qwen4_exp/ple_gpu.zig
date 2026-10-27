@@ -149,6 +149,11 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
         log.info("[qwen4] ple gather: cpu (no Metal kernels: the GPU gather is one)\n", .{});
         return null;
     }
+    // The kernel reads affine and BF16 rows; a trellis table's rings decode on the host.
+    if (table.trellis_k != 0) {
+        log.info("[qwen4] ple gather: cpu (a trellis table: its rings decode on the host)\n", .{});
+        return null;
+    }
     const b: Budget = .{
         .page = std.heap.pageSize(),
         .max_buffer = mlx.maxBufferLength(),
@@ -531,6 +536,14 @@ test "ple gpu: a declined embedded table keeps the host gather" {
     defer table.close();
     try testing.expect(load(&table, false, 0) == null);
     try testing.expect(load(&table, true, std.math.maxInt(u64)) == null);
+}
+
+test "ple gpu: a trellis table keeps the host gather, whatever the budget" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const empty: [0]u8 align(std.heap.page_size_min) = .{};
+    var table: qwen4.NgramTable = .{ .map = &empty, .rows = 1, .dim = 160, .bits = 6, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = 61, .scols = 0, .trellis_k = 6 };
+    try testing.expect(load(&table, true, 0) == null);
+    try testing.expect(!table.gpu_owns_map);
 }
 
 test "ple gpu arm gate: off unless --ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {

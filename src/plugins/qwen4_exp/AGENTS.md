@@ -28,6 +28,12 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
 - QSA's generic half is the SDK's block-sparse attention (`sdk/blocks/attention/sparse_block/`: `Blocks`/`Params`,
   score sheet, exact select, masks, decode kernel, float64 reference, its own contract); the indexer (YaRN/M-RoPE,
   pooled keys, hc reads), the key history and checkpoints, the gather and verify arms stay here.
+- EXL3 (`trunk/formats.zig`, bound once at load) goes through the quant seam (`abi/quant.zig`), claimants by
+  `sdk/quant/formats.zig` over the built-ins and the installed quant plugins: `trunk_quant`'s format (a plugin: no
+  built-in serves a dense EXL3 linear) loads every trunk `.weight` in neither of MLX's encodings and runs it from
+  `qmatmul`; `expert_quant`'s format (the built-in Sushi table, or a plugin that outranks it) loads each MoE layer's
+  banks and runs its SwiGLU. `MLX_SERVE_BIT_EXACT` sets the numerics (unset = reordered on an EXL3 pack); a path that
+  reorders a sum asks `trunk.reordered()`. The trellis n-gram table (`exl3_ngram_trellis`) decodes on the host.
 - Kernel contract: every Metal kernel registered (`contract*.zig` here and in `sparse_block/`); the multi-launch ones
   (qsa_decode, qsa_select's split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair.
 

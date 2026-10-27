@@ -34,6 +34,7 @@ const MTP_EV_WARMUP_ROUNDS = @import("depth.zig").MTP_EV_WARMUP_ROUNDS;
 const MtpCacheRef = @import("../mtp_head_ref.zig").MtpCacheRef;
 const MtpChainTestSlot = @import("chain.zig").MtpChainTestSlot;
 const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
+const MAX_ROUND_DRAFTS = @import("../mtp_head_ref.zig").MAX_ROUND_DRAFTS;
 const MtpHistStash = @import("chain.zig").MtpHistStash;
 const MtpPreDraft = @import("chain.zig").MtpPreDraft;
 const SamplingParams = @import("../../sampling/params.zig").SamplingParams;
@@ -385,6 +386,8 @@ pub fn mtpRoundAfterChain(
             // dry-spell policy (mtpExtDryAllows).
             self.mtp_ext_dry_streak +|= 1;
         }
+        // A kept plan's boundary as the round sees it (`ev_fix.Model.read_ms`): the read, plus chunk B when it fired.
+        if (plan.fire_ideal > 0 and self.spec_cost_solo) self.xfm.mtp_ev_fix.read_ms = mtpEmaMs(self.xfm.mtp_ev_fix.read_ms, sync_watch.read());
         if (tracing) {
             self.mtp_trace.add(.ext, ph.read());
             ph.reset();
@@ -494,6 +497,10 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     defer self.ctx.pipeline_build = 0;
     self.ctx.spec_verify = true;
     defer self.ctx.spec_verify = false;
+    // The PLE flush (inside a ladder build, or below) reads the verify ids off the arrays this input concatenates.
+    var ple_src_buf: [MAX_ROUND_DRAFTS + 1]mlx.mlx_array = undefined;
+    self.ctx.ple_ids_src = pleIdsSource(&ple_src_buf, st.chain.t1_arr, st.chain.draft_arrs[0..st.chain.m], st.verify_len);
+    defer self.ctx.ple_ids_src = null;
     const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
         self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
@@ -526,6 +533,15 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     st.verify_logits = verify_logits;
     st.new_hidden = new_hidden;
     st.verify_hidden_all = verify_hidden_all;
+}
+
+/// The arrays a solo verify input concatenates, `[t1, drafts[0..m]]`, lent to the PLE flush (`ForwardCtx.ple_ids_src`).
+/// Null where the input is not that concatenation (a row a group padded) or holds more ids than `buf`.
+pub fn pleIdsSource(buf: *[MAX_ROUND_DRAFTS + 1]mlx.mlx_array, t1: mlx.mlx_array, drafts: []const mlx.mlx_array, verify_len: u32) ?[]const mlx.mlx_array {
+    if (drafts.len > MAX_ROUND_DRAFTS or verify_len != 1 + drafts.len) return null;
+    buf[0] = t1;
+    @memcpy(buf[1 .. 1 + drafts.len], drafts);
+    return buf[0 .. 1 + drafts.len];
 }
 
 pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) !void {
@@ -847,6 +863,8 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     var fx = try @import("../mtp_test.zig").RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
     defer fx.deinit();
     var t: Qwen4Trunk = undefined;
+    // no trunk format: the build reads `formats` first (a format's head takes `formatHeadRerank`)
+    t.formats = .{};
     t.config = fx.xfm.config;
     t.s = s;
     t.lm_head_w = fx.xfm.lm_head_w;
@@ -990,6 +1008,8 @@ test "MTP continuation releases its owned chain when drafting fails" {
     xfm.s = s;
     var trunk: Qwen4Trunk = undefined;
     trunk.s = s;
+    // the draft sampling reads the head's profile before the head forward refuses
+    trunk.formats = .{};
     trunk.qwen4_mtp = null;
     var state: Qwen4MtpState = undefined;
     var gen: Generator = undefined;
@@ -1027,6 +1047,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
 test "batched MTP state includes the last row activated by round begin" {
     const allocator = testing.allocator;
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.qwen4_mtp_owner = null;
     var head: Qwen4Mtp = undefined;
     head.cache = try KVCache.init(allocator, 1);

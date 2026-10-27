@@ -92,6 +92,8 @@ test "quant block: every shipped block shape has one claimant" {
     try expectClaimant("hadamard", "{\"bits\":2,\"group_size\":128,\"mode\":\"affine\"}", prism);
     try expectClaimant("exl3", "{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14}", none);
     try expectClaimant("exl3", "{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"std1\",\"window\":15,\"codebook_table\":\"std1\",\"codebook_digest\":\"c5dba171\"}", none);
+    // A dense trunk's block (`trunk_quant`: no bank rate) is a quant plugin's, never Sushi's.
+    try expectClaimant(null, "{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16}", none);
     try expectClaimant("gguf", "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", none);
     try expectClaimant(null, "{\"quant_method\":\"bitsandbytes\",\"load_in_4bit\":true}", none);
     try expectClaimant(null, "{\"group_size\":64}", none);
@@ -107,6 +109,10 @@ test "quant block: blocks are found under their keys; a config without one has n
     try testing.expectEqualStrings("quantization", bs[0].key);
     try testing.expectEqualStrings("{\"bits\":4}", bs[0].json);
     try testing.expectEqualStrings("expert_quant", bs[1].key);
+    const full = try blocksOf(a, "{\"trunk_quant\":{\"format\":\"exl3\"},\"expert_quant\":{\"format\":\"exl3\",\"k\":5}}");
+    try testing.expectEqual(@as(usize, 2), full.len);
+    try testing.expectEqualStrings("expert_quant", full[0].key);
+    try testing.expectEqualStrings("trunk_quant", full[1].key);
     try testing.expectEqual(@as(usize, 0), (try blocksOf(a, "{\"model_type\":\"llama\"}")).len);
     try testing.expectEqual(@as(usize, 0), (try blocksOf(a, "not json")).len);
 }

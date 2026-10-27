@@ -8,6 +8,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const metrics = @import("../status.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
+const outside_quant = @import("../../sdk/quant/outside.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
@@ -158,7 +159,8 @@ pub fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram:
 /// Load-time bills price this static term (stable across boots); request-time admission reads live RAM.
 
 pub fn staticGpuMemoryCeiling() u64 {
-    return getGpuWorkingSetLimit();
+    // A quant plugin's resident matrices admitted and not kept yet are spoken for (0 when none).
+    return getGpuWorkingSetLimit() -| outside_quant.residentPending();
 }
 
 /// Diagnostic: `MLX_SERVE_GPU_CEILING_MB=N` stands in for the working-set limit in every bill
@@ -188,7 +190,7 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
         active_mem +| @as(u64, cache_mem),
         (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
         wiredCeilingFloorFor(config),
-    ) -| ane_bytes;
+    ) -| ane_bytes -| outside_quant.residentPending();
 }
 
 // ── tests ──

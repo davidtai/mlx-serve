@@ -22,6 +22,8 @@ const bill_mod = @import("bill.zig");
 const fixture = @import("fixture.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
 const trunk_load = @import("trunk_load.zig");
+const trunk_formats = @import("trunk/formats.zig");
+const quant_block = @import("../../sdk/quant/block.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 pub const config = @import("config.zig");
@@ -183,11 +185,30 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         .remote => {},
     };
     model.resolveWeightPrefix(&m.cfg, &m.weights);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
     m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{
         .head_mxfp8 = lmHeadMxfp8On(headMxfp8Setting(ctx.settings_json.slice()), null, mlx.cudaIntegrated(), true, m.cfg.quant_bits),
+        .pack = try packOf(arena.allocator(), ctx),
     });
     m.trunk.prepare();
     return m;
+}
+
+/// The pack's config text and the format blocks its quant formats claim (`trunk_quant`, `expert_quant`), read through
+/// the pack's folder into `a`, with the host table they load with.
+fn packOf(a: std.mem.Allocator, ctx: *const abi.LoadCtx) !trunk_formats.Pack {
+    var p: trunk_formats.Pack = .{ .host = ctx.host, .model_dir = ctx.model_dir.slice() };
+    const n = ctx.dir.fileBytes("config.json");
+    if (n == 0) return p;
+    if (n > 16 << 20) return error.ConfigTooLarge;
+    var why: Verdict = .{};
+    p.config_json = ctx.dir.readFile("config.json", try a.alloc(u8, @intCast(n)), &why) orelse return error.ConfigUnreadable;
+    for (try quant_block.blocksOf(a, p.config_json)) |b| {
+        if (std.mem.eql(u8, b.key, "trunk_quant")) p.trunk_quant = b.json;
+        if (std.mem.eql(u8, b.key, "expert_quant")) p.expert_quant = b.json;
+    }
+    return p;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
@@ -307,6 +328,8 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         .skip_lm_head = f.logits == .none,
         .ple_defer = f.defer_host,
         .ple_pending = r.pending,
+        // a solo verify's id arrays the engine lent its PLE flush (`pleFillFromSources`), which the ladder runs here
+        .ple_ids_src = if (ec) |e| e.ple_ids_src else null,
     };
     r.pending = null;
     defer {
@@ -562,4 +585,8 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("cost_profile.zig");
     _ = @import("trunk.zig");
+    _ = @import("trunk/formats.zig");
+    _ = @import("trunk_load.zig");
+    _ = @import("side_stream.zig");
+    _ = @import("wave.zig");
 }

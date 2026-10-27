@@ -140,7 +140,7 @@ pub const QSA_POOL_ROPE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_poo
 /// owns ONE row and lid.y 0 folds them 0..R-1 (R == 1 is a copy). At 9..31 each
 /// thread sums rows y, y+8, ... first, and at 32+ the looped/2pass kernels
 /// reduce in simdgroup trees, so a sum that cancels can differ in f32.
-const QSA_POOL_SERIAL_MAX_R: c_int = 8;
+pub const QSA_POOL_SERIAL_MAX_R: c_int = 8;
 
 var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_pool_rope_engaged: bool = false;
@@ -329,6 +329,7 @@ fn qsaIdxRopeCase(xfm: *Trunk, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: 
 
 fn qsaIdxRopeTestXfm(s: mlx.mlx_stream) Trunk {
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = std.testing.allocator;
     xfm.config = .{};
@@ -539,6 +540,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.formats = .{};
 
     t.s = s;
     t.allocator = testing.allocator;
@@ -618,6 +620,7 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.formats = .{};
 
     t.s = s;
     t.allocator = testing.allocator;
@@ -693,6 +696,7 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.formats = .{};
 
     t.s = s;
     t.allocator = testing.allocator;

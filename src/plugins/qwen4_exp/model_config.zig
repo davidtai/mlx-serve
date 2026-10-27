@@ -17,7 +17,8 @@ fn convert(comptime Dst: type, src: anytype) Dst {
 }
 
 /// `dir` (the pack's folder, absent in a stub) places the n-gram table the way the engine's `parseConfig` does:
-/// `ngram_table.bin` beside the weights, or the shards the index names, measured. `ModelConfig.deinit` frees it.
+/// `ngram_table.bin` (or the file the config names) beside the weights, or the shards the index names, measured.
+/// `ModelConfig.deinit` frees it.
 pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !model.ModelConfig {
     var m: model.ModelConfig = .{};
     inline for (@typeInfo(Config).@"struct".field_names) |name| {
@@ -39,7 +40,7 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
     m.rope_scaling_factor = 1.0;
     m.rope_local_base_freq = m.rope_theta;
     if (dir) |d| {
-        m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/ngram_table.bin", .{d});
+        m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ d, m.ngramTableFile() });
         errdefer m.deinit(a);
         if (try qwen4_exp.inspectEmbedded(d, try model.qwen4EmbeddedSpec(&m))) |info| m.embedded_ple_payload_bytes = info.payload_bytes;
         if (c.expert_quant) m.exl3 = try sushiSpec(a, d, m.num_experts_per_tok);
@@ -176,4 +177,10 @@ test "qwen4_exp model config: an index naming n-gram shards measures the embedde
 test "qwen4_exp model config: a Sushi pack's EXL3 experts equal the engine's parse" {
     const sushi = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\",\"window\":15}," ++ config.tiny_text[1..];
     try expectEngineParse(&.{.{ .name = "config.json", .bytes = sushi }});
+}
+
+test "qwen4_exp model config: a fully EXL3 pack's trunk format and n-gram table file equal the engine's parse" {
+    const full = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul1\"},\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16}," ++
+        "\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6,\"row_dim\":160}," ++ config.tiny_text[1..];
+    try expectEngineParse(&.{.{ .name = "config.json", .bytes = full }});
 }

@@ -347,6 +347,9 @@ pub const Generator = struct {
     /// fraction of the round. Always-on; the trace is not required.
     mtp_ev_sync_ms: f32 = 0,
     mtp_ev_round_ms: f32 = 0,
+    /// This request's record of the chunk-A boundary pricing (`ev_fix.zig`; the model's measurements are
+    /// `xfm.mtp_ev_fix`).
+    mtp_ev_fix: @import("../spec/mtp/ev_fix.zig").Request = .{},
     mtp_regime: MtpRegime = .{},
     mtp_regime_verdict: ?bool = null,
     /// Width-trial schedule for the round-cost table (one 2-round block per
@@ -444,6 +447,8 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
     spec_disable_reason: SpecDisableReason = .none,
+    /// This request's forced closes committed through the MTP head (`spec/mtp/forced.zig`).
+    tb_mtp: @import("../spec/mtp/forced.zig").TbMtpState = .{},
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
     /// This request has released the module-owned MTP head (sticky serial arm reached a serial
@@ -769,6 +774,8 @@ pub const Generator = struct {
     pub const mtpGroupPreDraft = @import("../spec/mtp/serial.zig").mtpGroupPreDraft;
     pub const mtpSerialMayResume = @import("../spec/mtp/serial.zig").mtpSerialMayResume;
     pub const mtpResumeAfterForced = @import("../spec/mtp/serial.zig").mtpResumeAfterForced;
+    pub const tbMtpWants = @import("../spec/mtp/forced.zig").tbMtpWants;
+    pub const commitForcedTokensMtp = @import("../spec/mtp/forced.zig").commitForcedTokensMtp;
     pub const mtpDetachHead = @import("../spec/mtp/serial.zig").mtpDetachHead;
     pub const mtpApplyStash = @import("../spec/mtp/serial.zig").mtpApplyStash;
     const mtpSerialOneToken = @import("../spec/mtp/serial.zig").mtpSerialOneToken;
@@ -877,6 +884,9 @@ pub const Generator = struct {
     pub const mtpEvPlanSrc = @import("../spec/mtp/ev_plan.zig").mtpEvPlanSrc;
     pub const mtpEvObserve = @import("../spec/mtp/ev_plan.zig").mtpEvObserve;
     pub const mtpChainLogConf = @import("../spec/mtp/ev_plan.zig").mtpChainLogConf;
+    pub const mtpEvFixOn = @import("../spec/mtp/ev_fix.zig").mtpEvFixOn;
+    pub const mtpEvFixPlan = @import("../spec/mtp/ev_fix.zig").mtpEvFixPlan;
+    pub const mtpEvFixObserve = @import("../spec/mtp/ev_fix.zig").mtpEvFixObserve;
     pub const MtpTrace = @import("../spec/mtp/trace.zig").MtpTrace;
     pub const SubLap = @import("../spec/mtp/trace.zig").SubLap;
     pub const DflashTrace = @import("../spec/mtp/trace.zig").DflashTrace;

@@ -2,6 +2,7 @@
 const std = @import("std");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
+const ssmChainCaptured = @import("../../ssm/entry.zig").ssmChainCaptured;
 const log = @import("../../../../sdk/util/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const group_planner = @import("../mtp_group_planner.zig");
@@ -515,6 +516,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.mtpTraceRoundEnd(m, m, m_lo);
         if (times_round) {
             self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+            self.mtpEvFixObserve(plan, m, m);
             self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
             if (chain.lookup) self.mtpLookupObserve(m, m + 1);
@@ -539,7 +541,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     new_hidden = .{ .ctx = null };
 
     const gdn_captured = if (self.ctx.ssm_entries) |entries|
-        entries.len > 0 and entries[0].spec_state_seq.ctx != null
+        entries.len > 0 and ssmChainCaptured(&entries[0])
     else
         false;
 
@@ -621,6 +623,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     self.mtpTraceRoundEnd(m, accepted, m_lo);
     if (times_round) {
         self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+        self.mtpEvFixObserve(plan, m, accepted);
         self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
     } else {
         if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);

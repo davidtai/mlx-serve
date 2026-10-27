@@ -62,7 +62,7 @@ pub const Reader = struct {
         var r: Reader = .{
             .src = src,
             .fmt = fmt,
-            .qctx = .{ .block_json = abi.Str.of(block_json), .source = src, .stream = ctx.stream },
+            .qctx = .{ .block_json = abi.Str.of(block_json), .source = src, .stream = ctx.stream, .host = ctx.host },
             .prefix = prefix,
             .s = .{ .ctx = ctx.stream.ctx },
         };

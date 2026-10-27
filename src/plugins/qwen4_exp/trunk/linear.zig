@@ -32,6 +32,8 @@ const fusedSwiGLU = @import("../../../sdk/blocks/mlp/fused_activations.zig").fus
 const spliceVisionRows = @import("../../../sdk/vision/splice.zig").spliceVisionRows;
 
 pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+    // A linear the pack's trunk format loaded (`trunk/formats.zig`) runs through that format.
+    if (self.formats.linearOf(w)) |fw| return self.formats.matmul(fw, x, self.s);
     if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
     const qp = self.quantParamsHinted(w, sc, lastDim(x));
     // A ternary 2-bit pack (bias == -scale on every weight) reads the 2-bit kernels; they decline other shapes.
@@ -318,6 +320,7 @@ test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag 
     @import("../../../mlx/device.zig").device_gen_override = .{ .gen = 13, .phone = false };
     defer @import("../../../mlx/device.zig").device_gen_override = null;
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.bits_cache = .{};
     xfm.config = std.mem.zeroes(@TypeOf(xfm.config));

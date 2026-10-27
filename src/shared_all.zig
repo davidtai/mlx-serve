@@ -6,6 +6,9 @@ comptime {
     _ = @import("sdk/util/err_name.zig").last_tls;
     if (@import("build_options").mlx_stream) _ = @import("mlx_stream").shared_state;
     _ = @import("host/plugins/loader.zig").process;
+    _ = @import("host/plugin_host_impl.zig").process_shared;
+    _ = @import("host/host_table.zig").published;
+    _ = @import("sdk/quant/outside.zig").tables;
     _ = @import("host/http/server.zig").serverState_shared;
     _ = @import("host/http/server.zig").launch_shared;
     _ = @import("host/registry/memory_ceiling.zig").overrides_shared;
@@ -17,6 +20,9 @@ comptime {
     _ = @import("plugins/qwen4_exp/ple_gpu.zig").pleGpu_shared;
     _ = @import("plugins/qwen4_exp/plugin.zig").EngineCtx;
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig").warm_shared;
+    _ = @import("plugins/qwen4_exp/side_stream.zig").SideStream.served_shared;
+    _ = @import("plugins/qwen4_exp/side_stream.zig").SideStream.tls_shared;
+    _ = @import("plugins/qwen4_exp/wave.zig").later_shared;
     _ = @import("sdk/blocks/attention/nax_attention.zig").naxCli_shared;
     _ = @import("sdk/blocks/attention/decode_attn_quant.zig").cli_shared;
     _ = @import("sdk/blocks/dit/w8a8.zig").w8a8State_shared;
@@ -34,4 +40,6 @@ comptime {
     _ = @import("engines/mlx/ssm/group.zig").ssmGroup_shared;
     _ = @import("engines/mlx/modules/stream_glue.zig").glueState_shared;
     _ = @import("mlx/ffi.zig").latch_shared;
+    _ = @import("mlx/ffi.zig").fault_chunk;
+    _ = @import("mlx/ffi.zig").fault_step;
 }

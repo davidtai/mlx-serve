@@ -1,7 +1,7 @@
 //! The gdn area's kernel contract. The delta-rule recurrence kernels (stock per-token with its scalar or per-channel
 //! gate and per-step state capture, blocked-seq and pipelined prefill) run at Qwen3.5-2B's 16 key and 16 value heads
-//! of 128; the decode-width kernels (packed prework, norm-gate, K1, the Hadamard K2, K1S and its fold, the tree's
-//! K1P / K1TR, the replay K1R) at Qwen3.5-4B's 16 key and 32 value heads. Each meets the float64 bound with a
+//! of 128; the decode-width kernels (packed prework, norm-gate, K1, the Hadamard K2, K1S, its fold and the replay
+//! fold, the tree's K1P / K1TR, the replay K1R) at Qwen3.5-4B's 16 key and 32 value heads. Each meets the float64 bound with a
 //! forward-error allowance (`host.Val`): the reference rounds the conv, MLX's sigmoid, the norms, the gate and the
 //! state where the kernels round, and carries the fast-math exp / log and fp32 errors. A kernel writing two dtypes
 //! registers once per dtype. M1 and up; K1S's 1024-thread build runs on NAX only, the fold probes its limit.
@@ -64,9 +64,13 @@ pub fn step(st: []Val, k: []const Val, q: []const Val, v: Val, g: []const Val, b
 
 // ── the recurrence kernels: stock, blocked, pipelined ──
 
-const Route = enum { stock, stock_vec, blocked, pipelined };
+/// `core`: a plugin's pipelined kernel with its geometry as template ints (`CoreGeo`), registered with its own launch.
+pub const Route = enum { stock, stock_vec, blocked, pipelined, core };
 /// What a registration reads: y (OutT), the states (StT), or both when they share a dtype.
-const Part = enum { y, states, both };
+pub const Part = enum { y, states, both };
+/// The core route's geometry: tokens a staged block, value rows a threadgroup, the k / q stage widths, rows a lane, and
+/// the threads (8 lanes a row group).
+pub const CoreGeo = struct { tb: c_int = 16, db: c_int = 32, kqf: c_int = 0, rpt: c_int = 1, nt: c_int = 256 };
 
 fn recurLaunch(comptime route: Route, comptime capture: bool, comptime m: u32) metal.Launch {
     const vec = route == .stock_vec;
@@ -75,6 +79,7 @@ fn recurLaunch(comptime route: Route, comptime capture: bool, comptime m: u32) m
             .stock, .stock_vec => "gated_delta_step" ++ (if (capture) "_seq" else "") ++ (if (vec) "_vec" else ""),
             .blocked => "gated_delta_blocked_tb32",
             .pipelined => "gated_delta_pipelined_tb12",
+            .core => @compileError("a core route registers its plugin's launch"),
         },
         .inputs = if (capture) &.{ "q", "k", "v", "g", "beta", "state_in", "T", "seq_stride" } else &.{ "q", "k", "v", "g", "beta", "state_in", "T" },
         .outputs = if (capture) &.{ "y", "state_seq", "state_out" } else &.{ "y", "state_out" },
@@ -82,6 +87,7 @@ fn recurLaunch(comptime route: Route, comptime capture: bool, comptime m: u32) m
             .stock, .stock_vec => gk.gdnKernelSource(vec, capture),
             .blocked => "constexpr int TB = 32;\n" ++ kernelSource("kernels/gdn/gated_delta_blocked_body.metal"),
             .pipelined => kernelSource("kernels/gdn/gdn_pipelined.metal"),
+            .core => @compileError("a core route registers its plugin's launch"),
         },
         // blocked: k_s, q_s [32][136] and v_s [32][40] bf16, g_s, b_s [32] f32; pipelined: k_s, q_s [12][128] bf16,
         // v_s [12][16] f32, g_s, b_s [12] f32, y_s [12][16] bf16.
@@ -89,6 +95,7 @@ fn recurLaunch(comptime route: Route, comptime capture: bool, comptime m: u32) m
             .stock, .stock_vec => 0,
             .blocked => 32 * (2 * 136 * 2 + 40 * 2 + 8),
             .pipelined => 2 * 12 * 128 * 2 + 12 * 16 * 4 + 2 * 12 * 4 + 12 * 16 * 2,
+            .core => @compileError("a core route registers its plugin's launch"),
         },
         .m1 = m,
         .m2 = m,
@@ -96,13 +103,14 @@ fn recurLaunch(comptime route: Route, comptime capture: bool, comptime m: u32) m
 }
 
 /// A shape's rows are the tokens T (one batch row); the head geometry is fixed.
-const Recur = struct {
+pub const Recur = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     route: Route,
     capture: bool,
     st_dt: mlx.mlx_dtype,
     part: Part,
+    core: CoreGeo = .{},
     arena: std.heap.ArenaAllocator,
     shape: Shape = undefined,
     q: []f64 = &.{},
@@ -115,6 +123,13 @@ const Recur = struct {
 
     fn init(a: std.mem.Allocator, launch: *const metal.Launch, route: Route, capture: bool, st_dt: mlx.mlx_dtype, part: Part) Recur {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .route = route, .capture = capture, .st_dt = st_dt, .part = part, .arena = .init(a) };
+    }
+
+    /// A core route: `launch` the plugin's kernel, a replacement of the pipelined kernel (`replaced`).
+    pub fn initCore(a: std.mem.Allocator, launch: *const metal.Launch, core: CoreGeo, st_dt: mlx.mlx_dtype, part: Part) Recur {
+        var r = init(a, launch, .core, false, st_dt, part);
+        r.core = core;
+        return r;
     }
 
     pub fn deinit(self: *Recur) void {
@@ -133,6 +148,7 @@ const Recur = struct {
             .stock, .stock_vec => .{ .grid = .{ 32, DV, HV }, .tg = .{ 32, 4, 1 } },
             .blocked => .{ .grid = .{ 256 * DV / 32, HV, 1 }, .tg = .{ 256, 1, 1 } },
             .pipelined => .{ .grid = .{ 128 * DV / 16, HV, 1 }, .tg = .{ 128, 1, 1 } },
+            .core => .{ .grid = .{ self.core.nt * @divExact(DV, self.core.db), HV, 1 }, .tg = .{ self.core.nt, 1, 1 } },
         };
         g.out(&.{ 1, t, HV, DV }, .bfloat16);
         if (self.capture) g.out(&.{ t, HV, DV, DK }, self.st_dt);
@@ -152,6 +168,12 @@ const Recur = struct {
         g.int("Dv", DV);
         g.int("Hk", HK);
         g.int("Hv", HV);
+        if (self.route == .core) {
+            g.int("TB", self.core.tb);
+            g.int("DB", self.core.db);
+            g.int("KQF", self.core.kqf);
+            g.int("RPT", self.core.rpt);
+        }
         return g;
     }
 
@@ -292,9 +314,24 @@ const Recur = struct {
     pub fn simulate(self: *const Recur, acc: spec.Accum, order: spec.Order, out: []f64) !void {
         try self.outputsIn(out, null, acc, order);
     }
+
+    /// A core route's baseline: the pipelined kernel's bytes of the outputs read, on the same inputs.
+    pub fn replaced(self: *Recur) ![]const u8 {
+        if (self.route != .core) return error.NoBaseline;
+        const g = self.args;
+        const r = try gk.gdnRunYState(.pipelined, 32, g[0], g[1], g[2], g[3], g[4], g[5], 1, @intCast(self.shape.rows), HK, HV, DK, DV, self.rig.stream());
+        defer for ([_]mlx.mlx_array{ r.y, r.state }) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        return switch (self.part) {
+            .y => self.rig.bytesOf(&.{r.y}),
+            .states => self.rig.bytesOf(&.{r.state}),
+            .both => self.rig.bytesOf(&.{ r.y, r.state }),
+        };
+    }
 };
 
-fn recurSpec(comptime name: []const u8, part: Part, st_dt: mlx.mlx_dtype, served: []const Shape, tiled: usize) spec.Spec {
+pub fn recurSpec(comptime name: []const u8, part: Part, st_dt: mlx.mlx_dtype, served: []const Shape, tiled: usize) spec.Spec {
     return .{
         .name = name,
         .accum = .f32,
@@ -308,7 +345,7 @@ fn recurSpec(comptime name: []const u8, part: Part, st_dt: mlx.mlx_dtype, served
 
 const decode_t: []const Shape = &.{ .{ .rows = 1, .n = HV, .k = DK }, .{ .rows = 4, .n = HV, .k = DK } };
 const verify_t: []const Shape = &.{ .{ .rows = 4, .n = HV, .k = DK }, .{ .rows = 16, .n = HV, .k = DK } };
-const prefill_t: []const Shape = &.{ .{ .rows = 1, .n = HV, .k = DK }, .{ .rows = 64, .n = HV, .k = DK } };
+pub const prefill_t: []const Shape = &.{ .{ .rows = 1, .n = HV, .k = DK }, .{ .rows = 64, .n = HV, .k = DK } };
 
 const stock = recurLaunch(.stock, false, 1024);
 const stock_seq = recurLaunch(.stock, true, 1024);
@@ -325,11 +362,11 @@ const CH = 2 * NK * DK + NV * DV;
 const VD = NV * DV;
 const PLANE = NV * DV * DK;
 
-const Kind = enum { prework, normgate, k1, k2, k1s, fold, k1p, k1tr, k1r };
+pub const Kind = enum { prework, normgate, k1, k2, k1s, fold, fold_replay, k1p, k1tr, k1r };
 /// Which outputs a registration reads: those in the activation dtype, the wider ones (state, an f32 gate), or all.
-const Reads = enum { act, wide, all };
+pub const Reads = enum { act, wide, all };
 
-const Cfg = struct {
+pub const Cfg = struct {
     kind: Kind,
     dt: mlx.mlx_dtype = .bfloat16,
     st: mlx.mlx_dtype = .bfloat16,
@@ -339,13 +376,24 @@ const Cfg = struct {
     swish: bool = true,
     block: c_int = 512,
     nt: c_int = 256,
+    /// The prework as a plugin's row stream (`kind` .prework, `tab`): R rows a simdgroup run, NSG head slots a
+    /// threadgroup; a replacement of the packed prework (`replaced`). Its wrapper takes it from 17 rows, where the
+    /// packed kernel reads the table; the kernel runs at any row count, so the small-shape gates run it below.
+    core: bool = false,
+    run_rows: c_int = 4,
+    nsg: c_int = 8,
 
-    fn gt(c: Cfg) mlx.mlx_dtype {
+    pub fn gt(c: Cfg) mlx.mlx_dtype {
         return dec.gateDtype(c.dt, c.st);
     }
 
+    /// The replay fold's wide outputs with the state in the activation dtype: its prework alone, no recurrence output.
+    fn preworkOnly(c: Cfg) bool {
+        return c.kind == .fold_replay and c.reads == .wide and c.st == c.dt;
+    }
+
     /// The dtype of each output, in the launch's order.
-    fn outDtypes(c: Cfg, buf: *[6]mlx.mlx_dtype) []const mlx.mlx_dtype {
+    fn outDtypes(c: Cfg, buf: *[8]mlx.mlx_dtype) []const mlx.mlx_dtype {
         const d = c.dt;
         const list: []const mlx.mlx_dtype = switch (c.kind) {
             .prework => &.{ d, d, d, d, c.gt(), d },
@@ -353,6 +401,7 @@ const Cfg = struct {
             .k1 => &.{ d, d, c.st },
             .k1s => &.{ d, d, c.st, c.st },
             .fold => &.{ d, d, c.st, c.st, d },
+            .fold_replay => &.{ d, d, c.st, d, .float32, .float32, .float32 },
             .k1p => &.{ .float32, .float32, .float32, .float32, d },
             .k1r => &.{ c.st, d },
         };
@@ -371,7 +420,7 @@ const Cfg = struct {
 
     fn outElem(c: Cfg) spec.Elem {
         if (c.reads != .wide) return host.elemOf(c.dt);
-        var buf: [6]mlx.mlx_dtype = undefined;
+        var buf: [8]mlx.mlx_dtype = undefined;
         for (c.outDtypes(&buf)) |d| if (d != c.dt) return host.elemOf(d);
         unreachable;
     }
@@ -441,6 +490,17 @@ fn decLaunch(comptime c: Cfg) metal.Launch {
             .m2 = 1024,
             .adapts = true,
         },
+        .fold_replay => .{
+            .name = "msv_gdn_decode_recur_seq_fold_replay",
+            .inputs = &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" },
+            .outputs = &.{ "gated", "conv_out", "state_out", "conv_in", "pk", "pv", "pg" },
+            .source = dec.K1S_FOLD_REPLAY_SOURCE,
+            .header = dec.HEADER,
+            .tg_bytes = dec.FOLD_MAX_SEQ * (DV * 4 + (DK + DK + DV) * 4 + 8),
+            .m1 = 1024,
+            .m2 = 1024,
+            .adapts = true,
+        },
         .k1p => .{
             .name = "msv_gdn_decode_tree_pre",
             .inputs = &.{ "qkv", "a_in", "b_in", "conv_state", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "parents" },
@@ -498,7 +558,7 @@ fn treeParents(rng: std.Random, out: []i32) void {
 }
 
 /// One registration's fixture; a shape's rows are the tokens (window rows for the tree kernels).
-const Dec = struct {
+pub const Dec = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     cfg: Cfg,
@@ -530,7 +590,7 @@ const Dec = struct {
     args: [13]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
-    fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg) Dec {
+    pub fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg) Dec {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .cfg = cfg, .arena = .init(a) };
     }
 
@@ -551,7 +611,7 @@ const Dec = struct {
         return switch (self.cfg.kind) {
             .k1, .k2 => s >= 1,
             .k1s, .k1p, .k1tr, .k1r => s >= 1 and s <= dec.MAX_SEQ,
-            .fold => s >= 1 and s <= dec.FOLD_MAX_SEQ,
+            .fold, .fold_replay => s >= 1 and s <= dec.FOLD_MAX_SEQ,
             .prework, .normgate => s >= 1 and s <= 64,
         };
     }
@@ -564,7 +624,10 @@ const Dec = struct {
         var g: metal.Geometry = undefined;
         switch (c.kind) {
             .prework => {
-                g = .{ .grid = .{ 32, @intCast(S), 2 * NK + NV }, .tg = .{ 32, 1, 1 } };
+                g = if (c.core)
+                    .{ .grid = .{ 32 * c.nsg, @divTrunc(S + c.run_rows - 1, c.run_rows), @divTrunc(2 * NK + NV + c.nsg - 1, c.nsg) }, .tg = .{ 32 * c.nsg, 1, 1 } }
+                else
+                    .{ .grid = .{ 32, @intCast(S), 2 * NK + NV }, .tg = .{ 32, 1, 1 } };
                 g.out(&.{ 1, S, NK, DK }, d);
                 g.out(&.{ 1, S, NK, DK }, d);
                 g.out(&.{ 1, S, NV, DV }, d);
@@ -574,9 +637,13 @@ const Dec = struct {
                 g.dtype("T", d);
                 g.dtype("GT", c.gt());
                 inline for (.{ .{ "HK", NK }, .{ "HV", NV }, .{ "DK", DK }, .{ "DV", DV }, .{ "NKEEP", 3 }, .{ "C", CH } }) |kv| g.int(kv[0], kv[1]);
-                g.int("TAB", @intFromBool(c.tab));
+                if (!c.core) g.int("TAB", @intFromBool(c.tab));
                 inline for (.{ .{ "QSTRIDE", CH }, .{ "QOFF", 0 }, .{ "BSTRIDE", NV }, .{ "BOFF", 0 }, .{ "ASTRIDE", NV }, .{ "AOFF", 0 } }) |kv| g.int(kv[0], kv[1]);
                 g.int("GATE", @intFromBool(c.gate));
+                if (c.core) {
+                    g.int("R", c.run_rows);
+                    g.int("NSG", c.nsg);
+                }
             },
             .normgate => {
                 g = .{ .grid = .{ 32, @intCast(S), NV }, .tg = .{ 32, 1, 1 } };
@@ -593,7 +660,7 @@ const Dec = struct {
                 g.int("DV", DV);
                 g.int("J", @divExact(c.block, 32));
             },
-            .k1, .k1s, .fold, .k1p, .k1tr => {
+            .k1, .k1s, .fold, .fold_replay, .k1p, .k1tr => {
                 switch (c.kind) {
                     .k1 => {
                         g = .{ .grid = .{ NV * 4 * 256, 1, 1 }, .tg = .{ 256, 1, 1 } };
@@ -617,6 +684,16 @@ const Dec = struct {
                         g.out(&.{ S, NV, DV, DK }, c.st);
                         g.out(&.{ 1, 3 + S, CH }, d);
                         g.poison = 0;
+                    },
+                    .fold_replay => {
+                        g = .{ .grid = .{ NV * 1024, 1, 1 }, .tg = .{ 1024, 1, 1 } };
+                        g.out(&.{ 1, S, VD }, d);
+                        g.out(&.{ 1, 3, CH }, d);
+                        g.out(&.{ 1, NV, DV, DK }, c.st);
+                        g.out(&.{ 1, 3 + S, CH }, d);
+                        g.out(&.{ S, NK, DK }, .float32);
+                        g.out(&.{ S, NV, DV }, .float32);
+                        g.out(&.{ S, NV, 2 }, .float32);
                     },
                     .k1p => {
                         g = .{ .grid = .{ 32, 2 * NK + NV, @intCast(S) }, .tg = .{ 32, 1, 1 } };
@@ -647,7 +724,7 @@ const Dec = struct {
                         g.int("SPLIT", 4);
                         g.int("TL", S);
                     },
-                    .fold => {
+                    .fold, .fold_replay => {
                         g.int("NT", 1024);
                         g.int("SPLIT", 1);
                         g.int("TL", S);
@@ -664,7 +741,7 @@ const Dec = struct {
                 inline for (.{ .{ "HK", NK }, .{ "HV", NV }, .{ "DK", DK }, .{ "DV", DV }, .{ "C", CH } }) |kv| g.int(kv[0], kv[1]);
             },
         }
-        var buf: [6]mlx.mlx_dtype = undefined;
+        var buf: [8]mlx.mlx_dtype = undefined;
         g.unread = 0;
         for (c.outDtypes(&buf), 0..) |dt, i| if (!c.reads_(i, dt)) {
             g.unread |= @as(u8, 1) << @intCast(i);
@@ -757,7 +834,8 @@ const Dec = struct {
                 // q and k are then exact (the scales), and a state of 8-bit multiples of 256 drives kv past fp16's
                 // range (all positive, so its sum passes 65504). The prework alone gets distinct integers (its squares pass fp16's range).
                 for (0..CH) |ch| self.cw[ch * 4 ..][0..4].* = .{ 0, 0, 0, 1 };
-                const flat = c.kind != .prework and c.kind != .k1p;
+                // The replay fold's prework outputs alone take the prework's distinct integers, as K1P's do.
+                const flat = c.kind != .prework and c.kind != .k1p and !c.preworkOnly();
                 for (self.qkv) |*x| x.* = if (flat) 16 else @floatFromInt(rng.intRangeAtMost(i32, 16, 64));
                 @memset(self.b_in, 16);
                 @memset(self.a_in, 0);
@@ -800,10 +878,10 @@ const Dec = struct {
                 args[0..5].* = .{ try rig.input(dt, &.{ 1, 1, NV, DV }, self.y_in), try rig.input(dt, &.{ 1, 1, VD }, self.z), try rig.input(dt, &.{DV}, self.nw), try rig.scalar(@floatCast(self.eps)), try rig.input(.float32, &.{VD}, self.signs) };
                 n = 5;
             },
-            .k1, .k1s, .fold => {
+            .k1, .k1s, .fold, .fold_replay => {
                 args[0..10].* = .{ qkv, try rig.input(dt, &.{ 1, Si, NV }, self.a_in), try rig.input(dt, &.{ 1, Si, NV }, self.b_in), cs, try rig.input(c.st, &.{ 1, NV, DV, DK }, self.s0), cw, try rig.input(dt, &.{NV}, self.alog), try rig.input(dt, &.{NV}, self.dtb), qs, ks };
                 n = 10;
-                if (c.kind == .fold) {
+                if (c.kind == .fold or c.kind == .fold_replay) {
                     args[10..13].* = .{ try rig.input(dt, &.{ 1, Si, VD }, self.z), try rig.input(dt, &.{DV}, self.nw), try rig.scalar(@floatCast(self.eps)) };
                     n = 13;
                 }
@@ -830,8 +908,8 @@ const Dec = struct {
     }
 
     pub fn count(self: *const Dec) usize {
-        var buf: [6]mlx.mlx_dtype = undefined;
-        var lens: [6]usize = undefined;
+        var buf: [8]mlx.mlx_dtype = undefined;
+        var lens: [8]usize = undefined;
         const outs = self.cfg.outDtypes(&buf);
         self.lengths(&lens);
         var n: usize = 0;
@@ -841,7 +919,7 @@ const Dec = struct {
         return n;
     }
 
-    fn lengths(self: *const Dec, lens: *[6]usize) void {
+    fn lengths(self: *const Dec, lens: *[8]usize) void {
         const S = self.toks(self.shape);
         const l: []const usize = switch (self.cfg.kind) {
             .prework => &.{ S * NK * DK, S * NK * DK, S * VD, 3 * CH, S * NV, S * NV },
@@ -850,6 +928,7 @@ const Dec = struct {
             .k1 => &.{ VD, 3 * CH, PLANE },
             .k1s => &.{ S * VD, 3 * CH, PLANE, S * PLANE },
             .fold => &.{ S * VD, 3 * CH, PLANE, S * PLANE, (3 + S) * CH },
+            .fold_replay => &.{ S * VD, 3 * CH, PLANE, (3 + S) * CH, S * NK * DK, S * VD, S * NV * 2 },
             .k1p => &.{ S * NK * DK, S * NK * DK, S * VD, S * NV * 2, (3 + S) * CH },
             .k1r => &.{ PLANE, 3 * CH },
         };
@@ -998,11 +1077,11 @@ const Dec = struct {
     }
 
     /// Every output, in the launch's order (unread ones too), as the device should leave them.
-    fn outputs(self: *const Dec, a: std.mem.Allocator, acc: ?spec.Accum, order: spec.Order) ![6][]Val {
+    fn outputs(self: *const Dec, a: std.mem.Allocator, acc: ?spec.Accum, order: spec.Order) ![8][]Val {
         const S = self.toks(self.shape);
         const c = self.cfg;
-        var o: [6][]Val = @splat(&.{});
-        const pre_acc = if (c.kind == .prework or c.kind == .k1p) acc else null;
+        var o: [8][]Val = @splat(&.{});
+        const pre_acc = if (c.kind == .prework or c.kind == .k1p or c.preworkOnly()) acc else null;
         const win = try a.alloc(usize, S * 4);
         for (0..S) |t| for (0..4) |tap| {
             win[t * 4 + tap] = if (c.kind == .k1p) @intFromFloat(self.table[S + t * 4 + tap]) else t + tap;
@@ -1032,6 +1111,18 @@ const Dec = struct {
                 o[2] = final;
                 if (seq) |x| o[3] = x;
                 if (c.kind == .fold) o[4] = try self.copyRows(a, all);
+            },
+            .fold_replay => {
+                const pw = try self.prework(a, win, pre_acc, order);
+                const ys = try a.alloc(Val, S * VD);
+                const final = try a.alloc(Val, PLANE);
+                try self.recur(a, pw, acc, order, ys, null, final);
+                const gb = try a.alloc(Val, S * NV * 2);
+                for (0..S * NV) |i| {
+                    gb[2 * i] = pw.g[i];
+                    gb[2 * i + 1] = pw.beta[i];
+                }
+                o[0..7].* = .{ try self.normGate(a, ys, acc, order), try self.copyRows(a, next), final, try self.copyRows(a, all), pw.k, pw.v, gb };
             },
             .k1p => {
                 const pw = try self.prework(a, win, pre_acc, order);
@@ -1104,7 +1195,7 @@ const Dec = struct {
         var arena = std.heap.ArenaAllocator.init(self.rig.a);
         defer arena.deinit();
         const outs = try self.outputs(arena.allocator(), acc, order);
-        var buf: [6]mlx.mlx_dtype = undefined;
+        var buf: [8]mlx.mlx_dtype = undefined;
         var at: usize = 0;
         for (self.cfg.outDtypes(&buf), 0..) |dt, i| if (self.cfg.reads_(i, dt)) {
             for (outs[i]) |v| {
@@ -1123,6 +1214,27 @@ const Dec = struct {
     pub fn simulate(self: *const Dec, acc: spec.Accum, order: spec.Order, out: []f64) !void {
         try self.emit(out, null, acc, order);
     }
+
+    /// A core prework's baseline: the packed prework's bytes of the outputs read, on the same inputs.
+    pub fn replaced(self: *Dec) ![]const u8 {
+        const c = self.cfg;
+        if (c.kind != .prework or !c.core) return error.NoBaseline;
+        const g = self.args;
+        const S: c_int = @intCast(self.toks(self.shape));
+        const r = (try df.gdnPreworkFused(self.rig.stream(), .{ .qkv = g[0], .qkv_off = 0, .qkv_stride = CH, .b = g[5], .b_off = 0, .b_stride = NV, .a = g[6], .a_off = 0, .a_stride = NV, .A_log = g[7], .dt_bias = g[8], .conv_state = g[1], .conv_w = g[2], .q_scale = g[3], .k_scale = g[4], .hk = NK, .hv = NV, .dk = DK, .dv = DV, .seq = S, .gate = c.gate, .g_dtype = c.gt() })) orelse return error.WrapperDeclined;
+        const all = [_]mlx.mlx_array{ r.q, r.k, r.v, r.conv_state, r.g, r.beta };
+        defer for (all) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        var buf: [8]mlx.mlx_dtype = undefined;
+        var keep: [6]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        for (c.outDtypes(&buf), 0..) |dt, i| if (c.reads_(i, dt)) {
+            keep[n] = all[i];
+            n += 1;
+        };
+        return self.rig.bytesOf(keep[0..n]);
+    }
 };
 
 fn launchOf(comptime c: Cfg) *const metal.Launch {
@@ -1131,14 +1243,14 @@ fn launchOf(comptime c: Cfg) *const metal.Launch {
     }.l;
 }
 
-fn tokens(comptime list: []const usize) []const Shape {
+pub fn tokens(comptime list: []const usize) []const Shape {
     comptime var out: [list.len]Shape = undefined;
     inline for (list, 0..) |r, i| out[i] = .{ .rows = r, .n = NV, .k = DK };
     const final = out;
     return &final;
 }
 
-fn decSpec(comptime name: []const u8, comptime c: Cfg, comptime served: []const Shape) spec.Spec {
+pub fn decSpec(comptime name: []const u8, comptime c: Cfg, comptime served: []const Shape) spec.Spec {
     // These reads only copy rows.
     const moves = c.reads == .act and (c.kind == .k1p or c.kind == .k1r);
     const gate_only = c.reads == .wide and c.kind == .prework;
@@ -1190,6 +1302,10 @@ fn registerDecode(set: *kc.Set) !void {
     try addDec(set, "gdn_decode_recur_seq_fold bf16 swish, bf16 state", .{ .kind = .fold }, &.{ 1, 4, 8 });
     try addDec(set, "gdn_decode_recur_seq_fold bf16 sigmoid, f32 state (gated, conv)", .{ .kind = .fold, .st = f32s, .swish = false, .reads = .act }, &.{ 2, 8 });
     try addDec(set, "gdn_decode_recur_seq_fold bf16 sigmoid, f32 state (states)", .{ .kind = .fold, .st = f32s, .swish = false, .reads = .wide }, &.{ 2, 8 });
+    try addDec(set, "gdn_decode_recur_seq_fold_replay bf16 swish, bf16 state (gated, conv, state)", .{ .kind = .fold_replay, .reads = .act }, &.{ 1, 4, 8 });
+    try addDec(set, "gdn_decode_recur_seq_fold_replay bf16 swish, bf16 state (prework)", .{ .kind = .fold_replay, .reads = .wide }, &.{ 1, 4, 8 });
+    try addDec(set, "gdn_decode_recur_seq_fold_replay bf16 sigmoid, f32 state (gated, conv)", .{ .kind = .fold_replay, .st = f32s, .swish = false, .reads = .act }, &.{ 2, 8 });
+    try addDec(set, "gdn_decode_recur_seq_fold_replay bf16 sigmoid, f32 state (state, prework)", .{ .kind = .fold_replay, .st = f32s, .swish = false, .reads = .wide }, &.{ 2, 8 });
     try addDec(set, "gdn_decode_tree_pre bf16, bf16 gate (q, k, v, g)", .{ .kind = .k1p, .reads = .wide }, &.{ 2, 8, 16 });
     try addDec(set, "gdn_decode_tree_pre bf16 (conv input)", .{ .kind = .k1p, .reads = .act }, &.{ 2, 8, 16 });
     try addDec(set, "gdn_decode_tree_pre bf16, f32 gate (q, k, v, g)", .{ .kind = .k1p, .st = f32s, .reads = .wide }, &.{ 2, 8 });
@@ -1254,7 +1370,7 @@ fn decInputs(t: *const Dec, state: mlx.mlx_array) dec.Inputs {
     const g = t.args;
     const none = mlx.mlx_array{ .ctx = null };
     if (t.cfg.kind == .k1p) return .{ .qkv = g[0], .a = g[1], .b = g[2], .conv_state = g[3], .ssm_state = state, .conv_w = g[4], .A_log = g[5], .dt_bias = g[6], .q_scale = g[7], .k_scale = g[8], .z = none, .norm_w = none, .eps = none, .signs = none };
-    const fold = t.cfg.kind == .fold;
+    const fold = t.cfg.kind == .fold or t.cfg.kind == .fold_replay;
     return .{ .qkv = g[0], .a = g[1], .b = g[2], .conv_state = g[3], .ssm_state = g[4], .conv_w = g[5], .A_log = g[6], .dt_bias = g[7], .q_scale = g[8], .k_scale = g[9], .z = if (fold) g[10] else none, .norm_w = if (fold) g[11] else none, .eps = if (fold) g[12] else none, .signs = none };
 }
 
@@ -1329,6 +1445,13 @@ fn decDrift(t: *Dec, name: []const u8, shape: Shape) !void {
             defer freeAll(&theirs);
             for (theirs, 0..) |x, i| try expectSame(name, i, t.rig.output(i), x, if (i == 3) PLANE * mlx.mlx_array_itemsize(x) else 0, s);
         },
+        .fold_replay => {
+            try runAll(t, shape);
+            const r = (try dec.recurSeqFoldReplay(geo_dec, S, decInputs(t, .{ .ctx = null }), c.swish, s)) orelse return error.WrapperDeclined;
+            const theirs = [_]mlx.mlx_array{ r.gated, r.conv_state, r.ssm_state, r.conv_input, r.prework.k, r.prework.v, r.prework.gb };
+            defer freeAll(&theirs);
+            for (theirs, 0..) |x, i| try expectSame(name, i, t.rig.output(i), x, 0, s);
+        },
         .k1p, .k1tr => {
             // The wrapper runs K1P then K1TR: ours run the same pair from a K1P fixture of the same seed.
             const pc = comptime Cfg{ .kind = .k1p, .reads = .act };
@@ -1373,7 +1496,7 @@ fn recurDrift(t: *Recur, name: []const u8, shape: Shape) !void {
             .stock => .stock,
             .blocked => .blocked,
             .pipelined => .pipelined,
-            .stock_vec => unreachable,
+            .stock_vec, .core => unreachable,
         };
         const r = try gk.gdnRunYState(route, 32, g[0], g[1], g[2], g[3], g[4], g[5], 1, T, HK, HV, DK, DV, s);
         defer freeAll(&.{ r.y, r.state });

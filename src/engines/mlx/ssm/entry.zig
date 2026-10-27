@@ -37,6 +37,9 @@ pub const SSMCacheEntry = struct {
     /// commit replays the kept path from them (`gdn_decode.replay`).
     spec_state_in: mlx.mlx_array = .{ .ctx = null },
     spec_prework: gdn_decode.Prework = .{},
+    /// A chain verify left `spec_state_in` / `spec_prework` (the round's input state and its rows' recurrence inputs)
+    /// in place of `spec_state_seq`; a partial accept replays rows 0..accepted from them (`ssmRollbackFromCapture`).
+    spec_replay: bool = false,
     /// qwen4_exp per-request state beside the GDN pair: the PLE dilated-conv
     /// window `[B, (K-1)*dilation, hc*hidden]` on the PLE layer, the raw QSA
     /// indexer key history `[B, kv, idx_hd]` on full-attention layers.
@@ -282,11 +285,27 @@ pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
         _ = mlx.mlx_array_free(a.*);
         a.* = .{ .ctx = null };
     };
+    entry.spec_replay = false;
     if (entry.spec_ple_input.ctx != null) {
         _ = mlx.mlx_array_free(entry.spec_ple_input);
         entry.spec_ple_input = .{ .ctx = null };
     }
     entry.spec_ple_len = 0;
+}
+
+/// Whether a chain verify left this entry a rollback capture: the per-step states (`spec_state_seq`), or the replay's
+/// round input state and rows' recurrence inputs (`spec_replay`), which `ssmRollbackFromCapture` replays.
+pub fn ssmChainCaptured(entry: *const SSMCacheEntry) bool {
+    return entry.spec_state_seq.ctx != null or entry.spec_replay;
+}
+
+/// A chain's accepted prefix as `gdn_decode.replay` walks it (verify rows 0..accepted, oldest first) and the conv window
+/// `ssmRollbackFromCapture` slices (conv-input rows 1 + accepted .. 3 + accepted); `buf` holds accepted + 1.
+pub fn gdnReplayPlan(accepted: u32, buf: []i32) struct { path: []const i32, conv_rows: [3]i32 } {
+    const n: usize = @as(usize, accepted) + 1;
+    for (buf[0..n], 0..) |*p, i| p.* = @intCast(i);
+    const a: i32 = @intCast(accepted);
+    return .{ .path = buf[0..n], .conv_rows = .{ 1 + a, 2 + a, 3 + a } };
 }
 
 fn ssmAxisView(s: mlx.mlx_stream, arr: mlx.mlx_array, axis: usize, i: usize) !mlx.mlx_array {
@@ -455,6 +474,21 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
             entry.ssm_state = reshaped;
             patch_ssm = true;
         }
+    } else if (entry.spec_replay) {
+        // The state after verify rows 0..accepted, replayed from the round's input state with the rows' recurrence
+        // inputs the fold wrote (K1R runs K1S's per-row statements): the bits `spec_state_seq[accepted]` would hold. The
+        // conv window stays the slice below (the same rows the replay copies).
+        const kp = mlx.getShape(entry.spec_prework.k); // [T, Hk, Dk]
+        if (accepted + 1 > @as(u32, @intCast(kp[0]))) return error.GdnReplayRange;
+        const sh = mlx.getShape(entry.spec_state_in); // [B, Hv, Dv, Dk]
+        const g = gdn_decode.Geometry{ .hk = kp[1], .hv = sh[1], .dk = sh[3], .dv = sh[2] };
+        var buf: [gdn_decode.FOLD_MAX_SEQ]i32 = undefined;
+        const plan = gdnReplayPlan(accepted, &buf);
+        const c = (try gdn_decode.replay(g, entry.spec_state_in, entry.spec_prework, plan.path, entry.spec_conv_input, plan.conv_rows, s)) orelse return error.GdnReplayUnavailable;
+        _ = mlx.mlx_array_free(c.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.ssm_state = c.ssm_state;
+        patch_ssm = true;
     }
 
     // conv_state = spec_conv_input[:, (1+accepted) : (1+accepted)+(kernel-1), :]
@@ -479,4 +513,22 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
             .aux = patch_aux,
         });
     }
+}
+
+// ── tests ──
+
+test "gdn replay: the plan walks rows 0..accepted and keeps conv rows 1+a..3+a; the marker is a capture until the round frees it" {
+    const std = @import("std");
+    var buf: [gdn_decode.FOLD_MAX_SEQ]i32 = undefined;
+    const p = gdnReplayPlan(2, &buf);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, p.path);
+    try std.testing.expectEqual([3]i32{ 3, 4, 5 }, p.conv_rows);
+    const full = gdnReplayPlan(gdn_decode.FOLD_MAX_SEQ - 1, &buf);
+    try std.testing.expectEqual(@as(usize, gdn_decode.FOLD_MAX_SEQ), full.path.len);
+    var e: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
+    try std.testing.expect(!ssmChainCaptured(&e));
+    e.spec_replay = true;
+    try std.testing.expect(ssmChainCaptured(&e));
+    ssmFreeSpecCapture(&e);
+    try std.testing.expect(!e.spec_replay and !ssmChainCaptured(&e));
 }

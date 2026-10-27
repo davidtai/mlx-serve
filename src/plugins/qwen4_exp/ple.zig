@@ -31,6 +31,10 @@ const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const qsaArraysAllEqual = @import("../../sdk/testing/parity.zig").qsaArraysAllEqual;
 const PleWeights = @import("weights.zig").PleWeights;
+const kernelSource = @import("../../mlx/kernels.zig").source;
+const cachedScalarInt = @import("../../sdk/blocks/linear/verify_qmm.zig").cachedScalarInt;
+const sigmoidTableFor = @import("../../sdk/blocks/mlp/fused_activations.zig").sigmoidTableFor;
+const ShapeKey = @import("../../sdk/blocks/moe/router_kernel.zig").ShapeKey;
 
 pub var verify_fault_after_ple_row: ?usize = null;
 
@@ -197,11 +201,148 @@ pub fn flushDeferredPle(self: *Trunk, ctx: *ForwardCtx) !void {
     } else {
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
-        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
+        const pk = out[0..mlx.mlx_array_size(p.emb)];
+        // a solo verify's ids off the arrays its input was built from, when the caller lent them
+        const from_src = if (ctx.ple_ids_src) |src| try pleFillFromSources(self, ctx, src, p.token_ids, p.entry, pk, p.capture) else false;
+        if (!from_src) try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, pk, p.capture);
     }
     ctx.ple_pending = null;
     releasePlePending(p);
 }
+
+/// The deferred leaf filled from `src` (`ForwardCtx.ple_ids_src`), the arrays the verify input concatenates, instead of
+/// an op over that input (`pleEvalIds`' `contiguous` queues behind everything already handed to the GPU, under the
+/// verify ladder layer 0): each id is read after its OWN producer's event, and while the next one is still running the
+/// rows of the ids already held are gathered. The leaf gets byte for byte what `pleGatherBf16` writes (a token's rows
+/// depend only on the history and the tokens up to it, and a token-aligned range keeps each row's head), and the
+/// history moves are the same call on the same ids. False, nothing read or moved, where `src` cannot stand in for
+/// `token_ids`.
+fn pleFillFromSources(self: *Trunk, ctx: *ForwardCtx, src: []const mlx.mlx_array, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, pk: []u16, capture: bool) !bool {
+    const st = self.qwen4 orelse return false;
+    const n: usize = src.len;
+    const nh: usize = st.hash.n_heads;
+    const emb_dim: usize = st.table.dim * nh;
+    if (!pleSourcesFit(n, mlx.mlx_array_size(token_ids), pk.len, emb_dim, ctx.batch_slots == null)) return false;
+    if (!pleRangesKeepHeads(nh, st.table.n_heads)) return false;
+    for (src) |a| if (!pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a))) return false;
+    // anything not yet handed to the GPU goes now, in one eval: reading unscheduled ids one by one would sync per id
+    {
+        const v = mlx.mlx_vector_array_new_data(src.ptr, src.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
+    }
+    const ids = try self.allocator.alloc(u32, n);
+    defer self.allocator.free(ids);
+    const rows = try self.allocator.alloc(i64, n * nh);
+    defer self.allocator.free(rows);
+    const host = try self.allocator.alloc(f32, n * emb_dim);
+    defer self.allocator.free(host);
+    const ctx_len: usize = st.hash.ngram_size - 1;
+    // the history `pleAdvanceSerial` hashes against: nothing touches the entry until that call below
+    const prev = plePrevOf(entry, st.hash.eos);
+    const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
+    var sched: PleSrcSchedule = .{};
+    var waited: u64 = 0;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for (src, 0..) |a, i| {
+        var ready = false;
+        _ = mlx._mlx_array_is_available(&ready, a);
+        if (sched.beforeRead(ready)) |r| pleGatherRange(st, prev[0..ctx_len], ids, r, rows, host, pk, kv_len);
+        var wait_lap = io_util_mod.Stopwatch.init(io);
+        ids[i] = try pleSourceId(a);
+        waited += wait_lap.read();
+        sched.afterRead();
+    }
+    self.verify_laps.ple_sync_ns = waited;
+    if (sched.finish()) |r| pleGatherRange(st, prev[0..ctx_len], ids, r, rows, host, pk, kv_len);
+    const moved = pleAdvanceSerial(st, entry, ids, capture);
+    std.debug.assert(std.mem.eql(u32, moved[0..ctx_len], prev[0..ctx_len]));
+    const Once = struct {
+        var logged = false;
+    };
+    if (!Once.logged) {
+        Once.logged = true;
+        log.info("[qwen4] verify PLE ids read off the draft arrays, each after its own event ({d} ids)\n", .{n});
+    }
+    return true;
+}
+
+/// Whether `n` source ids can stand in for a deferred leaf: one per token id, the leaf `n` rows of `emb_dim`, and a
+/// solo forward (a batched one hashes per slot).
+pub fn pleSourcesFit(n: usize, n_ids: usize, leaf_len: usize, emb_dim: usize, solo: bool) bool {
+    return solo and n > 0 and n == n_ids and leaf_len == n * emb_dim;
+}
+
+/// A trellis gather decodes row `i` of ITS call at head `i % table_heads`; a range that starts at a token boundary (a
+/// multiple of the hash's `nh` rows a token) keeps every row's head only when `table_heads` divides `nh`.
+pub fn pleRangesKeepHeads(nh: usize, table_heads: usize) bool {
+    return table_heads <= 1 or (nh > 0 and nh % table_heads == 0);
+}
+
+/// One source id array: a single integer element (the head's `[1]`, a sampler's `[1, 1]`, int32 or uint32), what the
+/// verify input concatenates.
+pub fn pleSourceUsable(size: usize, dtype: mlx.mlx_dtype) bool {
+    return size == 1 and (dtype == .int32 or dtype == .uint32);
+}
+
+/// One id off its source after the source's own event (`mlx_array_eval` on an array already handed to the GPU only
+/// waits for it). A token id is non-negative and below 2^31, so its int32 and uint32 readings agree with the input's
+/// `astype(int32)`.
+pub fn pleSourceId(a: mlx.mlx_array) !u32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    const v: i64 = switch (mlx.mlx_array_dtype(a)) {
+        .int32 => (mlx.mlx_array_data_int32(a) orelse return error.TokenIdsUnreadable)[0],
+        .uint32 => (mlx.mlx_array_data_uint32(a) orelse return error.TokenIdsUnreadable)[0],
+        else => return error.PleSourceDtype,
+    };
+    if (v < 0 or v > std.math.maxInt(i32)) return error.PleSourceRange;
+    return @intCast(v);
+}
+
+/// The rows of the held ids `ids[r[0]..r[1]]`, hashed over the history and every id up to `r[1]`, gathered and
+/// bf16-packed into their slice of the leaf: the rows, decode and rounding `pleFillFromIds` gives the whole range.
+fn pleGatherRange(st: *const qwen4_mod.Qwen4State, prev: []const u32, ids: []const u32, r: [2]usize, rows: []i64, host: []f32, pk: []u16, kv_len: u64) void {
+    const lo = r[0];
+    const hi = r[1];
+    if (lo >= hi) return;
+    const nh: usize = st.hash.n_heads;
+    const emb_dim: usize = st.table.dim * nh;
+    st.hash.rowIds(prev, ids[0..hi], rows[0 .. hi * nh]);
+    st.table.gather(rows[lo * nh .. hi * nh], host[lo * emb_dim .. hi * emb_dim], kv_len);
+    for (host[lo * emb_dim .. hi * emb_dim], pk[lo * emb_dim .. hi * emb_dim]) |v, *o| o.* = qwen4_mod.bf16Rne(v);
+}
+
+/// When `pleFillFromSources` gathers: the ids arrive in order, and before WAITING for the next one the rows of every id
+/// held but not gathered are gathered, so the host work runs while the GPU still produces the later ids; the rest goes
+/// after the last id. Every id is gathered once, in order, in contiguous ranges; all readable at once is ONE range.
+pub const PleSrcSchedule = struct {
+    /// Ids read so far.
+    held: usize = 0,
+    /// Ids whose rows are in the leaf.
+    gathered: usize = 0,
+
+    /// Before reading the next id (`ready`: readable without waiting): the token range to gather now, if any.
+    pub fn beforeRead(self: *PleSrcSchedule, ready: bool) ?[2]usize {
+        if (ready or self.gathered == self.held) return null;
+        return self.take();
+    }
+
+    pub fn afterRead(self: *PleSrcSchedule) void {
+        self.held += 1;
+    }
+
+    /// After the last id: the range still owed, if any.
+    pub fn finish(self: *PleSrcSchedule) ?[2]usize {
+        if (self.gathered == self.held) return null;
+        return self.take();
+    }
+
+    fn take(self: *PleSrcSchedule) [2]usize {
+        const r = [2]usize{ self.gathered, self.held };
+        self.gathered = self.held;
+        return r;
+    }
+};
 
 /// Fill every pending deferred-PLE leaf of a group in ONE pass. The caller retains
 /// rollback state until the whole round succeeds.
@@ -291,7 +432,42 @@ pub fn discardDeferredPle(_: *Trunk, ctx: *ForwardCtx) void {
 pub fn pleGatherBf16(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const ids_c = try self.pleEvalIds(token_ids);
     defer _ = mlx.mlx_array_free(ids_c);
+    try self.pleKickOff();
     return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
+}
+
+/// Starts the layers a prefill chunk built before its PLE layer (`Trunk.ple_kick`) on the GPU, so they run under the host
+/// gather that follows; called once the ids are read, whose eval would queue behind them. The same graph, started
+/// earlier: no op is added and no value changes.
+pub fn pleKickOff(self: *Trunk) !void {
+    const kick = self.ple_kick;
+    if (kick.ctx == null) return;
+    self.ple_kick = .{ .ctx = null };
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{kick}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+}
+
+/// A prefill of `prompt_ids` is about to start on `ctx`: the table reads the prompt's PLE rows ahead of each chunk's
+/// gather (`NgramTable.prefetchBegin`). Nothing on the GPU arm (its kernel reads the table in place) or without a PLE
+/// layer.
+pub fn plePrefetchBegin(self: *Trunk, ctx: *const ForwardCtx, prompt_ids: []const u32) void {
+    const st = self.qwen4 orelse return;
+    if (st.gpu != null) return;
+    const entries = ctx.ssm_entries orelse return;
+    for (self.moe_layers, 0..) |*lw, l| {
+        if (lw.ple == null) continue;
+        if (l >= entries.len) return;
+        const prev = plePrevOf(&entries[l], st.hash.eos);
+        st.table.prefetchBegin(&st.hash, prev[0 .. st.hash.ngram_size - 1], prompt_ids, ctx.moe_seq_offset.*);
+        return;
+    }
+}
+
+/// Ends the prefill's prefetch session (`plePrefetchBegin`), on every exit of the prefill.
+pub fn plePrefetchEnd(self: *Trunk) void {
+    const st = self.qwen4 orelse return;
+    st.table.prefetchEnd();
 }
 
 /// The GPU arm's host half: read the ids (the one sync), advance the history.
@@ -341,12 +517,13 @@ pub fn pleHostIds(self: *Trunk, ids_c: mlx.mlx_array) ![]u32 {
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
 /// row's ids together so the flush costs ONE host sync, not one per row.
 pub fn plePrepareIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    const s = if (self.ple_ids_stream.ctx != null) self.ple_ids_stream else self.s;
     var ids_i32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids_i32);
-    try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, s));
     var ids_c = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(ids_c);
-    try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
+    try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, s));
     return ids_c;
 }
 
@@ -415,6 +592,16 @@ pub fn pleAdvanceSerial(st: *const qwen4_mod.Qwen4State, entry: *SSMCacheEntry, 
 /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
 /// decode hands in the MERGED conv window as `entry.aux_state`.
 pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    return pleForwardWith(self, ctx, stream, token_ids, pw, entry, layer, batch, seq_len, false);
+}
+
+/// `stream + pleForward(stream, ...)`: the PLE layer with its call site's residual add (mlx Add of the stream), inside
+/// the fused tail's last launch where it runs.
+pub fn pleForwardResidual(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    return pleForwardWith(self, ctx, stream, token_ids, pw, entry, layer, batch, seq_len, true);
+}
+
+fn pleForwardWith(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int, residual: bool) !mlx.mlx_array {
     const cfg = &self.config;
     const hc: c_int = @intCast(cfg.hc_count);
     const hidden: c_int = @intCast(cfg.hidden_size);
@@ -424,6 +611,8 @@ pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_i
 
     const key_raw = try self.qmatmul(emb, pw.key_w, pw.key_s, pw.key_b);
     defer _ = mlx.mlx_array_free(key_raw);
+    // The fused tail: the elementwise ops below in four launches (`decodePleForward`); null: the chain
+    if (decodePleArmed(self, stream, key_raw, pw, entry)) if (try decodePleForward(self, stream, emb, key_raw, pw, entry, batch, seq_len, residual)) |out| return out;
     const key4 = try self.hcGroupNorm(key_raw, pw.norm_key, batch, seq_len);
     defer _ = mlx.mlx_array_free(key4);
     const value = try self.qmatmul(emb, pw.value_w, pw.value_s, pw.value_b);
@@ -437,35 +626,9 @@ pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_i
     var gate = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate);
     try mlx.check(mlx.mlx_sum_axis(&gate, kq, -1, true, self.s)); // [B,S,hc,1]
-    // Scalars in the activation dtype: an f32 scalar promotes the gate
-    // and, through the value product, the whole residual stream.
-    const gate_dt = mlx.mlx_array_dtype(gate);
-    const inv_sqrt_h = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(hidden))), gate_dt, self.s);
-    defer _ = mlx.mlx_array_free(inv_sqrt_h);
-    var gate_sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_sc);
-    try mlx.check(mlx.mlx_multiply(&gate_sc, gate, inv_sqrt_h, self.s));
-    // sqrt(max(|g|, 1e-6)) · sign(g)
-    var g_abs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_abs);
-    try mlx.check(mlx.mlx_abs(&g_abs, gate_sc, self.s));
-    const floor = try scalarOf(1e-6, gate_dt, self.s);
-    defer _ = mlx.mlx_array_free(floor);
-    var g_max = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_max);
-    try mlx.check(mlx.mlx_maximum(&g_max, g_abs, floor, self.s));
-    var g_sqrt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sqrt);
-    try mlx.check(mlx.mlx_sqrt(&g_sqrt, g_max, self.s));
-    var g_sign = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sign);
-    try mlx.check(mlx.mlx_sign(&g_sign, gate_sc, self.s));
-    var g_signed = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_signed);
-    try mlx.check(mlx.mlx_multiply(&g_signed, g_sqrt, g_sign, self.s));
-    var g_sig = mlx.mlx_array_new();
+    // the gate's seven ops (one function, which the fused tail tabulates)
+    const g_sig = try pleGateChain(self.s, gate, hidden);
     defer _ = mlx.mlx_array_free(g_sig);
-    try mlx.check(mlx.mlx_sigmoid(&g_sig, g_signed, self.s));
 
     const v_shape = [_]c_int{ batch, seq_len, 1, hidden };
     var value4 = mlx.mlx_array_new();
@@ -528,7 +691,308 @@ pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_i
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&out, gv, conv_act, self.s));
     if (Trunk.qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_out, out);
-    return out;
+    if (!residual) return out;
+    defer _ = mlx.mlx_array_free(out);
+    var h_ple = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(h_ple);
+    try mlx.check(mlx.mlx_add(&h_ple, stream, out, self.s));
+    return h_ple;
+}
+
+/// The PLE gate: g -> sigmoid(sqrt(max(|g / sqrt(H)|, 1e-6)) * sign(g / sqrt(H))), seven MLX ops in g's dtype. Caller
+/// owns the result.
+pub fn pleGateChain(s: mlx.mlx_stream, gate: mlx.mlx_array, hidden: c_int) !mlx.mlx_array {
+    // Scalars in the activation dtype: an f32 scalar promotes the gate
+    // and, through the value product, the whole residual stream.
+    const gate_dt = mlx.mlx_array_dtype(gate);
+    const inv_sqrt_h = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(hidden))), gate_dt, s);
+    defer _ = mlx.mlx_array_free(inv_sqrt_h);
+    var gate_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate_sc);
+    try mlx.check(mlx.mlx_multiply(&gate_sc, gate, inv_sqrt_h, s));
+    // sqrt(max(|g|, 1e-6)) · sign(g)
+    var g_abs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_abs);
+    try mlx.check(mlx.mlx_abs(&g_abs, gate_sc, s));
+    const floor = try scalarOf(1e-6, gate_dt, s);
+    defer _ = mlx.mlx_array_free(floor);
+    var g_max = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_max);
+    try mlx.check(mlx.mlx_maximum(&g_max, g_abs, floor, s));
+    var g_sqrt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_sqrt);
+    try mlx.check(mlx.mlx_sqrt(&g_sqrt, g_max, s));
+    var g_sign = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_sign);
+    try mlx.check(mlx.mlx_sign(&g_sign, gate_sc, s));
+    var g_signed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_signed);
+    try mlx.check(mlx.mlx_multiply(&g_signed, g_sqrt, g_sign, s));
+    var g_sig = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(g_sig);
+    try mlx.check(mlx.mlx_sigmoid(&g_sig, g_signed, s));
+    return g_sig;
+}
+
+// ── the PLE layer's elementwise tail in four launches ──
+//
+// Between its MLX projections, norms, gate sum and conv, the chain is 18 elementwise launches on the layer's critical
+// path: the group norms' three weight products and the keys x queries product, the gate's seven ops and its value
+// product, the conv input's concat, silu's sigmoid and product, the conv branch's add (and the call site's residual
+// add). Four launches carry them with every op's arithmetic and rounding unchanged: mlx Multiply / Add on two T values,
+// the concat's copy, and the two unary chains (the gate's seven ops, MLX's sigmoid) read from tables of MLX's own
+// results over every 16-bit pattern, so no transcendental is re-spelled. Pack-independent: the same bf16 operands on
+// any qwen4 pack, so it serves every one.
+
+pub const PLE_DEC_KQ_SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_dec_kq.metal");
+pub const PLE_DEC_GV_SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_dec_gv.metal");
+pub const PLE_DEC_CAT_SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_dec_cat.metal");
+pub const PLE_DEC_TAIL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_dec_tail.metal") ++ kernelSource("plugins/qwen4_exp/kernels/ple_dec_tail_out.metal");
+/// The tail with the call site's mlx Add of the stream too.
+pub const PLE_DEC_TAIL_RES_SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_dec_tail.metal") ++ kernelSource("plugins/qwen4_exp/kernels/ple_dec_tail_res.metal");
+
+pub const PleDecKind = enum(u8) { kq = 0, gv = 1, cat = 2, tail = 3, tail_res = 4 };
+var ple_dec_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
+const PleDecInt = struct { name: [*:0]const u8, value: c_int };
+const PleDecCfgKey = struct { shape: ShapeKey, t0: c_int, t1: c_int };
+var ple_dec_cfg: [5]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var ple_dec_cfg_key: [5]PleDecCfgKey = undefined;
+
+pub fn pleDecInputs(kind: PleDecKind) []const [*:0]const u8 {
+    return switch (kind) {
+        .kq => &.{ "nk", "wk", "nq", "wq", "N_size" },
+        .gv => &.{ "gate", "value", "gtab", "N_size" },
+        .cat => &.{ "prev", "nc", "wc", "N_size", "S_rows" },
+        .tail => &.{ "conv", "gv", "sigtab", "N_size" },
+        .tail_res => &.{ "conv", "gv", "sigtab", "N_size", "h" },
+    };
+}
+
+pub fn pleDecOutput(kind: PleDecKind) [*:0]const u8 {
+    return switch (kind) {
+        .kq => "kq",
+        .gv => "gv",
+        .cat => "cat",
+        .tail, .tail_res => "y",
+    };
+}
+
+pub const ple_dec_names = [5][*:0]const u8{ "mlxserve_ple_dec_kq", "mlxserve_ple_dec_gv", "mlxserve_ple_dec_cat", "mlxserve_ple_dec_tail", "mlxserve_ple_dec_tail_res" };
+pub const ple_dec_sources = [5][:0]const u8{ PLE_DEC_KQ_SOURCE, PLE_DEC_GV_SOURCE, PLE_DEC_CAT_SOURCE, PLE_DEC_TAIL_SOURCE, PLE_DEC_TAIL_RES_SOURCE };
+
+fn pleDecKernel(kind: PleDecKind) !mlx.mlx_fast_metal_kernel {
+    const i: usize = @intFromEnum(kind);
+    if (ple_dec_kernels[i]) |kr| return kr;
+    const ins = pleDecInputs(kind);
+    const outs = [_][*:0]const u8{pleDecOutput(kind)};
+    const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(ple_dec_names[i], in_vec, out_vec, ple_dec_sources[i], "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    ple_dec_kernels[i] = kernel;
+    return kernel;
+}
+
+/// One elementwise launch: bf16 output `out_shape` (one thread an element, 256 a group), template T bf16 and `ints`,
+/// `inputs` in the kernel's order. The caller owns the result.
+pub fn pleDecApply(s: mlx.mlx_stream, kind: PleDecKind, inputs: []const mlx.mlx_array, out_shape: []const c_int, ints: []const PleDecInt) !mlx.mlx_array {
+    if (out_shape.len == 0 or out_shape.len > 4) return error.DecodePleShape;
+    var n: i64 = 1;
+    for (out_shape) |d| n *= d;
+    if (n <= 0 or n > std.math.maxInt(c_int) - 256) return error.DecodePleShape;
+    const ni: c_int = @intCast(n);
+    const tg: c_int = 256;
+    const i: usize = @intFromEnum(kind);
+    // one config a kernel, rebuilt when the shape or a template constant changes: a config per call is graph-build time
+    const key = PleDecCfgKey{ .shape = ShapeKey.from(out_shape), .t0 = if (ints.len > 0) ints[0].value else 0, .t1 = if (ints.len > 1) ints[1].value else 0 };
+    if (ple_dec_cfg[i] == null or !std.meta.eql(ple_dec_cfg_key[i], key)) {
+        if (ple_dec_cfg[i]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        ple_dec_cfg[i] = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, out_shape.ptr, out_shape.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, t.name, t.value));
+        ple_dec_cfg[i] = config;
+        ple_dec_cfg_key[i] = key;
+    }
+    const kernel = try pleDecKernel(kind);
+    const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, ple_dec_cfg[i].?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    return y;
+}
+
+/// Launch 1: kq = (nk * wk) * (nq * wq) [B, S, hc, hidden] from the keys' and queries' RMS norms and their norm weights
+/// [hc, hidden] (the group norms' weight products and the layer's product).
+pub fn pleDecKq(s: mlx.mlx_stream, nk: mlx.mlx_array, wk: mlx.mlx_array, nq: mlx.mlx_array, wq: mlx.mlx_array) !mlx.mlx_array {
+    const n: c_int = @intCast(mlx.mlx_array_size(nk));
+    return pleDecApply(s, .kq, &.{ nk, wk, nq, wq, cachedScalarInt(n) }, mlx.getShape(nk), &.{.{ .name = "HW", .value = @intCast(mlx.mlx_array_size(wk)) }});
+}
+
+/// Launch 2: gv [B, S, hc * hidden] = table[gate] * value, from the gate's sum [B, S, hc, 1], the value projection
+/// [B, S, hidden] and the gate table (`pleGateTable`).
+pub fn pleDecGv(s: mlx.mlx_stream, gate: mlx.mlx_array, value: mlx.mlx_array, gtab: mlx.mlx_array, batch: c_int, seq_len: c_int, hc: c_int, hidden: c_int) !mlx.mlx_array {
+    const shape = [_]c_int{ batch, seq_len, hc * hidden };
+    return pleDecApply(s, .gv, &.{ gate, value, gtab, cachedScalarInt(batch * seq_len * hc * hidden) }, &shape, &.{ .{ .name = "H", .value = hidden }, .{ .name = "HC", .value = hc } });
+}
+
+/// Launch 3: cat [B, SL + S, C] = [state | gvn], gvn the RMS-normed gv [B, S, C] times the conv norm's weight [C].
+pub fn pleDecCat(s: mlx.mlx_stream, prev: mlx.mlx_array, nc: mlx.mlx_array, wc: mlx.mlx_array, batch: c_int, state_len: c_int, seq_len: c_int, width: c_int) !mlx.mlx_array {
+    const shape = [_]c_int{ batch, state_len + seq_len, width };
+    return pleDecApply(s, .cat, &.{ prev, nc, wc, cachedScalarInt(batch * (state_len + seq_len) * width), cachedScalarInt(seq_len) }, &shape, &.{ .{ .name = "C", .value = width }, .{ .name = "SL", .value = state_len } });
+}
+
+/// Launch 4: gv + silu(conv), plus the stream `h` when given (`pleForwardResidual`); [B, S, C].
+pub fn pleDecTail(s: mlx.mlx_stream, conv: mlx.mlx_array, gv: mlx.mlx_array, sigtab: mlx.mlx_array, h: ?mlx.mlx_array) !mlx.mlx_array {
+    const n: c_int = @intCast(mlx.mlx_array_size(conv));
+    if (h) |hh| return pleDecApply(s, .tail_res, &.{ conv, gv, sigtab, cachedScalarInt(n), hh }, mlx.getShape(conv), &.{});
+    return pleDecApply(s, .tail, &.{ conv, gv, sigtab, cachedScalarInt(n) }, mlx.getShape(conv), &.{});
+}
+
+/// The gate's table at the hidden width it was built for (`pleGateTable`): a per-process cache.
+var ple_gate_tables: struct { table: ?mlx.mlx_array = null, hidden: c_int = 0 } = .{};
+
+/// `pleGateChain` over every bf16 bit pattern (the raw patterns as its input, so the table is indexed by the gate's own
+/// bits, NaN payloads included), evaluated once per hidden width; borrowed by the caller.
+pub fn pleGateTable(s: mlx.mlx_stream, hidden: c_int) !mlx.mlx_array {
+    if (ple_gate_tables.table) |t| if (ple_gate_tables.hidden == hidden) return t;
+    const bits = try std.heap.c_allocator.alloc(u16, 1 << 16);
+    defer std.heap.c_allocator.free(bits);
+    for (bits, 0..) |*v, i| v.* = @intCast(i);
+    const x = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{1 << 16}, 1, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    const table = try pleGateChain(s, x, hidden);
+    errdefer _ = mlx.mlx_array_free(table);
+    if (mlx.mlx_array_dtype(table) != .bfloat16) return error.DecodePleTableDtype;
+    try mlx.check(mlx.mlx_array_eval(table));
+    if (ple_gate_tables.table) |old| _ = mlx.mlx_array_free(old);
+    ple_gate_tables = .{ .table = table, .hidden = hidden };
+    return table;
+}
+
+var ple_dec_said = [2]bool{ false, false };
+
+/// The fused tail's one decline line (false: the chain serves the call).
+fn decodePleDeclined(why: []const u8) bool {
+    if (!ple_dec_said[1]) {
+        ple_dec_said[1] = true;
+        log.info("[qwen4] PLE tail declined: {s}; the chain serves the PLE layer\n", .{why});
+    }
+    return false;
+}
+
+/// The fused tail's operands: bf16 throughout (the stream, the key projection, the three norm weights [hc, hidden], the
+/// conv weight, the conv state if any), a conv state (kernel >= 2), no trace (it reads the chain's `out`).
+fn decodePleArmed(self: *Trunk, stream: mlx.mlx_array, key_raw: mlx.mlx_array, pw: *const PleWeights, entry: *const SSMCacheEntry) bool {
+    if (Trunk.qwen4_trace != null or !mlx.streamIsGpu(self.s)) return false;
+    const hw: usize = @as(usize, self.config.hc_count) * @as(usize, self.config.hidden_size);
+    for ([_]mlx.mlx_array{ stream, key_raw, pw.norm_key, pw.norm_query, pw.norm_conv, pw.conv_w }) |a| {
+        if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return decodePleDeclined("an operand is not bf16");
+    }
+    for ([_]mlx.mlx_array{ pw.norm_key, pw.norm_query, pw.norm_conv }) |w| {
+        if (mlx.mlx_array_size(w) != hw) return decodePleDeclined("a norm weight is not [hc, hidden]");
+    }
+    if (hw == 0 or mlx.mlx_array_size(stream) % hw != 0 or mlx.mlx_array_size(key_raw) != mlx.mlx_array_size(stream)) return decodePleDeclined("the stream / keys are not [B, S, hc * hidden]");
+    if (entry.aux_state.ctx != null and mlx.mlx_array_dtype(entry.aux_state) != .bfloat16) return decodePleDeclined("the conv state is not bf16");
+    if (self.config.ple_conv_kernel < 2) return decodePleDeclined("no conv state (kernel 1)");
+    return true;
+}
+
+/// `hcGroupNorm`'s RMS norm alone ([B, S, hc, hidden]); the launch that reads it applies the norm's weight.
+fn hcGroupRms(self: *Trunk, x: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    const hc: c_int = @intCast(self.config.hc_count);
+    const hidden: c_int = @intCast(self.config.hidden_size);
+    const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
+    var x4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x4);
+    try mlx.check(mlx.mlx_reshape(&x4, x, &shape4, 4, self.s));
+    var n4 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(n4);
+    try mlx.check(mlx.mlx_fast_rms_norm(&n4, x4, self.ones_hidden, self.config.rms_norm_eps, self.s));
+    return n4;
+}
+
+/// The fused tail: `pleForwardWith`'s chain with its elementwise ops in four launches (`pleDecKq`, `pleDecGv`,
+/// `pleDecCat`, `pleDecTail`) and every MLX op between them the chain's own (the value projection, the three RMS norms,
+/// the gate's sum, the conv, the state's copy and capture): the same bytes, 14 dispatches and 11 dependent levels fewer
+/// per PLE layer (13 / 10 without the residual add). Null where the value projection is not bf16 (the chain runs).
+fn decodePleForward(self: *Trunk, stream: mlx.mlx_array, emb: mlx.mlx_array, key_raw: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int, residual: bool) !?mlx.mlx_array {
+    const cfg = &self.config;
+    const hc: c_int = @intCast(cfg.hc_count);
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const value = try self.qmatmul(emb, pw.value_w, pw.value_s, pw.value_b);
+    defer _ = mlx.mlx_array_free(value);
+    if (mlx.mlx_array_dtype(value) != .bfloat16) {
+        _ = decodePleDeclined("the value projection is not bf16");
+        return null;
+    }
+    // the keys' and queries' norms, then their weight products and product in one launch
+    const nk = try hcGroupRms(self, key_raw, batch, seq_len);
+    defer _ = mlx.mlx_array_free(nk);
+    const nq = try hcGroupRms(self, stream, batch, seq_len);
+    defer _ = mlx.mlx_array_free(nq);
+    const kq = try pleDecKq(self.s, nk, pw.norm_key, nq, pw.norm_query);
+    defer _ = mlx.mlx_array_free(kq);
+    var gate = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate);
+    try mlx.check(mlx.mlx_sum_axis(&gate, kq, -1, true, self.s)); // [B,S,hc,1]
+    // the gate's seven ops (one table read) and its value product in one launch: gv [B, S, hc * hidden]
+    const gv = try pleDecGv(self.s, gate, value, try pleGateTable(self.s, hidden), batch, seq_len, hc, hidden);
+    defer _ = mlx.mlx_array_free(gv);
+    const nc = try hcGroupRms(self, gv, batch, seq_len);
+    defer _ = mlx.mlx_array_free(nc);
+
+    // Dilated depthwise causal conv over [state | gvn]: gvn's weight product inside the concat launch.
+    const dilation: c_int = @intCast(cfg.ngram_size);
+    const state_len: c_int = (@as(c_int, @intCast(cfg.ple_conv_kernel)) - 1) * dilation;
+    var prev_state = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prev_state);
+    if (entry.aux_state.ctx != null) {
+        try mlx.check(mlx.mlx_array_set(&prev_state, entry.aux_state));
+    } else {
+        const zshape = [_]c_int{ batch, state_len, hc * hidden };
+        try mlx.check(mlx.mlx_zeros(&prev_state, &zshape, 3, .bfloat16, self.s));
+    }
+    const cat = try pleDecCat(self.s, prev_state, nc, pw.norm_conv, batch, state_len, seq_len, hc * hidden);
+    defer _ = mlx.mlx_array_free(cat);
+    var conv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(conv);
+    try mlx.check(mlx.mlx_conv1d(&conv, cat, pw.conv_w, 1, 0, dilation, hc * hidden, self.s));
+    // New state = the last state_len rows of the concat (materialized), as the chain keeps it.
+    {
+        const total: c_int = state_len + seq_len;
+        const start = [_]c_int{ 0, total - state_len, 0 };
+        const stop = [_]c_int{ batch, total, hc * hidden };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, cat, &start, 3, &stop, 3, &strides, 3, self.s));
+        const owned = try materializedOwnedCopy(self.s, view);
+        ssmFreeQsaState(entry); // PLE layer: no QSA state to lose
+        entry.aux_state = owned;
+    }
+    if (self.spec_capture_ssm and entry.spec_ple_len > 0) {
+        if (entry.spec_ple_input.ctx != null) _ = mlx.mlx_array_free(entry.spec_ple_input);
+        entry.spec_ple_input = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&entry.spec_ple_input, cat));
+    }
+    if (!ple_dec_said[0]) {
+        ple_dec_said[0] = true;
+        log.info("[qwen4] PLE tail in four launches ({d} rows{s})\n", .{ batch * seq_len, if (residual) ", the residual add inside the last" else "" });
+    }
+    // silu, the conv branch's add and (residual) the call site's add in one launch
+    return try pleDecTail(self.s, conv, gv, try sigmoidTableFor(self.s, .bfloat16), if (residual) stream else null);
 }
 
 // ── tests ──
@@ -1204,4 +1668,96 @@ test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a 
     try on.init(null);
     defer on.deinit();
     try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
+}
+
+test "PLE from sources: every id gathered once, in order, in contiguous ranges; held ids gathered before each wait" {
+    // all ids readable at once is ONE range (the input read's single gather); ids that become readable one by one are
+    // gathered as they arrive
+    const Case = struct { ready: []const bool, want: []const [2]usize };
+    const cases = [_]Case{
+        .{ .ready = &.{ true, true, true, true }, .want = &.{.{ 0, 4 }} },
+        .{ .ready = &.{ false, true, true, true }, .want = &.{.{ 0, 4 }} },
+        .{ .ready = &.{ false, true, false, false }, .want = &.{ .{ 0, 2 }, .{ 2, 3 }, .{ 3, 4 } } },
+        .{ .ready = &.{ true, false, false, false }, .want = &.{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 } } },
+        .{ .ready = &.{false}, .want = &.{.{ 0, 1 }} },
+    };
+    for (cases) |c| {
+        var sched: PleSrcSchedule = .{};
+        var got: [8][2]usize = undefined;
+        var n: usize = 0;
+        for (c.ready) |r| {
+            if (sched.beforeRead(r)) |g| {
+                got[n] = g;
+                n += 1;
+            }
+            sched.afterRead();
+        }
+        if (sched.finish()) |g| {
+            got[n] = g;
+            n += 1;
+        }
+        try testing.expect(sched.finish() == null);
+        try testing.expectEqual(c.want.len, n);
+        for (c.want, got[0..n]) |w, g| try testing.expectEqual(w, g);
+        var next: usize = 0;
+        for (got[0..n]) |g| {
+            try testing.expectEqual(next, g[0]);
+            try testing.expect(g[1] > g[0]);
+            next = g[1];
+        }
+        try testing.expectEqual(c.ready.len, next);
+    }
+}
+
+test "PLE from sources: only a solo, one-id-per-token, integer source list stands in for the leaf" {
+    try testing.expect(pleSourcesFit(4, 4, 4 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(4, 4, 4 * 2560, 2560, false));
+    try testing.expect(!pleSourcesFit(3, 4, 4 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(4, 4, 3 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(0, 0, 0, 2560, true));
+    // a token-aligned range keeps every row's trellis head only when the table's heads divide the hash's
+    try testing.expect(pleRangesKeepHeads(16, 16));
+    try testing.expect(pleRangesKeepHeads(16, 8));
+    try testing.expect(pleRangesKeepHeads(16, 1));
+    try testing.expect(pleRangesKeepHeads(16, 0));
+    try testing.expect(!pleRangesKeepHeads(16, 48));
+    try testing.expect(!pleRangesKeepHeads(16, 3));
+    try testing.expect(pleSourceUsable(1, .int32));
+    try testing.expect(pleSourceUsable(1, .uint32));
+    try testing.expect(!pleSourceUsable(2, .int32));
+    try testing.expect(!pleSourceUsable(1, .int64));
+    try testing.expect(!pleSourceUsable(1, .float32));
+}
+
+test "PLE from sources: an id reads the same off host data, a sampler's [1, 1] and a dispatched op, int32 or uint32" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const id: i32 = 248043;
+    const host = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(host);
+    try testing.expectEqual(@as(u32, 248043), try pleSourceId(host));
+    const zero = mlx.mlx_array_new_data(&@as(i32, 0), &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(zero);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, host, zero, s));
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_reshape(&sq, sum, &[_]c_int{ 1, 1 }, 2, s));
+    var unsigned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unsigned);
+    try mlx.check(mlx.mlx_astype(&unsigned, sum, .uint32, s));
+    // handed over as a dispatched chain is: one async eval, the reads wait on its event
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ sq, unsigned }, 2);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+    for ([_]mlx.mlx_array{ sq, unsigned, sum }) |a| {
+        try testing.expect(pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a)));
+        try testing.expectEqual(@as(u32, 248043), try pleSourceId(a));
+    }
+    // a negative id is no token: refused rather than wrapped
+    const neg_v: i32 = -3;
+    const neg = mlx.mlx_array_new_data(&neg_v, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(neg);
+    try testing.expectError(error.PleSourceRange, pleSourceId(neg));
 }

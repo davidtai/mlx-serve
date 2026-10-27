@@ -11,8 +11,11 @@ const ple_gpu = @import("ple_gpu.zig");
 const distributed_mod = @import("../../engines/mlx/cluster/distributed.zig");
 const fused_rows = @import("../../sdk/blocks/linear/fused_rows.zig");
 const Trunk = @import("trunk.zig").Trunk;
+const trunk_formats = @import("trunk/formats.zig");
+const SideStream = @import("side_stream.zig").SideStream;
 const loadHcWeights = @import("load.zig").loadHcWeights;
 const loadQwen4Mtp = @import("mtp.zig").loadQwen4Mtp;
+const headPrefix = @import("mtp.zig").headPrefix;
 const qsaNaxArm = @import("qsa/gather.zig").qsaNaxArm;
 const qsaScoreFusedArm = @import("../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreFusedArm;
 const checkQsaCompressRatio = @import("qsa/history.zig").checkQsaCompressRatio;
@@ -56,11 +59,19 @@ pub fn unservedLayout(config: *const model.ModelConfig, layers: []const MoeLayer
 pub const Options = struct {
     /// Quantize a dense bf16 head to MXFP8 at load (the lossy `lm_head_mxfp8` setting).
     head_mxfp8: bool = false,
+    /// The pack's format blocks and the host table, for the quant formats that serve its EXL3 weights.
+    pack: trunk_formats.Pack = .{},
 };
 
 /// `config` is borrowed for the trunk's life; `weights` must outlive it.
 pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, weights: *model.Weights, opts: Options) !Trunk {
     const s = mlx.gpuStream();
+    // The pack's quant formats: the trunk format's linears now, the expert format's banks once the layers are bound.
+    var fmts: trunk_formats.Loading = undefined;
+    try fmts.begin(a, config, weights, opts.pack, s);
+    defer fmts.end();
+    errdefer fmts.formats.deinit(a);
+    SideStream.serve(fmts.formats.profile);
     if (config.indexer_budget != 0) {
         qsaScoreFusedArm();
         qsaNaxArm();
@@ -139,6 +150,13 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     if (unservedLayout(config, ml.moe_layers)) |what| {
         log.err("[qwen4] this pack carries {s}, which the trunk does not run\n", .{what});
         return error.Qwen4UnservedLayout;
+    }
+    for (ml.moe_layers, 0..) |*lw, i| if (lw.attn == .linear) try @import("trunk/gdn_ab.zig").joinInPlace(&lw.attn.linear, weights, &name_buf, prefix, @intCast(i), &owned, a, s);
+    for (ml.moe_layers, 0..) |*lw, i| {
+        switch (lw.mlp) {
+            .moe => |*mw| try fmts.banks(prefix, @intCast(i), mw, config.hidden_size, config.moe_intermediate_size),
+            .dense => {},
+        }
     }
     // The layers' recurrent state lives on each slot; the binder's template entries are not kept.
     for (ml.ssm_entries) |*e| {
@@ -237,6 +255,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
         return error.NgramTableMismatch;
     }
+    if (st.table.trellis_k != 0) try trellisHeadBias(&st.table, weights, st.hash.n_heads);
     var weights_bytes: usize = 0;
     _ = mlx.mlx_get_active_memory(&weights_bytes);
     // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
@@ -249,6 +268,12 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     // A pipeline split's head would read the last layer's stream, which lives on the worker.
     var head = if (config.dist_span != null) null else try loadQwen4Mtp(a, config.*, weights, &name_buf, s);
     errdefer if (head) |*h| h.deinit(a);
+    if (head) |*h| {
+        switch (h.layer.mlp) {
+            .moe => |*mw| try fmts.banks(headPrefix(weights) orelse "", 0, mw, 0, 0),
+            .dense => {},
+        }
+    }
     log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
 
     // Prism's ternary codec writes every affine bias as exactly -scale; only then do the 2-bit kernels serve.
@@ -280,6 +305,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         .lm_head_w = lm_head_w,
         .lm_head_s = lm_head_s,
         .lm_head_b = lm_head_b,
+        .formats = fmts.formats,
         .moe_layers = ml.moe_layers,
         .ternary_2bit = ternary_2bit,
         .moe_owned_bf16 = try owned.toOwnedSlice(a),
@@ -299,6 +325,36 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     };
 }
 
+/// A trellis table's per-head bias (`*.ple.ple_embedding.head_bias`, [heads, dim], read once) handed to the table, which
+/// adds it to each row in f16; a trellis table without one is refused by name.
+fn trellisHeadBias(table: *qwen4_mod.NgramTable, weights: *model.Weights, n_heads: u32) !void {
+    var it = weights.map.iterator();
+    while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".ple.ple_embedding.head_bias")) {
+        const hb = e.value_ptr.*;
+        try mlx.check(mlx.mlx_array_eval(hb));
+        const n = mlx.mlx_array_size(hb);
+        switch (mlx.mlx_array_dtype(hb)) {
+            .float16 => {
+                const p = mlx.mlx_array_data_float16(hb) orelse return error.MissingWeight;
+                return table.setHeadBias(@as([*]const u16, @ptrCast(p))[0..n], n_heads);
+            },
+            .bfloat16 => {
+                const src = (mlx.mlx_array_data_bfloat16(hb) orelse return error.MissingWeight)[0..n];
+                const bits = try std.heap.page_allocator.alloc(u16, n);
+                defer std.heap.page_allocator.free(bits);
+                for (src, bits) |b, *t| t.* = @bitCast(@as(f16, @floatCast(@as(f32, @bitCast(@as(u32, b) << 16)))));
+                return table.setHeadBias(bits, n_heads);
+            },
+            else => {
+                log.err("[qwen4] {s} is {s}; the trellis n-gram table adds an f16 bias\n", .{ e.key_ptr.*, @tagName(mlx.mlx_array_dtype(hb)) });
+                return error.NgramTableHeader;
+            },
+        }
+    };
+    log.err("[qwen4] the trellis n-gram table needs its per-head bias (ple.ple_embedding.head_bias), which the pack does not hold\n", .{});
+    return error.MissingWeight;
+}
+
 test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the plugin's own config is not" {
     const testing = std.testing;
     const toModelConfig = @import("model_config.zig").toModelConfig;
@@ -316,4 +372,20 @@ test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the p
         @field(bad, m[0]) = m[1];
         try testing.expect(unservedLayout(&bad, &.{}) != null);
     }
+}
+
+test "qwen4_exp trunk: a trellis n-gram table takes its per-head bias from the map, and a pack without one is refused" {
+    const testing = std.testing;
+    const empty: [0]u8 align(std.heap.page_size_min) = .{};
+    var table: qwen4_mod.NgramTable = .{ .map = &empty, .rows = 1, .dim = 4, .bits = 6, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = 3, .scols = 0, .trellis_k = 6, .gpu_owns_map = true };
+    defer table.close();
+    var w = model.Weights.init(testing.allocator);
+    defer w.deinit();
+    try testing.expectError(error.MissingWeight, trellisHeadBias(&table, &w, 2));
+    // f16 1, -1, 0, 0.5, 2, 1, 0.25, -2
+    const bits = [_]u16{ 0x3C00, 0xBC00, 0x0000, 0x3800, 0x4000, 0x3C00, 0x3400, 0xC000 };
+    try w.put("m.layers.0.ple.ple_embedding.head_bias", mlx.mlx_array_new_data(&bits, &[_]c_int{ 2, 4 }, 2, .float16));
+    try trellisHeadBias(&table, &w, 2);
+    try testing.expectEqualSlices(f32, &.{ 1, -1, 0, 0.5, 2, 1, 0.25, -2 }, table.head_bias.?);
+    try testing.expectError(error.NgramTableHeader, trellisHeadBias(&table, &w, 3));
 }

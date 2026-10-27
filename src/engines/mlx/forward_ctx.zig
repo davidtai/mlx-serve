@@ -183,6 +183,9 @@ pub const ForwardCtx = struct {
     /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
+    /// A solo MTP verify's `[t1, drafts...]` id arrays, those its input concatenates: the deferred flush reads the ids
+    /// off them, each after its own producer's event. Borrowed for one forward.
+    ple_ids_src: ?[]const mlx.mlx_array = null,
     /// A served model's id for this slot (`Forward.slots`), 0 until its first forward, and what its last `defer_host`
     /// forward left owed (`plugin/settle.zig`).
     plugin_slot: u32 = 0,

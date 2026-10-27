@@ -12,8 +12,8 @@ const Claim = abi.Claim;
 const Verdict = abi.Verdict;
 const Value = std.json.Value;
 
-/// The config keys a quantization block sits under.
-pub const keys = [_][]const u8{ "quantization", "quantization_config", "expert_quant" };
+/// The config keys a quantization block sits under (`trunk_quant`: the trunk's linears' format beside `expert_quant`).
+pub const keys = [_][]const u8{ "quantization", "quantization_config", "expert_quant", "trunk_quant" };
 
 pub const Block = struct { key: []const u8, json: []const u8 };
 
@@ -200,11 +200,13 @@ fn validateHadamard(block_json: Str, config_json: Str, dir: *const abi.PackDir) 
     return if (hadamardBlock(sc.a(), config_json.slice()) != null) .ok else Verdict.refuse(.unsupported, "hadamard: modules without one shared rotation block");
 }
 
-/// Sushi's `expert_quant`: EXL3 (MCG, MUL1) and its STQ codebook family (a named codebook table).
+/// Sushi's `expert_quant`: EXL3 (MCG, MUL1) and its STQ codebook family (a named codebook table), its banks' rate `k`
+/// declared. A block without `k` (a dense trunk's, whose linears carry their own rates) is not Sushi's.
 fn claimsExl3(block_json: Str, _: Str) callconv(.c) Claim {
     var sc: Scratch = .{};
     defer sc.arena.deinit();
     const o = parseObject(sc.a(), block_json.slice()) orelse return .no;
+    if (o.get("k") == null) return .no;
     return if (eqlField(o, "format", "exl3") or eqlField(o, "format", "stq")) .by_type else .no;
 }
 

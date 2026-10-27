@@ -103,13 +103,15 @@ pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_tem
 }
 
 /// This request's draft sampler at chain depth `step`: the per-request
-/// proposal mode, the greedy tail and the loaded family's draft temperature,
+/// proposal mode, the greedy tail, the head's own argmax policy
+/// (`MtpHeadRef.exl3Profile`) and the loaded family's draft temperature,
 /// resolved in ONE place so no call site can read a different proposal than
 /// the one the verify's q came from.
 pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
+    const head_greedy = if (self.mtp) |h| h.exl3Profile() else false;
     return mtpDraftSamplingFor(
         self.sampling,
-        self.mtp_serial_accept or mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
+        self.mtp_serial_accept or head_greedy or mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
         mtpDraftTempFor(&self.xfm.config),
     );
 }
@@ -401,6 +403,26 @@ test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request d
     }
 }
 
+test "mtpDraftSampling: the qwen4 head over an EXL3 pack drafts its argmax for every request" {
+    const Qwen4Trunk = @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk;
+    var xfm: Transformer = undefined;
+    xfm.config = .{};
+    var trunk: Qwen4Trunk = undefined;
+    trunk.formats = .{};
+    var g: Generator = undefined;
+    g.xfm = &xfm;
+    g.sampling = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+    g.mtp_serial_accept = false;
+    g.mtp_greedy_tail = false;
+    g.mtp = .{ .qwen4 = &trunk };
+    // Off an EXL3 pack a sampled request drafts from the sharpened sampler.
+    try testing.expect(g.mtpDraftSampling(0).temperature > 0.01);
+    trunk.formats.profile = true;
+    for (0..mtp_mod.MAX_DEPTH) |d| try testing.expectEqual(@as(f32, 0.0), g.mtpDraftSampling(@intCast(d)).temperature);
+    g.mtp = null;
+    try testing.expect(g.mtpDraftSampling(0).temperature > 0.01);
+}
+
 test "greedy tail: an argmax draft consumes no draw index (mtpSamplingDraw)" {
     var g: Generator = undefined;
     g.sampling = .{ .temperature = 1.0, .seed = 3, .draw = 5 };
@@ -464,6 +486,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // scratch. Only the two seed fields are touched here; the rest of the head
     // (and of the Transformer) is never read on this path.
     var t: @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
+    t.formats = .{};
     t.qwen4_mtp = null;
     const ref = MtpHeadRef{ .qwen4 = &t };
 

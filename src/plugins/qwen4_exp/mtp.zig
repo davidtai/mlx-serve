@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
+const draft_fuse = @import("../../sdk/spec/mtp/draft_fuse.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
@@ -32,6 +33,8 @@ const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
 const ssmSnapshot = @import("../../engines/mlx/ssm/entry.zig").ssmSnapshot;
 const ssmSnapshotDeinit = @import("../../engines/mlx/ssm/entry.zig").ssmSnapshotDeinit;
 const Trunk = @import("trunk.zig").Trunk;
+const abi = @import("../../abi/quant.zig");
+const HcPending = @import("hc_fused.zig").HcPending;
 const concatAxis0 = @import("../../mlx/array.zig").concatAxis0;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const attn256MaxDiff = @import("../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
@@ -142,14 +145,16 @@ pub const Qwen4Mtp = struct {
     }
 };
 
+/// The prefix of the MTP head's weights the pack ships (`<prefix>.fc_hidden` and its layer), or null.
+pub fn headPrefix(weights: *const Weights) ?[]const u8 {
+    if (weights.get("language_model.mtp.fc_hidden.weight") != null) return "language_model.mtp";
+    if (weights.get("mtp.fc_hidden.weight") != null) return "mtp";
+    return null;
+}
+
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
 pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-    const mtp_prefix = if (weights.get("language_model.mtp.fc_hidden.weight") != null)
-        "language_model.mtp"
-    else if (weights.get("mtp.fc_hidden.weight") != null)
-        "mtp"
-    else
-        return null;
+    const mtp_prefix = headPrefix(weights) orelse return null;
     var mcfg = config;
     // The head's experts stay whole on a tensor-parallel rank 0 (`distributed.headOnly`).
     if (mcfg.dist_shard) |sh| {
@@ -561,13 +566,13 @@ pub fn qwen4MtpAdvance(cache: *KVCache, seq_offset: *usize, seq_len: c_int) void
 pub fn qwen4MtpForward(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null, null);
 }
 
 pub fn qwen4MtpForwardOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null, null);
 }
 
 /// A draft row written past a padded history append. Key slots `[live_end, dead_end)`
@@ -582,7 +587,22 @@ pub const HeadPlace = struct {
 pub fn qwen4MtpForwardPlaced(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place, null);
+}
+
+/// `qwen4MtpForward` with the row's normalized embedding handed in (`front_en`: the previous draft step's fused pick,
+/// bit for bit `rmsNorm(embedding(token_ids_in), pre_norm_emb)`, `draft_fuse.zig`); null builds it here.
+pub fn qwen4MtpForwardFront(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, front_en: ?mlx.mlx_array) !Qwen4MtpOut {
+    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    var live = qwen4MtpLiveModule(m);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null, front_en);
+}
+
+/// `qwen4MtpForwardPlaced` with the row's normalized embedding handed in (`qwen4MtpForwardFront`).
+pub fn qwen4MtpForwardPlacedFront(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject, front_en: ?mlx.mlx_array) !Qwen4MtpOut {
+    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    var live = qwen4MtpLiveModule(m);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place, front_en);
 }
 
 pub const Qwen4MtpBatchRow = struct {
@@ -876,7 +896,7 @@ pub fn qwen4MtpForwardBatched(
     return buf.abandon();
 }
 
-pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace) !Qwen4MtpOut {
+pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace, front_en: ?mlx.mlx_array) !Qwen4MtpOut {
     qwen4_mtp_head_graphs += 1;
     self.fwd_gen +%= 1; // per-forward QSA scratch key
     const cfg = &self.config;
@@ -893,12 +913,23 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
         if (pos_offset != live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))) return error.MtpPositionGap;
     }
 
-    var token_ids = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(token_ids);
-    try mlx.check(mlx.mlx_reshape(&token_ids, token_ids_in, &[_]c_int{ batch, seq_len }, 2, self.s));
-    const e = try self.embedding(token_ids);
-    defer _ = mlx.mlx_array_free(e);
-    const en = try self.rmsNorm(e, m.pre_norm_emb);
+    // The previous draft step's fused pick built this row's `embedding` + `rmsNorm(pre_norm_emb)` (`draft_fuse.zig`,
+    // bit for bit); a front that is not one [1,1,hidden] bf16 row is ignored.
+    const front: ?mlx.mlx_array = if (front_en) |fe| (if (draft_fuse.frontEnFits(fe, batch, seq_len, hidden)) fe else null) else null;
+    const en = if (front) |fe| blk: {
+        var c = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_array_set(&c, fe));
+        draft_fuse.noteFront();
+        break :blk c;
+    } else blk: {
+        var token_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(token_ids);
+        try mlx.check(mlx.mlx_reshape(&token_ids, token_ids_in, &[_]c_int{ batch, seq_len }, 2, self.s));
+        const e = try self.embedding(token_ids);
+        defer _ = mlx.mlx_array_free(e);
+        break :blk try self.rmsNorm(e, m.pre_norm_emb);
+    };
     defer _ = mlx.mlx_array_free(en);
     const ep = try self.qmatmul(en, m.fc_emb_w, m.fc_emb_s, m.fc_emb_b);
     defer _ = mlx.mlx_array_free(ep);
@@ -935,6 +966,14 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
     }
     try self.beginMropeChunk(&ctx, @intCast(live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))), @intCast(seq_len), mlx.mlx_array_dtype(h));
     defer endMropeChunk(&ctx);
+    // A history append keeps the KV rows and the QSA history; its callers drop the stream (`fusion.kvOnlySkips`).
+    const kv_only_was = self.fused.kv_only;
+    self.fused.kv_only = project == .none;
+    defer self.fused.kv_only = kv_only_was;
+    // The head's two writes defer to its next read, as the trunk's do (the read's first launch applies stream +
+    // out * inj, bit for bit the write and then the read); flushed wherever the stream itself is needed.
+    var pending: ?HcPending = null;
+    defer if (pending) |*pd| pd.deinit();
     const li: u32 = cfg.num_hidden_layers;
     const lw = &m.layer;
     var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
@@ -944,24 +983,28 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
         .linear => return error.MtpLayerNotAttention,
     };
     defer _ = mlx.mlx_array_free(attn_out);
-    h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len);
-    var pre2 = try self.hcRead(h, &lw.hc_mlp.?, batch, seq_len);
+    try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+    var pre2 = try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
     defer pre2.deinit();
     const mlp_out = switch (lw.mlp) {
         .moe => |*mw| try self.moeMLP(pre2.mixed, mw),
         .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
     };
     defer _ = mlx.mlx_array_free(mlp_out);
-    h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
+    try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, m.mixer.inject_flat, &pending);
     qwen4MtpAdvance(live.cache, live.seq_offset, seq_len);
 
     // History append wants the stream and nothing else: the mixer read and
     // the vocab-wide projection are pure, so skipping them is free.
-    if (project == .none) return .{ .logits = .{ .ctx = null }, .stream = h };
+    if (project == .none) {
+        try self.hcFlush(&h, batch, seq_len, &pending);
+        return .{ .logits = .{ .ctx = null }, .stream = h };
+    }
     // Last-row-only: cut `h` HERE, so the mixer + lm_head see one row
     // instead of S. Same values as slicing the outputs afterwards.
     var out_seq: c_int = seq_len;
     if ((project == .last_row or project == .mixed_last_row) and seq_len > 1) {
+        try self.hcFlush(&h, batch, seq_len, &pending);
         const hs = mlx.getShape(h);
         var h_last = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(h_last);
@@ -981,7 +1024,8 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
         out_seq = 1;
     }
 
-    const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
+    // With a deferred write (one row: the draft chain) the mixer read applies it and hands back the written stream.
+    const mix = try self.hcReadPending(&h, &m.mixer, batch, out_seq, &pending);
     if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
     // Rerank draft: the mixer output IS the answer. Skipping
     // `lmHeadProject` here is the whole point — the 248320-wide 8-bit
@@ -1011,16 +1055,67 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
     m.rerank_tried = true;
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Timestamp.now(io, .awake);
-    // The ONE env read: the built head carries its width from here on.
-    const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS) orelse return false;
+    // A trunk format's head (the EXL3 pack's trellis) has no affine rows: the coarse head is built from what it
+    // computes.
+    const built = if (self.formats.linearOf(self.lm_head_w)) |fw| formatHeadRerank(self, fw) else mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS);
+    const rc = built orelse return false;
     m.rerank = rc;
-    const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
+    const h: c_int = @intCast(self.config.hidden_size);
+    var bytes = mtp_mod.rerankCoarseBytes(rc.rows, h, rc.bits);
+    if (rc.exact != null) bytes += mtp_mod.rerankCoarseBytes(rc.rows, h, mtp_mod.RERANK_EXACT_BITS);
+    if (rc.sub != null) bytes += mtp_mod.rerankCoarseBytes(rc.sub_rows, h, rc.bits);
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
     log.info(
-        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring\n",
-        .{ rc.bits, bytes / (1024 * 1024), ms },
+        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit{s} ({d} MB, {d} ms) + exact top-32 rescoring; single-row drafts read {d} rows\n",
+        .{ rc.bits, if (rc.exact != null) " + 8-bit re-score copy" else "", bytes / (1024 * 1024), ms, rc.readout().rows },
     );
     return true;
+}
+
+/// The coarse head over a trunk format's lm_head: the rows it computes (`formatHeadRows`) requantized once
+/// (`mtp_mod.buildRerankCoarseRows`), then dropped. Proposal side only: the verify reads the head itself.
+fn formatHeadRerank(self: *Trunk, fw: *const abi.Weight) ?mtp_mod.RerankCoarse {
+    // no byte saving over a head already at the coarse width
+    if (fw.bits != 0 and mtp_mod.DRAFT_HEAD_BITS >= fw.bits) return null;
+    const dense = formatHeadRows(self) catch |err| {
+        log.warn("[qwen4] MTP draft rerank: the head's rows failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+        return null;
+    };
+    defer _ = mlx.mlx_array_free(dense);
+    return mtp_mod.buildRerankCoarseRows(self.s, dense, mtp_mod.DRAFT_HEAD_BITS);
+}
+
+/// The `[V, H]` rows a trunk format's lm_head computes: the head applied to I_H (row i of the identity reads column i
+/// of W through the dispatch every readout takes), transposed. Lazy; a load-time transient of V x H in the activation
+/// dtype once evaluated.
+fn formatHeadRows(self: *const Trunk) !mlx.mlx_array {
+    const h: c_int = @intCast(self.config.hidden_size);
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_arange(&idx, 0, @floatFromInt(h), 1, .int32, self.s));
+    var col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(col);
+    try mlx.check(mlx.mlx_reshape(&col, idx, &[_]c_int{ h, 1 }, 2, self.s));
+    var hit = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hit);
+    try mlx.check(mlx.mlx_equal(&hit, col, idx, self.s));
+    var eye = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye);
+    try mlx.check(mlx.mlx_astype(&eye, hit, self.actDtype(), self.s));
+    // one H-row chunk [1, H, H], as a prefill chunk reaches the head
+    var eye3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye3);
+    try mlx.check(mlx.mlx_reshape(&eye3, eye, &[_]c_int{ 1, h, h }, 3, self.s));
+    const cols3 = try self.lmHeadProject(eye3); // [1, H, V] = W^T
+    defer _ = mlx.mlx_array_free(cols3);
+    const v = mlx.getShape(cols3)[2];
+    var cols = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cols);
+    try mlx.check(mlx.mlx_reshape(&cols, cols3, &[_]c_int{ h, v }, 2, self.s));
+    var rows = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_transpose(&rows, cols, self.s));
+    return rows;
 }
 
 /// Is the qwen4_exp head's draft rerank available? A pure read once the
@@ -1041,6 +1136,48 @@ pub fn qwen4DraftSelect(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
     return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
+}
+
+/// The fused draft pick (`draft_fuse.zig`): `qwen4DraftSelect`'s id for one row `x` `[1,1,H]` in fewer launches, bit
+/// for bit, plus the next draft step's normalized embedding for `qwen4MtpForwardFront`. Null = off the EXL3 profile, or
+/// declined (logged): the caller runs `qwen4DraftSelect`.
+pub fn qwen4DraftPick(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?draft_fuse.Pick {
+    const m = &(self.qwen4_mtp orelse return null);
+    const front = draftFuseFront(self, m) orelse return null;
+    if (m.rerank != null) return mtp_mod.rerankPickFused(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask, front);
+    // No coarse head (never built, or retired): `fullReadoutArgmax`'s readout, its mask and argmax in the pick.
+    const logits = try self.lmHeadForeign(x);
+    defer _ = mlx.mlx_array_free(logits);
+    return draft_fuse.pickExactChecked(self.s, logits, suppress_mask, front, .int32);
+}
+
+/// A greedy draft from the head's own logits `[1,1,V]` (`sampleTokenLazy`'s temperature-0 path): its where + argmax
+/// (`[1,1]` uint32), then the next step's normalized embedding in one launch. Null = off the EXL3 profile, or declined
+/// (logged): the caller runs `sampleTokenLazy`.
+pub fn qwen4GreedyPick(self: *Trunk, logits: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?draft_fuse.Pick {
+    const m = &(self.qwen4_mtp orelse return null);
+    const front = draftFuseFront(self, m) orelse return null;
+    return draft_fuse.pickExactChecked(self.s, logits, suppress_mask, front, .uint32);
+}
+
+/// The head's front as `qwen4MtpForwardLive` builds it, when a pick can build it instead: a dense table's row cast to
+/// bfloat16, then `rmsNorm(pre_norm_emb)`. The EXL3 profile only (`Formats.profile`): elsewhere the path is unmeasured.
+fn draftFuseFront(self: *const Trunk, m: *const Qwen4Mtp) ?draft_fuse.Front {
+    if (!self.formats.profile) return null;
+    if (!mlx.streamIsGpu(self.s) or mlx.cudaAvailable()) {
+        draft_fuse.decline(.no_metal);
+        return null;
+    }
+    if (self.emb_s.ctx != null) {
+        draft_fuse.decline(.embedding);
+        return null;
+    }
+    const f: draft_fuse.Front = .{ .emb = self.emb_w, .norm_w = m.pre_norm_emb, .eps = self.config.rms_norm_eps, .hidden = @intCast(self.config.hidden_size) };
+    if (draft_fuse.frontReason(f)) |r| {
+        draft_fuse.decline(r);
+        return null;
+    }
+    return f;
 }
 
 /// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
@@ -1098,6 +1235,7 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1153,6 +1291,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1737,6 +1876,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1809,6 +1949,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1911,6 +2052,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1997,6 +2139,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
 test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     const head_cache = try KVCache.init(t.allocator, 1);
@@ -2021,7 +2164,7 @@ test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
 pub fn qwen4MtpForwardPlacedOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
+    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place, null);
 }
 
 test "qwen4 MTP head: last-row and no-logits projections match the full block (QWEN4_TEST_MODEL)" {
@@ -2124,6 +2267,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
 test "qwen4 MTP head KV: the head cache is rebuilt under the scheme it is handed" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     xfm.config = .{};
     xfm.config.num_hidden_layers = 4;
     xfm.config.head_dim = 64;
@@ -2361,6 +2505,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     defer ssmSnapshotDeinit(&aux);
 
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
 
     xfm.allocator = allocator;
     xfm.s = mlx.mlx_default_cpu_stream_new();
@@ -2394,6 +2539,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
     var xfm: Trunk = undefined;
+    xfm.formats = .{};
     const old_features = verify_projection.single_verify_test_features;
     defer verify_projection.single_verify_test_features = old_features;
     verify_projection.single_verify_test_features = @splat(true);

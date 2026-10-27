@@ -55,6 +55,7 @@ sdk.blocks.moe.moe_affine4.env_enabled
 sdk.blocks.moe.moe_affine4.views_enabled
 plugins.qwen4_exp.ple_gpu.dispatches
 plugins.qwen4_exp.qsa.gather.qsa_nax_os_cached
+plugins.qwen4_exp.trunk.gdn_tail.devc_cached
 plugins.qwen4_exp.qsa.pooled.qsa_pool_rope_tpl_count
 plugins.qwen4_exp.qsa_decode.cfgs
 plugins.qwen4_exp.qsa_decode.env_enabled
@@ -70,6 +71,7 @@ sdk.blocks.attention.sdpa.nax_sdpa_avail_cache
 sdk.blocks.dit.w8a8.signs_cache
 sdk.blocks.gdn.decode.k1_cache
 sdk.blocks.gdn.decode.k1f_cache
+sdk.blocks.gdn.decode.k1fr_cache
 sdk.blocks.gdn.decode.k1p_cache
 sdk.blocks.gdn.decode.k1s_cache
 sdk.blocks.gdn.decode.k1tr_cache

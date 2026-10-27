@@ -5,6 +5,7 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const mlx_stream = @import("../modules/stream.zig");
+const modules = @import("../modules/call.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -277,7 +278,7 @@ pub fn initWithOptions(
             .exact => unreachable,
         }
     }
-    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling))
+    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling) and !options.mtp.?.exl3Profile())
         log.info("  [mtp-draft] greedy tail engaged: depth 0 samples, later depths take the head's argmax\n", .{});
     var mtp_cache: ?MtpCacheRef = null;
     var mtp_position_base: usize = ssm_cp_offset;
@@ -335,6 +336,10 @@ pub fn initWithOptions(
         .width_min = @intCast(PREFILL_CHUNK),
         .width_max = @intCast(PREFILL_CHUNK),
     };
+
+    // A qwen4 trunk reads the prompt's PLE rows ahead of each chunk's gather, until the prefill ends on any path.
+    if (final_start > 0) if (xfm.qwen4Trunk()) |t| modules.call("qwen4_ple_prefetch_begin", .{ t, &ctx, prompt_ids });
+    defer if (xfm.qwen4Trunk()) |t| modules.call("qwen4_ple_prefetch_end", .{t});
 
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;

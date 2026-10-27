@@ -63,6 +63,7 @@ pub fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
 }
 
 pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
+    self.mtp_ev_fix.wall_ms = 0;
     if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
     if (group_planner.enabled() and self.mtp_planner_width != null) return;
     // An interval spanning a speculative round is neither arm's number.
@@ -73,6 +74,8 @@ pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool
     // ends warmup was still the legacy controller's (a w2 sample there
     // anchored the table at 2 on the M4 base 9B).
     const ev_planned = self.mtp_ev_rounds > MTP_EV_WARMUP_ROUNDS;
+    // A running clock makes `wall` a real inter-round interval (a fresh one returns the round's own stopwatch).
+    const clocked = self.mtp_regime_clock != null;
     const wall = if (post_warmup) self.mtpRegimeWallMs(round_ms) else round_ms;
     const tok: f32 = @floatFromInt(tokens);
     if (post_warmup and self.spec_cost_solo and !width_trial) mtpRegimeObserve(&self.mtp_regime, two_chunk, m_lo, wall, tok);
@@ -86,6 +89,8 @@ pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool
     // as better than the 5 -> 6 two-chunk it was measured FROM (M4 Max
     // 27B @16k, -4.5%). The shape question stays the regime gate's.
     const shape_changed = self.spec_round_prev_two_chunk != two_chunk or self.spec_round_prev_two_chunk2 != two_chunk;
+    // The EV fix reads this round's wall as a boundary sample (`mtpEvFixObserve`, after this).
+    if (post_warmup and clocked and !shape_changed) self.mtp_ev_fix.wall_ms = wall;
     self.spec_round_prev_two_chunk2 = self.spec_round_prev_two_chunk;
     self.spec_round_prev_two_chunk = two_chunk;
     // The realized price of speculation for this request (every non-trial round, extension

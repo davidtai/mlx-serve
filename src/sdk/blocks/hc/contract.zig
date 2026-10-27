@@ -22,14 +22,14 @@ const Shape = spec.Shape;
 const U = host.U;
 
 /// Flash Next's hyper-connection geometry.
-const HC = 4;
-const HID = 2560;
-const K = HC * HID;
-const R = 320;
-const EPS: f32 = 1e-6;
+pub const HC = 4;
+pub const HID = 2560;
+pub const K = HC * HID;
+pub const R = 320;
+pub const EPS: f32 = 1e-6;
 
 /// Threadgroup bytes: `partial[32]` + `inv` (f32).
-const norm_launch: metal.Launch = .{
+pub const norm_launch: metal.Launch = .{
     .name = "msv_hc_prefill_norm",
     .inputs = &.{ "x", "w", "eps", "wo", "wi" },
     .outputs = &.{ "normed", "stream" },
@@ -39,7 +39,7 @@ const norm_launch: metal.Launch = .{
     .m2 = 1024,
 };
 
-const mix_launch: metal.Launch = .{
+pub const mix_launch: metal.Launch = .{
     .name = "msv_hc_prefill_mix",
     .inputs = &.{ "up", "normed", "sigtab", "rows" },
     .outputs = &.{"out"},
@@ -50,7 +50,7 @@ const mix_launch: metal.Launch = .{
 };
 
 /// Threadgroup bytes: `xs[H]` (bf16), `npart[8]`, `tgi[8 * HC]` (f32).
-fn ndLaunch(comptime m: u32) metal.Launch {
+pub fn ndLaunch(comptime m: u32) metal.Launch {
     return .{
         .name = "mlxserve_hc_read_nd",
         .inputs = &.{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" },
@@ -64,7 +64,7 @@ fn ndLaunch(comptime m: u32) metal.Launch {
 }
 
 /// Threadgroup bytes: `acts[R]` (bf16).
-fn u2Launch(comptime m: u32) metal.Launch {
+pub fn u2Launch(comptime m: u32) metal.Launch {
     return .{
         .name = "mlxserve_hc_read_u2",
         .inputs = &.{ "xn_in", "parts_in", "uw_q", "uw_s", "uw_b" },
@@ -78,7 +78,7 @@ fn u2Launch(comptime m: u32) metal.Launch {
 }
 
 /// Threadgroup bytes: `act_tg[ROWS * R]` (f32) at 16 rows.
-fn u2vLaunch(comptime m: u32) metal.Launch {
+pub fn u2vLaunch(comptime m: u32) metal.Launch {
     return .{
         .name = "mlxserve_hc_read_u2v",
         .inputs = &.{ "xn_in", "parts_in", "uw_q", "uw_s", "uw_b" },
@@ -95,7 +95,7 @@ fn u2vLaunch(comptime m: u32) metal.Launch {
 
 /// A shape's rows are the streams, `n` the tokens (one batch row), `k` the hidden width: the gates' small shapes
 /// vary the streams (the kernels take 1..8), since the wrappers take more than 16 tokens.
-const PrefillNorm = struct {
+pub const PrefillNorm = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     wr: bool,
@@ -107,7 +107,7 @@ const PrefillNorm = struct {
     wi: []f64 = &.{},
     args: [5]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator, wr: bool) PrefillNorm {
+    pub fn init(a: std.mem.Allocator, wr: bool) PrefillNorm {
         return .{ .rig = metal.Rig.init(a), .launch = &norm_launch, .wr = wr, .arena = .init(a) };
     }
 
@@ -178,7 +178,7 @@ const PrefillNorm = struct {
     }
 
     /// The stream after the pending write (exact chain values), row `row` (token * streams + stream).
-    fn streamAt(self: *const PrefillNorm, row: usize, i: usize) f64 {
+    pub fn streamAt(self: *const PrefillNorm, row: usize, i: usize) f64 {
         const h = self.shape.k;
         const x = self.x[row * h + i];
         if (!self.wr) return x;
@@ -187,7 +187,7 @@ const PrefillNorm = struct {
         return host.rt(.bfloat16, x + delta);
     }
 
-    fn outputsIn(self: *const PrefillNorm, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+    pub fn outputsIn(self: *const PrefillNorm, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
         const h = self.shape.k;
         const rows = self.shape.n * self.shape.rows;
         const v = try self.rig.a.alloc(f64, h);
@@ -231,7 +231,7 @@ const PrefillNorm = struct {
         return if (self.wr) self.rig.bytesOf(&.{ normed, stream }) else self.rig.bytesOf(&.{normed});
     }
 
-    fn wrapper(self: *PrefillNorm) ![]const u8 {
+    pub fn wrapper(self: *PrefillNorm) ![]const u8 {
         const x = self.args;
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
@@ -245,7 +245,7 @@ const PrefillNorm = struct {
 
 // ── prefill mix ──
 
-const PrefillMix = struct {
+pub const PrefillMix = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     arena: std.heap.ArenaAllocator,
@@ -255,7 +255,7 @@ const PrefillMix = struct {
     tab: []f64 = &.{},
     args: [4]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator) PrefillMix {
+    pub fn init(a: std.mem.Allocator) PrefillMix {
         return .{ .rig = metal.Rig.init(a), .launch = &mix_launch, .arena = .init(a) };
     }
 
@@ -338,7 +338,7 @@ const PrefillMix = struct {
         return self.rig.bytesOf(&.{try g.mean(prod, 2, false)});
     }
 
-    fn wrapper(self: *PrefillMix) ![]const u8 {
+    pub fn wrapper(self: *PrefillMix) ![]const u8 {
         const out = (try hp.mix(self.rig.stream(), self.args[0], self.args[1], 1, @intCast(self.shape.n))) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(out);
         return self.rig.bytesOf(&.{out});
@@ -348,12 +348,12 @@ const PrefillMix = struct {
 // ── decode: norm + down ──
 
 /// Which outputs an `nd` registration reads: the normed and written streams (bf16), or the down/inject partials (f32).
-const NdPart = enum { streams, partials };
+pub const NdPart = enum { streams, partials };
 
-const Cfg = struct { bits: u32, gs: usize = 64, inj: bool = true, wr: bool = true };
+pub const Cfg = struct { bits: u32, gs: usize = 64, inj: bool = true, wr: bool = true };
 
 /// A shape's rows are the decode rows; the geometry is Flash Next's.
-const Nd = struct {
+pub const Nd = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     cfg: Cfg,
@@ -368,7 +368,7 @@ const Nd = struct {
     dw: host.Quant = undefined,
     args: [9]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg, part: NdPart) Nd {
+    pub fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg, part: NdPart) Nd {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .cfg = cfg, .part = part, .arena = .init(a) };
     }
 
@@ -461,7 +461,7 @@ const Nd = struct {
         };
     }
 
-    fn outputsIn(self: *const Nd, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+    pub fn outputsIn(self: *const Nd, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
         const c = self.cfg;
         const a = self.rig.a;
         const xv = try a.alloc(f64, HID);
@@ -530,7 +530,7 @@ const Nd = struct {
         };
     }
 
-    fn biasAt(self: *const Nd, n: usize, k: usize) f64 {
+    pub fn biasAt(self: *const Nd, n: usize, k: usize) f64 {
         return if (self.cfg.bits == 16) 0 else self.dw.biases[n * (K / self.cfg.gs) + k / self.cfg.gs];
     }
 
@@ -546,7 +546,7 @@ const Nd = struct {
 /// Integer weights for gate 4: scale 1, bias minus half the code range, so a value is code - mid; with `mirror`, the
 /// first half of each row is positive (its partial sums grow past fp16's integers), the second negates it, and the
 /// first value is 1.
-fn integerWeights(a: std.mem.Allocator, rng: std.Random, q: *host.Quant, rows: usize, cols: usize, bits: u32, gs: usize, mirror: bool) !void {
+pub fn integerWeights(a: std.mem.Allocator, rng: std.Random, q: *host.Quant, rows: usize, cols: usize, bits: u32, gs: usize, mirror: bool) !void {
     if (bits == 16) {
         const per_row = cols / 2;
         @memset(q.words, 0);
@@ -572,7 +572,7 @@ fn integerWeights(a: std.mem.Allocator, rng: std.Random, q: *host.Quant, rows: u
 
 // ── decode: up + mix ──
 
-const Up = struct {
+pub const Up = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     cfg: Cfg,
@@ -584,7 +584,7 @@ const Up = struct {
     uw: host.Quant = undefined,
     args: [5]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg, vec: bool) Up {
+    pub fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg, vec: bool) Up {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .cfg = cfg, .vec = vec, .arena = .init(a) };
     }
 
@@ -678,7 +678,7 @@ const Up = struct {
         return self.shape.rows * (HID + if (self.cfg.inj) @as(usize, HC) else 0);
     }
 
-    fn outputsIn(self: *const Up, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+    pub fn outputsIn(self: *const Up, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
         const a = self.rig.a;
         const pr = R + HC;
         const act = try a.alloc(Val, R);
@@ -743,7 +743,7 @@ const Up = struct {
 };
 
 /// v = T(sum of the streams' partials), then silu (T(v * T(sigmoid(v)))) or the sigmoid alone.
-fn activation(p: [HC]f64, acc: ?spec.Accum, order: spec.Order, silu: bool) Val {
+pub fn activation(p: [HC]f64, acc: ?spec.Accum, order: spec.Order, silu: bool) Val {
     var m: f64 = 0;
     for (p) |x| m += @abs(x);
     const sum = if (acc) |ac| spec.sumIn(ac, order, &p) else host.sum(&p);
@@ -754,19 +754,19 @@ fn activation(p: [HC]f64, acc: ?spec.Accum, order: spec.Order, silu: bool) Val {
 }
 
 /// The streams' partials: four per thread sequentially, the simdgroup tree, the partials' tree.
-fn prefillDepth(_: Shape) usize {
+pub fn prefillDepth(_: Shape) usize {
     return 4 + 5 + 5;
 }
 
-fn mixDepth(shape: Shape) usize {
+pub fn mixDepth(shape: Shape) usize {
     return shape.rows;
 }
 
-const prefill_shapes: []const Shape = &.{ .{ .rows = HC, .n = 17, .k = HID }, .{ .rows = HC, .n = 64, .k = HID } };
-const decode_rows: []const Shape = &.{ .{ .rows = 1, .n = R, .k = K }, .{ .rows = 4, .n = R, .k = K }, .{ .rows = 16, .n = R, .k = K } };
-const decode_one: []const Shape = &.{.{ .rows = 1, .n = R, .k = K }};
+pub const prefill_shapes: []const Shape = &.{ .{ .rows = HC, .n = 17, .k = HID }, .{ .rows = HC, .n = 64, .k = HID } };
+pub const decode_rows: []const Shape = &.{ .{ .rows = 1, .n = R, .k = K }, .{ .rows = 4, .n = R, .k = K }, .{ .rows = 16, .n = R, .k = K } };
+pub const decode_one: []const Shape = &.{.{ .rows = 1, .n = R, .k = K }};
 
-fn prefillNormSpec(comptime name: []const u8, wr: bool) spec.Spec {
+pub fn prefillNormSpec(comptime name: []const u8, wr: bool) spec.Spec {
     return .{
         .name = name,
         .accum = .f32,
@@ -781,7 +781,7 @@ fn prefillNormSpec(comptime name: []const u8, wr: bool) spec.Spec {
     };
 }
 
-fn decodeSpec(comptime name: []const u8, out: spec.Elem, served: []const Shape, sums: spec.Sums) spec.Spec {
+pub fn decodeSpec(comptime name: []const u8, out: spec.Elem, served: []const Shape, sums: spec.Sums) spec.Spec {
     return .{
         .name = name,
         .accum = .f32,
@@ -794,16 +794,16 @@ fn decodeSpec(comptime name: []const u8, out: spec.Elem, served: []const Shape, 
 }
 
 /// The norm's output: its sum of squares sits behind the rsqrt, where bf16 accumulation stays near the rounding.
-const norm_sums: spec.Sums = .{ .f16 = 100, .bf16 = 0, .why = "the squares' sum reaches the output through rsqrt" };
+pub const norm_sums: spec.Sums = .{ .f16 = 100, .bf16 = 0, .why = "the squares' sum reaches the output through rsqrt" };
 
 // M1/M2 records (`offline.zig`): nd 512 where conclusive (the 8-bit write + inject build is not); u2v 576 at 16
 // rows, the other row counts inconclusive; u2 inconclusive at every shape, so its record stays 1024.
-const nd8 = ndLaunch(512);
-const nd4 = ndLaunch(512);
-const nd16 = ndLaunch(512);
-const up4 = u2Launch(1024);
-const up16 = u2Launch(1024);
-const upv8 = u2vLaunch(576);
+pub const nd8 = ndLaunch(512);
+pub const nd4 = ndLaunch(512);
+pub const nd16 = ndLaunch(512);
+pub const up4 = u2Launch(1024);
+pub const up16 = u2Launch(1024);
+pub const upv8 = u2vLaunch(576);
 
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
@@ -829,12 +829,19 @@ pub fn register(set: *kc.Set) !void {
     try set.add(Up, .init(a, &upv8, .{ .bits = 8 }, true), decodeSpec("hc_read_u2v 8-bit", .bf16, decode_rows, up_sums), null);
     try set.add(Up, .init(a, &up4, .{ .bits = 4 }, false), decodeSpec("hc_read_u2 4-bit", .bf16, decode_rows, up_sums), null);
     try set.add(Up, .init(a, &up16, .{ .bits = 16, .inj = false }, false), decodeSpec("hc_read_u2 bf16 weights (no inject)", .bf16, decode_one, up_sums), null);
+    try @import("contract_decode.zig").register(set);
+    try @import("contract_prefill.zig").register(set);
 }
 
 // ── tests ──
 
+test {
+    _ = @import("contract_decode.zig");
+    _ = @import("contract_prefill.zig");
+}
+
 /// The decode registrations' two launches chained (norm + down, then up + mix) equal the shipped read's outputs.
-fn decodeDrift(a: std.mem.Allocator, nd: *Nd, up: *Up, rows: usize) !void {
+pub fn decodeDrift(a: std.mem.Allocator, nd: *Nd, up: *Up, rows: usize) !void {
     const c = nd.cfg;
     try std.testing.expect(try nd.prepare(.{ .rows = rows, .n = R, .k = K }, .random, 11));
     var geo = nd.geometry(nd.shape).?;

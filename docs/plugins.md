@@ -38,7 +38,8 @@ Step-by-step guides: [model](plugin-model.md), [media](plugin-media.md), [quant]
   and copies it into `~/.mlx-serve/plugins/` with a receipt (name, kind, version, sha256, signer, model types).
 - **Loading** (`src/host/plugins/loader.zig`): at startup, when `plugins.json` says `"enabled": true`. Each dylib must
   match its receipt's hash, is negotiated (`src/abi/dylib.zig`: a plugin built against another MLX is refused) and
-  joins the claims (a same-name plugin replaces a built-in; higher rank wins; a built-in wins a tie). A refusal names
+  joins the claims (a same-name plugin replaces a built-in; higher rank wins; a built-in wins a tie); a quant plugin
+  joins the quant-block claims by the same rule (`src/sdk/quant/formats.zig`). A refusal names
   the file and the reason, and the server serves on without it. A dylib is never unloaded; `--no-plugins` loads none.
   `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`; the app's Settings ▸ Server lists the
   receipts with a switch each (writes `plugins.json`). macOS only, never in the Mac App Store build.
@@ -109,8 +110,9 @@ and `io_util` through `mlx_host`; `src/sdk/quant/exl3/format.zig` is its quant t
 - **Parse.** `parseExpertQuant(quantization_config.expert_quant)` gives `ModelConfig.exl3` (rate, codebook, window),
   then `admitTopK`.
 - **Load.** `checkExl3Bank` asks `trellisAdmitted` for each bank's geometry and refuses by name.
-- **Forward.** `exl3.routed(s, x, bank, inds, scores, spec, opts)` replaces the routed-expert matmul in qwen4_exp's
-  MoE layer.
+- **Forward.** qwen4_exp loads each MoE layer's banks through the claimant of `expert_quant` (`load_bank`) and runs
+  them as one SwiGLU (`swiglu`; `plugins/qwen4_exp/trunk/formats.zig`). An installed EXL3 quant plugin that outranks
+  this table takes them; a pack's `trunk_quant` linears run through that block's claimant (`load_tensor`, `matmul`).
 - **Free from the host.** The whole qwen4_exp trunk, MTP and batching.
 
 mlx-stream reads the same format with its own decoder and kernels, pinned to DeepSeek-V4.1's shapes

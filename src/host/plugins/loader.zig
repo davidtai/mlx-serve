@@ -10,6 +10,8 @@ const common = @import("../../abi/common.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
 const sdk_plugin = @import("../../sdk/plugin.zig");
 const log = @import("../../sdk/util/log.zig");
+const quant_abi = @import("../../abi/quant.zig");
+const outside_quant = @import("../../sdk/quant/outside.zig");
 const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;
@@ -278,9 +280,11 @@ pub fn homePath(a: Allocator, rel: []const u8) ![]u8 {
     return std.fs.path.join(a, &.{ home, ".mlx-serve", rel });
 }
 
-/// At startup: loads the installed plugins when `plugins.json` switches them on and `--no-plugins` was not given,
-/// logging each plugin loaded or refused and each built-in an outside plugin replaces.
+/// At startup: publishes the process's `Host` table, which every model load hands its plugin, then loads the installed
+/// plugins when `plugins.json` switches them on and `--no-plugins` was not given, logging each plugin loaded or refused
+/// and each built-in an outside plugin replaces.
 pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entry, cli_off: bool, host_mlx: []const u8) void {
+    _ = @import("../plugin_host_impl.zig").processHost();
     if (!supported) return;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -302,6 +306,24 @@ pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entr
         log.info("[plugins] loaded {s} ({t}, sha256 {s}) from {s}\n", .{ p.name(), p.manifest.kind, p.sha256[0..12], p.path });
         for (builtins) |e| if (std.mem.eql(u8, e.plugin.name, p.name())) log.info("[plugins] {s} replaces the built-in plugin of that name\n", .{p.name()});
     }
+    joinQuantClaims(a, st.set.entries.items);
+}
+
+/// Hands the loaded quant plugins' tables to the quant-block claimant (`sdk/quant/formats.zig` weighs them against the
+/// built-in formats); the list lives for the process, as the dylibs do.
+fn joinQuantClaims(a: Allocator, of: []const sdk_plugin.Entry) void {
+    var list: std.ArrayList(*const quant_abi.QuantTable) = .empty;
+    for (of) |e| if (e.quant) |t| list.append(a, t) catch {
+        list.deinit(a);
+        return;
+    };
+    if (list.items.len == 0) return;
+    const tables = list.toOwnedSlice(a) catch {
+        list.deinit(a);
+        return;
+    };
+    outside_quant.tables.get().list = tables;
+    for (tables) |t| log.info("[plugins] {s} joins the quant-block claims\n", .{t.name.slice()});
 }
 
 // ── tests ──
@@ -327,6 +349,19 @@ test {
     _ = @import("kit_test.zig");
     _ = dylib_abi;
     _ = @import("../../sdk/dylib.zig");
+}
+
+test "loader: the loaded quant plugins join the quant-block claims, the others do not" {
+    const t: quant_abi.QuantTable = .{ .name = .of("fmt_x"), .claims = undefined, .validate = undefined, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
+    const saved = outside_quant.tables.get().list;
+    defer outside_quant.tables.get().list = saved;
+    joinQuantClaims(testing.allocator, &.{.{ .plugin = .{ .name = "m", .kind = .model } }});
+    try testing.expectEqual(saved.len, outside_quant.tables.get().list.len);
+    joinQuantClaims(testing.allocator, &.{ .{ .plugin = .{ .name = "m", .kind = .model } }, .{ .plugin = .{ .name = "fmt_x", .kind = .quant }, .quant = &t } });
+    const got = outside_quant.tables.get().list;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(&t, got[0]);
 }
 
 fn fakeModel(comptime name: []const u8, comptime types: []const []const u8) model_abi.ModelTable {

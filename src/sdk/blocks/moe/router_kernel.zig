@@ -55,18 +55,28 @@ const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 /// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it
 /// replaces is two dependent launches ahead of the router). It needs at least two simdgroups.
 /// `logit_bias` (kolibri1) selects on `logits + bias` and weights by `sigmoid(logits)`.
-pub const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4 };
+/// `softmax_gate_gemv` is `softmax_gate` at 2..4 rows with the logit summed exactly as MLX's gemv sums it (simdgroups
+/// 1..8 of a 288-thread group play the gemv's 0..7): the bytes of the shared gate's matmul, which its consumer then drops.
+pub const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4, softmax_gate_gemv = 5 };
+const n_modes = @typeInfo(RouterMode).@"enum".field_names.len;
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
 /// 16 KiB of the 32 KiB budget.
-const ROUTER_MAX_EXPERTS: c_int = 2048;
+pub const ROUTER_MAX_EXPERTS: c_int = 2048;
+
+/// Where `softmax_gate_gemv`'s order is MLX's: bf16 operands and output, 2..4 rows (one row runs MLX's dot kernel), the
+/// gate width K > 64 and K >= 16 rows (matmul's non-transposed gemv takes BM 1 BN 8 there).
+pub fn gateGemvShape(rows: c_int, k: c_int, xd: mlx.mlx_dtype, wd: mlx.mlx_dtype, od: mlx.mlx_dtype) bool {
+    return xd == .bfloat16 and wd == .bfloat16 and od == .bfloat16 and rows >= 2 and rows <= 4 and k > 64 and k >= 16 * rows;
+}
 
 fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     const logit_sel = mode == .logit_bias;
     const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or logit_sel;
     const grouped = mode == .sigmoid_bias_grouped;
-    const gate = mode == .softmax_gate;
+    const gate_gemv = mode == .softmax_gate_gemv;
+    const gate = mode == .softmax_gate or gate_gemv;
     return std.fmt.comptimePrint(kernelSource("kernels/moe/router.fmt.metal"), .{
         if (grouped)
             "threadgroup float rw[NE];\nthreadgroup float gs[NG];"
@@ -94,7 +104,9 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             kernelSource("kernels/moe/router_sigmoid_score.metal") ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             "  rk[e] = float(logits[rbase + e]);",
-        if (gate)
+        if (gate_gemv)
+            "if (tid >= 32u && tid < 32u * 9u)\n" ++ kernelSource("kernels/moe/router_gate_gemv.metal")
+        else if (gate)
             // Simdgroups 1.. take the shared-expert gate's dot while simdgroup 0 selects; their partials
             // meet after the selection, so the dot never waits on it nor the selection on the dot.
             kernelSource("kernels/moe/router_gate_dot.metal")
@@ -143,16 +155,19 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // `sum` over the K probabilities lands back in the output dtype
             // before the divide, exactly as mlx_sum_axis + mlx_divide do.
             "  w = w / float(TOUT(tot));",
-        if (gate)
+        if (gate_gemv)
+            // the gemv's simdgroup 0 lane 0 folds the 8 partials in order, then the bf16 store
+            "threadgroup_barrier(mem_flags::mem_threadgroup);\nif (tid == 0) {\n" ++ kernelSource("kernels/moe/router_gate_sum.metal") ++ "}"
+        else if (gate)
             kernelSource("kernels/moe/router_gate_store.metal")
         else
             "",
     });
 }
 
-pub const ROUTER_SOURCES = [5][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias) };
-const ROUTER_NAMES = [5][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate", "mlxserve_moe_router_logit_bias" };
-var router_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
+pub const ROUTER_SOURCES = [n_modes][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias), moeRouterSource(.softmax_gate_gemv) };
+const ROUTER_NAMES = [n_modes][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate", "mlxserve_moe_router_logit_bias", "mlxserve_moe_router_softmax_gate_gemv" };
+var router_kernels: [n_modes]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const mi: usize = @backingInt(mode);
@@ -162,12 +177,12 @@ fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const sigmoid_inputs = [_][*:0]const u8{ "logits", "bias", "scale" };
     const input_names: []const [*:0]const u8 = switch (mode) {
         .softmax => &softmax_inputs,
-        .softmax_gate => &gate_inputs,
+        .softmax_gate, .softmax_gate_gemv => &gate_inputs,
         .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
     const plain_outputs = [_][*:0]const u8{ "inds", "scores" };
     const gate_outputs = [_][*:0]const u8{ "inds", "scores", "glogit" };
-    const output_names: []const [*:0]const u8 = if (mode == .softmax_gate) &gate_outputs else &plain_outputs;
+    const output_names: []const [*:0]const u8 = if (mode == .softmax_gate or mode == .softmax_gate_gemv) &gate_outputs else &plain_outputs;
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(output_names.ptr, output_names.len);
@@ -230,7 +245,7 @@ const RouterCfgSlot = struct {
     key: RouterCfgKey = std.mem.zeroes(RouterCfgKey),
     scale_arr: mlx.mlx_array = .{ .ctx = null },
 };
-var router_cfg_cache: [5]RouterCfgSlot = .{ .{}, .{}, .{}, .{}, .{} };
+var router_cfg_cache: [n_modes]RouterCfgSlot = @splat(.{});
 
 pub var moe_router_fused_override: ?bool = null;
 var moe_router_engaged: bool = false;
@@ -293,9 +308,12 @@ pub fn moeRouterTopK(
         const wd = mlx.mlx_array_dtype(gt.w);
         if ((xd != .bfloat16 and xd != .float16) or (wd != .bfloat16 and wd != .float16)) return null;
         gate_k = @intCast(wn);
+        if (mode == .softmax_gate_gemv and !gateGemvShape(rows, gate_k, xd, wd, out_dtype)) return null;
     }
+    if (mode == .softmax_gate_gemv and gate == null) return null;
 
-    const tg = moeRouterThreadGroup(num_experts);
+    // the gemv mode's logit takes simdgroups 1..8 beside the selection's 0, whatever the expert count
+    const tg: c_int = if (mode == .softmax_gate_gemv) 32 * 9 else moeRouterThreadGroup(num_experts);
     // The gate's dot runs on the simdgroups that sit out the selection: with one there is none to run it.
     if (mode == .softmax_gate and tg < 64) return moeRouterTopK(s, logits, bias, k, .softmax, route_norm, route_scale, out_dtype, n_group, topk_group, null);
 
@@ -325,7 +343,7 @@ pub fn moeRouterTopK(
         out_shape[lsh.len - 1] = k;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, .uint32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, out_dtype));
-        if (mode == .softmax_gate) {
+        if (mode == .softmax_gate or mode == .softmax_gate_gemv) {
             // One logit per router row.
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{rows}, 1, out_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GK", gate_k));
@@ -351,7 +369,7 @@ pub fn moeRouterTopK(
     const sigmoid_inputs = [_]mlx.mlx_array{ logits, bias, slot.scale_arr };
     const inputs_arr: []const mlx.mlx_array = switch (mode) {
         .softmax => &softmax_inputs,
-        .softmax_gate => &gate_inputs,
+        .softmax_gate, .softmax_gate_gemv => &gate_inputs,
         .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
@@ -361,7 +379,7 @@ pub fn moeRouterTopK(
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != (if (mode == .softmax_gate) @as(usize, 3) else 2)) return error.MetalKernelBadOutputCount;
+    if (mlx.mlx_vector_array_size(outputs_vec) != (if (mode == .softmax_gate or mode == .softmax_gate_gemv) @as(usize, 3) else 2)) return error.MetalKernelBadOutputCount;
 
     var inds = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(inds);
@@ -370,7 +388,7 @@ pub fn moeRouterTopK(
     errdefer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_vector_array_get(&scores, outputs_vec, 1));
     var gate_logit = mlx.mlx_array{ .ctx = null };
-    if (mode == .softmax_gate) {
+    if (mode == .softmax_gate or mode == .softmax_gate_gemv) {
         gate_logit = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(&gate_logit, outputs_vec, 2));
     }
