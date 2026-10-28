@@ -36,4 +36,6 @@ comptime {
     _ = @import("engines/mlx/ssm/group.zig").ssmGroup_shared;
     _ = @import("engines/mlx/modules/stream_glue.zig").glueState_shared;
     _ = @import("mlx/ffi.zig").latch_shared;
+    _ = @import("mlx/ffi.zig").fault_chunk;
+    _ = @import("mlx/ffi.zig").fault_step;
 }
