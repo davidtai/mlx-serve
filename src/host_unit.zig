@@ -15,6 +15,9 @@ pub const exl3 = main_mod.exl3;
 pub const dsa_nax = main_mod.dsa_nax;
 pub const fp8_block128_gemv = main_mod.fp8_block128_gemv;
 pub const log = main_mod.log;
+/// What turboexl3's facades read through `mlx_host` (sdk/quant/exl3/turboexl3_{sdk,host}.zig).
+pub const quant_abi = main_mod.quant_abi;
+pub const kit = main_mod.kit;
 pub const plugin_profile = main_mod.plugin_profile;
 
 comptime {

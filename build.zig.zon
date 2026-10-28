@@ -8,5 +8,12 @@
         "build.zig.zon",
         "src",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels, the quant table and the plugin-kit launcher that qwen4_exp
+        // serves a full EXL3 pack with (build/libs.zig `addTurboExl3`).
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/9267f8e347788be43e8c374e635724a3c8a7b446.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b_aqbgAGnywI8hsYdVbRUdxtrID1EyQEfbVp-4Lz",
+        },
+    },
 }

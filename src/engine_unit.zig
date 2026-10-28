@@ -18,4 +18,7 @@ pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
 pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
 pub const log = @import("sdk/util/log.zig");
+/// What turboexl3's facades read through `mlx_host` (sdk/quant/exl3/turboexl3_{sdk,host}.zig).
+pub const quant_abi = @import("abi/quant.zig");
+pub const kit = @import("kit.zig");
 pub const plugin_profile: bool = @import("build_options").plugin_profile;

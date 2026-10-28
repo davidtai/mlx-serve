@@ -64,6 +64,7 @@ fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Sl
         },
     });
     _ = libs.addExl3Module(b, mod, ios_target, .ReleaseFast);
+    libs.addTurboExl3(b, mod, ios_target, .ReleaseFast);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).

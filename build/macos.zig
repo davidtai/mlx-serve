@@ -155,6 +155,7 @@ const Shared = struct {
         // dylib + headers extracted from the pinned XCFramework). See src/engines/llama/bridge.zig.
         libs.addLlamaLib(b, mod);
         _ = libs.addExl3Module(b, mod, target, optimize);
+        libs.addTurboExl3(b, mod, target, optimize);
         libs.addMlxStreamModule(b, mod, target, optimize);
 
         // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
@@ -241,18 +242,25 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
     run_step.dependOn(&run_cmd.step);
 }
 
-/// A `-Dunits` object's module rooted at `root`: the exe module's imports and include dirs, its own pair of absorbed
-/// modules (they import their host root), and no C sources (the exe links those once).
+/// A `-Dunits` object's module rooted at `root`: the exe module's imports and include dirs, its own absorbed modules
+/// and turboexl3's (they import their host root), and no C sources (the exe links those once).
 fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, root: []const u8) *std.Build.Module {
     const b = g.b;
     const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true });
     var it = g.exe_mod.import_table.iterator();
-    while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3") and !std.mem.eql(u8, e.key_ptr.*, "mlx_stream")) m.addImport(e.key_ptr.*, e.value_ptr.*);
+    while (it.next()) |e| if (!rootBound(e.key_ptr.*)) m.addImport(e.key_ptr.*, e.value_ptr.*);
     m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
     libs.addMlxLib(b, m);
     _ = libs.addExl3Module(b, m, g.target, g.optimize);
+    libs.addTurboExl3(b, m, g.target, g.optimize);
     m.addImport("mlx_stream", libs.mlxStreamPkg(b, m, "src/mlx_stream.zig", g.target, g.optimize, false, false));
     return m;
+}
+
+/// The exe module's imports that import its root (`mlx_host`): a unit makes its own over its own root.
+fn rootBound(name: []const u8) bool {
+    for ([_][]const u8{ "sushi_exl3", "mlx_stream", "turboexl3", "turboexl3_table" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
 }
 
 pub const Tests = struct {

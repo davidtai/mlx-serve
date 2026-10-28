@@ -232,6 +232,56 @@ pub fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.R
     return exl3;
 }
 
+/// turboexl3 (build.zig.zon, pinned by URL and hash): its library, its plugin-kit launcher and its quant table, which
+/// qwen4_exp's trunk formats serve a full EXL3 pack with. One instance of each per root module, as `addExl3Module` makes
+/// Sushi's: they reach mlx-serve through two facades of its own (`src/sdk/quant/exl3/turboexl3_{sdk,host}.zig`), which
+/// import the root as `mlx_host`, so no file is in two modules. The root imports `mlx_steel_sources` first.
+pub fn addTurboExl3(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const dep = b.dependency("turboexl3", .{ .target = target, .optimize = optimize });
+    const steel = host.import_table.get("mlx_steel_sources") orelse @panic("addTurboExl3: the root module imports mlx_steel_sources first");
+    const sdk = b.createModule(.{
+        .root_source_file = b.path("src/sdk/quant/exl3/turboexl3_sdk.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "mlx_host", .module = host }, .{ .name = "mlx_steel_sources", .module = steel } },
+    });
+    const kit_root = b.createModule(.{
+        .root_source_file = b.path("src/sdk/quant/exl3/turboexl3_host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    const kit = b.createModule(.{
+        .root_source_file = dep.path("kit/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "sdk", .module = sdk }, .{ .name = "mlx_serve", .module = kit_root } },
+    });
+    sdk.addImport("turboexl3_kit", kit);
+    const t3 = b.createModule(.{
+        .root_source_file = dep.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "sdk", .module = sdk }},
+    });
+    const table = b.createModule(.{
+        .root_source_file = dep.path("table/table.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "sdk", .module = sdk },
+            .{ .name = "mlx_serve", .module = kit_root },
+            .{ .name = "turboexl3", .module = t3 },
+            .{ .name = "turboexl3_kit", .module = kit },
+        },
+    });
+    host.addImport("turboexl3", t3);
+    host.addImport("turboexl3_table", table);
+}
+
 /// mlx-stream (absorbed from davidtai/mlx-stream): the streamed packs' archs (`src/plugins/<model>/stream/`), their
 /// EXL3 lanes (`src/sdk/quant/exl3/stream/`) and the expert streamer (`src/sdk/weights/streamed/`), one module rooted at
 /// `src/mlx_stream.zig` (`src/engines/mlx/modules/stream_glue.zig` binds it). Its contract types are its own `sdk` module;

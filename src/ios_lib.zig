@@ -49,6 +49,9 @@ const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const server_mod = @import("host/http/server.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
 pub const log = @import("sdk/util/log.zig");
+/// What turboexl3's facades read through `mlx_host` (sdk/quant/exl3/turboexl3_{sdk,host}.zig).
+pub const quant_abi = @import("abi/quant.zig");
+pub const kit = @import("kit.zig");
 
 comptime {
     // One compile unit: the MLX engine's table is exported from here.

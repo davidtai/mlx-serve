@@ -72,6 +72,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         // Jinja2 template engine — same vendored sources as the macOS graph, built
         // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
         _ = libs.addExl3Module(b, mod, target, optimize);
+        libs.addTurboExl3(b, mod, target, optimize);
         if (windows) {
             mod.addCSourceFiles(.{
                 .root = b.path("lib/jinja_cpp"),

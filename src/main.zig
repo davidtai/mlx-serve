@@ -60,6 +60,9 @@ comptime {
 }
 const launch_mod = @import("host/launch/launch.zig");
 pub const log = @import("sdk/util/log.zig");
+/// What turboexl3's facades read through `mlx_host` (sdk/quant/exl3/turboexl3_{sdk,host}.zig).
+pub const quant_abi = @import("abi/quant.zig");
+pub const kit = @import("kit.zig");
 const metrics_mod = @import("host/metrics/metrics.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("sdk/ane/offload.zig");
