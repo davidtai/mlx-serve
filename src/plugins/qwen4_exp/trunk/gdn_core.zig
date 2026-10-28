@@ -60,6 +60,15 @@ pub fn recurServes(dv: c_int, in_dtype: mlx.mlx_dtype, out_dtype: mlx.mlx_dtype)
     return recurTgBytes(128, in_size, 2) <= METAL_TG_BYTES;
 }
 
+var declined_said = false;
+
+/// The declined line, once: the first prefill chunk whose recurrence the core kernel does not serve.
+pub fn sayDeclined(why: []const u8) void {
+    if (declined_said) return;
+    declined_said = true;
+    log.info("[gdn-core] declined: {s}; the pipelined recurrence serves\n", .{why});
+}
+
 /// The engaged line, once: the first call that ran a part.
 pub fn say(seq_len: c_int, pw_ran: bool, rec: bool) void {
     if (core_said or (!pw_ran and !rec)) return;

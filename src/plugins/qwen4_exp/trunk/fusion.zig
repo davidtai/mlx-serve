@@ -313,13 +313,10 @@ pub fn idxPrepMask(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const 
 /// chain evaluates k and v without q (its q chain is built, never evaluated). Its k and v are the fused input's bytes.
 /// Without a trunk format there is no fused attention input to leave out: false, and nothing said.
 pub fn kvOnlySkips(self: *const Trunk, rows: c_int) bool {
-    if (!self.fused.kv_only or rows <= joint_rope_rows) return false;
-    const Once = struct {
-        var said_once = false;
-    };
-    if (!Once.said_once) {
-        Once.said_once = true;
-        log.info("[fused] the MTP head's history append projects k and v without the attention input's q|gate (rows={d})\n", .{rows});
+    if (self.formats.trunk == null or !self.fused.kv_only or rows <= joint_rope_rows) return false;
+    if (!kv_only_said) {
+        kv_only_said = true;
+        log.info("[fused] kv-only append engaged: the MTP head's history append projects k and v without the attention input's q|gate (rows={d})\n", .{rows});
     }
     return true;
 }
@@ -537,12 +534,9 @@ pub fn routedShared(self: *Trunk, expert_x: mlx.mlx_array, mw: *const MoeMlpWeig
         .k = self.config.num_experts_per_tok,
     };
     const y = callSharedSwiglu(self, banks, expert_x, .{ .ctx = null }, .{ .ctx = null }, &opts, true) orelse return null;
-    const Once = struct {
-        var said_once = false;
-    };
-    if (!Once.said_once) {
-        Once.said_once = true;
-        log.info("[fused] swiglu_shared: the router's top-k inside the routed prepare launch (rows={d}{s})\n", .{ rowsOf(expert_x), if (gvec != null) ", the gate's logit there too" else "" });
+    if (!routed_said) {
+        routed_said = true;
+        log.info("[fused] routed swiglu_shared engaged: the router's top-k inside the routed prepare launch (rows={d}{s})\n", .{ rowsOf(expert_x), if (gvec != null) ", the gate's logit there too" else "" });
     }
     return y;
 }
@@ -555,7 +549,12 @@ var routed_said = false;
 pub fn gateRouting(self: *Trunk, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, router_logits: mlx.mlx_array) !?MoeRouting {
     const v = gateVec(self, expert_x, mw, router_logits) orelse return null;
     const k: c_int = @intCast(self.config.num_experts_per_tok);
-    return router_kernel.moeRouterTopK(self.s, router_logits, .{ .ctx = null }, k, .softmax_gate_gemv, true, 1.0, mlx.mlx_array_dtype(router_logits), 0, 0, .{ .x = expert_x, .w = v });
+    const r = (try router_kernel.moeRouterTopK(self.s, router_logits, .{ .ctx = null }, k, .softmax_gate_gemv, true, 1.0, mlx.mlx_array_dtype(router_logits), 0, 0, .{ .x = expert_x, .w = v })) orelse return null;
+    if (!gate_gemv_said) {
+        gate_gemv_said = true;
+        log.info("[fused] gate-gemv routing engaged: the router kernel sums the shared gate's logit in MLX's gemv order for the fused shared expert (rows={d})\n", .{rowsOf(expert_x)});
+    }
+    return r;
 }
 
 var gate_gemv_said = false;

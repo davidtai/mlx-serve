@@ -172,6 +172,10 @@ pub fn mtpEvFixPlan(self: *Generator, plan: MtpRoundPlan, cap: u32, src: MtpCost
         .fire_ratio = r.fire,
     });
     self.mtp_ev_fix.priced +|= 1;
+    if (!ev_fix_said) {
+        ev_fix_said = true;
+        log.info("[mtp] ev-fix engaged: two-chunk plans priced at this model's chunk-A boundary (first {d}->{d}, {d:.2} ms measured)\n", .{ plan.m_lo, plan.m_hi, ms orelse 0 });
+    }
     if (gated.m_hi == gated.m_lo) {
         self.mtp_ev_fix.collapsed +|= 1;
         if (!st.logged) {

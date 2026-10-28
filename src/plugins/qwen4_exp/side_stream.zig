@@ -146,7 +146,7 @@ pub fn addGatedShared(t: *Trunk, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_ar
 
 const testing = std.testing;
 
-test "side stream: a part takes a call only on a served pack at a prefill width; the stream is made once" {
+test "side stream: a part takes a call only on an EXL3 trunk at a prefill width, per trunk; the stream is made once" {
     defer {
         SideStream.override = null;
         SideStream.min_rows_override = null;

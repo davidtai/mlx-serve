@@ -254,18 +254,30 @@ pub fn placedMask(self: *Trunk, sheet: mlx.mlx_array, p: *const Trunk.HeadPlace,
     if (!self.config.trunk_format) return null;
     if (!solo or batch != 1 or seq_len != 1 or nb <= block_topk) return null;
     if (env.onCached(&prof_mod.qwen4_debug_scores_env, .QWEN4_DEBUG_SCORES)) return null;
-    if (p.live_end.ctx == null or mlx.mlx_array_ndim(p.live_end) != 0 or mlx.mlx_array_dtype(p.live_end) != .int32) return null;
-    if (mlx.mlx_array_ndim(sheet) != 3 or mlx.mlx_array_dtype(sheet) != .float32) return null;
-    const m = (try placedRowMask(self.s, sheet, p.live_end, p.dead_end, offset, kv, nb, ratio, block_topk)) orelse return null;
+    if (p.live_end.ctx == null or mlx.mlx_array_ndim(p.live_end) != 0 or mlx.mlx_array_dtype(p.live_end) != .int32) return placedDeclined("the row's live end is not a 0-d int32");
+    if (mlx.mlx_array_ndim(sheet) != 3 or mlx.mlx_array_dtype(sheet) != .float32) return placedDeclined("the score sheet is not an f32 [1, 1, nb] row");
+    if (!mlx.streamIsGpu(self.s)) return placedDeclined("not a Metal stream");
+    const m = (try placedRowMask(self.s, sheet, p.live_end, p.dead_end, offset, kv, nb, ratio, block_topk)) orelse return placedDeclined("the bounded select declined the row");
     self.fused.place_vis = true;
     const Once = struct {
         var logged = false;
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[qsa] a placed draft row's bounded select and its key visibility in one launch (kv={d} top-{d})\n", .{ kv, block_topk });
+        log.info("[qsa] placed-row visibility engaged: a placed draft row's bounded select and its key visibility in one launch (kv={d} top-{d})\n", .{ kv, block_topk });
     }
     return m;
+}
+
+var placed_declined_said = false;
+
+/// The placed row's mask's first decline, said once. Null: the chain.
+fn placedDeclined(why: []const u8) ?mlx.mlx_array {
+    if (!placed_declined_said) {
+        placed_declined_said = true;
+        log.info("[qsa] placed-row visibility declined: {s}; the chain and headPlaceVisibility run\n", .{why});
+    }
+    return null;
 }
 
 // ── the ring rebuild ──
@@ -360,7 +372,7 @@ pub fn ringRebuild(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, he
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[qsa] the key ring's concat and owned copy in one launch (held={d} add={d})\n", .{ held, add });
+        log.info("[qsa] key-ring concat engaged: the ring's concat and owned copy in one launch (held={d} add={d})\n", .{ held, add });
     }
     return true;
 }

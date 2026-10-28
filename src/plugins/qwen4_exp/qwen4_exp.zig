@@ -779,10 +779,13 @@ pub const NgramTable = struct {
     /// Ends any open session first. A trellis table on the pooled gather only, and a prompt long enough to hide behind.
     pub fn prefetchBegin(self: *NgramTable, hash: *const NgramHash, prev: []const u32, ids: []const u32, base: u64) void {
         self.prefetchEnd();
-        if (self.trellis_k == 0 or self.fd < 0 or self.pool == null or plePrefillPrefetchMode() == .off) return;
+        if (plePrefillPrefetchMode() == .off) return;
+        if (self.trellis_k == 0) return aheadDeclined("not a trellis table");
+        if (self.fd < 0) return aheadDeclined("an embedded table (its rows sit in the model's shards)");
+        if (self.pool == null) return aheadDeclined("no reader pool");
         if (ids.len < AHEAD_MIN_TOKENS or hash.n_heads == 0 or prev.len != hash.ngram_size - 1) return;
         const nb: usize = @as(usize, self.wcols) * 2;
-        if (nb == 0 or nb > PrefetchPool.ROW_BUF) return;
+        if (nb == 0 or nb > PrefetchPool.ROW_BUF) return aheadDeclined("a trellis row wider than a reader's buffer");
         const a = self.ahead orelse blk: {
             const made = Ahead.create() catch |err| {
                 if (!ahead_failed_said.swap(true, .monotonic)) log.warn("[qwen4] PLE prefetch: no reader threads ({s}); the gathers read their own rows\n", .{@errorName(err)});
@@ -795,7 +798,12 @@ pub const NgramTable = struct {
             if (!ahead_failed_said.swap(true, .monotonic)) log.warn("[qwen4] PLE prefetch: no session ({s}); the gathers read their own rows\n", .{@errorName(err)});
             return;
         };
-        if (!ahead_said.swap(true, .monotonic)) log.info("[qwen4] PLE prefetch: {d} readers stage each prefill's rows ahead of its gathers\n", .{a.n_threads});
+        if (!ahead_said.swap(true, .monotonic)) log.info("[qwen4] PLE prefetch engaged: {d} readers stage each prefill's rows ahead of its gathers\n", .{a.n_threads});
+    }
+
+    /// The prefetch's first decline for a reason the table fixes, said once: each gather reads its own rows.
+    fn aheadDeclined(why: []const u8) void {
+        if (!ahead_declined_said.swap(true, .monotonic)) log.info("[qwen4] PLE prefetch declined: {s}; each gather reads its own rows\n", .{why});
     }
 
     /// Ends the open prefetch session, if any; each reader finishes its row in flight. The prefill calls it on every exit.
@@ -950,7 +958,7 @@ const PrefetchPool = struct {
     fn runTrellis(self: *PrefetchPool, table: *const NgramTable, rows: []const i64, out: []f32) void {
         if (rows.len >= PREFILL_SAY_MIN_ROWS and !self.trellis_said) {
             self.trellis_said = true;
-            log.info("[qwen4] PLE trellis gather: decoded on {d} workers ({d} rows)\n", .{ N, rows.len });
+            log.info("[qwen4] PLE trellis gather engaged: decoded on {d} workers ({d} rows)\n", .{ N, rows.len });
         }
         self.cold_rows.store(0, .monotonic);
         _ = self.dispatch(table, rows, .trellis, out);
@@ -1082,7 +1090,7 @@ pub var cold_test_force = false;
 var cold_pread_said: [2]std.atomic.Value(bool) = .{ .init(false), .init(false) };
 fn noteColdPread(cold: u64, rows: usize, wide: bool) void {
     if (cold == 0 or cold_pread_said[@intFromBool(wide)].swap(true, .monotonic)) return;
-    log.info("[qwen4] PLE {s} gather: {d} of {d} rows not resident, read in parallel\n", .{ if (wide) "prefill" else "decode", cold, rows });
+    log.info("[qwen4] PLE {s} gather cold preads engaged: {d} of {d} rows not resident, read in parallel\n", .{ if (wide) "prefill" else "decode", cold, rows });
 }
 
 // ── The PLE prefetch: a prefill's trellis rows, read ahead of its gathers ──
@@ -1114,6 +1122,7 @@ const AHEAD_WAIT_NS: u64 = 2_000_000;
 pub var ahead_wait_override: ?u64 = null;
 var ahead_said = std.atomic.Value(bool).init(false);
 var ahead_failed_said = std.atomic.Value(bool).init(false);
+var ahead_declined_said = std.atomic.Value(bool).init(false);
 
 /// Row ids of positions [a, b) of `ids`, which follow the (ngram_size-1)-token history `prev0`: `NgramHash.rowIds` over
 /// `ids[a..b]` given the history a chunked gather holds at `a` (`advancePlePrev`). A row depends only on its token and

@@ -896,6 +896,15 @@ pub fn qwen4MtpForwardBatched(
     return buf.abandon();
 }
 
+var head_defer_said = false;
+
+/// The head's deferred hc write on an EXL3 trunk pack (`hcWriteOrDefer` left a write `pending`), said once.
+fn noteHeadDefer(deferred: bool, rows: c_int) void {
+    if (!deferred or head_defer_said) return;
+    head_defer_said = true;
+    log.info("[qwen4] MTP head deferred hc write engaged: the head's write rides its next read's first launch (rows={d})\n", .{rows});
+}
+
 pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace, front_en: ?mlx.mlx_array) !Qwen4MtpOut {
     qwen4_mtp_head_graphs += 1;
     self.fwd_gen +%= 1; // per-forward QSA scratch key
@@ -1080,7 +1089,10 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
 /// (`mtp_mod.buildRerankCoarseRows`), then dropped. Proposal side only: the verify reads the head itself.
 fn formatHeadRerank(self: *Trunk, fw: *const abi.Weight) ?mtp_mod.RerankCoarse {
     // no byte saving over a head already at the coarse width
-    if (fw.bits != 0 and mtp_mod.DRAFT_HEAD_BITS >= fw.bits) return null;
+    if (fw.bits != 0 and mtp_mod.DRAFT_HEAD_BITS >= fw.bits) {
+        log.info("[qwen4] MTP draft rerank declined: the trunk format's lm_head is {d}-bit, no wider than the {d}-bit coarse head; drafts read the full head\n", .{ fw.bits, mtp_mod.DRAFT_HEAD_BITS });
+        return null;
+    }
     const dense = formatHeadRows(self) catch |err| {
         log.warn("[qwen4] MTP draft rerank: the head's rows failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
         return null;

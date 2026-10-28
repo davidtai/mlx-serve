@@ -11,6 +11,9 @@ const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transp
 const weightTriple = @import("../../engines/mlx/load/weights.zig").weightTriple;
 const HcWeights = @import("weights.zig").HcWeights;
 const PleWeights = @import("weights.zig").PleWeights;
+const log = @import("../../sdk/util/log.zig");
+
+var hc_rows_said = false;
 
 pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !HcWeights {
     var nb: [160]u8 = undefined;

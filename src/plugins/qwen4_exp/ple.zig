@@ -222,9 +222,9 @@ fn pleFillFromSources(self: *Trunk, ctx: *ForwardCtx, src: []const mlx.mlx_array
     const n: usize = src.len;
     const nh: usize = st.hash.n_heads;
     const emb_dim: usize = st.table.dim * nh;
-    if (!pleSourcesFit(n, mlx.mlx_array_size(token_ids), pk.len, emb_dim, ctx.batch_slots == null)) return false;
-    if (!pleRangesKeepHeads(nh, st.table.n_heads)) return false;
-    for (src) |a| if (!pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a))) return false;
+    if (!pleSourcesFit(n, mlx.mlx_array_size(token_ids), pk.len, emb_dim, ctx.batch_slots == null)) return pleSourcesDeclined("the lent arrays are not this solo verify's ids, one per row");
+    if (!pleRangesKeepHeads(nh, st.table.n_heads)) return pleSourcesDeclined("the table's heads do not divide the hash's, so a token range would shift a row's head");
+    for (src) |a| if (!pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a))) return pleSourcesDeclined("a lent array is not one int32 or uint32 id");
     // anything not yet handed to the GPU goes now, in one eval: reading unscheduled ids one by one would sync per id
     {
         const v = mlx.mlx_vector_array_new_data(src.ptr, src.len);
@@ -257,14 +257,23 @@ fn pleFillFromSources(self: *Trunk, ctx: *ForwardCtx, src: []const mlx.mlx_array
     if (sched.finish()) |r| pleGatherRange(st, prev[0..ctx_len], ids, r, rows, host, pk, kv_len);
     const moved = pleAdvanceSerial(st, entry, ids, capture);
     std.debug.assert(std.mem.eql(u32, moved[0..ctx_len], prev[0..ctx_len]));
-    const Once = struct {
-        var logged = false;
-    };
-    if (!Once.logged) {
-        Once.logged = true;
-        log.info("[qwen4] verify PLE ids read off the draft arrays, each after its own event ({d} ids)\n", .{n});
+    if (!ple_src_said) {
+        ple_src_said = true;
+        log.info("[qwen4] PLE id lend engaged: verify PLE ids read off the draft arrays, each after its own event ({d} ids)\n", .{n});
     }
     return true;
+}
+
+var ple_src_said = false;
+var ple_src_declined_said = false;
+
+/// The id lend's first decline, said once: the flush reads the verify input's ids itself. False, nothing read or moved.
+fn pleSourcesDeclined(why: []const u8) bool {
+    if (!ple_src_declined_said) {
+        ple_src_declined_said = true;
+        log.info("[qwen4] PLE id lend declined: {s}; the flush reads the verify input's ids\n", .{why});
+    }
+    return false;
 }
 
 /// Whether `n` source ids can stand in for a deferred leaf: one per token id, the leaf `n` rows of `emb_dim`, and a
@@ -446,6 +455,10 @@ pub fn pleKickOff(self: *Trunk) !void {
     const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{kick}, 1);
     defer _ = mlx.mlx_vector_array_free(v);
     try mlx.check(mlx.mlx_async_eval(v));
+    if (!ple_kick_said) {
+        ple_kick_said = true;
+        log.info("[qwen4] PLE kick engaged: a prefill chunk's layers before the PLE layer start on the GPU once its ids are read, under the host gather\n", .{});
+    }
 }
 
 var ple_kick_said = false;
@@ -993,7 +1006,7 @@ fn decodePleForward(self: *Trunk, stream: mlx.mlx_array, emb: mlx.mlx_array, key
     }
     if (!ple_dec_said[0]) {
         ple_dec_said[0] = true;
-        log.info("[qwen4] PLE tail in four launches ({d} rows{s})\n", .{ batch * seq_len, if (residual) ", the residual add inside the last" else "" });
+        log.info("[qwen4] PLE decode tail engaged: four launches ({d} rows{s})\n", .{ batch * seq_len, if (residual) ", the residual add inside the last" else "" });
     }
     // silu, the conv branch's add and (residual) the call site's add in one launch
     return try pleDecTail(self.s, conv, gv, try sigmoidTableFor(self.s, .bfloat16), if (residual) stream else null);

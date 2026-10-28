@@ -116,6 +116,18 @@ pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
     );
 }
 
+var head_greedy_said = false;
+
+/// The head's own argmax policy (an EXL3 trunk pack's head): every depth drafts greedy. Said once, at the first sampled
+/// request whose drafts it makes greedy.
+fn mtpHeadGreedySampling(self: *const Generator) SamplingParams {
+    if (self.sampling.temperature > 0.01 and !head_greedy_said) {
+        head_greedy_said = true;
+        log.info("[mtp-draft] head greedy engaged: a sampled request drafts the head's argmax at every depth\n", .{});
+    }
+    return mtpDraftSamplingFor(self.sampling, true, mtpDraftTempFor(&self.xfm.config));
+}
+
 /// Full Leviathan acceptance ratio; q clamped so a sampled draft (q > 0
 /// by construction) can never divide by an underflowed zero.
 pub fn specAcceptProb(p: f32, q_draft: f32) f32 {

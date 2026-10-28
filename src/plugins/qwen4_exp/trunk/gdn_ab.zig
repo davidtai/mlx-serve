@@ -18,6 +18,7 @@ const sliceQkvPart = @import("../../../sdk/blocks/linear/fused_rows.zig").sliceQ
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 
 var engaged_logged = false;
+var declined_logged = false;
 
 /// Where a join of parts `wa` and `wb` wide puts b, and its width: b at the first multiple of 32 at or past a's end
 /// (MLX's NAX simdgroup tile is 32 columns wide), zero columns between.
@@ -87,7 +88,14 @@ pub fn joinRows(a_rows: mlx.mlx_array, b_rows: mlx.mlx_array, s: mlx.mlx_stream)
 /// the row views, and the binder's transposed views leave `owned`, so the originals are released (no weight resident
 /// twice). Nothing changes for a combined projection, a quantized part, or parts the map does not hold under their names.
 pub fn joinInPlace(la: *LinearAttnWeights, weights: *model.Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    if (la.combined_proj or la.a_w.ctx == null or la.b_w.ctx == null or la.a_s.ctx != null or la.b_s.ctx != null) return;
+    if (la.combined_proj or la.a_w.ctx == null or la.b_w.ctx == null) return;
+    if (la.a_s.ctx != null or la.b_s.ctx != null) {
+        if (!declined_logged) {
+            declined_logged = true;
+            log.info("[gdn-ab] declined at load: in_proj_a and in_proj_b are quantized; the joined GEMM reads unquantized rows, so the two matmuls serve\n", .{});
+        }
+        return;
+    }
     const names = [_][]const u8{ "linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight" };
     const old = [_]mlx.mlx_array{ la.a_w, la.b_w };
     var rows: [2]mlx.mlx_array = undefined;
