@@ -12,8 +12,8 @@ const Claim = abi.Claim;
 const Verdict = abi.Verdict;
 const Value = std.json.Value;
 
-/// The config keys a quantization block sits under.
-pub const keys = [_][]const u8{ "quantization", "quantization_config", "expert_quant" };
+/// The config keys a quantization block sits under (`trunk_quant`: the trunk's linears' format beside `expert_quant`).
+pub const keys = [_][]const u8{ "quantization", "quantization_config", "expert_quant", "trunk_quant" };
 
 pub const Block = struct { key: []const u8, json: []const u8 };
 

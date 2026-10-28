@@ -9,10 +9,13 @@
 //! affine table (`weight` U32 [R, dim*bits/32], `scales`/`biases` BF16
 //! [R, dim/gs]) written by `tests/convert_qwen38_flash_next.py`, or one
 //! merged RAW BF16 table (`weight` BF16 [R, dim], no scales/biases,
-//! `"bits":"16"`) for bit-exact PLE lookups.
+//! `"bits":"16"`) for bit-exact PLE lookups. A fully EXL3 pack names its own
+//! file (`ngram_table.file`): `exl3_ngram_trellis` rows, K-bit MUL1 trellis
+//! rings decoded on the host, plus a per-head bias the pack's shards hold.
 
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
+const env = @import("../../env.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const log = @import("../../sdk/util/log.zig");
 const ple_gpu = @import("ple_gpu.zig");
@@ -149,6 +152,12 @@ fn warmEnabled() bool {
     return warm_override orelse true;
 }
 
+/// An EXL3 trunk pack's warm, decided at load: on when its loaded weights and the table both fit in the machine's RAM
+/// (an unknown RAM size, 0, keeps it on); past that the table's pages only evict the weights'.
+pub fn exl3WarmFits(weights: u64, table: u64, ram: u64) bool {
+    return ram == 0 or weights +| table <= ram;
+}
+
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const WarmState = struct {
     /// What the background page-cache warm has read so far, and the table's total size. Published
@@ -259,6 +268,7 @@ pub const NgramTable = struct {
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
         t.pool = PrefetchPool.create() catch null;
+        if (t.trellis_k != 0 and t.pool != null) t.ahead = Ahead.create() catch null;
         return t;
     }
 
@@ -305,6 +315,7 @@ pub const NgramTable = struct {
         const meta_v = obj.get("__metadata__") orelse return error.NgramTableHeader;
         if (meta_v != .object) return error.NgramTableHeader;
         const meta = meta_v.object;
+        if (meta.get("format")) |f| if (f == .string and std.mem.eql(u8, f.string, "exl3_ngram_trellis")) return parseTrellis(map, obj, meta, data_off);
         if (meta.get("format")) |f| {
             if (f != .string or !std.mem.eql(u8, f.string, "mlx-serve-ngram")) return error.NgramTableHeader;
         } else if (!stamp_warned) {
@@ -364,7 +375,139 @@ pub const NgramTable = struct {
         };
     }
 
+    /// The `exl3_ngram_trellis` format: one I16 tensor [rows, 1 + dim*K/16] whose row is the ring's f16 scale and then
+    /// its dim*K-bit stream (stream bits [i*K, (i+1)*K) are symbol i). Metadata: `K` 2..8, `row_dim`, codebook MUL1.
+    fn parseTrellis(map: []align(std.heap.page_size_min) const u8, obj: std.json.ObjectMap, meta: std.json.ObjectMap, data_off: usize) !NgramTable {
+        const k_v = meta.get("K") orelse return error.NgramTableHeader;
+        if (k_v != .string) return error.NgramTableHeader;
+        const K = std.fmt.parseInt(u32, k_v.string, 10) catch return error.NgramTableHeader;
+        if (K < 2 or K > 8) return error.NgramTableBits;
+        const dim_v = meta.get("row_dim") orelse return error.NgramTableHeader;
+        if (dim_v != .string) return error.NgramTableHeader;
+        const dim = std.fmt.parseInt(u32, dim_v.string, 10) catch return error.NgramTableHeader;
+        if (dim == 0 or dim > max_trellis_dim or (dim * K) % 16 != 0) return error.NgramTableHeader;
+        if (meta.get("codebook")) |c| if (c != .string or !std.mem.eql(u8, c.string, "mul1")) return error.NgramTableHeader;
+        var key: ?[]const u8 = null;
+        var it = obj.iterator();
+        while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".trellis")) {
+            if (key != null) return error.NgramTableHeader;
+            key = e.key_ptr.*;
+        };
+        const r = try headerRegion(obj, key orelse return error.NgramTableHeader, "I16", 2, map.len, data_off);
+        if (r.cols != 1 + (dim * K) / 16) return error.NgramTableHeader;
+        return .{
+            .map = map,
+            .rows = r.rows,
+            .dim = dim,
+            .bits = K,
+            .group_size = 0,
+            .w_off = data_off + @as(usize, @intCast(r.start)),
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = @intCast(r.cols),
+            .scols = 0,
+            .trellis_k = K,
+        };
+    }
+
+    /// The trellis rows' per-hash-head bias (`n_heads` x `dim` f16 bits), copied widened to f32.
+    pub fn setHeadBias(self: *NgramTable, bias_bits: []const u16, n_heads: u32) !void {
+        if (n_heads == 0 or bias_bits.len != @as(usize, n_heads) * self.dim) return error.NgramTableHeader;
+        const wide = try std.heap.page_allocator.alloc(f32, bias_bits.len);
+        for (wide, bias_bits) |*w, b| w.* = @floatCast(@as(f16, @bitCast(b)));
+        if (self.head_bias) |old| std.heap.page_allocator.free(old);
+        self.head_bias = wide;
+        self.n_heads = n_heads;
+    }
+
+    /// Row `r` of a trellis table decoded from the mapping, plus `head`'s bias (null: the stored ring alone).
+    fn trellisRowMapped(self: *const NgramTable, r: u64, head: ?u32, out: []f32) void {
+        const nb: usize = @as(usize, self.wcols) * 2;
+        self.trellisDecode(self.map[self.w_off + r * nb ..][0..nb], head, out);
+    }
+
+    /// The ring on a row's bytes (`raw`: the f16 scale word, then the dim*K-bit stream) at the table's K.
+    fn trellisDecode(self: *const NgramTable, raw: []const u8, head: ?u32, out: []f32) void {
+        switch (self.trellis_k) {
+            inline 2...8 => |k| self.trellisDecodeK(k, raw, head, out),
+            else => unreachable, // `parseTrellis` admits K 2..8
+        }
+    }
+
+    /// value_i = mul1(state_i) * scale (+ the head's bias_i): state_i stacks symbols i, i-1, ... (K bits each, circular
+    /// over dim) from bit 0 into a 16-bit codeword. The symbols are cut from a copy of the stream padded with its first
+    /// two bytes (a K <= 8 symbol spans two bytes, the ring wraps there), the states built 16 lanes at a time, MUL1
+    /// through `mul1_by_sum`.
+    fn trellisDecodeK(self: *const NgramTable, comptime K: u32, raw: []const u8, head: ?u32, out: []f32) void {
+        const L = 16;
+        const V = @Vector(L, u32);
+        const stack: u32 = (15 + K) / K;
+        const lead: usize = stack - 1;
+        const kmask: u32 = (1 << K) - 1;
+        const dim: usize = self.dim;
+        const nbytes: usize = dim * K / 8;
+        const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[0..2], .little))));
+        var sb: [max_trellis_dim + 2]u8 = undefined;
+        @memcpy(sb[0..nbytes], raw[2..][0..nbytes]);
+        sb[nbytes] = sb[0];
+        sb[nbytes + 1] = sb[1];
+        // syms[lead + i] = symbol i; syms[0 .. lead] = the ring's last symbols, so state i reads syms[lead + i - j]
+        var syms: [8 + max_trellis_dim]u32 = undefined;
+        for (0..dim) |i| {
+            const bit = i * K;
+            const w: u32 = std.mem.readInt(u16, sb[bit >> 3 ..][0..2], .little);
+            syms[lead + i] = (w >> @intCast(bit & 7)) & kmask;
+        }
+        for (0..lead) |j| syms[j] = syms[dim + j];
+        const bias: ?[]const f32 = if (head) |h| (if (self.head_bias) |hb| hb[@as(usize, h) * dim ..][0..dim] else null) else null;
+        const vscale: @Vector(L, f32) = @splat(scale);
+        var i: usize = 0;
+        while (i + L <= dim) : (i += L) {
+            var st: V = syms[lead + i ..][0..L].*;
+            inline for (1..stack) |j| st |= @as(V, syms[lead + i - j ..][0..L].*) << @as(@Vector(L, u5), @splat(@intCast(j * K)));
+            const code = st & @as(V, @splat(0xFFFF));
+            const x = code *% @as(V, @splat(mul1_mult));
+            const y = (x & @as(V, @splat(0x00FF00FF))) + ((x >> @as(@Vector(L, u5), @splat(8))) & @as(V, @splat(0x00FF00FF)));
+            const t = (y & @as(V, @splat(0xFFFF))) + (y >> @as(@Vector(L, u5), @splat(16)));
+            var m: @Vector(L, f32) = undefined;
+            inline for (0..L) |k| m[k] = mul1_by_sum[t[k]];
+            var v = m * vscale;
+            if (bias) |b| v += @as(@Vector(L, f32), b[i..][0..L].*);
+            out[i..][0..L].* = v;
+        }
+        while (i < dim) : (i += 1) {
+            var state: u32 = syms[lead + i];
+            inline for (1..stack) |j| state |= syms[lead + i - j] << @intCast(j * K);
+            var v: f32 = mul1_by_sum[mul1ByteSum(@truncate(state))] * scale;
+            if (bias) |b| v += b[i];
+            out[i] = v;
+        }
+    }
+
+    /// A gather's trellis rows, row i (of the gather) at head `(first + i) % n_heads`.
+    fn gatherTrellis(self: *const NgramTable, row_ids: []const i64, first: usize, out: []f32) void {
+        const heads: usize = @max(self.n_heads, 1);
+        for (row_ids, first..) |r, i| self.trellisRowMapped(@intCast(r), @as(u32, @intCast(i % heads)), out[(i - first) * self.dim ..][0..self.dim]);
+    }
+
+    /// Whether row `r`'s trellis bytes are in the page cache (`mincore` over the pages they span).
+    fn rowResident(self: *const NgramTable, r: u64) bool {
+        if (comptime @import("builtin").os.tag == .windows) return true; // `open` refuses there
+        if (cold_test_force) return false;
+        const nb: usize = @as(usize, self.wcols) * 2;
+        const page = std.heap.pageSize();
+        const off = self.w_off + @as(usize, @intCast(r)) * nb;
+        const a0 = off & ~(page - 1);
+        const a1 = (off + nb - 1) & ~(page - 1);
+        var vec: [2]u8 = .{ 0, 0 };
+        if (mincore(self.map.ptr + a0, a1 - a0 + page, &vec) != 0) return false;
+        return (vec[0] & 1) != 0 and (a1 == a0 or (vec[1] & 1) != 0);
+    }
+
     pub fn close(self: *NgramTable) void {
+        // The readers pread through `fd`: joined before it closes.
+        if (self.ahead) |a| a.destroy();
+        self.ahead = null;
         if (self.warm_thread) |th| {
             self.warm_stop.store(true, .release);
             th.join();
@@ -374,6 +517,8 @@ pub const NgramTable = struct {
         warmBytes().live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
+        if (self.head_bias) |hb| std.heap.page_allocator.free(hb);
+        self.head_bias = null;
         if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
         if (self.embedded) |source| {
@@ -462,6 +607,14 @@ pub const NgramTable = struct {
         return if (i == 0 and self.fd >= 0) .{ .fd = self.fd, .off = 0, .len = self.map.len } else null;
     }
 
+    /// The bytes the warm reads (`warmRegion`'s ranges).
+    pub fn warmTotal(self: *const NgramTable) u64 {
+        var total: u64 = 0;
+        var i: usize = 0;
+        while (self.warmRegion(i)) |r| : (i += 1) total += r.len;
+        return total;
+    }
+
     /// Read the whole table through its fds once, in the background, so the
     /// first prompt's PLE gathers hit a warm page cache. Call only once the
     /// table sits at its final address (the thread holds `self`).
@@ -516,8 +669,10 @@ pub const NgramTable = struct {
     /// Dequantize one row into `out[0..dim]` (mx.quantize packing: element i
     /// sits at bit offset i * bits of the little-endian u32 stream and may
     /// straddle a word boundary at 3/5/6 bits).
+    /// A trellis table's row is its stored ring, no head's bias (`gather` adds each row's).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
+        if (self.trellis_k != 0) return self.trellisRowMapped(r, null, out);
         if (self.embedded) |source| {
             const parts = source.rowParts(r);
             self.dequantRow(parts.weight, parts.scales, parts.biases, out);
@@ -1390,6 +1545,13 @@ fn ngramTestImage(header: []const u8, data_bytes: usize) ![]align(std.heap.page_
 fn ngramTestParse(header: []const u8, data_bytes: usize) !NgramTable {
     const buf = try ngramTestImage(header, data_bytes);
     return NgramTable.parse(buf, buf[8..520], 520);
+}
+
+test "ngram table warm: an EXL3 trunk pack warms only when its weights and the table both fit in RAM" {
+    const gib: u64 = 1 << 30;
+    try testing.expect(exl3WarmFits(50 * gib, 51 * gib, 128 * gib));
+    try testing.expect(!exl3WarmFits(80 * gib, 51 * gib, 128 * gib));
+    try testing.expect(exl3WarmFits(80 * gib, 51 * gib, 0));
 }
 
 /// rows 4, dim 64, 4-bit, group 32 => wcols 8, scols 2; w 128 B, s/b 16 B each.

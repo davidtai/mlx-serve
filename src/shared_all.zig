@@ -10,6 +10,7 @@ comptime {
     _ = @import("host/plugins/loader.zig").process;
     _ = @import("host/plugin_host_impl.zig").process_shared;
     _ = @import("host/host_table.zig").published;
+    _ = @import("sdk/quant/resident.zig").pending;
     _ = @import("host/http/server.zig").serverState_shared;
     _ = @import("host/http/server.zig").launch_shared;
     _ = @import("host/registry/memory_ceiling.zig").overrides_shared;

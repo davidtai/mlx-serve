@@ -9,6 +9,7 @@ const sdk = @import("../../sdk/plugin.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const ple_table = @import("ple_table.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
+const pack_keys = @import("../../sdk/quant/exl3/pack_keys.zig");
 
 pub const model_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 
@@ -62,6 +63,8 @@ pub const Config = struct {
     num_experts_per_tok: u32 = 0,
     /// A Sushi pack: routed experts in EXL3 (`expert_quant`, read by `toModelConfig`).
     expert_quant: bool = false,
+    /// A fully EXL3 pack: the trunk's linears are a quant format's (`trunk_quant`, `toModelConfig`'s `trunk_format`).
+    trunk_format: bool = false,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
 
@@ -93,6 +96,9 @@ pub const Config = struct {
     ngram_vocab_divisor: u32 = 128,
     ngram_seed: u64 = 1234,
     split_ngram_parts: u32 = 128,
+    /// The n-gram table's file in the pack (`ngram_table.file`); empty = `ngram_table.bin`.
+    ngram_table_file_buf: [96]u8 = @splat(0),
+    ngram_table_file_len: u8 = 0,
     qwen4_norm_convention: ?NormConvention = null,
     indexer_n_heads: u32 = 0,
     indexer_head_dim: u32 = 0,
@@ -190,7 +196,7 @@ pub const Config = struct {
     }
 };
 
-pub const ParseError = error{
+pub const ParseError = pack_keys.Error || error{
     InvalidConfigField,
     UnsupportedQuantMode,
     UnsupportedQuantBits,
@@ -354,6 +360,12 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
         if (v != .string) return error.InvalidQwen4NormConvention;
         c.qwen4_norm_convention = std.meta.stringToEnum(NormConvention, v.string) orelse return error.InvalidQwen4NormConvention;
     }
+    // As the engine's parse: the n-gram table's file is read in a fully EXL3 pack only (an MLX pack's is never read).
+    c.trunk_format = try pack_keys.hasTrunkQuant(root);
+    if (c.trunk_format) if (try pack_keys.ngramTableFile(root)) |f| {
+        @memcpy(c.ngram_table_file_buf[0..f.len], f);
+        c.ngram_table_file_len = @intCast(f.len);
+    };
     c.ssm_state_f32 = gdnStateF32();
     if (field(cfg, "query_pre_attn_scalar") == null) c.query_pre_attn_scalar = c.head_dim;
     c.hc_count = 4;
@@ -836,4 +848,24 @@ test "qwen4_exp config: a bad bound is refused by name, another family's key is 
     const audio = "{\"model_type\":\"qwen4_exp\",\"audio_config\":{}}";
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(audio), .{}, null, true, &p).code);
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(tiny_text), .{}, &.{ .first = 0, .count = 2 }, true, &p).code);
+}
+
+test "qwen4_exp config: a fully EXL3 pack's trunk format and n-gram table file parse, a malformed trunk block is refused by name" {
+    const full = try parseOk("{\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mcg\",\"window\":15},\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\"}," ++ tiny_text[1..]);
+    defer gpa.destroy(full);
+    try testing.expect(full.trunk_format);
+    try testing.expectEqualStrings("ngram_embedding.safetensors", full.ngram_table_file_buf[0..full.ngram_table_file_len]);
+    const plain = try parseOk(tiny_text);
+    defer gpa.destroy(plain);
+    try testing.expect(!plain.trunk_format and plain.ngram_table_file_len == 0);
+    // without `trunk_quant` the key is never read, as in the engine's parse: even a file no pack may name
+    const mlx_pack = try parseOk("{\"ngram_table\":{\"file\":\"../ngram_table.bin\"}," ++ tiny_text[1..]);
+    defer gpa.destroy(mlx_pack);
+    try testing.expect(!mlx_pack.trunk_format and mlx_pack.ngram_table_file_len == 0);
+    const mem: fixture.MemDir = .{ .files = &.{} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    const bad = "{\"trunk_quant\":\"exl3\"," ++ tiny_text[1..];
+    const v = parse(&dir, .of(bad), .{}, null, true, &p);
+    try testing.expect(v.code == .failed and std.mem.indexOf(u8, v.why.slice(), "TrunkQuantNotAnObject") != null and p.private == null);
 }

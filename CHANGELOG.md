@@ -6,6 +6,7 @@
 - **Outside plugins can draft and see.** A plugin can run its own speculative drafter (greedy or sampled requests), serve images through its own vision tower, and read the model's `ctx_size` to size its memory.
 - **DiffusionGemma is no longer supported.**
 - **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
+- **Qwen3.8 Flash Next packs in full EXL3.** Packs with the trunk and the drafter in EXL3, not only the experts, serve through turboexl3, which the build links in. A pack that loads more than half the machine's RAM reads its shards past the page cache.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 

@@ -8,6 +8,7 @@ const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx_gguf = @import("../quant/gguf/claim.zig");
 const exl3 = @import("../quant/exl3/format.zig");
+const exl3_pack_keys = @import("../quant/exl3/pack_keys.zig");
 const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
 const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
@@ -334,14 +335,19 @@ pub const ModelConfig = struct {
     /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
     /// served by src/sdk/quant/exl3; null = the pack's own affine banks.
     exl3: ?exl3.Spec = null,
+    /// A fully EXL3 pack (`trunk_quant`): the trunk's linears are a quant format's, loaded and run through the claimant of
+    /// that block (turboexl3's, linked in: no built-in format serves a dense EXL3 linear).
+    trunk_format: bool = false,
+    /// The n-gram table's file in the pack (`ngram_table.file`); empty = `ngram_table.bin`.
+    ngram_table_file_buf: [96]u8 = @splat(0),
+    ngram_table_file_len: u8 = 0,
     /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
     modelopt: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
-    /// `<model_dir>/ngram_table.bin` for the PLE table (mmapped by the
-    /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
-    /// config does.
+    /// `<model_dir>/ngram_table.bin` (or the file `ngram_table_file_buf` names) for the PLE table (mmapped by the
+    /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the config does.
     ngram_table_path: ?[]const u8 = null,
     /// The pack's directory: deepseek_v41's Engram tables sit beside the
     /// weights, an mlx-stream pack (`glm_stream`) loads from it, and an `expert_bank`
@@ -1657,6 +1663,11 @@ pub const ModelConfig = struct {
         });
     }
 
+    /// The n-gram table's file name in the pack: `ngram_table.file`, else `ngram_table.bin`.
+    pub fn ngramTableFile(self: *const ModelConfig) []const u8 {
+        return if (self.ngram_table_file_len > 0) self.ngram_table_file_buf[0..self.ngram_table_file_len] else "ngram_table.bin";
+    }
+
     /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
     /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
     /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
@@ -1745,7 +1756,10 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.glm_stream = true;
     }
     if (config.isQwen4()) {
-        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+        if (config.ngram_table_file_len > 0)
+            config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, config.ngramTableFile() })
+        else
+            config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
@@ -2082,6 +2096,17 @@ fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
     const v = try qwen4ConfigU64(cfg_obj, key) orelse return null;
     if (v > std.math.maxInt(u32)) return error.InvalidQwen4ConfigField;
     return @intCast(v);
+}
+
+/// A fully EXL3 pack's top-level keys (`exl3_pack_keys`): the trunk's format block and, in that pack only, the n-gram
+/// table's file.
+fn parseQwen4FullExl3(root: std.json.ObjectMap, config: *ModelConfig) !void {
+    config.trunk_format = try exl3_pack_keys.hasTrunkQuant(root);
+    if (!config.trunk_format) return;
+    if (try exl3_pack_keys.ngramTableFile(root)) |f| {
+        @memcpy(config.ngram_table_file_buf[0..f.len], f);
+        config.ngram_table_file_len = @intCast(f.len);
+    }
 }
 
 pub var gdn_state_f32_override: ?bool = null; // test seam
@@ -3115,6 +3140,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (jsonField(root, "expert_quant") != null) {
             config.exl3 = try exl3.parse(root, config.num_experts_per_tok);
         }
+        try parseQwen4FullExl3(root, &config);
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -4864,9 +4890,30 @@ pub const indexOwners = weights_load.indexOwners;
 /// Sushi's EXL3 expert banks run on its Metal kernels only: without them (CUDA) the pack is
 /// refused by name before any weight loads.
 fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
+    if (config.trunk_format and !metal) {
+        log.err("this pack's EXL3 trunk linears run on turboexl3's Metal kernels only; this backend cannot serve it\n", .{});
+        return error.Exl3NeedsMetal;
+    }
     if (config.exl3 == null or metal) return;
     log.err("this Sushi pack's EXL3 experts run on Metal kernels only; this backend cannot serve it\n", .{});
     return error.Exl3NeedsMetal;
+}
+
+/// Whether the weights load reads an EXL3 trunk pack's shards past the page cache (`nocache_reader`), as a DeepSeek-V4.1
+/// pack's always does: when what it loads is more than half the machine's RAM (`nocacheFor`). MLX's own reader leaves
+/// each shard's pages cached beside the arrays, so such a pack peaks near twice its weights until the kernel evicts the
+/// cache. The embedded n-gram table is read per lookup, never loaded, so it does not count. Every other pack loads as
+/// before.
+fn nocacheLoad(io: std.Io, model_dir: []const u8, config: *const ModelConfig) bool {
+    if (!config.trunk_format) return false;
+    const shards = @import("../../engines/mlx/runtime/preflight.zig").modelDiskBytes(io, model_dir);
+    return nocacheFor(shards -| (config.embedded_ple_payload_bytes orelse 0), @import("../util/system.zig").getTotalMemBytes());
+}
+
+/// `weights` bytes loaded on a machine of `ram` bytes read past the page cache when they are more than half of it (an
+/// unknown RAM size, 0, never does).
+pub fn nocacheFor(weights: u64, ram: u64) bool {
+    return ram > 0 and weights > ram / 2;
 }
 
 /// A tensor worker never runs the MTP head or the towers.
@@ -4983,7 +5030,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.pairDsv41(.{ .lo = r.start, .hi = r.end, .worker = false }),
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt, .trunk_format = config.trunk_format, .nocache = nocacheLoad(io, model_dir, config) });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
@@ -9557,6 +9604,36 @@ test "parseConfigFromJson: a Sushi qwen4_exp pack's expert_quant selects EXL3 ba
     try testing.expect((try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).exl3 == null);
     const bad = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul2\"},";
     try testing.expectError(error.ExpertLayoutUnsupported, parseConfigFromJson(testing.allocator, bad ++ QWEN4_SHIPPED[1..]));
+}
+
+test "parseConfigFromJson: a fully EXL3 qwen4_exp pack names its trunk's format and its n-gram table's file" {
+    const full = "{\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16},\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6,\"row_dim\":160},";
+    const c = try parseConfigFromJson(testing.allocator, full ++ QWEN4_SHIPPED[1..]);
+    try testing.expect(c.trunk_format);
+    try testing.expectEqualStrings("ngram_embedding.safetensors", c.ngramTableFile());
+    // the shipped pack: an affine trunk beside `ngram_table.bin`
+    const shipped = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(!shipped.trunk_format);
+    try testing.expectEqualStrings("ngram_table.bin", shipped.ngramTableFile());
+    try testing.expectError(error.TrunkQuantNotAnObject, parseConfigFromJson(testing.allocator, "{\"trunk_quant\":\"exl3\"," ++ QWEN4_SHIPPED[1..]));
+    try testing.expectError(error.InvalidNgramTableFile, parseConfigFromJson(testing.allocator, "{\"trunk_quant\":{\"format\":\"exl3\"},\"ngram_table\":{\"file\":\"../ngram_table.bin\"}," ++ QWEN4_SHIPPED[1..]));
+    // without `trunk_quant` the key is never read: the table is `ngram_table.bin`
+    const affine = try parseConfigFromJson(testing.allocator, "{\"ngram_table\":{\"file\":\"../ngram_table.bin\"}," ++ QWEN4_SHIPPED[1..]);
+    try testing.expectEqualStrings("ngram_table.bin", affine.ngramTableFile());
+}
+
+test "admitExl3Backend: a fully EXL3 trunk is refused by name where Metal kernels are missing" {
+    const full = try parseConfigFromJson(testing.allocator, "{\"trunk_quant\":{\"format\":\"exl3\"}," ++ QWEN4_SHIPPED[1..]);
+    try testing.expectError(error.Exl3NeedsMetal, admitExl3Backend(&full, false));
+    try admitExl3Backend(&full, true);
+}
+
+test "nocacheFor: an EXL3 trunk pack reads past the page cache only when it loads more than half the RAM" {
+    const gib: u64 = 1 << 30;
+    try testing.expect(nocacheFor(80 * gib, 128 * gib));
+    try testing.expect(!nocacheFor(64 * gib, 128 * gib));
+    try testing.expect(!nocacheFor(40 * gib, 128 * gib));
+    try testing.expect(!nocacheFor(80 * gib, 0));
 }
 
 test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {

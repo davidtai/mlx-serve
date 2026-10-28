@@ -22,8 +22,11 @@ const bill_mod = @import("bill.zig");
 const fixture = @import("fixture.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
 const trunk_load = @import("trunk_load.zig");
+const trunk_formats = @import("trunk/formats.zig");
+const quant_block = @import("../../sdk/quant/block.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
+const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -41,7 +44,7 @@ pub const table = abi.ModelTable{
     .release_slot = &releaseSlot,
     .meters = &meters,
     .cache = &.{ .layout = &layout },
-    .weights = &.{ .resident_bytes = &residentBytes },
+    .weights = &.{ .resident_bytes = &residentBill },
 };
 
 /// P8 debt (`engines/mlx/plugin/intree.zig`): the engine's context of the serial forward in flight when the MLX
@@ -183,11 +186,32 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         .remote => {},
     };
     model.resolveWeightPrefix(&m.cfg, &m.weights);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
     m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{
         .head_mxfp8 = lmHeadMxfp8On(headMxfp8Setting(ctx.settings_json.slice()), null, mlx.cudaIntegrated(), true, m.cfg.quant_bits),
+        // the format blocks, read only for a pack that has one (`Loading.begin` reads nothing else of them): an MLX
+        // pack's load opens no config.json here, as main's does not
+        .pack = if (m.cfg.trunk_format or m.cfg.exl3 != null) try packOf(arena.allocator(), ctx) else .{},
     });
     m.trunk.prepare();
     return m;
+}
+
+/// The pack's config text and the format blocks its quant formats claim (`trunk_quant`, `expert_quant`), read through
+/// the pack's folder into `a`, with the host table they load with.
+fn packOf(a: std.mem.Allocator, ctx: *const abi.LoadCtx) !trunk_formats.Pack {
+    var p: trunk_formats.Pack = .{ .host = ctx.host, .model_dir = ctx.model_dir.slice() };
+    const n = ctx.dir.fileBytes("config.json");
+    if (n == 0) return p;
+    if (n > 16 << 20) return error.ConfigTooLarge;
+    var why: Verdict = .{};
+    p.config_json = ctx.dir.readFile("config.json", try a.alloc(u8, @intCast(n)), &why) orelse return error.ConfigUnreadable;
+    for (try quant_block.blocksOf(a, p.config_json)) |b| {
+        if (std.mem.eql(u8, b.key, "trunk_quant")) p.trunk_quant = b.json;
+        if (std.mem.eql(u8, b.key, "expert_quant")) p.expert_quant = b.json;
+    }
+    return p;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
@@ -527,6 +551,36 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u
     return .ok;
 }
 
+/// The resident bill: the shards' (`residentBytes`), and on an EXL3 trunk pack the rerank head its MTP head builds at
+/// load (`rerankHeadBytes`).
+fn residentBill(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    const v = residentBytes(p, model_dir, settings_json, shards, out);
+    const c = config.of(p);
+    if (v.isOk() and c.trunk_format) out.* +|= rerankHeadBytes(c, settings_json.slice());
+    return v;
+}
+
+/// An EXL3 trunk pack's rerank head (`mtp.zig`'s `qwen4BuildDraftRerank`, over the rows its head computes): the coarse
+/// copy, the re-score copy and, on a vocab of `DRAFT_VOCAB_MIN` ids or more, the coarse vocab subset. Built at load
+/// unless the load's settings turn MTP off.
+fn rerankHeadBytes(c: *const config.Config, settings_json: []const u8) u64 {
+    if (mtpSetting(settings_json) == false) return 0;
+    const v: c_int = @intCast(c.vocab_size);
+    const h: c_int = @intCast(c.hidden_size);
+    var bytes = mtp_mod.rerankCoarseBytes(v, h, mtp_mod.DRAFT_HEAD_BITS) + mtp_mod.rerankCoarseBytes(v, h, mtp_mod.RERANK_EXACT_BITS);
+    if (v >= mtp_mod.DRAFT_VOCAB_MIN) bytes += mtp_mod.rerankCoarseBytes(mtp_mod.DRAFT_VOCAB_ROWS, h, mtp_mod.DRAFT_HEAD_BITS);
+    return bytes;
+}
+
+/// The load's `mtp` setting (`LoadCtx.settings_json`); null when unset.
+fn mtpSetting(settings_json: []const u8) ?bool {
+    if (settings_json.len == 0) return null;
+    const S = struct { mtp: ?bool = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.mtp;
+}
+
 /// The tiny pack the conformance suite runs: four layers (GDN and QSA attention), the PLE, bf16 weights.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     return .{ .files = try fixture.files(a, 7, .bf16) };
@@ -548,6 +602,19 @@ test "qwen4_exp resident bill: an embedded n-gram table's payload is not residen
     try std.testing.expect(!residentBytes(&.{ .private = &c }, .of(dir), .{}, 100, &out).isOk());
     c.embedded_ngram = false;
     try std.testing.expect(residentBytes(&.{ .private = &c }, .of(dir), .{}, 1000, &out).isOk());
+    try std.testing.expectEqual(@as(u64, 1000), out);
+}
+
+test "qwen4_exp resident bill: an EXL3 trunk pack's rerank head is billed unless MTP is off; any other pack's is not" {
+    var c: config.Config = .{ .vocab_size = 248320, .hidden_size = 2560 };
+    var out: u64 = 0;
+    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .{}, 1000, &out).isOk());
+    try std.testing.expectEqual(@as(u64, 1000), out);
+    c.trunk_format = true;
+    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .{}, 1000, &out).isOk());
+    // the coarse copy (278.1 MB), the re-score copy (675.4 MB) and the vocab subset (110.1 MB): the load's 1,014 MiB
+    try std.testing.expectEqual(@as(u64, 1000 + 1_063_649_280), out);
+    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .of("{\"mtp\":false}"), 1000, &out).isOk());
     try std.testing.expectEqual(@as(u64, 1000), out);
 }
 

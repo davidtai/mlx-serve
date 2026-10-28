@@ -107,6 +107,10 @@ test "quant block: blocks are found under their keys; a config without one has n
     try testing.expectEqualStrings("quantization", bs[0].key);
     try testing.expectEqualStrings("{\"bits\":4}", bs[0].json);
     try testing.expectEqualStrings("expert_quant", bs[1].key);
+    const full = try blocksOf(a, "{\"trunk_quant\":{\"format\":\"exl3\"},\"expert_quant\":{\"format\":\"exl3\",\"k\":5}}");
+    try testing.expectEqual(@as(usize, 2), full.len);
+    try testing.expectEqualStrings("expert_quant", full[0].key);
+    try testing.expectEqualStrings("trunk_quant", full[1].key);
     try testing.expectEqual(@as(usize, 0), (try blocksOf(a, "{\"model_type\":\"llama\"}")).len);
     try testing.expectEqual(@as(usize, 0), (try blocksOf(a, "not json")).len);
 }

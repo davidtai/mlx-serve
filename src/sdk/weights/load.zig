@@ -24,7 +24,11 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
 /// `skip`: a tensor it names never enters the map (qwen4's embedded n-gram table, read from disk per lookup).
-pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, skip: ?*const fn (key: []const u8) bool = null, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+/// `trunk_format`: the trunk's linears are a quant format's (`trunk_quant`); their 1-D f16 `.scales` / `.biases` (an
+/// EXL3 trunk's suh / svh) stay as stored, the format's operands.
+/// `nocache`: an EXL3 trunk load reads its shards past the page cache, as `dsv41`'s are (model.zig's `nocacheLoad`
+/// decides, for `trunk_format` packs only).
+pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, skip: ?*const fn (key: []const u8) bool = null, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null, trunk_format: bool = false, nocache: bool = false };
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -271,6 +275,8 @@ pub fn loadSafetensorsFile(
 
     if (opts.dsv41 and comptime builtin.os.tag.isDarwin())
         try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
+    else if (opts.trunk_format and readsPastPageCache(opts, comptime builtin.os.tag.isDarwin()))
+        try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
     else
         try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
@@ -301,7 +307,7 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
+        if (!(opts.trunk_format and keepsF16Operand(key_str, ndim, opts)) and !(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
             !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or (opts.modelopt and narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value)))) and
             (ndim != 1 or narrow1dEnabled()))
         {
@@ -320,6 +326,19 @@ pub fn loadSafetensorsFile(
 }
 
 pub const dsv41_text_prefix = "language_model.";
+
+/// Whether a shard loads through `nocache_reader` (Darwin only): a DeepSeek-V4.1 pack, or any pack loaded `nocache`.
+pub fn readsPastPageCache(opts: LoadOpts, darwin: bool) bool {
+    return darwin and (opts.dsv41 or opts.nocache);
+}
+
+/// An EXL3 trunk pack's f16 tensor a kernel reads in f16, never narrowed: a trunk format's 1-D `.scales` / `.biases`
+/// (suh / svh), and the trellis n-gram table's per-head bias (a `trunk_quant` pack's only), which its rows add in f16.
+pub fn keepsF16Operand(key: []const u8, ndim: usize, opts: LoadOpts) bool {
+    if (!opts.trunk_format) return false;
+    if (std.mem.endsWith(u8, key, ".ple.ple_embedding.head_bias")) return true;
+    return ndim == 1 and (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases"));
+}
 
 pub fn qwen4NormNeedsFold(key: []const u8) bool {
     const suffixes = [_][]const u8{
@@ -406,4 +425,56 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
     w.* = d;
     sc.* = mlx.mlx_array_new();
     bi.* = mlx.mlx_array_new();
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "keepsF16Operand: an EXL3 trunk's 1-D suh and svh and the trellis table's bias stay f16, nothing else does" {
+    const exl3: LoadOpts = .{ .trunk_format = true };
+    try testing.expect(keepsF16Operand("m.layers.0.self_attn.q_proj.scales", 1, exl3));
+    try testing.expect(keepsF16Operand("m.layers.0.self_attn.q_proj.biases", 1, exl3));
+    try testing.expect(!keepsF16Operand("m.layers.0.mlp.gate.scales", 2, exl3));
+    try testing.expect(!keepsF16Operand("m.layers.0.input_layernorm.weight", 1, exl3));
+    try testing.expect(!keepsF16Operand("m.layers.0.self_attn.q_proj.scales", 1, .{}));
+    try testing.expect(keepsF16Operand("m.layers.2.ple.ple_embedding.head_bias", 2, exl3));
+    try testing.expect(!keepsF16Operand("m.layers.2.ple.ple_embedding.head_bias", 2, .{}));
+}
+
+/// One safetensors shard of f16 zeros: two 1-D [2] side tensors, a 2-D [2, 2] `.scales` and a [2, 2] head bias.
+fn writeF16Shard(dir: std.Io.Dir, io: std.Io) !void {
+    const hdr = "{\"m.q.scales\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[0,4]}," ++
+        "\"m.q.biases\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[4,8]}," ++
+        "\"m.g.scales\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[8,16]}," ++
+        "\"m.ple.ple_embedding.head_bias\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[16,24]}}";
+    var shard: [8 + hdr.len + 24]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &shard });
+}
+
+test "loadWeightsOpt: an EXL3 trunk keeps its 1-D suh and svh f16 while 2-D side tensors narrow; an affine pack narrows them" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeF16Shard(tmp.dir, io);
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    for ([_]bool{ true, false }) |exl3| {
+        var w = try loadWeightsOpt(io, testing.allocator, dir, .{ .trunk_format = exl3 });
+        defer w.deinit();
+        const side: mlx.mlx_dtype = if (exl3 or !narrow1dEnabled()) .float16 else .bfloat16;
+        try testing.expectEqual(side, mlx.mlx_array_dtype(w.get("m.q.scales").?));
+        try testing.expectEqual(side, mlx.mlx_array_dtype(w.get("m.q.biases").?));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w.get("m.g.scales").?));
+        try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(w.get("m.ple.ple_embedding.head_bias").?));
+    }
+}
+
+test "readsPastPageCache: a nocache load and a DeepSeek-V4.1 pack read past the page cache on Darwin; nothing else does" {
+    try testing.expect(readsPastPageCache(.{ .nocache = true }, true));
+    try testing.expect(readsPastPageCache(.{ .dsv41 = true }, true));
+    try testing.expect(!readsPastPageCache(.{}, true));
+    try testing.expect(!readsPastPageCache(.{ .nocache = true, .dsv41 = true }, false));
 }
