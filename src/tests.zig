@@ -169,6 +169,7 @@ test {
     _ = @import("sdk/blocks/moe/moe_gather_ubench.zig");
     _ = @import("sdk/blocks/moe/moe_affine4.zig");
     _ = @import("sdk/blocks/hc/hc_decode2.zig");
+    _ = @import("sdk/blocks/hc/hc_prefill_nax.zig");
     _ = @import("sdk/blocks/hc/hc_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_prefill_cuda.zig");

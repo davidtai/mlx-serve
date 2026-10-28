@@ -149,6 +149,8 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         log.err("[qwen4] this pack carries {s}, which the trunk does not run\n", .{what});
         return error.Qwen4UnservedLayout;
     }
+    // The joined a | b GEMM (`trunk/gdn_ab.zig`): an EXL3 trunk pack's only; every other pack keeps main's two matmuls.
+    if (config.trunk_format) for (ml.moe_layers, 0..) |*lw, i| if (lw.attn == .linear) try @import("trunk/gdn_ab.zig").joinInPlace(&lw.attn.linear, weights, &name_buf, prefix, @intCast(i), &owned, a, s);
     for (ml.moe_layers, 0..) |*lw, i| {
         switch (lw.mlp) {
             .moe => |*mw| try fmts.banks(prefix, @intCast(i), mw, config.hidden_size, config.moe_intermediate_size),

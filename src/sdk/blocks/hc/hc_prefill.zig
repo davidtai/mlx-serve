@@ -16,7 +16,7 @@ pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32, inject: mlx.mlx_
     return inject.ctx != null and dtype == .bfloat16 and mlx.mlx_array_dtype(inject) == .bfloat16 and geometry(batch, seq) and hc >= 1 and hc <= 8 and hidden >= 128 and hidden <= 4096 and hidden % 128 == 0;
 }
 
-fn geometry(batch: c_int, seq: c_int) bool {
+pub fn geometry(batch: c_int, seq: c_int) bool {
     return batch >= 1 and batch <= 2 and seq > 16 and seq <= @divTrunc(max_seq, batch);
 }
 

@@ -71,6 +71,7 @@ sdk.blocks.attention.sdpa.nax_sdpa_avail_cache
 sdk.blocks.dit.w8a8.signs_cache
 sdk.blocks.gdn.decode.k1_cache
 sdk.blocks.gdn.decode.k1f_cache
+sdk.blocks.gdn.decode.k1fr_cache
 sdk.blocks.gdn.decode.k1p_cache
 sdk.blocks.gdn.decode.k1s_cache
 sdk.blocks.gdn.decode.k1tr_cache

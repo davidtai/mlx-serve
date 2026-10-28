@@ -49,9 +49,11 @@ const expectPleHistoryEqual = @import("ple.zig").expectPleHistoryEqual;
 const pleArmEntry = @import("ple.zig").pleArmEntry;
 const pleArmIds = @import("ple.zig").pleArmIds;
 const qwen4BatchedPleForward = @import("ple.zig").qwen4BatchedPleForward;
+const pleForwardResidual = @import("ple.zig").pleForwardResidual;
 const Qwen4AttnProf = @import("prof.zig").Qwen4AttnProf;
 const Qwen4FwdProf = @import("prof.zig").Qwen4FwdProf;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
+const wave = @import("wave.zig");
 
 /// qwen4_exp's batched decode builds each step's graph while the GPU idles, so its ladder ships ON at this stride.
 /// Serial decode and other arches keep `decode_async_ladder`.
@@ -345,6 +347,8 @@ pub fn forwardQwen4Stream(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array)
 }
 
 pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    // A wide prefill chunk in reordered numerics runs as the wavefront's two halves (`wave.zig`).
+    if (wave.pfWavePlanFor(self, ctx, token_ids)) |halves| return wave.forwardQwen4Wave(self, ctx, token_ids, halves);
     const stream_in = ctx.stream_in;
     self.fwd_gen +%= 1; // per-forward QSA scratch key
     const ml = self.moe_layers;
@@ -377,7 +381,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
 
-    if (self.qwen4_stream_f32 or env.onCached(&qwen4_stream_f32_env, .QWEN4_STREAM_F32)) {
+    if (streamF32(self)) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
         _ = mlx.mlx_array_free(h);
@@ -406,6 +410,9 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
 
     const ladder = if (ctx.batch_slots != null) self.decode_async_ladder_qwen4 else self.decode_async_ladder;
     var ladder_blocked = false;
+    // A spec verify (2..16 rows) on the EXL3 pack goes to the GPU every 4th layer while the rest is built, its first
+    // layer at once: otherwise the GPU idles through the build, the PLE flush and eval's walk of the graph.
+    const vladder: usize = if (self.formats.profile and ctx.spec_verify and batch == 1 and seq_len > 1 and seq_len <= 16) 4 else 0;
     for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
         const li: u32 = @intCast(layer_idx);
         const lw = &ml[layer_idx];
@@ -413,10 +420,11 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
 
         if (lw.ple) |*pw| {
             try self.hcFlush(&h, batch, seq_len, &pending);
-            const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
-            defer _ = mlx.mlx_array_free(add);
-            var h_ple = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
+            // A prefill chunk's host gather runs with the GPU idle: the layers built so far start once its ids are read.
+            const kick = is_prefill and prefillEvalCadenceApplies(seq_len) and self.qwen4 != null and self.qwen4.?.table.prefetchKick();
+            if (kick) self.ple_kick = h;
+            defer self.ple_kick = .{ .ctx = null };
+            const h_ple = try pleForwardResidual(self, ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
             _ = mlx.mlx_array_free(h);
             h = h_ple;
             try prof.lap(h, .ple);
@@ -469,6 +477,17 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
             };
             // `mlp_out` rides along: the HC write that folds it into `h` is deferred to the next read.
             if (!ladder_blocked) ladderStepMulti(&.{ h, mlp_out }, ladder, layer_idx, seq_len);
+        }
+        if (vladder != 0 and layer_idx + 1 < layerCap(cfg.num_hidden_layers) and (layer_idx == 0 or (layer_idx + 1) % vladder == 0)) {
+            // past the PLE layer its host leaf is filled first, so the draft ids sync here instead of after the build
+            if (layer_idx > 0) if (ctx.ple_pending) |pp| if (!pp.gpu) try self.flushDeferredPle(ctx);
+            const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ h, mlp_out }, 2);
+            defer _ = mlx.mlx_vector_array_free(v);
+            try mlx.check(mlx.mlx_async_eval(v));
+            if (!verify_ladder_said) {
+                verify_ladder_said = true;
+                log.info("[qwen4] verify ladder engaged: stride {d} ({d} rows)\n", .{ vladder, seq_len });
+            }
         }
 
         if (ctx.capture_layers) |cl| {
@@ -535,6 +554,14 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
 /// =all: per-block GPU ms with a sync per block, never on by default;
 /// QWEN4_OPCOUNT=1: FFI op attribution per block, no syncs.
 var qwen4_stream_f32_env: ?bool = null;
+
+/// The verify ladder's one engaged line.
+var verify_ladder_said = false;
+
+/// The residual streams run in f32 (the fixture oracle's bar, or the `QWEN4_STREAM_F32` diag).
+pub fn streamF32(self: *const Trunk) bool {
+    return self.qwen4_stream_f32 or env.onCached(&qwen4_stream_f32_env, .QWEN4_STREAM_F32);
+}
 
 // ── tests ──
 

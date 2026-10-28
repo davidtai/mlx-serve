@@ -49,6 +49,7 @@ const qsaArraysAllEqual = @import("../../../sdk/testing/parity.zig").qsaArraysAl
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const testing = std.testing;
 const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
+const merges = @import("merges.zig");
 
 pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
     const sh = mlx.getShape(src);
@@ -111,6 +112,8 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
         try self.qsaInstallRing(entry, k_raw, s);
     } else if (held + add <= QSA_RING_ROWS) {
         try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, ring_cap);
+    } else if (try merges.ringRebuild(self, entry, k_raw, held, add)) {
+        // the ring's last rows and this forward's keys rebuilt in one launch
     } else {
         const keep_old = QSA_RING_ROWS - add;
         const sh = mlx.getShape(entry.aux_state);
@@ -595,6 +598,9 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
 
     const sheet = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
     defer _ = mlx.mlx_array_free(sheet);
+    // A placed draft row's select bounded where headPlaceScores puts -inf, and its key visibility in one launch
+    // (`merges.placedMask`); null: the chain below and `headPlaceVisibility`.
+    if (ctx.head_place) |p| if (try merges.placedMask(self, sheet, p, offset, seq_len, kv, nb, ratio, block_topk, batch, solo)) |m| return m;
     const scores = if (ctx.head_place) |p| try headPlaceScores(self.s, sheet, p, ratio, nb) else sheet;
     defer if (ctx.head_place != null) {
         _ = mlx.mlx_array_free(scores);

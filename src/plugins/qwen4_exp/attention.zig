@@ -6,6 +6,7 @@ const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const FullAttnWeights = @import("../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const Trunk = @import("trunk.zig").Trunk;
+const fusion = @import("trunk/fusion.zig");
 const AttnVerifyInputs = @import("trunk/verify.zig").AttnVerifyInputs;
 const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
 const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
@@ -34,18 +35,23 @@ pub fn qwen4AttnProjected(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: 
                 sc.qsa_blocks = .{ .ctx = null };
             }
         }
+        self.fused.releaseLayer();
     }
     const prof = Qwen4AttnProf.begin(x, seq_len);
     defer Qwen4AttnProf.active = false;
     if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
-        ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
+        // Where the fused attention input runs: the indexer's prepare inside its prepare (it then takes what it made);
+        // null, or verify-supplied projections: `qsaMask`.
+        const folded: ?mlx.mlx_array = if (projected != null) null else try fusion.idxPrepMask(self, ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len, is_prefill);
+        ctx.qsa_mask = folded orelse try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
     }
     if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
-    if (ctx.head_place) |p| {
+    // a placed row's mask that already is its key visibility (`qsa/merges.zig`) skips `headPlaceVisibility`
+    if (ctx.head_place) |p| if (!self.fused.place_vis) {
         const vis = try headPlaceVisibility(self.s, ctx.qsa_mask, p, @intCast(self.config.indexer_compress_ratio), cache_len + seq_len);
         if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
         ctx.qsa_mask = vis;
-    }
+    };
     if (layer == 3) if (Trunk.qwen4_trace) |tr| {
         if (ctx.qsa_mask.ctx != null) {
             Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);

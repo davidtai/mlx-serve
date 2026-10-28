@@ -2,6 +2,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
+const ssmChainCaptured = @import("../ssm/entry.zig").ssmChainCaptured;
 const log = @import("../../../sdk/util/log.zig");
 const pld_index = @import("../../../sdk/spec/pld_index.zig");
 const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
@@ -427,7 +428,7 @@ pub fn nextPld(
         // proven restore + re-forward fallback below. Byte-identical either
         // way (pinned by tests/test_pld_equivalence.sh).
         const gdn_captured = if (self.ctx.ssm_entries) |entries|
-            entries.len > 0 and entries[0].spec_state_seq.ctx != null
+            entries.len > 0 and ssmChainCaptured(&entries[0])
         else
             false;
 

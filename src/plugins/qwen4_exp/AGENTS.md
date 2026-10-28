@@ -35,6 +35,8 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   built-in Sushi table on an expert-only pack) loads each MoE layer's banks and runs its SwiGLU. The numerics are
   reordered on an EXL3 trunk pack and exact elsewhere; a path that reorders a sum asks `trunk.reordered()`. The trellis
   n-gram table (`exl3_ngram_trellis`) decodes on the host.
+- Every fast path engages only on an EXL3 trunk pack (`config.trunk_format`, the pack's `trunk_quant`) and says once
+  whether it engaged or declined; an MLX pack runs main's code.
 - Kernel contract: every Metal kernel registered (`contract*.zig` here and in `sparse_block/`); the multi-launch ones
   (qsa_decode, qsa_select's split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair.
 

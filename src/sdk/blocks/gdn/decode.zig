@@ -600,3 +600,98 @@ pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.m
     }
     return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .conv_input = out[4] };
 }
+
+// The fold without the per-step state capture. In its place each threadgroup writes the rows' recurrence inputs K1S holds
+// in threadgroup memory (`Prework`'s layout, what K1R reads), so a partial accept replays the kept rows from the round's
+// input state (`replay`) instead of slicing a capture. Every other statement is the fold's.
+pub const K1S_FOLD_REPLAY_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));\n" ++ kernelSource("kernels/gdn/decode_k1s_tail_noseq.metal") ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_fold_epilogue.metal") ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_prework_out.metal");
+
+/// `recurSeqFold`'s outputs but the per-step states, plus the rows' recurrence inputs `replay` reads.
+pub const RecurSeqFoldReplay = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, conv_input: mlx.mlx_array, prework: Prework };
+
+var k1fr_cache: ?mlx.mlx_fast_metal_kernel = null;
+var fold_replay_cfgs: [FOLD_MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+// As `fold_ok`, for this pipeline (its thread limit is its own).
+var fold_replay_ok: [FOLD_MAX_SEQ + 1]?bool = @splat(null);
+var fold_replay_cfg_key: ?FoldKey = null;
+
+/// The fold's launch shape and template arguments; its outputs without state_seq, then pk [T,Hk,Dk], pv [T,Hv,Dv] and
+/// pg [T,Hv,2] (f32).
+fn buildFoldReplayConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool) !mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv * g.dv }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3 + t_len, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hk, g.dk }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, g.dv }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, 2 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));
+    return cfg;
+}
+
+/// `recurSeqFold` with the per-step state capture left out and the rows' recurrence inputs written instead: gated, the
+/// next conv state, the final state and conv_input are the fold's bits; `prework` is what `replay` reads to rebuild the
+/// state after any prefix of the rows from the round's input state (`state_seq[r]`'s bits). Null where the fold
+/// declines, where `replay` could not serve the geometry (its grid copies the 3 x C conv window, one thread an element),
+/// or where this GPU refuses the pipeline (latched per width, as the fold's).
+pub fn recurSeqFoldReplay(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFoldReplay {
+    if (!mlx.streamIsGpu(s)) return null;
+    if (t_len < 1 or t_len > FOLD_MAX_SEQ) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    if (3 * (2 * g.hk * g.dk + g.hv * g.dv) > 32 * g.dv * g.hv) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    if (mlx.mlx_array_dtype(in.eps) != .float32) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, true)) return null;
+    if (k1fr_cache == null) k1fr_cache = try makeKernel("msv_gdn_decode_recur_seq_fold_replay", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" }, &.{ "gated", "conv_out", "state_out", "conv_in", "pk", "pv", "pg" }, K1S_FOLD_REPLAY_SOURCE, HEADER);
+    const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish, .nt = foldNt() };
+    if (fold_replay_cfg_key == null or !std.meta.eql(fold_replay_cfg_key.?, key)) {
+        for (&fold_replay_cfgs) |*slot| if (slot.*) |c| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            slot.* = null;
+        };
+        fold_replay_ok = @splat(null);
+        fold_replay_cfg_key = key;
+    }
+    const idx: usize = @intCast(t_len);
+    if (fold_replay_ok[idx] == false) return null;
+    if (fold_replay_cfgs[idx] == null) fold_replay_cfgs[idx] = try buildFoldReplayConfig(g, t_len, dt, st, swish);
+
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1fr_cache.?, v1, fold_replay_cfgs[idx].?, s));
+    var out: [7]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    // The fold's latch: the first dispatch per width evaluates here, and a refused pipeline declines this width for good.
+    if (fold_replay_ok[idx] == null and !mlx.errorPending()) {
+        _ = mlx.mlx_eval(o1);
+        if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) {
+            fold_replay_ok[idx] = false;
+            log.info("[gdn-replay] declined at T={d}: this GPU's pipeline runs fewer than {d} threads per threadgroup (the capturing fold serves)\n", .{ t_len, foldNt() });
+            for (out) |a| _ = mlx.mlx_array_free(a);
+            return null;
+        }
+        if (!mlx.errorPending()) fold_replay_ok[idx] = true;
+    }
+    return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .conv_input = out[3], .prework = .{ .k = out[4], .v = out[5], .gb = out[6] } };
+}

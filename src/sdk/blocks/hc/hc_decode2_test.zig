@@ -90,12 +90,13 @@ fn sliceRow(a: mlx.mlx_array, row: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
 
 /// A `rows`-row read agrees, row by row, with each row read alone through the one-row launches.
 /// A row read among others is byte-identical to the same row read alone: a grouped verify must not change a row's output.
+/// Bit patterns (a bf16 or f32 output widens to f32 exactly), so -0 and +0 differ and a NaN matches only its own bits.
 fn expectEqualBits(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
     const rh = try readF32(ref, s);
     defer testing.allocator.free(rh);
     const gh = try readF32(got, s);
     defer testing.allocator.free(gh);
-    try testing.expectEqualSlices(f32, rh, gh);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rh), std.mem.sliceAsBytes(gh));
 }
 
 fn parityRows(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64, rows: c_int) !void {
@@ -175,4 +176,199 @@ test "hc decode2: a multi-row read matches each row read alone (Flash Next geome
 test "hc decode2: a multi-row read matches each row read alone (4/5/6-bit, per-row up launch)" {
     try parityRows(512, 64, 4, 64, 0x2D0DE4, 3);
     for ([_]u32{ 5, 6 }) |bits| try parityRows(2560, 320, bits, 64, 0x2D0DE5 + bits, 5);
+}
+
+/// Dense bf16 hc weights as a fully EXL3 pack carries them: the down [R, K] and up [K, R] rows viewed as u32 words,
+/// evaluated as a loaded pack's are.
+const Dense = struct {
+    dwb: mlx.mlx_array,
+    uwb: mlx.mlx_array,
+    dw: mlx.mlx_array,
+    uw: mlx.mlx_array,
+
+    fn init(rnd: std.Random, h: c_int, r: c_int, s: mlx.mlx_stream) !Dense {
+        const k = 4 * h;
+        var d: Dense = .{ .dwb = try randBf16(rnd, &.{ r, k }, 0.02, 0.0, s), .uwb = .{ .ctx = null }, .dw = mlx.mlx_array_new(), .uw = mlx.mlx_array_new() };
+        errdefer d.deinit();
+        d.uwb = try randBf16(rnd, &.{ k, r }, 0.02, 0.0, s);
+        try mlx.check(mlx.mlx_view(&d.dw, d.dwb, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(d.dw));
+        try mlx.check(mlx.mlx_view(&d.uw, d.uwb, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(d.uw));
+        return d;
+    }
+
+    fn deinit(d: Dense) void {
+        inline for (.{ "dwb", "uwb", "dw", "uw" }) |name| {
+            if (@field(d, name).ctx != null) _ = mlx.mlx_array_free(@field(d, name));
+        }
+    }
+};
+
+fn freeRead(o: anytype) void {
+    inline for (.{ "mixed", "inj", "stream" }) |name| {
+        if (@field(o, name).ctx != null) _ = mlx.mlx_array_free(@field(o, name));
+    }
+}
+
+const read_cases = [_]struct { inject: bool, pending: bool }{
+    .{ .inject = true, .pending = true },
+    .{ .inject = true, .pending = false },
+    .{ .inject = false, .pending = false },
+    .{ .inject = false, .pending = true },
+};
+
+/// Dense weights through `readTrunk`'s multi-row launches (decode3 held off) against each row read alone, byte for byte.
+fn parityRowsDense(h: c_int, r: c_int, seed: u64, rows: c_int) !void {
+    const xfm = @import("../../../engines/mlx/transformer.zig");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const hcf = @import("../../../plugins/qwen4_exp/hc_fused.zig");
+    hcf.hc_fused_override = true;
+    defer hcf.hc_fused_override = null;
+    hc_decode2.rows_override = rows;
+    defer hc_decode2.rows_override = null;
+    hc_decode2.decode3_override = false;
+    defer hc_decode2.decode3_override = null;
+    const hc: c_int = 4;
+    const k = hc * h;
+    const d = try Dense.init(rnd, h, r, s);
+    defer d.deinit();
+    const none: mlx.mlx_array = .{ .ctx = null };
+    const x = try randBf16(rnd, &.{ 1, rows, k }, 4.0, 0.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const nw = try randBf16(rnd, &.{ hc, h }, 1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(nw);
+    const iw = try randBf16(rnd, &.{ k, hc }, 0.1, 0.0, s);
+    defer _ = mlx.mlx_array_free(iw);
+    const wo = try randBf16(rnd, &.{ 1, rows, h }, 2.0, 0.0, s);
+    defer _ = mlx.mlx_array_free(wo);
+    const wi = try randBf16(rnd, &.{ 1, rows, hc, 1 }, 1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(wi);
+    for (read_cases) |c| {
+        const inj_w: mlx.mlx_array = if (c.inject) iw else none;
+        const pend: ?xfm.HcPending = if (c.pending) .{ .out = wo, .inj = wi } else null;
+        const before = hc_decode2.multi_served;
+        const got = (try hcf.hcReadFusedPack(s, x, 1, rows, nw, d.dw, none, none, d.uw, none, none, inj_w, 1e-6, hc, h, 16, 16, pend, true)) orelse return error.HcFusedDeclined;
+        defer freeRead(got);
+        try testing.expectEqual(before + 1, hc_decode2.multi_served);
+        var row: c_int = 0;
+        while (row < rows) : (row += 1) {
+            const xr = try sliceRow(x, row, s);
+            defer _ = mlx.mlx_array_free(xr);
+            const wor = try sliceRow(wo, row, s);
+            defer _ = mlx.mlx_array_free(wor);
+            const wir = try sliceRow(wi, row, s);
+            defer _ = mlx.mlx_array_free(wir);
+            const one_pend: ?xfm.HcPending = if (c.pending) .{ .out = wor, .inj = wir } else null;
+            const one = (try xfm.hcReadFused(s, xr, 1, 1, nw, d.dw, none, none, d.uw, none, none, inj_w, 1e-6, hc, h, 16, 16, one_pend)) orelse return error.HcFusedDeclined;
+            defer freeRead(one);
+            inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(got, name).ctx != null) {
+                    const part = try sliceRow(@field(got, name), row, s);
+                    defer _ = mlx.mlx_array_free(part);
+                    try expectEqualBits(@field(one, name), part, s);
+                }
+            }
+        }
+    }
+}
+
+/// `readTrunk`'s decode3 against its two-launch read on the same operands (the multi-row launches from two rows, which the
+/// tests above tie to each row read alone), every output byte for byte.
+fn parity3(h: c_int, r: c_int, seed: u64, rows: c_int) !void {
+    const xfm = @import("../../../engines/mlx/transformer.zig");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const hcf = @import("../../../plugins/qwen4_exp/hc_fused.zig");
+    hcf.hc_fused_override = true;
+    defer hcf.hc_fused_override = null;
+    hc_decode2.rows_override = rows;
+    defer hc_decode2.rows_override = null;
+    defer hc_decode2.decode3_override = null;
+    const hc: c_int = 4;
+    const k = hc * h;
+    const d = try Dense.init(rnd, h, r, s);
+    defer d.deinit();
+    const none: mlx.mlx_array = .{ .ctx = null };
+    const x = try randBf16(rnd, &.{ 1, rows, k }, 4.0, 0.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const nw = try randBf16(rnd, &.{ hc, h }, 1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(nw);
+    const iw = try randBf16(rnd, &.{ k, hc }, 0.1, 0.0, s);
+    defer _ = mlx.mlx_array_free(iw);
+    const wo = try randBf16(rnd, &.{ 1, rows, h }, 2.0, 0.0, s);
+    defer _ = mlx.mlx_array_free(wo);
+    const wi = try randBf16(rnd, &.{ 1, rows, hc, 1 }, 1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(wi);
+    for (read_cases) |c| {
+        const inj_w: mlx.mlx_array = if (c.inject) iw else none;
+        const pend: ?xfm.HcPending = if (c.pending) .{ .out = wo, .inj = wi } else null;
+        hc_decode2.decode3_override = false;
+        const ref3 = hc_decode2.d3_served;
+        const ref = (try hcf.hcReadFusedPack(s, x, 1, rows, nw, d.dw, none, none, d.uw, none, none, inj_w, 1e-6, hc, h, 16, 16, pend, true)) orelse return error.HcFusedDeclined;
+        defer freeRead(ref);
+        try testing.expectEqual(ref3, hc_decode2.d3_served);
+        hc_decode2.decode3_override = null;
+        const got = (try hcf.hcReadFusedPack(s, x, 1, rows, nw, d.dw, none, none, d.uw, none, none, inj_w, 1e-6, hc, h, 16, 16, pend, true)) orelse return error.HcFusedDeclined;
+        defer freeRead(got);
+        // decode3 served it: a silent fall-back to the two-launch read would pass the byte check vacuously
+        try testing.expectEqual(ref3 + 1, hc_decode2.d3_served);
+        inline for (.{ "mixed", "inj", "stream" }) |name| {
+            try testing.expect((@field(ref, name).ctx != null) == (@field(got, name).ctx != null));
+            if (@field(ref, name).ctx != null) try expectEqualBits(@field(ref, name), @field(got, name), s);
+        }
+    }
+}
+
+test "hc decode2: a multi-row read matches each row read alone (Flash Next geometry, dense bf16 weights, multi-row launches)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    for ([_]c_int{ 2, 3, 4, 5, 8, 16 }) |rows| try parityRowsDense(2560, 320, 0x2DE45E + @as(u64, @intCast(rows)), rows);
+}
+
+test "hc decode2: decode3 is byte-identical to the two-launch read (Flash Next geometry, dense bf16, 2..8 and 16 rows)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8, 16 }) |rows| try parity3(2560, 320, 0xD3C0DE + @as(u64, @intCast(rows)), rows);
+}
+
+test "hc decode2: decode3 declines quantized weights and a single row" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xD3E0);
+    const rnd = prng.random();
+    const hcf = @import("../../../plugins/qwen4_exp/hc_fused.zig");
+    hcf.hc_fused_override = true;
+    defer hcf.hc_fused_override = null;
+    const hc: c_int = 4;
+    const h: c_int = 2560;
+    const r: c_int = 320;
+    const none: mlx.mlx_array = .{ .ctx = null };
+    const nw = try randBf16(rnd, &.{ hc, h }, 1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(nw);
+    {
+        // 8-bit quantized at four rows: the two-launch read (decode3 is the dense read's)
+        const down = try quantRandom(rnd, r, hc * h, 8, 64, s);
+        defer down.deinit();
+        const up = try quantRandom(rnd, hc * h, r, 8, 64, s);
+        defer up.deinit();
+        const x = try randBf16(rnd, &.{ 1, 4, hc * h }, 4.0, 0.0, s);
+        defer _ = mlx.mlx_array_free(x);
+        const before = hc_decode2.d3_served;
+        const got = (try hcf.hcReadFusedPack(s, x, 1, 4, nw, down.w, down.s, down.b, up.w, up.s, up.b, none, 1e-6, hc, h, 8, 64, null, true)) orelse return error.HcFusedDeclined;
+        freeRead(got);
+        try testing.expectEqual(before, hc_decode2.d3_served);
+    }
+    {
+        // one row: the two-launch read
+        const d = try Dense.init(rnd, h, r, s);
+        defer d.deinit();
+        const x = try randBf16(rnd, &.{ 1, 1, hc * h }, 4.0, 0.0, s);
+        defer _ = mlx.mlx_array_free(x);
+        const before = hc_decode2.d3_served;
+        const got = (try hcf.hcReadFusedPack(s, x, 1, 1, nw, d.dw, none, none, d.uw, none, none, none, 1e-6, hc, h, 16, 16, null, true)) orelse return error.HcFusedDeclined;
+        freeRead(got);
+        try testing.expectEqual(before, hc_decode2.d3_served);
+    }
 }

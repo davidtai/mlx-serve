@@ -18,12 +18,14 @@ const HC_FUSED_MAX_ROWS = @import("hc_fused.zig").HC_FUSED_MAX_ROWS;
 const HcFusedOut = @import("hc_fused.zig").HcFusedOut;
 const HcPending = @import("hc_fused.zig").HcPending;
 const hcFusedEnabled = @import("hc_fused.zig").hcFusedEnabled;
-const hcReadFused = @import("hc_fused.zig").hcReadFused;
+const hcReadFusedPack = @import("hc_fused.zig").hcReadFusedPack;
 const hcReadJoined = @import("hc_fused.zig").hcReadJoined;
 const HcWeights = @import("weights.zig").HcWeights;
+const hpn = @import("../../sdk/blocks/hc/hc_prefill_nax.zig");
 const PleWeights = @import("weights.zig").PleWeights;
 
-/// qwen4_exp: compile the four hyper-connection elementwise tails.
+/// qwen4_exp: compile the four hyper-connection elementwise tails. An EXL3 trunk pack's load also says whether its rows
+/// take the prefill kernels.
 pub fn compileQwen4Hc(self: *Trunk) void {
     const specs = .{
         .{ &self.compiled_hc_silu, &hcSiluCallback, true },
@@ -43,6 +45,7 @@ pub fn compileQwen4Hc(self: *Trunk) void {
         }
     }
     if (n > 0) log.info("[qwen4] hyper-connection tails compiled ({d}/4 kernels)\n", .{n});
+    if (self.config.trunk_format and self.moe_layers.len > 0) if (self.moe_layers[0].hc_attn) |*w| @import("load.zig").sayHcPrefillAtLoad(w);
 }
 
 pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
@@ -150,6 +153,10 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
     const hidden: c_int = @intCast(self.config.hidden_size);
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
+        // Where MLX runs one chain over K the normalized rows are never written; else the norm kernel.
+        if (self.config.trunk_format and hpn.fuseNormOn(self.s, batch, seq_len, stream, w.down_rows, w.up_rows, w.inject_flat, hc, hidden)) {
+            if (try hcReadFoldNorm(self, stream, w, batch, seq_len, pend)) |o| return o;
+        }
         if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
             defer n.deinit();
             var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, n.raw_inject);
@@ -164,12 +171,12 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
         }
     }
     if (batch * seq_len > HC_FUSED_MAX_ROWS or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
-    if (w.down_rows.ctx != null) return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_rows, .{ .ctx = null }, .{ .ctx = null }, w.up_rows, .{ .ctx = null }, .{ .ctx = null }, w.inject_flat, self.config.rms_norm_eps, hc, hidden, 16, 16, pend);
+    if (w.down_rows.ctx != null) return hcReadFusedPack(self.s, stream, batch, seq_len, w.norm_w, w.down_rows, .{ .ctx = null }, .{ .ctx = null }, w.up_rows, .{ .ctx = null }, .{ .ctx = null }, w.inject_flat, self.config.rms_norm_eps, hc, hidden, 16, 16, pend, self.config.trunk_format);
     if (w.down_s.ctx == null or w.up_s.ctx == null) return null;
     const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
     const uqp = self.quantParamsFor(w.up_w, w.up_s);
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
-    return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend);
+    return hcReadFusedPack(self.s, stream, batch, seq_len, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend, self.config.trunk_format);
 }
 
 pub fn addVerifyPle(self: *Trunk, row: anytype, pw: *const PleWeights, layer: usize, index: usize) !void {
@@ -201,7 +208,7 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]Hc
     const dqp: QuantParams = if (dense) .{ .bits = 16, .group_size = 16 } else self.quantParamsHinted(w.down_w, w.down_s, 10240);
     const uqp: QuantParams = if (dense) dqp else self.quantParamsFor(w.up_w, w.up_s);
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
-    const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null)) orelse return null;
+    const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null, self.config.trunk_format)) orelse return null;
     defer self.allocator.free(joined);
     errdefer for (joined) |value| inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(value, name).ctx != null) _ = mlx.mlx_array_free(@field(value, name));
@@ -293,56 +300,134 @@ pub fn hcReadNormed(self: *Trunk, n4: mlx.mlx_array, w: *const HcWeights, batch:
     try mlx.check(mlx.mlx_reshape(&n_flat, n4, &flat_shape, 3, self.s));
 
     // down/inject carry the reference's `/hc` in their weights (load-time fold).
-    const down = try self.qmatmul(n_flat, w.down_w, w.down_s, w.down_b);
-    defer _ = mlx.mlx_array_free(down);
-    const act = (try applyClosure(self.compiled_hc_silu, &.{down})) orelse try self.silu(down);
+    // The down, silu, inject matmul and gate in one launch, where the chain's inject is hp.norm's matmul of
+    // `inject_flat` or absent (the mixer's read): its act and inj stand in for the chain's, bit for bit.
+    const fused: ?hpn.FuseOut = if (self.config.trunk_format and (w.inject_w.ctx == null or raw_inject != null) and hpn.fuseOn(self.s, batch, seq_len, n4, w.down_rows)) fz: {
+        const iw: mlx.mlx_array = if (w.inject_w.ctx != null) w.inject_flat else .{ .ctx = null };
+        const tabs = try hcFuseTables(self);
+        if (try hpn.readDown(self.s, n_flat, w.down_rows, iw, tabs, batch, seq_len, hc)) |f| break :fz f;
+        break :fz try hpn.fuseDown(self.s, n_flat, w.down_rows, iw, tabs, batch, seq_len, hc);
+    } else null;
+    // The fused `inj` moves into the result below; until then it is this function's.
+    var fused_inj: mlx.mlx_array = if (fused) |f| f.inj else .{ .ctx = null };
+    errdefer if (fused_inj.ctx != null) {
+        _ = mlx.mlx_array_free(fused_inj);
+    };
+    // The NAX down and up + mix, bit for bit the matmuls and the mix kernel; asked once, so both agree.
+    const nax_read = self.config.trunk_format and hpn.naxOn(self.s, batch, seq_len, n4, w.down_rows, w.up_rows);
+    const act = if (fused) |f| f.act else blk: {
+        const down = (if (nax_read) try hpn.naxDown(self.s, n_flat, w.down_rows, batch, seq_len) else null) orelse try self.qmatmul(n_flat, w.down_w, w.down_s, w.down_b);
+        defer _ = mlx.mlx_array_free(down);
+        break :blk (try applyClosure(self.compiled_hc_silu, &.{down})) orelse try self.silu(down);
+    };
     defer _ = mlx.mlx_array_free(act);
-    const up = try self.qmatmul(act, w.up_w, w.up_s, w.up_b);
-    defer _ = mlx.mlx_array_free(up);
-    const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
-    var up4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up4);
-    try mlx.check(mlx.mlx_reshape(&up4, up, &shape4, 4, self.s));
+    const reg_mixed = if (self.config.trunk_format and hpn.readUpOn(self.s, batch, seq_len, n4, w.up_rows)) try hpn.readUpMix(self.s, act, w.up_rows, n4, batch, seq_len) else null;
+    const nax_mixed = reg_mixed orelse if (nax_read) try hpn.naxUpMix(self.s, act, w.up_rows, n4, batch, seq_len) else null;
     var mixed: mlx.mlx_array = undefined;
-    const prefill_mix = if (@import("../../sdk/blocks/hc/hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(n4)))
-        (try @import("../../sdk/blocks/hc/hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len)) orelse try @import("../../sdk/blocks/hc/hc_prefill_cuda.zig").mix(self.s, up4, n4)
-    else
-        null;
-    if (prefill_mix) |m| {
-        mixed = m;
-    } else if (try applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
+    if (nax_mixed) |m| {
         mixed = m;
     } else {
-        var mix = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mix);
-        try mlx.check(mlx.mlx_sigmoid(&mix, up4, self.s));
-        var prod = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(prod);
-        try mlx.check(mlx.mlx_multiply(&prod, mix, n4, self.s));
-        mixed = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s));
+        const up = try self.qmatmul(act, w.up_w, w.up_s, w.up_b);
+        defer _ = mlx.mlx_array_free(up);
+        const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
+        var up4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(up4);
+        try mlx.check(mlx.mlx_reshape(&up4, up, &shape4, 4, self.s));
+        const prefill_mix = if (@import("../../sdk/blocks/hc/hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(n4)))
+            (try @import("../../sdk/blocks/hc/hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len)) orelse try @import("../../sdk/blocks/hc/hc_prefill_cuda.zig").mix(self.s, up4, n4)
+        else
+            null;
+        if (prefill_mix) |m| {
+            mixed = m;
+        } else if (try applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
+            mixed = m;
+        } else {
+            var mix = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(mix);
+            try mlx.check(mlx.mlx_sigmoid(&mix, up4, self.s));
+            var prod = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(prod);
+            try mlx.check(mlx.mlx_multiply(&prod, mix, n4, self.s));
+            mixed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s));
+        }
     }
     errdefer _ = mlx.mlx_array_free(mixed);
 
     var inj = mlx.mlx_array_new();
-    if (w.inject_w.ctx != null) {
+    if (fused_inj.ctx != null) {
+        _ = mlx.mlx_array_free(inj);
+        inj = fused_inj;
+        fused_inj = .{ .ctx = null };
+    } else if (w.inject_w.ctx != null) {
         const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, w.inject_w, w.inject_s, w.inject_b);
         defer _ = mlx.mlx_array_free(raw);
-        const g = (try applyClosure(self.compiled_hc_inj, &.{raw})) orelse blk: {
-            var sig = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sig);
-            try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
-            const two = try scalarOf(2.0, mlx.mlx_array_dtype(raw), self.s);
-            defer _ = mlx.mlx_array_free(two);
-            var g2 = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&g2, sig, two, self.s));
-            break :blk g2;
-        };
+        const g = (try applyClosure(self.compiled_hc_inj, &.{raw})) orelse try hcInjGateChain(self, raw);
         defer _ = mlx.mlx_array_free(g);
         const inj_shape = [_]c_int{ batch, seq_len, hc, 1 };
         try mlx.check(mlx.mlx_reshape(&inj, g, &inj_shape, 4, self.s));
     }
     return .{ .mixed = mixed, .inj = inj };
+}
+
+/// The chain's inject gate where its compiled closure is absent: 2 sigmoid(raw), in raw's dtype.
+fn hcInjGateChain(self: *const Trunk, raw: mlx.mlx_array) !mlx.mlx_array {
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
+    const two = try scalarOf(2.0, mlx.mlx_array_dtype(raw), self.s);
+    defer _ = mlx.mlx_array_free(two);
+    var g2 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(g2);
+    try mlx.check(mlx.mlx_multiply(&g2, sig, two, self.s));
+    return g2;
+}
+
+/// The fused read's tables: this trunk's silu and inject gate (the compiled closures, or the op chains where they did
+/// not compile) of every bf16 pattern, computed once by those very functions on a rank-3 array (the rank the read calls
+/// them at), so the lookups hold whatever bits the chain computes.
+fn hcFuseTables(self: *Trunk) !hpn.FuseTables {
+    const slot = @as(usize, @intFromBool(self.compiled_hc_silu != null)) | (@as(usize, @intFromBool(self.compiled_hc_inj != null)) << 1);
+    if (hpn.fuse_tables[slot]) |t| return t;
+    var bits: [65536]u16 = undefined;
+    for (&bits, 0..) |*v, i| v.* = @intCast(i);
+    const x = mlx.mlx_array_new_data(&bits, &[_]c_int{ 1, 1, 65536 }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    const silu3 = (try applyClosure(self.compiled_hc_silu, &.{x})) orelse try self.silu(x);
+    defer _ = mlx.mlx_array_free(silu3);
+    const gate3 = (try applyClosure(self.compiled_hc_inj, &.{x})) orelse try hcInjGateChain(self, x);
+    defer _ = mlx.mlx_array_free(gate3);
+    var t: hpn.FuseTables = .{ .silu = mlx.mlx_array_new(), .gate = mlx.mlx_array_new() };
+    errdefer {
+        _ = mlx.mlx_array_free(t.silu);
+        _ = mlx.mlx_array_free(t.gate);
+    }
+    try mlx.check(mlx.mlx_reshape(&t.silu, silu3, &[_]c_int{65536}, 1, self.s));
+    try mlx.check(mlx.mlx_reshape(&t.gate, gate3, &[_]c_int{65536}, 1, self.s));
+    hpn.fuse_tables[slot] = t;
+    return t;
+}
+
+/// The prefill read with the normalized rows never written (`normInv`, then the down and the up + mix normalizing from
+/// the stream), bit for bit the norm kernel and `hcReadNormed`. Null when a launch declines: the caller takes the norm
+/// kernel.
+fn hcReadFoldNorm(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
+    const tabs = try hcFuseTables(self);
+    const pre = (try hpn.normInv(self.s, stream, w.norm_w, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) orelse return null;
+    defer pre.deinit();
+    const fused = (try hpn.rwDown(self.s, pre.stream, pre.invs, w.norm_w, w.down_rows, w.inject_flat, tabs, batch, seq_len)) orelse
+        (try hpn.fuseDownNorm(self.s, pre.stream, pre.invs, w.norm_w, w.down_rows, w.inject_flat, tabs, batch, seq_len)) orelse return null;
+    defer _ = mlx.mlx_array_free(fused.act);
+    errdefer if (fused.inj.ctx != null) {
+        _ = mlx.mlx_array_free(fused.inj);
+    };
+    const mixed = (try hpn.rwUpMix(self.s, fused.act, w.up_rows, pre.stream, pre.invs, w.norm_w, batch, seq_len)) orelse
+        (try hpn.upMixNorm(self.s, fused.act, w.up_rows, pre.stream, pre.invs, w.norm_w, batch, seq_len)) orelse {
+        if (fused.inj.ctx != null) _ = mlx.mlx_array_free(fused.inj);
+        return null;
+    };
+    errdefer _ = mlx.mlx_array_free(mixed);
+    return .{ .stream = try standinRef(pre.stream), .mixed = mixed, .inj = fused.inj };
 }
 
 /// `stream + flatten(out[..., None, :] * inj)`. Consumes `stream`.
@@ -374,4 +459,106 @@ pub fn hcWrite(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx
     try mlx.check(mlx.mlx_reshape(&next, next4, &flat_shape, 3, self.s));
     _ = mlx.mlx_array_free(stream);
     return next;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const bf16BitEqual = @import("../../sdk/testing/parity.zig").bf16BitEqual;
+const testRandUniformBf16 = @import("../../sdk/testing/parity.zig").testRandUniformBf16;
+
+fn tOwned(comptime f: anytype, args: anytype) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(@call(.auto, f, .{&o} ++ args));
+    return o;
+}
+
+test "hc read: the prefill read gives MLX's chain's bits (stream, mixed, inj) through the fused and folded launches" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const hc: c_int = 4;
+    const hidden: c_int = 2560;
+    const r: c_int = 320;
+    const width = hc * hidden;
+    var prng = std.Random.DefaultPrng.init(0x48434652);
+    const rnd = prng.random();
+    // Dense bf16 weights as the loader binds them: transposed views of the [out, in] rows, those rows as u32 words, the
+    // inject weight's contiguous copy.
+    const down_src = try testRandUniformBf16(rnd, &.{ r, width }, -0.04, 0.04, s);
+    const up_src = try testRandUniformBf16(rnd, &.{ width, r }, -0.1, 0.1, s);
+    const inj_src = try testRandUniformBf16(rnd, &.{ hc, width }, -0.05, 0.05, s);
+    var w: HcWeights = .{
+        .norm_w = try testRandUniformBf16(rnd, &.{ hc, hidden }, 0.5, 1.5, s),
+        .down_w = try tOwned(mlx.mlx_transpose, .{ down_src, s }),
+        .down_s = .{ .ctx = null },
+        .down_b = .{ .ctx = null },
+        .up_w = try tOwned(mlx.mlx_transpose, .{ up_src, s }),
+        .up_s = .{ .ctx = null },
+        .up_b = .{ .ctx = null },
+        .inject_w = try tOwned(mlx.mlx_transpose, .{ inj_src, s }),
+    };
+    w.inject_flat = try tOwned(mlx.mlx_contiguous, .{ w.inject_w, false, s });
+    w.down_rows = try tOwned(mlx.mlx_view, .{ down_src, mlx.mlx_dtype.uint32, s });
+    w.up_rows = try tOwned(mlx.mlx_view, .{ up_src, mlx.mlx_dtype.uint32, s });
+    defer for ([_]mlx.mlx_array{ down_src, up_src, inj_src, w.norm_w, w.down_w, w.up_w, w.inject_w, w.inject_flat, w.down_rows, w.up_rows }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var mixer = w;
+    mixer.inject_w = .{ .ctx = null };
+    mixer.inject_flat = .{ .ctx = null };
+    const ones = try standinOnes(&.{hidden}, s);
+    defer _ = mlx.mlx_array_free(ones);
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator });
+    xfm.config.hc_count = 4;
+    xfm.config.hidden_size = 2560;
+    xfm.config.rms_norm_eps = 1e-6;
+    // the fused and folded launches are an EXL3 trunk pack's only
+    xfm.config.trunk_format = true;
+    xfm.rms_eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(xfm.rms_eps_arr);
+    xfm.ones_hidden = ones;
+    xfm.compileQwen4Hc();
+    defer inline for (.{ xfm.compiled_hc_silu, xfm.compiled_hc_mix, xfm.compiled_hc_inj, xfm.compiled_hc_write }) |slot| {
+        if (slot) |closure| _ = mlx.mlx_closure_free(closure);
+    };
+    defer hpn.disabled_for_test = false;
+    // split-K tails (the fused down on the norm kernel's rows), MLX's edge and the 8192 chunk (the folded read)
+    for ([_][2]c_int{ .{ 1, 33 }, .{ 2, 33 }, .{ 1, 3414 }, .{ 1, 8192 } }) |bs| {
+        const b = bs[0];
+        const seq = bs[1];
+        const x = try testRandUniformBf16(rnd, &.{ b, seq, width }, -3, 3, s);
+        defer _ = mlx.mlx_array_free(x);
+        const wo = try testRandUniformBf16(rnd, &.{ b, seq, hidden }, -1, 1, s);
+        defer _ = mlx.mlx_array_free(wo);
+        const wi = try testRandUniformBf16(rnd, &.{ b, seq, hc, 1 }, 0, 2, s);
+        defer _ = mlx.mlx_array_free(wi);
+        for ([_]bool{ false, true }) |pending| {
+            // [0]: MLX's chain (every launch off), [1]: the served read
+            var hs: [2]mlx.mlx_array = undefined;
+            var reads: [2]HcRead = undefined;
+            for ([_]bool{ true, false }, &hs, &reads) |plain, *h, *rd| {
+                hpn.disabled_for_test = plain;
+                h.* = try standinRef(x);
+                var pend: ?HcPending = if (pending) .{ .out = try standinRef(wo), .inj = try standinRef(wi) } else null;
+                defer if (pend) |*p| p.deinit();
+                rd.* = try xfm.hcReadPending(h, &w, b, seq, &pend);
+            }
+            defer for (&hs, &reads) |h, *rd| {
+                _ = mlx.mlx_array_free(h);
+                rd.deinit();
+            };
+            try testing.expect(try bf16BitEqual(hs[1], hs[0], s));
+            try testing.expect(try bf16BitEqual(reads[1].mixed, reads[0].mixed, s));
+            try testing.expect(try bf16BitEqual(reads[1].inj, reads[0].inj, s));
+        }
+        // the mixer's read (no inject): the fused down without its inject chain
+        hpn.disabled_for_test = true;
+        var mref = try xfm.hcRead(x, &mixer, b, seq);
+        defer mref.deinit();
+        hpn.disabled_for_test = false;
+        var mgot = try xfm.hcRead(x, &mixer, b, seq);
+        defer mgot.deinit();
+        try testing.expect(try bf16BitEqual(mgot.mixed, mref.mixed, s));
+    }
 }

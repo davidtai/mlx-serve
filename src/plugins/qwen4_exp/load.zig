@@ -72,6 +72,17 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
     return out;
 }
 
+/// Says once, at an EXL3 trunk pack's load (`compileQwen4Hc`), why the hc prefill read, write and norm kernels decline
+/// its hyper-connection rows `w`, if they do. No other pack's load says anything.
+pub fn sayHcPrefillAtLoad(w: *const HcWeights) void {
+    if (hc_rows_said) return;
+    hc_rows_said = true;
+    if (w.down_rows.ctx == null)
+        log.info("[hc-prefill] declined at load: the hyper-connection mix projections are not bf16; the prefill read, write and norm kernels read bf16 rows\n", .{})
+    else if (!@import("../../mlx/device.zig").naxAvailable())
+        log.info("[hc-prefill] declined at load: this GPU has no NAX (the read, write and norm kernels need an M5 or later)\n", .{});
+}
+
 pub fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !PleWeights {
     var nb: [160]u8 = undefined;
     const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);

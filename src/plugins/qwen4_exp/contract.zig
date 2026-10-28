@@ -388,6 +388,8 @@ pub fn register(set: *kc.Set) !void {
     try @import("contract_affine4.zig").register(set);
     try @import("contract_qsa_gather.zig").register(set);
     try @import("contract_qsa_attn.zig").register(set);
+    try @import("contract_gdn.zig").register(set);
+    try @import("contract_merges.zig").register(set);
 }
 
 // ── tests ──
@@ -415,4 +417,6 @@ test {
     _ = @import("contract_affine4.zig");
     _ = @import("contract_qsa_gather.zig");
     _ = @import("contract_qsa_attn.zig");
+    _ = @import("contract_gdn.zig");
+    _ = @import("contract_merges.zig");
 }

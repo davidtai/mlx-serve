@@ -62,11 +62,22 @@ pub const LinearAttnWeights = struct {
     in: FusedRows = .{},
     /// q/k/v quantized at different widths cannot join: `qkv_w` is null and each projects alone.
     qkv_parts: [3]QW = .{ .{}, .{}, .{} },
+    /// bf16 in_proj_a / in_proj_b joined at load (qwen4_exp `trunk/gdn_ab.zig`): `a_w` / `b_w` are views of it.
+    ab: GdnAb = .{},
 
     /// The ANE GDN program projects one joined qkv and a full-rank z.
     pub fn aneGdnServes(la: *const LinearAttnWeights) bool {
         return !la.combined_proj and la.qkv_w.ctx != null;
     }
+};
+
+/// A GDN layer's joined bf16 a / b: `w` the transposed view [hidden, n] of the row-major buffer [a | 0 | b] (null-ctx:
+/// not joined), b's first column `b_off`, the parts' widths.
+pub const GdnAb = struct {
+    w: mlx.mlx_array = .{ .ctx = null },
+    n: c_int = 0,
+    b_off: c_int = 0,
+    widths: [2]c_int = .{ 0, 0 },
 };
 
 // ── GatedDeltaNet (linear attention layers) ──

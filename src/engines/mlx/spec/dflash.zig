@@ -3,6 +3,7 @@ const std = @import("std");
 const DFLASH_GATE_WARMUP = @import("gates.zig").DFLASH_GATE_WARMUP;
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
+const ssmChainCaptured = @import("../ssm/entry.zig").ssmChainCaptured;
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -698,7 +699,7 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
             // re-point moe_seq_offset at the committed length.
             self.ctx.cache.step = kv_step_snap;
             if (self.ctx.ssm_entries) |entries| {
-                const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                const gdn_captured = entries.len > 0 and ssmChainCaptured(&entries[0]);
                 if (!gdn_captured) return error.SpecRollbackUnavailable;
                 try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
             }

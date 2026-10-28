@@ -52,7 +52,7 @@ pub const HcPending = struct {
 /// `inj [B,S,hc,1]`, or null when the geometry/quant is outside the kernel
 /// (caller keeps the chain).
 pub const HC_FUSED_MAX_ROWS: c_int = 16;
-pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?[]const HcPending) !?[]HcFusedOut {
+pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?[]const HcPending, trunk: bool) !?[]HcFusedOut {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 2) return null;
     const total = @as(c_int, @intCast(inputs.len)) * width;
     if (total > HC_FUSED_MAX_ROWS or w.inject_flat.ctx == null) return null;
@@ -95,7 +95,7 @@ pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx
         joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]) };
     }
     const dense = w.down_rows.ctx != null;
-    const full = (try hcReadFused(s, joined, 1, total, w.norm_w, if (dense) w.down_rows else w.down_w, w.down_s, w.down_b, if (dense) w.up_rows else w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending)) orelse return null;
+    const full = (try hcReadFusedPack(s, joined, 1, total, w.norm_w, if (dense) w.down_rows else w.down_w, w.down_s, w.down_b, if (dense) w.up_rows else w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending, trunk)) orelse return null;
     defer inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(full, name).ctx != null) _ = mlx.mlx_array_free(@field(full, name));
     };
@@ -135,6 +135,7 @@ fn hcEpsArray(eps: f32) !mlx.mlx_array {
     return hc_fused_eps.?;
 }
 
+/// `hcReadFusedPack` on a pack whose trunk is not an EXL3 format's.
 pub fn hcReadFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -154,6 +155,32 @@ pub fn hcReadFused(
     bits: u32,
     group_size: u32,
     pend: ?HcPending,
+) !?HcFusedOut {
+    return hcReadFusedPack(s, x, batch, seq, nw, dw, ds, db, uw, us, ub, iw, eps, hc, hidden, bits, group_size, pend, false);
+}
+
+/// The fused read on a pack whose trunk is (`trunk`, the config's `trunk_format`) or is not an EXL3 format's: an EXL3
+/// trunk's decode read is `hc_decode2.readTrunk`, every other pack's `hc_decode2.read`.
+pub fn hcReadFusedPack(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    batch: c_int,
+    seq: c_int,
+    nw: mlx.mlx_array,
+    dw: mlx.mlx_array,
+    ds: mlx.mlx_array,
+    db: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    us: mlx.mlx_array,
+    ub: mlx.mlx_array,
+    iw: mlx.mlx_array,
+    eps: f32,
+    hc: c_int,
+    hidden: c_int,
+    bits: u32,
+    group_size: u32,
+    pend: ?HcPending,
+    trunk: bool,
 ) !?HcFusedOut {
     if (!hcFusedEnabled()) return null;
     if (!mlx.streamIsGpu(s) and !mlx.cudaAvailable()) return null;
@@ -193,6 +220,8 @@ pub fn hcReadFused(
     const pending: ?hc_decode2.Pending = if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null;
     const read = if (mlx.cudaAvailable())
         try @import("../../sdk/blocks/hc/hc_cuda.zig").read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending)
+    else if (trunk and rows <= hc_decode2.maxRows())
+        try hc_decode2.readTrunk(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending)
     else if (rows <= hc_decode2.maxRows())
         try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending)
     else

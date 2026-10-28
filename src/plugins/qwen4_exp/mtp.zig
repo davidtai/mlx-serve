@@ -970,8 +970,9 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
     const kv_only_was = self.fused.kv_only;
     self.fused.kv_only = project == .none;
     defer self.fused.kv_only = kv_only_was;
-    // The head's two writes defer to its next read, as the trunk's do (the read's first launch applies stream +
-    // out * inj, bit for bit the write and then the read); flushed wherever the stream itself is needed.
+    // On an EXL3 trunk pack the head's two writes defer to its next read, as the trunk's do (the read's first launch
+    // applies stream + out * inj, bit for bit the write and then the read); flushed wherever the stream itself is needed.
+    // Every other pack writes as main does, and `pending` stays null.
     var pending: ?HcPending = null;
     defer if (pending) |*pd| pd.deinit();
     const li: u32 = cfg.num_hidden_layers;
@@ -983,7 +984,10 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
         .linear => return error.MtpLayerNotAttention,
     };
     defer _ = mlx.mlx_array_free(attn_out);
-    try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+    if (self.config.trunk_format) {
+        try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+        noteHeadDefer(pending != null, batch * seq_len);
+    } else h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len);
     var pre2 = try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
     defer pre2.deinit();
     const mlp_out = switch (lw.mlp) {
@@ -991,7 +995,7 @@ pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stre
         .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
     };
     defer _ = mlx.mlx_array_free(mlp_out);
-    try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, m.mixer.inject_flat, &pending);
+    if (self.config.trunk_format) try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, m.mixer.inject_flat, &pending) else h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
     qwen4MtpAdvance(live.cache, live.seq_offset, seq_len);
 
     // History append wants the stream and nothing else: the mixer read and
