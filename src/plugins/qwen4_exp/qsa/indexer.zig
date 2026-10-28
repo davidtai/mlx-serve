@@ -325,10 +325,17 @@ pub fn qsaSlotEntry(sc: *ForwardCtx, layer: u32) *SSMCacheEntry {
 }
 
 pub fn qsaMask(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    // The indexer epilogue: at decode rows the projection's finish normalizes and rotates the index queries and pools
+    // the block the call completes (`merges.indexerMerged`); null: the projection below and qsaMaskFromQk's chain.
+    if (ctx.batch_slots == null) if (try merges.indexerMerged(self, ctx, x, fa, entry, cache_len, pos_base, batch, seq_len)) |im| {
+        var idx = im;
+        defer idx.deinit();
+        return self.qsaMaskFromQk(ctx, idx.qk, fa, entry, cache_len, pos_base, batch, seq_len, layer, true, &idx);
+    };
     const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
     defer _ = mlx.mlx_array_free(qk);
     if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
-    return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer, true);
+    return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer, true, null);
 }
 
 /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
@@ -365,7 +372,7 @@ pub fn qsaMaskBatched(self: *Trunk, slots: []const *ForwardCtx, qk: mlx.mlx_arra
         var qk_i = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(qk_i);
         try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seq_len, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-        masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer, false);
+        masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer, false, null);
         kv_lens[i] = cache_len + seq_len;
         if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
         if (masks[i].ctx != null) any = true;
@@ -419,8 +426,8 @@ pub fn qsaMaskBatched(self: *Trunk, slots: []const *ForwardCtx, qk: mlx.mlx_arra
     return concatAxis0(self.s, padded);
 }
 
-/// Serial per-slot body of `qsaMask` over the projected `qk` rows.
-pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32, solo: bool) !mlx.mlx_array {
+/// Serial per-slot body of `qsaMask` over the projected `qk` rows; `idx_merge` what the indexer epilogue built of them.
+pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32, solo: bool, idx_merge: ?*const merges.IdxMerge) !mlx.mlx_array {
     const offset = cache_len;
     const cfg = &self.config;
     const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -440,7 +447,8 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
     if (env.onCached(&prof_mod.qwen4_no_pooled_env, .QWEN4_NO_POOLED)) return error.QsaPooledRequired;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
-    if (nb > nb_cached) {
+    // the block key the indexer projection's finish pooled (the epilogue), appended in the chain's place
+    if (nb > nb_cached and !(try merges.appendPooled(self, entry, idx_merge, nb, nb_cached))) {
         const leftover_n = offset - nb_cached * ratio;
         if (leftover_n < 0) return error.QsaHistoryGap;
         const held: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
@@ -491,43 +499,48 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
 
     // Index queries: per-head norm → [B, n, S, hd] → partial RoPE at the
     // chunk's positions.
-    var q = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q);
-    try mlx.check(mlx.mlx_slice(&q, qk, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, n_idx * idx_hd }, 3, &strides3, 3, self.s));
-    const q_shape = [_]c_int{ batch, seq_len, n_idx, idx_hd };
-    var q4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q4);
-    try mlx.check(mlx.mlx_reshape(&q4, q, &q_shape, 4, self.s));
-    const qn = try self.rmsNorm(q4, fa.idx_q_norm);
-    defer _ = mlx.mlx_array_free(qn);
-    const perm = [_]c_int{ 0, 2, 1, 3 };
-    var qt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(qt);
-    try mlx.check(mlx.mlx_transpose_axes(&qt, qn, &perm, 4, self.s));
     var q_rope = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(q_rope);
-    if (ctx.mrope_cos_cur) |cos| {
-        _ = mlx.mlx_array_free(q_rope);
-        q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
+    if (merges.qRope(idx_merge)) |qr| {
+        // the indexer projection's finish normalized and rotated them (the epilogue)
+        try mlx.check(mlx.mlx_array_set(&q_rope, qr));
     } else {
-        const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-        // The SAME spectrum attention rotates with (scaled when the config
-        // says YaRN): the index queries and keys are the only place the
-        // model asks "how far apart are these two blocks", and a block
-        // pick made on unscaled angles at 1M positions would select
-        // against a position notion the attention layers no longer have.
-        // Indexer is 128-wide / 64 rotated, so score = ms²·A+B and mscale
-        // CAN change a top-k. M-RoPE tables already carry mscale via
-        // fillCosSin; this scalar arm must too. Never yarnScaleQK here
-        // (that table is [head_dim] = 256). Keep mlx_fast_rope scale=1.0.
-        const use_yarn = self.yarnActive();
-        const freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
-        if (ctx.head_rope_pos.ctx != null) {
-            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, ctx.head_rope_pos, freqs, self.s));
+        var q = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q);
+        try mlx.check(mlx.mlx_slice(&q, qk, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, n_idx * idx_hd }, 3, &strides3, 3, self.s));
+        const q_shape = [_]c_int{ batch, seq_len, n_idx, idx_hd };
+        var q4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q4);
+        try mlx.check(mlx.mlx_reshape(&q4, q, &q_shape, 4, self.s));
+        const qn = try self.rmsNorm(q4, fa.idx_q_norm);
+        defer _ = mlx.mlx_array_free(qn);
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        var qt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qt);
+        try mlx.check(mlx.mlx_transpose_axes(&qt, qn, &perm, 4, self.s));
+        if (ctx.mrope_cos_cur) |cos| {
+            _ = mlx.mlx_array_free(q_rope);
+            q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
         } else {
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, eff_off, freqs, self.s));
+            const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            // The SAME spectrum attention rotates with (scaled when the config
+            // says YaRN): the index queries and keys are the only place the
+            // model asks "how far apart are these two blocks", and a block
+            // pick made on unscaled angles at 1M positions would select
+            // against a position notion the attention layers no longer have.
+            // Indexer is 128-wide / 64 rotated, so score = ms²·A+B and mscale
+            // CAN change a top-k. M-RoPE tables already carry mscale via
+            // fillCosSin; this scalar arm must too. Never yarnScaleQK here
+            // (that table is [head_dim] = 256). Keep mlx_fast_rope scale=1.0.
+            const use_yarn = self.yarnActive();
+            const freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
+            if (ctx.head_rope_pos.ctx != null) {
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, ctx.head_rope_pos, freqs, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, eff_off, freqs, self.s));
+            }
+            if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
         }
-        if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
     }
 
     // Pooled block keys: mean of leftover + this chunk, already appended above.
@@ -953,6 +966,7 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.formats = .{};
 
     t.s = s;
     t.allocator = testing.allocator;

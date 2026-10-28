@@ -432,6 +432,9 @@ pub const Transformer = struct {
     /// each request's own estimate starts.
     mtp_depth_acc: f32 = 0.8,
     mtp_depth_rounds: u32 = 0,
+    /// What two-chunk MTP rounds cost and returned on this model (`ev_fix.Model`): on the model like `round_cost`, so
+    /// the warm-up's measurements price the next request's plans from its first round.
+    mtp_ev_fix: @import("spec/mtp/ev_fix.zig").Model = .{},
     /// Per-token cos|sin rows for the fused QK-norm+RoPE kernel, one slot per
     /// rope family (0 = default/sliding base, 1 = YaRN freqs). Keyed by
     /// offset: every layer of one decode step shares the row, the next token

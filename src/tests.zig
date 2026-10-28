@@ -225,6 +225,7 @@ test {
     _ = @import("engines/mlx/spec/dflash/policy.zig");
     _ = @import("sdk/spec/mtp/mtp.zig");
     _ = @import("engines/mlx/spec/mtp_test.zig");
+    _ = @import("engines/mlx/spec/mtp/forced.zig");
     _ = @import("engines/mlx/spec/round_cost.zig");
     _ = @import("engines/mlx/spec/mtp_group_planner.zig");
     _ = @import("plugins/deepseek_v4/deepseek_v4.zig");

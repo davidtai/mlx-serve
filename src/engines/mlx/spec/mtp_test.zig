@@ -1185,3 +1185,143 @@ test "mtp: a row-scaled FP8 trunk head reads through fp8Linear and latches nothi
         return error.MlxErrorLatched;
     }
 }
+
+test "mtp: a head built from the rows it computes re-scores through its 8-bit copy, never the head's own tables" {
+    // A trunk format's head (the EXL3 pack's trellis) has no affine rows to gather: the coarse head and its re-score
+    // copy come from the rows it computes (`buildRerankCoarseRows`), and the shortlist re-scores through the copy.
+    // Proposal side only: the verify reads the head itself.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var fx = try RerankFixture.init(s, mtp.TOP32_MIN_ROWS + 96, 256, 8, 64, 0x7E11);
+    defer fx.deinit();
+    var slot: ?mtp.RerankCoarse = mtp.buildRerankCoarseRows(s, fx.dense, 3) orelse return error.CoarseBuildDeclined;
+    defer if (slot) |*q| q.deinit();
+    const copy = slot.?.exact orelse return error.NoRescoreCopy;
+    try testing.expectEqual(fx.vocab, slot.?.rows);
+    // under DRAFT_VOCAB_MIN ids every draft reads the whole head
+    try testing.expect(slot.?.sub == null);
+    // the head's own tables become a trellis-shaped stand-in and two side vectors: nothing in them is a row
+    for ([_]*mlx.mlx_array{ &fx.xfm.lm_head_w, &fx.xfm.lm_head_s, &fx.xfm.lm_head_b }) |a| {
+        _ = mlx.mlx_array_free(a.*);
+        a.* = mlx.mlx_array_new();
+    }
+    try mlx.check(mlx.mlx_zeros(&fx.xfm.lm_head_w, &[_]c_int{ @divTrunc(fx.vocab, 16), @divTrunc(fx.hidden, 16), 96 }, 3, .int16, s));
+    try mlx.check(mlx.mlx_zeros(&fx.xfm.lm_head_s, &[_]c_int{fx.hidden}, 1, .float16, s));
+    try mlx.check(mlx.mlx_zeros(&fx.xfm.lm_head_b, &[_]c_int{fx.vocab}, 1, .float16, s));
+    var logged = false;
+    const eps: f32 = 1e-3;
+    var decisive: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+        // the copy's full readout: what the re-score reads, row for row
+        var full = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(full);
+        try mlx.check(mlx.mlx_quantized_matmul(&full, x, copy.w, copy.s, copy.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", s));
+        const ex = try readRow(allocator, s, full, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+        var sl = (try mtp.rerankShortlist(s, &fx.xfm, &slot, &logged, x, null)) orelse return error.RerankDeclined;
+        defer sl.deinit();
+        try testing.expectEqual(fx.vocab, sl.rows);
+        try mlx.check(mlx.mlx_array_eval(sl.cands));
+        const cands = (mlx.mlx_array_data_uint32(sl.cands) orelse return error.NoData)[0..32];
+        const picked_arr = try mtp.shortlistArgmax(s, sl);
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        if (std.mem.indexOfScalar(u32, cands, want) != null) {
+            decisive += 1;
+            try testing.expect(ex[picked] >= ex[want] - eps);
+        }
+    }
+    try testing.expect(decisive >= 4);
+}
+
+test "mtp: draft rerank over a vocab subset: the subset's exact argmax, the mask honoured, vocab-wide shortlists; a head without it drafts over the whole vocab" {
+    // `withVocabSubset`: single-row drafts read the coarse head's leading rows. A draft is the exact argmax over those
+    // ids whenever the coarse shortlist holds it, never a later id, never a suppressed one (the vocab-wide mask's
+    // leading ids go on the narrower readout), and a shortlist's `rows` stays the vocab (a sampled draft's dense
+    // proposal row is vocab-wide). A head without the subset drafts the whole head's argmax, whatever its id.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const keep: c_int = mtp.TOP32_MIN_ROWS + 64;
+    var fx = try RerankFixture.init(s, 2 * mtp.TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5B5E7);
+    defer fx.deinit();
+    var subset: ?mtp.RerankCoarse = mtp.withVocabSubset(s, mtp.buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined, keep);
+    defer if (subset) |*q| q.deinit();
+    try testing.expectEqual(fx.vocab, subset.?.rows);
+    try testing.expectEqual(keep, subset.?.sub_rows);
+    try testing.expect(subset.?.sub != null);
+    var whole: ?mtp.RerankCoarse = mtp.buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    defer if (whole) |*q| q.deinit();
+    try testing.expect(whole.?.sub == null);
+    // no subset at or past the vocab, nor under the shortlist's least width
+    try testing.expect(mtp.withVocabSubset(s, whole.?, fx.vocab).sub == null);
+    try testing.expect(mtp.withVocabSubset(s, whole.?, mtp.TOP32_MIN_ROWS - 1).sub == null);
+    var logged = false;
+
+    const mask_buf = try allocator.alloc(bool, @intCast(fx.vocab));
+    defer allocator.free(mask_buf);
+    const eps: f32 = 1e-3;
+    var decisive: [2]u32 = .{ 0, 0 };
+    var beyond: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        for ([_]bool{ true, false }, 0..) |active, arm| {
+            const slot: *?mtp.RerankCoarse = if (active) &subset else &whole;
+            const lim: usize = if (active) @intCast(keep) else @intCast(fx.vocab);
+            var want: u32 = 0;
+            for (ex[0..lim], 0..) |v, i| if (v > ex[want]) {
+                want = @intCast(i);
+            };
+            if (!active and want >= @as(u32, @intCast(keep))) beyond += 1;
+
+            // unmasked: the readout's argmax when the coarse shortlist holds it, never an id past the subset while
+            // active
+            var sl = (try mtp.rerankShortlist(s, &fx.xfm, slot, &logged, x, null)) orelse return error.RerankDeclined;
+            defer sl.deinit();
+            try testing.expectEqual(fx.vocab, sl.rows);
+            try mlx.check(mlx.mlx_array_eval(sl.cands));
+            const cands = (mlx.mlx_array_data_uint32(sl.cands) orelse return error.NoData)[0..32];
+            var listed = false;
+            for (cands) |c| {
+                if (active) try testing.expect(c < @as(u32, @intCast(keep)));
+                if (c == want) listed = true;
+            }
+            const picked_arr = (try mtp.rerankSelect(s, &fx.xfm, slot, &logged, x, null)) orelse return error.RerankDeclined;
+            defer _ = mlx.mlx_array_free(picked_arr);
+            const picked = try readIdScalar(picked_arr);
+            if (active) try testing.expect(picked < @as(u32, @intCast(keep)));
+            if (listed) {
+                decisive[arm] += 1;
+                try testing.expect(ex[picked] >= ex[want] - eps);
+            }
+
+            // masked: the readout's winner suppressed through the vocab-wide mask
+            @memset(mask_buf, false);
+            mask_buf[want] = true;
+            const mask = mlx.mlx_array_new_data(mask_buf.ptr, &[_]c_int{fx.vocab}, 1, .bool_);
+            defer _ = mlx.mlx_array_free(mask);
+            const masked_arr = (try mtp.rerankSelect(s, &fx.xfm, slot, &logged, x, mask)) orelse return error.RerankDeclined;
+            defer _ = mlx.mlx_array_free(masked_arr);
+            const masked = try readIdScalar(masked_arr);
+            try testing.expect(masked != want);
+            if (active) try testing.expect(masked < @as(u32, @intCast(keep)));
+        }
+    }
+    try testing.expect(decisive[0] >= 4 and decisive[1] >= 4);
+    // the whole head's winner lies past the subset on some draws, so the arms really differ
+    try testing.expect(beyond >= 1);
+}

@@ -158,6 +158,9 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     if (src.fromTable()) cap = @min(cap_free, @max(cap_row, self.xfm.round_cost.widestMeasured(src.bucket) orelse cap_row));
     const policy = mtpDepthPolicyFor(mtpDepthPolicy(), kv_len);
     var plan = mtpPlanInBounds(mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1), depth_bounds.floorFor(depth_bounds.active, cap), cap);
+    // A two-chunk plan pays its chunk-A boundary or becomes the best single chunk (`ev_fix.zig`), before the base-depth
+    // bookkeeping: the streak, the climb damping and the next request's EV seed read the plan that runs.
+    if (plan.m_hi > plan.m_lo and self.mtpEvFixOn()) plan = mtpPlanInBounds(self.mtpEvFixPlan(plan, cap, src), depth_bounds.floorFor(depth_bounds.active, cap), cap);
     if (plan.m_lo == self.mtp_ev_m_lo_prev) self.mtp_m_lo_streak +|= 1 else self.mtp_m_lo_streak = 0;
     self.mtp_ev_m_lo_prev = plan.m_lo;
     // Live-cost lever: shorten dry exploration bursts when the MEASURED

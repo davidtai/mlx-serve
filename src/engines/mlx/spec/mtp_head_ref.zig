@@ -8,6 +8,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
+const draft_fuse = @import("../../../sdk/spec/mtp/draft_fuse.zig");
 const plugin_head = @import("../plugin/head.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -122,6 +123,51 @@ pub const MtpHeadRef = union(enum) {
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
+    fn qwen4Project(want: mtp_mod.StepWant) Qwen4Mtp.Qwen4MtpProject {
+        return switch (want) {
+            .logits => .last_row,
+            .mixed => .mixed_last_row,
+            .none => .none,
+        };
+    }
+
+    /// `forward` with the row's normalized embedding handed in (the previous draft step's fused pick built it for
+    /// draft `id_arr`, `draft_fuse.zig`): the qwen4 arm reads it instead of building `embedding` + `rmsNorm`; the other
+    /// arms never get one.
+    pub fn forwardFront(
+        self: MtpHeadRef,
+        target: *Transformer,
+        cache: *MtpCacheRef,
+        id_arr: mlx.mlx_array,
+        hidden: mlx.mlx_array,
+        rope_offset: c_int,
+        want: mtp_mod.StepWant,
+        mrope_ctx: ?mtp_mod.MropeContext,
+        host_ids: ?[]const u32,
+        front_en: ?mlx.mlx_array,
+    ) !mtp_mod.StepOut {
+        const fe = front_en orelse return self.forward(target, cache, id_arr, hidden, rope_offset, want, mrope_ctx, host_ids);
+        const t = switch (self) {
+            .qwen4 => |t| t,
+            .qwen, .plugin => return self.forward(target, cache, id_arr, hidden, rope_offset, want, mrope_ctx, host_ids),
+        };
+        cache.activate();
+        const out = try modules.call("qwen4_mtp_forward_front", .{ t, hidden, id_arr, rope_offset + 1, mrope_ctx, qwen4Project(want), fe });
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
+    /// `forwardPlaced` with the row's normalized embedding handed in (`forwardFront`).
+    pub fn forwardPlacedFront(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Qwen4Mtp.HeadPlace, want: mtp_mod.StepWant, front_en: ?mlx.mlx_array) !mtp_mod.StepOut {
+        const fe = front_en orelse return self.forwardPlaced(cache, id_arr, hidden, place, want);
+        const t = switch (self) {
+            .qwen, .plugin => return error.MtpPlacement,
+            .qwen4 => |t| t,
+        };
+        cache.activate();
+        const out = try modules.call("qwen4_mtp_forward_placed_front", .{ t, hidden, id_arr, place, qwen4Project(want), fe });
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
     /// Deepest draft the head can make: a draft past a per-depth plugin's last head re-runs
     /// that head at the same position and is never accepted.
     pub fn maxDepth(self: MtpHeadRef) u32 {
@@ -186,6 +232,25 @@ pub const MtpHeadRef = union(enum) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| modules.call("qwen4_draft_select", .{ t, x, suppress_mask }),
             .plugin => |h| h.draftSelect(target, x, suppress_mask),
+        };
+    }
+
+    /// The fused draft pick (`draft_fuse.zig`): `draftSelect`'s greedy id for one row in fewer launches, bit for bit,
+    /// plus the next draft step's normalized embedding. Null = not this head's, or declined: the caller runs
+    /// `draftSelect`.
+    pub fn draftPick(self: MtpHeadRef, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?draft_fuse.Pick {
+        return switch (self) {
+            .qwen4 => |t| modules.call("qwen4_draft_pick", .{ t, x, suppress_mask }),
+            .qwen, .plugin => null,
+        };
+    }
+
+    /// A greedy draft from the head's own logits through the fused pick (`sampleTokenLazy`'s temperature-0 path, bit
+    /// for bit). Null = not this head's, or declined: the caller runs `sampleTokenLazy`.
+    pub fn greedyPick(self: MtpHeadRef, logits: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?draft_fuse.Pick {
+        return switch (self) {
+            .qwen4 => |t| modules.call("qwen4_greedy_pick", .{ t, logits, suppress_mask }),
+            .qwen, .plugin => null,
         };
     }
 
@@ -271,6 +336,15 @@ pub const MtpHeadRef = union(enum) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| @import("../../../plugins/qwen4_exp/cost_profile.zig").qwen4G17CostProfileForKv(t, kv),
             .plugin => |h| h.m5NaxCostProfile(target),
+        };
+    }
+
+    /// The qwen4_exp head over an EXL3 pack (`Formats.profile`): it drafts its argmax for every request and its
+    /// two-chunk plans pay their chunk-A boundary (`ev_fix.zig`). Every other head keeps the generic policy.
+    pub fn exl3Profile(self: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen4 => |t| t.formats.profile,
+            .qwen, .plugin => false,
         };
     }
 

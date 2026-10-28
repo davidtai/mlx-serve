@@ -6300,6 +6300,7 @@ fn pcQsaFeed(xfm: *Qwen4Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -6337,6 +6338,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -6713,6 +6715,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const P: usize = 20;
     const hd: c_int = 8;
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -6793,6 +6796,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -6849,6 +6853,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const B: usize = 19;
     const H: usize = 80;
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -6944,6 +6949,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
     var xfm: Qwen4Trunk = undefined;
+    xfm.formats = .{};
     xfm.s = s;
     xfm.allocator = testing.allocator;
 

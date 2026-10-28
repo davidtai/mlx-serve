@@ -8,6 +8,7 @@ const Generator = @import("../generate/generator.zig").Generator;
 const StepTrace = @import("../generate/step.zig").StepTrace;
 const mtpDepthPolicy = @import("mtp/ev_plan.zig").mtpDepthPolicy;
 const mtpDepthPolicyFor = @import("mtp/ev_plan.zig").mtpDepthPolicyFor;
+const ev_fix = @import("mtp/ev_fix.zig");
 
 
 /// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
@@ -136,6 +137,13 @@ pub fn logSpecStats(self: *const Generator) void {
             },
         );
         log.info("  [spec-stats] lazy={d}/{d}\n", .{ self.mtp_lazy_built, self.mtp_lazy_kept });
+        if (self.mtp_ev_fix.priced > 0 or self.mtpEvFixOn()) {
+            const fx = self.xfm.mtp_ev_fix;
+            const r = ev_fix.ratios(fx);
+            log.info("  [spec-stats] ev_fix priced={d} collapsed={d} boundary_ms={d:.2} read_ms={d:.2} excess_ms={d:.2}/{d} gain_ratio={d:.2} fire_ratio={d:.2}\n", .{
+                self.mtp_ev_fix.priced, self.mtp_ev_fix.collapsed, ev_fix.boundaryMs(fx) orelse 0, fx.read_ms, fx.excess_ms, fx.excess_n, r.gain, r.fire,
+            });
+        }
         if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
             round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
             self.xfm.round_cost.formatLookupBucket(table_bucket, &lookup_buf),

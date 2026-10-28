@@ -6,6 +6,7 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const mlx_stream = @import("../modules/stream.zig");
+const modules = @import("../modules/call.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -341,6 +342,10 @@ pub fn initWithOptions(
         .width_min = @intCast(PREFILL_CHUNK),
         .width_max = @intCast(PREFILL_CHUNK),
     };
+
+    // An EXL3 qwen4 trunk reads the prompt's PLE rows ahead of each chunk's gather, until the prefill ends on any path.
+    if (final_start > 0 and xfm.config.trunk_format) if (xfm.qwen4Trunk()) |t| modules.call("qwen4_ple_prefetch_begin", .{ t, &ctx, prompt_ids });
+    defer if (xfm.config.trunk_format) if (xfm.qwen4Trunk()) |t| modules.call("qwen4_ple_prefetch_end", .{t});
 
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;

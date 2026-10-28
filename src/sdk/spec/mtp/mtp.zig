@@ -52,6 +52,7 @@ const QuantMode = @import("../../quant/params.zig").QuantMode;
 const KVCache = cache_mod.KVCache;
 const Weights = @import("../../weights/resident.zig").Weights;
 const mtp_source = @import("source.zig");
+const draft_fuse = @import("draft_fuse.zig");
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
@@ -726,11 +727,114 @@ pub const RerankCoarse = struct {
     bits: u32,
     group_size: u32,
     rows: c_int,
+    /// The re-score's rows when the head's own cannot be gathered (a trunk format's head, `buildRerankCoarseRows`): a
+    /// `RERANK_EXACT_BITS`/gs64 copy of the rows it computes. Null = re-score through `target.lm_head_*`.
+    exact: ?QLinear = null,
+    /// A copy of `q`'s leading `sub_rows` rows (`withVocabSubset`), which a single-row draft reads instead of `q`. A
+    /// shortlist's `rows` (a dense proposal row's width) stays `rows`, the vocab.
+    sub: ?QLinear = null,
+    sub_rows: c_int = 0,
+
+    pub const Readout = struct { q: QLinear, rows: c_int };
+
+    /// The coarse rows a single-row draft reads: the vocab subset when one is built, else the whole head.
+    pub fn readout(self: *const RerankCoarse) Readout {
+        if (self.sub) |q| return .{ .q = q, .rows = self.sub_rows };
+        return .{ .q = self.q, .rows = self.rows };
+    }
 
     pub fn deinit(self: *RerankCoarse) void {
         self.q.deinit();
+        if (self.exact) |*e| e.deinit();
+        if (self.sub) |*e| e.deinit();
     }
 };
+
+/// Width of a trunk format head's re-score copy (`RerankCoarse.exact`).
+pub const RERANK_EXACT_BITS: u32 = 8;
+
+/// The vocab subset a trunk format head's single-row drafts read (`withVocabSubset`), on a vocab of DRAFT_VOCAB_MIN ids
+/// or more: the first 96 Ki ids. A byte-level BPE vocab numbers its merges most frequent first, so these carry nearly
+/// all text; a draft never proposes a later id and the verify reads the full head, so it costs acceptance, never
+/// output.
+pub const DRAFT_VOCAB_ROWS: c_int = 98304;
+pub const DRAFT_VOCAB_MIN: c_int = 131072;
+
+/// A contiguous copy of `q`'s leading `n` rows (packed weights and both group tables), unevaluated; the caller frees
+/// it.
+fn leadingCopy(s: mlx.mlx_stream, q: QLinear, n: c_int) !QLinear {
+    var parts: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+    errdefer for (parts) |a| {
+        if (a.ctx != null) _ = mlx.mlx_array_free(a);
+    };
+    for ([_]mlx.mlx_array{ q.w, q.s, q.b }, &parts) |a, *out| {
+        const sh = mlx.getShape(a);
+        if (sh.len != 2) return error.UnsupportedDraftHeadShape;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, a, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ n, sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        out.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_copy(out, view, s));
+    }
+    return .{ .w = parts[0], .s = parts[1], .b = parts[2] };
+}
+
+/// `rc` plus a copy of its leading `keep` rows (`RerankCoarse.sub`), evaluated. A `keep` under TOP32_MIN_ROWS or not
+/// under the vocab, or a refused copy, leaves the whole head alone.
+pub fn withVocabSubset(s: mlx.mlx_stream, rc: RerankCoarse, keep: c_int) RerankCoarse {
+    if (keep < TOP32_MIN_ROWS or keep >= rc.rows) return rc;
+    var sub = leadingCopy(s, rc.q, keep) catch |err| {
+        log.warn("[mtp] draft rerank vocab subset failed ({s}) - drafting over the whole vocab\n", .{@errorName(err)});
+        return rc;
+    };
+    const eval_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(eval_vec);
+    for ([_]mlx.mlx_array{ sub.w, sub.s, sub.b }) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+    mlx.check(mlx.mlx_eval(eval_vec)) catch {
+        sub.deinit();
+        log.warn("[mtp] draft rerank vocab subset eval failed - drafting over the whole vocab\n", .{});
+        return rc;
+    };
+    var out = rc;
+    out.sub = sub;
+    out.sub_rows = keep;
+    return out;
+}
+
+/// `buildRerankCoarse` for a head whose rows exist only as what it computes (a trunk format's head): `dense`, those
+/// `[V, H]` rows, requantized to the coarse width and to the re-score copy (`RerankCoarse.exact`), with the vocab
+/// subset on a vocab of DRAFT_VOCAB_MIN ids or more. Proposal side only: the verify reads the head itself, so its bytes
+/// stand.
+pub fn buildRerankCoarseRows(s: mlx.mlx_stream, dense: mlx.mlx_array, bits: u32) ?RerankCoarse {
+    if (bits == 0 or bits >= RERANK_EXACT_BITS) return null;
+    mlx.check(mlx.mlx_array_eval(dense)) catch {
+        log.warn("[mtp] draft rerank: the head's rows failed to evaluate - keeping the full-readout path\n", .{});
+        return null;
+    };
+    const sh = mlx.getShape(dense);
+    if (sh.len != 2 or sh[0] < TOP32_MIN_ROWS) return null;
+    const none: mlx.mlx_array = .{ .ctx = null };
+    var coarse = requantizeRows(s, dense, none, none, 0, 16, "affine", RERANK_COARSE_GROUP, bits, 32768) catch |err| {
+        log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+        return null;
+    };
+    var exact = requantizeRows(s, dense, none, none, 0, 16, "affine", RERANK_COARSE_GROUP, RERANK_EXACT_BITS, 32768) catch |err| {
+        coarse.deinit();
+        log.warn("[mtp] draft rerank re-score copy failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+        return null;
+    };
+    const eval_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(eval_vec);
+    for ([_]mlx.mlx_array{ coarse.w, coarse.s, coarse.b, exact.w, exact.s, exact.b }) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+    mlx.check(mlx.mlx_eval(eval_vec)) catch {
+        coarse.deinit();
+        exact.deinit();
+        log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
+        return null;
+    };
+    const rc: RerankCoarse = .{ .q = coarse, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = sh[0], .exact = exact };
+    return withVocabSubset(s, rc, if (sh[0] >= DRAFT_VOCAB_MIN) DRAFT_VOCAB_ROWS else 0);
+}
 
 /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
 /// lm_head, materialized so the first draft does not pay for it. Infallible —
@@ -1006,6 +1110,8 @@ pub fn rerankShortlist(
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !?Shortlist {
+    // A trunk format head's coarse head (`buildRerankCoarseRows`) reads its vocab subset and its re-score copy.
+    if (coarse.*) |c| if (c.exact != null or c.sub != null) return rerankShortlistFormat(s, target, coarse, logged, x, suppress_mask);
     const rc = if (coarse.*) |*p| p else return null;
     const coarse_bits = rc.bits;
     const rows = rc.rows;
@@ -1041,6 +1147,219 @@ pub fn rerankSelect(
     var sl = (try rerankShortlist(s, target, coarse, logged, x, suppress_mask)) orelse return null;
     defer sl.deinit();
     return try shortlistArgmax(s, sl);
+}
+
+/// `rerankMaskCoarse` on a trunk format head's readout: a vocab subset's (`RerankCoarse.sub`) is narrower than the
+/// mask, and its ids are the mask's leading ones.
+fn rerankMaskCoarseFormat(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !void {
+    // The mask goes on the COARSE row: a reserved id that never enters the
+    // shortlist cannot be re-scored back into the draft.
+    const full = suppress_mask orelse return;
+    const msh = mlx.getShape(full);
+    const lsh = mlx.getShape(logits.*);
+    var lead = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lead);
+    var m = full;
+    if (msh.len == 1 and lsh.len >= 1 and msh[0] > lsh[lsh.len - 1]) {
+        try mlx.check(mlx.mlx_slice(&lead, full, &[_]c_int{0}, 1, &[_]c_int{lsh[lsh.len - 1]}, 1, &[_]c_int{1}, 1, s));
+        m = lead;
+    }
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var masked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
+    _ = mlx.mlx_array_free(logits.*);
+    logits.* = masked;
+}
+
+/// `rerankShortlistRow` for a trunk format head: re-scored through its copy (`RerankCoarse.exact`), a vocab subset's
+/// shortlist still spanning the vocab.
+fn rerankShortlistRowFormat(
+    s: mlx.mlx_stream,
+    target: anytype,
+    coarse: *?RerankCoarse,
+    flat: mlx.mlx_array,
+    rows: c_int,
+    x_row: mlx.mlx_array,
+) !?Shortlist {
+    // `rows` is the coarse readout's width; a vocab subset's shortlist still spans the vocab
+    const vocab: c_int = if (coarse.*) |rc| rc.rows else rows;
+    // A trunk format's head has no rows to gather: its re-score copy stands in (`RerankCoarse.exact`).
+    const copy: ?QLinear = if (coarse.*) |rc| rc.exact else null;
+    const cands = draftTop32(s, flat, rows) catch |err| {
+        log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
+        var dead = coarse.*.?;
+        dead.deinit();
+        coarse.* = null;
+        return null;
+    };
+    errdefer _ = mlx.mlx_array_free(cands);
+
+    // Re-score the shortlist through the trunk head's own rows: gathered
+    // packed rows are self-contained (w [V, K*bits/32], scales/biases
+    // [V, K/gs]), so a 32-row quantized matmul is exact; dense rows are a plain matmul.
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    if (copy == null and target.lm_head_s.ctx == null) {
+        try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose(&wt, w32, s));
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_matmul(&dense, x_row, wt, s));
+        return .{ .cands = cands, .exact = dense, .rows = vocab };
+    }
+    const src: QLinear = copy orelse .{ .w = target.lm_head_w, .s = target.lm_head_s, .b = target.lm_head_b };
+    const qp: params_mod.QuantParams = if (copy != null)
+        .{ .bits = RERANK_EXACT_BITS, .group_size = RERANK_COARSE_GROUP, .mode = .affine }
+    else
+        headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    var s32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_take_axis(&w32, src.w, cands, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&s32, src.s, cands, 0, s));
+    if (src.b.ctx != null)
+        try mlx.check(mlx.mlx_take_axis(&b32, src.b, cands, 0, s));
+
+    var exact = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(exact);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &exact,
+        x_row,
+        w32,
+        s32,
+        b32,
+        true,
+        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(qp.bits)),
+        qp.mode.cstr(),
+        s,
+    ));
+    return .{ .cands = cands, .exact = exact, .rows = vocab };
+}
+
+/// `rerankCoarseFlat` over `head` (`RerankCoarse.readout`: a trunk format head's vocab subset when one is built).
+fn rerankCoarseFlatFormat(
+    s: mlx.mlx_stream,
+    rc: *const RerankCoarse,
+    head: RerankCoarse.Readout,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !mlx.mlx_array {
+    var coarse_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &coarse_logits,
+        x,
+        head.q.w,
+        head.q.s,
+        head.q.b,
+        true,
+        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
+        // The BUILT width and group, never `DRAFT_HEAD_BITS`: the packed
+        // geometry implies K, so a per-step env re-read that disagrees with the
+        // build does not read a coarser vocab - it reads a different one.
+        mlx.mlx_optional_int.some(@intCast(rc.bits)),
+        "affine",
+        s,
+    ));
+    try rerankMaskCoarseFormat(s, &coarse_logits, suppress_mask);
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    const flat_shape = [_]c_int{head.rows};
+    try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+    return flat;
+}
+
+/// `rerankShortlist` for a trunk format head (`buildRerankCoarseRows`): its vocab subset's readout, re-scored through
+/// its copy.
+fn rerankShortlistFormat(
+    s: mlx.mlx_stream,
+    target: anytype,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?Shortlist {
+    const rc = if (coarse.*) |*p| p else return null;
+    const coarse_bits = rc.bits;
+    // the vocab subset's rows when one is built
+    const head = rc.readout();
+
+    const flat = try rerankCoarseFlatFormat(s, rc, head, x, suppress_mask);
+    defer _ = mlx.mlx_array_free(flat);
+
+    const sl = (try rerankShortlistRowFormat(s, target, coarse, flat, head.rows, x)) orelse return null;
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
+        logged.* = true;
+    }
+    return sl;
+}
+
+/// The fused draft pick (`draft_fuse.zig`): `rerankSelect` with the finalize and the re-score in one launch and MLX's
+/// own argmax, then one launch for the take + astype that also builds the next draft step's front. The coarse readout
+/// and its mask are `rerankCoarseFlat`'s (a trunk format head's: `rerankCoarseFlatFormat`'s), the candidates
+/// `draftTop32`'s first launch, the re-score rows `rerankShortlistRow`'s (`rerankShortlistRowFormat`'s); the id is
+/// `shortlistArgmax`'s ([1,1] int32), bit for bit. Proposal side only, like
+/// `rerankSelect`. Null = no coarse head, or a declined call (logged): the caller runs `rerankSelect`.
+pub fn rerankPickFused(
+    s: mlx.mlx_stream,
+    target: anytype,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+    front: draft_fuse.Front,
+) !?draft_fuse.Pick {
+    const rc = if (coarse.*) |*p| p else return null;
+    const head = rc.readout();
+    const copy: ?QLinear = rc.exact;
+    if (copy == null and target.lm_head_s.ctx == null) {
+        draft_fuse.decline(.rescore_rows);
+        return null;
+    }
+    const src: QLinear = copy orelse .{ .w = target.lm_head_w, .s = target.lm_head_s, .b = target.lm_head_b };
+    const qp: params_mod.QuantParams = if (copy != null)
+        .{ .bits = RERANK_EXACT_BITS, .group_size = RERANK_COARSE_GROUP, .mode = .affine }
+    else
+        headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    if (qp.mode != .affine) {
+        draft_fuse.decline(.rescore_quant);
+        return null;
+    }
+    const rescore: draft_fuse.Rescore = .{ .w = src.w, .sc = src.s, .bi = src.b, .bits = qp.bits, .group_size = qp.group_size };
+    if (draft_fuse.rescoreReason(x, rescore, front.hidden, head.rows)) |r| {
+        draft_fuse.decline(r);
+        return null;
+    }
+    if (!top32RowsOk(head.rows)) {
+        draft_fuse.decline(.shortlist);
+        return null;
+    }
+    // the shortlist's ids index the embedding table in the pick
+    if (head.rows > mlx.getShape(front.emb)[0]) {
+        draft_fuse.decline(.vocab);
+        return null;
+    }
+    const flat = if (rc.exact != null or rc.sub != null) try rerankCoarseFlatFormat(s, rc, head, x, suppress_mask) else try rerankCoarseFlat(s, rc, x, suppress_mask);
+    defer _ = mlx.mlx_array_free(flat);
+    const cands = draftTop32Cands(s, flat, head.rows) catch {
+        draft_fuse.decline(.shortlist);
+        return null;
+    };
+    defer for (cands) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const pick = try draft_fuse.pickRerank(s, cands[0], cands[1], x, rescore, front, .int32);
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{rc.bits});
+        logged.* = true;
+    }
+    return pick;
 }
 
 pub fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse) !mlx.mlx_array {
@@ -1122,7 +1441,7 @@ pub fn rerankShortlistsBatched(
         try mlx.check(mlx.mlx_slice(&xi, x, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
         // A shortlist failure retires the coarse head mid-loop; the caller's
         // fallback answers for the whole group, so the rows already built go.
-        out[i] = (try rerankShortlistRow(s, target, coarse, flat, rows, xi)) orelse {
+        out[i] = (if (rc.exact != null or rc.sub != null) try rerankShortlistRowFormat(s, target, coarse, flat, rows, xi) else try rerankShortlistRow(s, target, coarse, flat, rows, xi)) orelse {
             for (out[0..built]) |*sl| sl.deinit();
             return false;
         };
@@ -2961,7 +3280,7 @@ const TOP32_FINAL_SRC = kernelSource("kernels/spec/mtp_top32_final.metal");
 const TOP32_K: c_int = 32;
 const TOP32_TG: c_int = 256;
 const TOP32_TILES: c_int = 64;
-const TOP32_CANDS: c_int = TOP32_TILES * TOP32_K;
+pub const TOP32_CANDS: c_int = TOP32_TILES * TOP32_K;
 /// Minimum row count: below TILES*TG some simdgroups hold fewer than 32 real
 /// candidates and the zero-initialized empty slots become reachable.
 pub const TOP32_MIN_ROWS: c_int = TOP32_TILES * TOP32_TG;
@@ -3087,9 +3406,71 @@ pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_a
     return token_ids;
 }
 
+/// Whether `draftTop32`'s Metal kernels take a `rows`-wide row.
+pub fn top32RowsOk(rows: c_int) bool {
+    if (rows < TOP32_MIN_ROWS) return false;
+    const per_thread = @divTrunc(rows + TOP32_TILES * TOP32_TG - 1, TOP32_TILES * TOP32_TG);
+    return per_thread <= 32;
+}
+
+/// `draftTop32`'s first launch: the TOP32_CANDS (ordinal, index) candidates, `[TOP32_CANDS]` uint32 each, that its
+/// finalize reduces (the fused draft pick runs that finalize inside its own launch). Metal GPU streams; the caller
+/// frees both.
+pub fn draftTop32Cands(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) ![2]mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (!top32RowsOk(rows)) return error.UnsupportedTop32Shape;
+    const pk = try getTop32Partial();
+    var cand_ord = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cand_ord);
+    var cand_idx = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cand_idx);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const cand_shape = [_]c_int{TOP32_CANDS};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TILES * TOP32_TG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RC", rows));
+    const inputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    _ = mlx.mlx_vector_array_append_value(inputs, row);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, pk, inputs, cfg, s));
+    try mlx.check(mlx.mlx_vector_array_get(&cand_ord, outputs, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&cand_idx, outputs, 1));
+    return .{ cand_ord, cand_idx };
+}
+
+/// `draftTop32`'s second launch: the 32 ids of the first's candidates, `[32]` uint32 (lazy).
+pub fn draftTop32Final(s: mlx.mlx_stream, cand_ord: mlx.mlx_array, cand_idx: mlx.mlx_array) !mlx.mlx_array {
+    const fk = try getTop32Final();
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const out_shape = [_]c_int{TOP32_K};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+    const inputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_ord);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_idx);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, fk, inputs, cfg, s));
+    var token_ids = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&token_ids, outputs, 0));
+    return token_ids;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
+
+test {
+    _ = draft_fuse;
+}
 
 test "draftTop32 on CUDA: the 32 largest ids of a vocab row, as a set" {
     if (!mlx.cudaAvailable()) return error.SkipZigTest;

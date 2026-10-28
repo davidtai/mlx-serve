@@ -55,6 +55,7 @@ sdk.blocks.moe.moe_affine4.env_enabled
 sdk.blocks.moe.moe_affine4.views_enabled
 plugins.qwen4_exp.ple_gpu.dispatches
 plugins.qwen4_exp.qsa.gather.qsa_nax_os_cached
+plugins.qwen4_exp.trunk.gdn_tail.devc_cached
 plugins.qwen4_exp.qsa.pooled.qsa_pool_rope_tpl_count
 plugins.qwen4_exp.qsa_decode.cfgs
 plugins.qwen4_exp.qsa_decode.env_enabled

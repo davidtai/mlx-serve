@@ -331,6 +331,8 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         .skip_lm_head = f.logits == .none,
         .ple_defer = f.defer_host,
         .ple_pending = r.pending,
+        // a solo verify's id arrays the engine lent its PLE flush (`pleFillFromSources`), which the ladder runs here
+        .ple_ids_src = if (ec) |e| e.ple_ids_src else null,
     };
     r.pending = null;
     defer {
@@ -629,4 +631,8 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("cost_profile.zig");
     _ = @import("trunk.zig");
+    _ = @import("trunk/formats.zig");
+    _ = @import("trunk_load.zig");
+    _ = @import("side_stream.zig");
+    _ = @import("wave.zig");
 }

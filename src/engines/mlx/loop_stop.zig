@@ -70,7 +70,8 @@ fn loopRecoveryAction(tb: ?*generate_mod.ThinkBound, ids: []const u32, completio
 /// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
 /// attributed to the slot whose forward raised it instead of the next request's prefill.
 /// The repetition-loop guard every decode tick runs first. True = the slot was finished here.
-pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+/// `solo`: the slot's own decode tick, where a forced close may go through its MTP head (`commitForcedTick`).
+pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator, solo: bool) !bool {
     // Stop a runaway repetition loop before generating more. Some models (seen
     // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
     // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
@@ -99,7 +100,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
             log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
             const tb = gen.sampling.think_bound.?;
             tb.fired = true;
-            _ = try commitForcedTick(sch, slot, gen, tb.forced, .think_bound);
+            _ = try commitForcedTick(sch, slot, gen, tb.forced, .think_bound, solo);
             return true;
         }
         var stop = relative_stop;
@@ -117,8 +118,8 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }
-    if (try thinkBoundTick(sch, slot, gen)) return true;
-    return toolForceTick(sch, slot, gen);
+    if (try thinkBoundTick(sch, slot, gen, solo)) return true;
+    return toolForceTick(sch, slot, gen, solo);
 }
 
 // ── tests ──

@@ -218,6 +218,7 @@ test {
     _ = @import("spec/mtp/ev_costs.zig");
     _ = @import("spec/mtp/observe.zig");
     _ = @import("spec/mtp/ev_plan.zig");
+    _ = @import("spec/mtp/ev_fix.zig");
     _ = @import("spec/mtp/trace.zig");
     _ = @import("spec/mtp/regime.zig");
     _ = @import("spec/mtp/adaptive.zig");

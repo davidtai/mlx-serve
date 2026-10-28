@@ -258,7 +258,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         if (out.finished) finishSlot(sch, slot, gen.finish_reason);
         return;
     }
-    if (try loopGuardTick(sch, slot, gen)) return;
+    if (try loopGuardTick(sch, slot, gen, true)) return;
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
     }
@@ -374,6 +374,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
     var xfm: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
+    xfm.formats = .{};
     var model: model_registry_mod.LoadedModel = undefined;
     model.transformer = null;
     var gen: Generator = undefined;

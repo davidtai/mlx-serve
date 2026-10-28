@@ -58,6 +58,10 @@ pub const MtpRoundPlan = struct {
     /// cost table): skipped by the regime gate, which compares shapes
     /// at ONE base depth.
     width_trial: bool = false,
+    /// Set only on a two-chunk plan `ev_fix.gate` kept: the ideal gate's firing probability and the extension tokens it
+    /// promises, which the round's outcome folds against. 0 = not priced.
+    fire_ideal: f32 = 0,
+    gain_ideal: f32 = 0,
 };
 
 /// Resolve the configured depth cap. 0 = auto (`--mtp-max-depth` not passed):
@@ -845,7 +849,7 @@ test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
     try testing.expectEqual(@as(u32, 1), plan.m_hi);
 }
 
-fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
+pub fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
     xfm.config.model_type = "qwen4_exp";
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {

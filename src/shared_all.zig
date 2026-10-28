@@ -22,6 +22,8 @@ comptime {
     _ = @import("plugins/qwen4_exp/ple_gpu.zig").pleGpu_shared;
     _ = @import("plugins/qwen4_exp/plugin.zig").EngineCtx;
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig").warm_shared;
+    _ = @import("plugins/qwen4_exp/side_stream.zig").SideStream.tls_shared;
+    _ = @import("plugins/qwen4_exp/wave.zig").later_shared;
     _ = @import("sdk/blocks/attention/nax_attention.zig").naxCli_shared;
     _ = @import("sdk/blocks/attention/decode_attn_quant.zig").cli_shared;
     _ = @import("sdk/blocks/dit/w8a8.zig").w8a8State_shared;

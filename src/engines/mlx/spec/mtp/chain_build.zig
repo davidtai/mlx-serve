@@ -36,6 +36,8 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
     const mc = &self.mtp_cache.?;
     const mtp_mrope_ctx = self.mtpMropeContext();
     const rerank_drafts = self.mtpRerankDrafts();
+    // The fused draft front and picks (`draft_fuse.zig`) serve the head over an EXL3 trunk pack only.
+    const fuse = head.exl3Profile();
     std.debug.assert(chain.n_drafted == from);
     var i: u32 = from;
     while (i < to) : (i += 1) {
@@ -58,8 +60,18 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
         if (i == 0 and self.mtp_hist_stash != null and self.mtp_hist_stash.?.pad != null and self.mtpPaddedHistory()) {
             try self.mtpPaddedHistoryAppend(chain);
         }
+        // The fused pick of draft i - 1 built this step's `embedding` + `rmsNorm` (null otherwise).
+        const front_en = if (fuse) chain.frontFor(i) else null;
+        // This step's pick output for step i + 1 (owned until `setEnNext` takes it).
+        var pick_en: ?mlx.mlx_array = null;
+        errdefer if (pick_en) |e| {
+            _ = mlx.mlx_array_free(e);
+        };
         var step_out = if (chain.place) |*place|
-            try head.forwardPlaced(mc, prev_tok_arr, h_prev_arg, place, want)
+            if (fuse)
+                try head.forwardPlacedFront(mc, prev_tok_arr, h_prev_arg, place, want, front_en)
+            else
+                try head.forwardPlaced(mc, prev_tok_arr, h_prev_arg, place, want)
         else if (i == 0 and self.mtp_hist_stash != null) blk: {
             // Deferred history append (stashed at the END of the
             // previous round, Phase 5a) merged into this chain's first
@@ -95,7 +107,10 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
             @memcpy(merged_host[0..st.n], st.host_ids[0..st.n]);
             merged_host[st.n] = chain.t1;
             break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx, merged_host[0 .. st.n + 1]);
-        } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx, if (i == 0) &.{chain.t1} else null);
+        } else if (fuse)
+            try head.forwardFront(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx, if (i == 0) &.{chain.t1} else null, front_en)
+        else
+            try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx, if (i == 0) &.{chain.t1} else null);
         errdefer {
             if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
             _ = mlx.mlx_array_free(step_out.hidden_next);
@@ -127,7 +142,14 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
             chain.n_qp = i + 1;
         } else if (use_rerank) {
             const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
-            chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
+            if (fuse) {
+                if (try head.draftPick(rerank_x, draft_sampling.suppress_mask)) |pk| {
+                    chain.draft_arrs[i] = pk.id;
+                    pick_en = pk.en;
+                } else chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
+            } else {
+                chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
+            }
         } else if (chain.q_probs) |slots| {
             const prop = try logitsStepProposal(step_out.logits, self.mtpSamplingDraw(draft_sampling), s);
             slots[i] = prop.q;
@@ -138,8 +160,19 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
             var sp = self.sampling;
             sp.draw = chain.pos0 + i;
             chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, sp, s);
+        } else if (fuse) {
+            // a greedy draft off the head's own logits, through the fused pick where it serves
+            const fused = if (draft_sampling.temperature < 0.01) try head.greedyPick(step_out.logits, draft_sampling.suppress_mask) else null;
+            if (fused) |pk| {
+                chain.draft_arrs[i] = pk.id;
+                pick_en = pk.en;
+            } else chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
         } else {
             chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+        }
+        if (fuse) {
+            chain.setEnNext(i, pick_en);
+            pick_en = null;
         }
         chain.n_drafted = i + 1;
         if (chain.conf_arrs != null and i < chain.plan.m_lo) {

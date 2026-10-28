@@ -430,10 +430,49 @@ pub fn qsaSparseAttnFloor(
     attn_scale: f32,
     min_s: c_int,
 ) !?mlx.mlx_array {
+    return sparseAttnFloorCore(s, q_rope, views, blocks, ratio, attn_scale, min_s, null);
+}
+
+/// The split pass's partials of a one-view call (each the holder's): pacc f32 [Hq, S, NSPLIT, 256], pml f32 [Hq, S,
+/// NSPLIT, 2].
+pub const SplitParts = struct {
+    pacc: mlx.mlx_array = .{ .ctx = null },
+    pml: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *SplitParts) void {
+        inline for (.{ &self.pacc, &self.pml }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
+            a.* = .{ .ctx = null };
+        }
+    }
+};
+
+/// `qsaSparseAttn`'s split pass alone, for a consumer that runs the merge's statements itself (the fused o_proj
+/// prepare); null where `qsaSparseAttn` declines.
+pub fn qsaSparseAttnSplit(s: mlx.mlx_stream, q_rope: mlx.mlx_array, kv_view: *const DenseKVView, blocks: mlx.mlx_array, ratio: c_int, attn_scale: f32) !?SplitParts {
+    var parts: SplitParts = .{};
+    errdefer parts.deinit();
+    if ((try sparseAttnFloorCore(s, q_rope, kv_view[0..1], &.{blocks}, ratio, attn_scale, qsaAttnMinS(), &parts)) == null) return null;
+    return parts;
+}
+
+/// `qsaSparseAttnFloor`'s body. With `parts` (one view) the split pass's outputs are handed over and the merge does not
+/// launch: a served call then returns a null-ctx array (null still means declined).
+fn sparseAttnFloorCore(
+    s: mlx.mlx_stream,
+    q_rope: mlx.mlx_array,
+    views: []const DenseKVView,
+    blocks: []const mlx.mlx_array,
+    ratio: c_int,
+    attn_scale: f32,
+    min_s: c_int,
+    parts: ?*SplitParts,
+) !?mlx.mlx_array {
     if (!qsaAttnKernelEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
     const n = views.len;
     if (n == 0 or n > 4 or blocks.len != n) return null;
+    if (parts != null and n != 1) return null;
     const kv_view = &views[0];
     if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks[0]) != 3) return null;
     const qs = mlx.getShape(q_rope);
@@ -568,15 +607,23 @@ pub fn qsaSparseAttnFloor(
     try mlx.check(mlx.mlx_vector_array_get(&pacc, parts_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&pml, parts_vec, 1));
 
-    const merge_in = [_]mlx.mlx_array{ pacc, pml };
-    const merge_vec = mlx.mlx_vector_array_new_data(&merge_in, merge_in.len);
-    defer _ = mlx.mlx_vector_array_free(merge_vec);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, cfgs[1], s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    var out: mlx.mlx_array = .{ .ctx = null };
+    if (parts) |p| {
+        p.pacc = mlx.mlx_array_new();
+        p.pml = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&p.pacc, pacc));
+        try mlx.check(mlx.mlx_array_set(&p.pml, pml));
+    } else {
+        const merge_in = [_]mlx.mlx_array{ pacc, pml };
+        const merge_vec = mlx.mlx_vector_array_new_data(&merge_in, merge_in.len);
+        defer _ = mlx.mlx_vector_array_free(merge_vec);
+        var outputs_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs_vec);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, merge_kernel, merge_vec, cfgs[1], s));
+        if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+        out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    }
     // One bit per arm: width bucket (+4 dense) for one view, bit 8 for the slot launch.
     if (n > 1) {
         if (qsa_attn_engaged_bits.take(8)) {

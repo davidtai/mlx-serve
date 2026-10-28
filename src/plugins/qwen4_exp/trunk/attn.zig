@@ -11,6 +11,7 @@ const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
 const residual_norm = @import("../../../sdk/blocks/norms/residual_norm.zig");
 const layered = @import("../../../engines/mlx/batched/layered.zig");
 const Trunk = @import("../trunk.zig").Trunk;
+const fusion = @import("fusion.zig");
 const MAX_BATCH_ROWS = layered.MAX_BATCH_ROWS;
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
@@ -80,12 +81,18 @@ pub fn gatedFullAttnProjected(
     const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
     const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
+    // The fused attention input: q|gate, k and v projected, normed, rotated and head-major in one call
+    // (`fusion.attnInFused`); null: the projections, split, norms and ropes below. A KV-only forward past the
+    // joint-rope widths takes them (k and v without q).
+    const fused_in: ?fusion.AttnIn = if (projected == null and !fusion.kvOnlySkips(self, seq_len)) try fusion.attnInFused(self, ctx, x, fa, offset, batch, seq_len, is_prefill) else null;
+    defer if (fused_in) |f| f.deinit();
+
     // Q, K, V projections: one joined matmul where the loader built it.
     var joined: [3]mlx.mlx_array = @splat(.{ .ctx = null });
     defer for (joined) |a| if (a.ctx != null) {
         _ = mlx.mlx_array_free(a);
     };
-    if (projected == null and fa.qkv.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
+    if (fused_in == null and projected == null and fa.qkv.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
         const all = try self.qmatmul(x, fa.qkv.w, fa.qkv.s, fa.qkv.b);
         defer _ = mlx.mlx_array_free(all);
         for (&joined, 0..) |*p, i| {
@@ -97,9 +104,15 @@ pub fn gatedFullAttnProjected(
             log.info("[attn] joined q|k|v engaged: rows={d}\n", .{batch * seq_len});
         }
     }
-    const own = projected == null and joined[0].ctx == null;
-    const q_proj = if (projected) |values| values.q else if (!own) joined[0] else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
-    defer if (own) {
+    const own = fused_in == null and projected == null and joined[0].ctx == null;
+    // The query planes: at decode rows q_proj's finish writes the split's two halves as contiguous planes
+    // (`fusion.qPlanes`); null: q_proj below.
+    const q_planes: ?[2]mlx.mlx_array = if (own) fusion.qPlanes(self, x, fa, batch, seq_len) else null;
+    defer if (q_planes) |pl| for (pl) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const q_proj = if (fused_in != null or q_planes != null) mlx.mlx_array{ .ctx = null } else if (projected) |values| values.q else if (!own) joined[0] else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
+    defer if (own and q_proj.ctx != null) {
         _ = mlx.mlx_array_free(q_proj);
     };
 
@@ -110,7 +123,12 @@ pub fn gatedFullAttnProjected(
     var gate: mlx.mlx_array = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate);
 
-    if (cfg.attn_output_gate) {
+    if (fused_in) |f| {
+        try mlx.check(mlx.mlx_array_set(&gate, f.gate));
+    } else if (q_planes) |pl| {
+        try mlx.check(mlx.mlx_array_set(&queries, pl[0]));
+        try mlx.check(mlx.mlx_array_set(&gate, pl[1]));
+    } else if (cfg.attn_output_gate) {
         // Mirror mlx-lm qwen3_next.py:130-134: reshape Q-proj output to [B, S, H, D*2]
         // then `mx.split(_, 2, axis=-1)` into (queries, gate). The single split op
         // replaces our prior two-slice pattern (2 dispatches → 1 dispatch). Adds up
@@ -139,11 +157,11 @@ pub fn gatedFullAttnProjected(
         try mlx.check(mlx.mlx_reshape(&queries, q_proj, &q_shape, 4, self.s));
     }
 
-    const k_proj = if (projected) |values| values.k else if (!own) joined[1] else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
+    const k_proj = if (fused_in != null) mlx.mlx_array{ .ctx = null } else if (projected) |values| values.k else if (!own) joined[1] else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
     defer if (own) {
         _ = mlx.mlx_array_free(k_proj);
     };
-    const v_proj = if (projected) |values| values.v else if (!own) joined[2] else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
+    const v_proj = if (fused_in != null) mlx.mlx_array{ .ctx = null } else if (projected) |values| values.v else if (!own) joined[2] else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
     defer if (own) {
         _ = mlx.mlx_array_free(v_proj);
     };
@@ -153,14 +171,20 @@ pub fn gatedFullAttnProjected(
     defer _ = mlx.mlx_array_free(k_r);
     var v_r = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(v_r);
-    try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
-    try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+    if (fused_in == null) {
+        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+    }
 
-    // V transpose (independent of the q/k chain).
+    // V transpose (independent of the q/k chain); the fused attention input's v is head-major already.
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var v_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(v_t);
-    try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+    if (fused_in) |f| {
+        try mlx.check(mlx.mlx_array_set(&v_t, f.v));
+    } else {
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+    }
 
     // Fused decode QK-norm+RoPE (the laguna kernel, hd-128 partial-rotary):
     // one dispatch replaces per-head RMSNorm → transpose → partial RoPE for
@@ -191,7 +215,13 @@ pub fn gatedFullAttnProjected(
     var k_rope = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_rope);
     var fused_qk = false;
-    if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
+    if (fused_in) |f| {
+        // the fused attention input normed and rotated both in its finish
+        try mlx.check(mlx.mlx_array_set(&q_rope, f.q));
+        try mlx.check(mlx.mlx_array_set(&k_rope, f.k));
+        fused_qk = true;
+    }
+    if (!fused_qk and batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
         self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
     blk: {
@@ -328,8 +358,13 @@ pub fn gatedFullAttnProjected(
                 }
             }
         }
-        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer, skip_output, null);
     }
+
+    // The merged and the fused attention outputs read the gate where it lies: the fused input's or the query planes'
+    // gate, or the q_proj
+    // this layer projected itself.
+    const gate_src = fusion.gateSrc(if (fused_in) |f| f.gate else if (q_planes) |pl| pl[1] else null, if (own and cfg.attn_output_gate and q_proj.ctx != null) q_proj else null, h_count, hd);
 
     var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
     defer kv_view.deinit();
@@ -356,6 +391,9 @@ pub fn gatedFullAttnProjected(
             Qwen4AttnProf.sync(full_v);
             Qwen4AttnProf.lap(q_rope, .proj);
         }
+        // The merged attention output: the fused core's split pass, then its merge, the gate and o_proj's prepare in
+        // one launch (`fusion.mergedGatedOut`); null: qsaSlotAttn and the tail.
+        if (!skip_output) if (gate_src) |gs| if (try fusion.mergedGatedOut(self, ctx, q_rope, &kv_view, gs, fa, flat_shape, batch, seq_len, ratio, attn_scale)) |y| return y;
         const served = try qsaSlotAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, &ctx.qsa_mask, &ctx.qsa_arms, seq_len, ratio, attn_scale);
         if (Qwen4AttnProf.active) Qwen4AttnProf.lap(served.out, .qsa);
         if (self.cost_trace_active) self.cost_attention |= served.cost_bit;
@@ -396,7 +434,7 @@ pub fn gatedFullAttnProjected(
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
     }
 
-    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer, skip_output, gate_src);
 }
 
 /// Shared tail of `gatedFullAttnWith`: transpose the attention output back
@@ -412,7 +450,10 @@ pub fn gatedAttnTail(
     is_prefill: bool,
     layer: u32,
     skip_output: bool,
+    gate_src: ?fusion.GateSrc,
 ) !mlx.mlx_array {
+    // The fused attention output: the gate's product inside o_proj's prepare (`fusion.gatedOut`)
+    if (!skip_output) if (gate_src) |gs| if (try fusion.gatedOut(self, attn_out, gs, fa, flat_shape, batch, is_prefill)) |y| return y;
     // Transpose back [B,H,S,D] -> [B,S,H,D] (view)
     const perm_back = [_]c_int{ 0, 2, 1, 3 };
     var attn_t = mlx.mlx_array_new();

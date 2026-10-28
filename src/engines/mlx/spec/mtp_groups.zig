@@ -361,7 +361,7 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     var count: usize = 0;
     for (active) |slot| {
         const gen = &slot.legacy_gen.?;
-        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (try loopGuardTick(sch, slot, gen, false)) continue;
         if (try gen.checkStop()) {
             finishSlot(sch, slot, gen.finish_reason);
             continue;
@@ -515,7 +515,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
 
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
-        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (try loopGuardTick(sch, slot, gen, false)) continue;
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             gen.mtp_batch_head = false;
@@ -772,7 +772,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
 
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
-        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (try loopGuardTick(sch, slot, gen, false)) continue;
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             slot.markError(@errorName(e));

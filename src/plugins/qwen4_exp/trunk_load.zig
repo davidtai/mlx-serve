@@ -11,6 +11,7 @@ const ple_gpu = @import("ple_gpu.zig");
 const distributed_mod = @import("../../engines/mlx/cluster/distributed.zig");
 const fused_rows = @import("../../sdk/blocks/linear/fused_rows.zig");
 const Trunk = @import("trunk.zig").Trunk;
+const trunk_formats = @import("trunk/formats.zig");
 const loadHcWeights = @import("load.zig").loadHcWeights;
 const loadQwen4Mtp = @import("mtp.zig").loadQwen4Mtp;
 const headPrefix = @import("mtp.zig").headPrefix;
@@ -64,6 +65,11 @@ pub const Options = struct {
 /// `config` is borrowed for the trunk's life; `weights` must outlive it.
 pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, weights: *model.Weights, opts: Options) !Trunk {
     const s = mlx.gpuStream();
+    // The pack's quant formats: the trunk format's linears now, the expert format's banks once the layers are bound.
+    var fmts: trunk_formats.Loading = undefined;
+    try fmts.begin(a, config, weights, opts.pack, s);
+    defer fmts.end();
+    errdefer fmts.formats.deinit(a);
     if (config.indexer_budget != 0) {
         qsaScoreFusedArm();
         qsaNaxArm();

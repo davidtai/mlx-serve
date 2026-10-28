@@ -7,7 +7,6 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
-const exl3 = @import("../../../sdk/quant/exl3/format.zig");
 const distributed_mod = @import("../../../engines/mlx/cluster/distributed.zig");
 const gather_qmm_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const gather_qmv = @import("../../../sdk/blocks/moe/gather_qmv.zig");
@@ -18,6 +17,7 @@ const moe_affine4 = @import("../../../sdk/blocks/moe/moe_affine4.zig");
 const profile = @import("../../../engines/mlx/diag/profile.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
 const Trunk = @import("../trunk.zig").Trunk;
+const fusion = @import("fusion.zig");
 const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const ProfClock = profile.ProfClock;
 const decodeProfileEnabled = profile.decodeProfileEnabled;
@@ -321,6 +321,14 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
     } else try self.moeRouterLogits(router_x, mw);
     defer _ = mlx.mlx_array_free(router_logits);
 
+    // The routed shared expert: at 2..4 rows the router's top-k rides the fused shared expert's routed prepare launch
+    // (`fusion.routedShared`); null: the chain below.
+    const route_fold = router_override == null and !skip_shared;
+    if (route_fold) if (try fusion.routedShared(self, expert_x, mw, router_logits)) |y| return y;
+    // Where the routed shared expert did not run: the router kernel sums the shared gate's logit in MLX's gemv order
+    // for the fused shared expert (`fusion.gateRouting`), whose gemv launch then goes.
+    const gate_routing: ?MoeRouting = if (route_fold) try fusion.gateRouting(self, expert_x, mw, router_logits) else null;
+
     // Top-K + softmax/renormalize as a single fused kernel (when compiled).
     // At one decode row the shared-expert gate's logit rides the softmax router kernel (RouterMode.softmax_gate).
     const gate_fold: ?RouterGate = blk: {
@@ -332,13 +340,14 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         if (rows != 1 or mlx.mlx_array_size(expert_x) != mlx.mlx_array_size(mw.shared_gate_vec)) break :blk null;
         break :blk .{ .x = expert_x, .w = mw.shared_gate_vec };
     };
-    const routed = try self.computeMoeRouting(router_logits, gate_fold);
+    const routed = gate_routing orelse try self.computeMoeRouting(router_logits, gate_fold);
     defer if (routed.gate_logit.ctx != null) {
         _ = mlx.mlx_array_free(routed.gate_logit);
     };
     // With the gate's logit in hand the shared expert's down output is built up front: the affine-4
     // down kernel adds it in its epilogue, and the tail below uses it when another arm served the routed part.
-    const shared_down: ?mlx.mlx_array = if (routed.gate_logit.ctx != null) (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})) else null;
+    // An EXL3 pack's branch below never reads it (its shared expert rides `fusion.sharedFused` or `addGatedShared`).
+    const shared_down: ?mlx.mlx_array = if (routed.gate_logit.ctx != null and cfg.exl3 == null) (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})) else null;
     defer if (shared_down) |sd| {
         _ = mlx.mlx_array_free(sd);
     };
@@ -397,18 +406,18 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         norm_scores = scaled_scores;
     }
 
-    if (cfg.exl3) |spec| {
-        const bank: exl3.Bank = .{
-            .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
-            .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
-            .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
-        };
+    if (cfg.exl3 != null) {
+        // The banks the pack's expert format loaded run as one SwiGLU through it (`trunk/formats.zig`).
+        const banks = self.formats.banksOf(mw) orelse return error.Exl3BanksNotLoaded;
         const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp) orelse return error.Exl3SwigluLimitUnsupported;
-        const y = try exl3.routed(self.s, expert_x, bank, inds, norm_scores, spec, .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null });
+        // The fused shared expert: the shared expert inside the routed launches (`fusion.sharedFused`); null: the
+        // SwiGLU and the shared expert below.
+        if (!skip_shared) if (try fusion.sharedFused(self, expert_x, mw, banks, inds, norm_scores, if (gate_routing != null) routed.gate_logit else null)) |y| return y;
+        const y = try self.formats.swiglu(banks, expert_x, inds, norm_scores, .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null }, self.s);
         if (skip_shared) return y;
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
         defer _ = mlx.mlx_array_free(y);
-        return self.moeAddGatedShared(y, expert_x, mw, null);
+        return @import("../side_stream.zig").addGatedShared(self, y, expert_x, mw);
     }
 
     // Expert computation. Two paths:

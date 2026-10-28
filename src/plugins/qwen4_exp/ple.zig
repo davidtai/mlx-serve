@@ -197,11 +197,148 @@ pub fn flushDeferredPle(self: *Trunk, ctx: *ForwardCtx) !void {
     } else {
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
-        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
+        const pk = out[0..mlx.mlx_array_size(p.emb)];
+        // a solo verify's ids off the arrays its input was built from, when the caller lent them
+        const from_src = if (ctx.ple_ids_src) |src| try pleFillFromSources(self, ctx, src, p.token_ids, p.entry, pk, p.capture) else false;
+        if (!from_src) try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, pk, p.capture);
     }
     ctx.ple_pending = null;
     releasePlePending(p);
 }
+
+/// The deferred leaf filled from `src` (`ForwardCtx.ple_ids_src`), the arrays the verify input concatenates, instead of
+/// an op over that input (`pleEvalIds`' `contiguous` queues behind everything already handed to the GPU, under the
+/// verify ladder layer 0): each id is read after its OWN producer's event, and while the next one is still running the
+/// rows of the ids already held are gathered. The leaf gets byte for byte what `pleGatherBf16` writes (a token's rows
+/// depend only on the history and the tokens up to it, and a token-aligned range keeps each row's head), and the
+/// history moves are the same call on the same ids. False, nothing read or moved, where `src` cannot stand in for
+/// `token_ids`.
+fn pleFillFromSources(self: *Trunk, ctx: *ForwardCtx, src: []const mlx.mlx_array, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, pk: []u16, capture: bool) !bool {
+    const st = self.qwen4 orelse return false;
+    const n: usize = src.len;
+    const nh: usize = st.hash.n_heads;
+    const emb_dim: usize = st.table.dim * nh;
+    if (!pleSourcesFit(n, mlx.mlx_array_size(token_ids), pk.len, emb_dim, ctx.batch_slots == null)) return false;
+    if (!pleRangesKeepHeads(nh, st.table.n_heads)) return false;
+    for (src) |a| if (!pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a))) return false;
+    // anything not yet handed to the GPU goes now, in one eval: reading unscheduled ids one by one would sync per id
+    {
+        const v = mlx.mlx_vector_array_new_data(src.ptr, src.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
+    }
+    const ids = try self.allocator.alloc(u32, n);
+    defer self.allocator.free(ids);
+    const rows = try self.allocator.alloc(i64, n * nh);
+    defer self.allocator.free(rows);
+    const host = try self.allocator.alloc(f32, n * emb_dim);
+    defer self.allocator.free(host);
+    const ctx_len: usize = st.hash.ngram_size - 1;
+    // the history `pleAdvanceSerial` hashes against: nothing touches the entry until that call below
+    const prev = plePrevOf(entry, st.hash.eos);
+    const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
+    var sched: PleSrcSchedule = .{};
+    var waited: u64 = 0;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for (src, 0..) |a, i| {
+        var ready = false;
+        _ = mlx._mlx_array_is_available(&ready, a);
+        if (sched.beforeRead(ready)) |r| pleGatherRange(st, prev[0..ctx_len], ids, r, rows, host, pk, kv_len);
+        var wait_lap = io_util_mod.Stopwatch.init(io);
+        ids[i] = try pleSourceId(a);
+        waited += wait_lap.read();
+        sched.afterRead();
+    }
+    self.verify_laps.ple_sync_ns = waited;
+    if (sched.finish()) |r| pleGatherRange(st, prev[0..ctx_len], ids, r, rows, host, pk, kv_len);
+    const moved = pleAdvanceSerial(st, entry, ids, capture);
+    std.debug.assert(std.mem.eql(u32, moved[0..ctx_len], prev[0..ctx_len]));
+    const Once = struct {
+        var logged = false;
+    };
+    if (!Once.logged) {
+        Once.logged = true;
+        log.info("[qwen4] verify PLE ids read off the draft arrays, each after its own event ({d} ids)\n", .{n});
+    }
+    return true;
+}
+
+/// Whether `n` source ids can stand in for a deferred leaf: one per token id, the leaf `n` rows of `emb_dim`, and a
+/// solo forward (a batched one hashes per slot).
+pub fn pleSourcesFit(n: usize, n_ids: usize, leaf_len: usize, emb_dim: usize, solo: bool) bool {
+    return solo and n > 0 and n == n_ids and leaf_len == n * emb_dim;
+}
+
+/// A trellis gather decodes row `i` of ITS call at head `i % table_heads`; a range that starts at a token boundary (a
+/// multiple of the hash's `nh` rows a token) keeps every row's head only when `table_heads` divides `nh`.
+pub fn pleRangesKeepHeads(nh: usize, table_heads: usize) bool {
+    return table_heads <= 1 or (nh > 0 and nh % table_heads == 0);
+}
+
+/// One source id array: a single integer element (the head's `[1]`, a sampler's `[1, 1]`, int32 or uint32), what the
+/// verify input concatenates.
+pub fn pleSourceUsable(size: usize, dtype: mlx.mlx_dtype) bool {
+    return size == 1 and (dtype == .int32 or dtype == .uint32);
+}
+
+/// One id off its source after the source's own event (`mlx_array_eval` on an array already handed to the GPU only
+/// waits for it). A token id is non-negative and below 2^31, so its int32 and uint32 readings agree with the input's
+/// `astype(int32)`.
+pub fn pleSourceId(a: mlx.mlx_array) !u32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    const v: i64 = switch (mlx.mlx_array_dtype(a)) {
+        .int32 => (mlx.mlx_array_data_int32(a) orelse return error.TokenIdsUnreadable)[0],
+        .uint32 => (mlx.mlx_array_data_uint32(a) orelse return error.TokenIdsUnreadable)[0],
+        else => return error.PleSourceDtype,
+    };
+    if (v < 0 or v > std.math.maxInt(i32)) return error.PleSourceRange;
+    return @intCast(v);
+}
+
+/// The rows of the held ids `ids[r[0]..r[1]]`, hashed over the history and every id up to `r[1]`, gathered and
+/// bf16-packed into their slice of the leaf: the rows, decode and rounding `pleFillFromIds` gives the whole range.
+fn pleGatherRange(st: *const qwen4_mod.Qwen4State, prev: []const u32, ids: []const u32, r: [2]usize, rows: []i64, host: []f32, pk: []u16, kv_len: u64) void {
+    const lo = r[0];
+    const hi = r[1];
+    if (lo >= hi) return;
+    const nh: usize = st.hash.n_heads;
+    const emb_dim: usize = st.table.dim * nh;
+    st.hash.rowIds(prev, ids[0..hi], rows[0 .. hi * nh]);
+    st.table.gather(rows[lo * nh .. hi * nh], host[lo * emb_dim .. hi * emb_dim], kv_len);
+    for (host[lo * emb_dim .. hi * emb_dim], pk[lo * emb_dim .. hi * emb_dim]) |v, *o| o.* = qwen4_mod.bf16Rne(v);
+}
+
+/// When `pleFillFromSources` gathers: the ids arrive in order, and before WAITING for the next one the rows of every id
+/// held but not gathered are gathered, so the host work runs while the GPU still produces the later ids; the rest goes
+/// after the last id. Every id is gathered once, in order, in contiguous ranges; all readable at once is ONE range.
+pub const PleSrcSchedule = struct {
+    /// Ids read so far.
+    held: usize = 0,
+    /// Ids whose rows are in the leaf.
+    gathered: usize = 0,
+
+    /// Before reading the next id (`ready`: readable without waiting): the token range to gather now, if any.
+    pub fn beforeRead(self: *PleSrcSchedule, ready: bool) ?[2]usize {
+        if (ready or self.gathered == self.held) return null;
+        return self.take();
+    }
+
+    pub fn afterRead(self: *PleSrcSchedule) void {
+        self.held += 1;
+    }
+
+    /// After the last id: the range still owed, if any.
+    pub fn finish(self: *PleSrcSchedule) ?[2]usize {
+        if (self.gathered == self.held) return null;
+        return self.take();
+    }
+
+    fn take(self: *PleSrcSchedule) [2]usize {
+        const r = [2]usize{ self.gathered, self.held };
+        self.gathered = self.held;
+        return r;
+    }
+};
 
 /// Fill every pending deferred-PLE leaf of a group in ONE pass. The caller retains
 /// rollback state until the whole round succeeds.
@@ -291,7 +428,42 @@ pub fn discardDeferredPle(_: *Trunk, ctx: *ForwardCtx) void {
 pub fn pleGatherBf16(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const ids_c = try self.pleEvalIds(token_ids);
     defer _ = mlx.mlx_array_free(ids_c);
+    try self.pleKickOff();
     return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
+}
+
+/// Starts the layers a prefill chunk built before its PLE layer (`Trunk.ple_kick`) on the GPU, so they run under the host
+/// gather that follows; called once the ids are read, whose eval would queue behind them. The same graph, started
+/// earlier: no op is added and no value changes.
+pub fn pleKickOff(self: *Trunk) !void {
+    const kick = self.ple_kick;
+    if (kick.ctx == null) return;
+    self.ple_kick = .{ .ctx = null };
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{kick}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+}
+
+/// A prefill of `prompt_ids` is about to start on `ctx`: the table reads the prompt's PLE rows ahead of each chunk's
+/// gather (`NgramTable.prefetchBegin`). Nothing on the GPU arm (its kernel reads the table in place) or without a PLE
+/// layer.
+pub fn plePrefetchBegin(self: *Trunk, ctx: *const ForwardCtx, prompt_ids: []const u32) void {
+    const st = self.qwen4 orelse return;
+    if (st.gpu != null) return;
+    const entries = ctx.ssm_entries orelse return;
+    for (self.moe_layers, 0..) |*lw, l| {
+        if (lw.ple == null) continue;
+        if (l >= entries.len) return;
+        const prev = plePrevOf(&entries[l], st.hash.eos);
+        st.table.prefetchBegin(&st.hash, prev[0 .. st.hash.ngram_size - 1], prompt_ids, ctx.moe_seq_offset.*);
+        return;
+    }
+}
+
+/// Ends the prefill's prefetch session (`plePrefetchBegin`), on every exit of the prefill.
+pub fn plePrefetchEnd(self: *Trunk) void {
+    const st = self.qwen4 orelse return;
+    st.table.prefetchEnd();
 }
 
 /// The GPU arm's host half: read the ids (the one sync), advance the history.
@@ -341,12 +513,13 @@ pub fn pleHostIds(self: *Trunk, ids_c: mlx.mlx_array) ![]u32 {
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
 /// row's ids together so the flush costs ONE host sync, not one per row.
 pub fn plePrepareIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    const s = if (self.ple_ids_stream.ctx != null) self.ple_ids_stream else self.s;
     var ids_i32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids_i32);
-    try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, s));
     var ids_c = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(ids_c);
-    try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
+    try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, s));
     return ids_c;
 }
 
@@ -1204,4 +1377,96 @@ test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a 
     try on.init(null);
     defer on.deinit();
     try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
+}
+
+test "PLE from sources: every id gathered once, in order, in contiguous ranges; held ids gathered before each wait" {
+    // all ids readable at once is ONE range (the input read's single gather); ids that become readable one by one are
+    // gathered as they arrive
+    const Case = struct { ready: []const bool, want: []const [2]usize };
+    const cases = [_]Case{
+        .{ .ready = &.{ true, true, true, true }, .want = &.{.{ 0, 4 }} },
+        .{ .ready = &.{ false, true, true, true }, .want = &.{.{ 0, 4 }} },
+        .{ .ready = &.{ false, true, false, false }, .want = &.{ .{ 0, 2 }, .{ 2, 3 }, .{ 3, 4 } } },
+        .{ .ready = &.{ true, false, false, false }, .want = &.{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 } } },
+        .{ .ready = &.{false}, .want = &.{.{ 0, 1 }} },
+    };
+    for (cases) |c| {
+        var sched: PleSrcSchedule = .{};
+        var got: [8][2]usize = undefined;
+        var n: usize = 0;
+        for (c.ready) |r| {
+            if (sched.beforeRead(r)) |g| {
+                got[n] = g;
+                n += 1;
+            }
+            sched.afterRead();
+        }
+        if (sched.finish()) |g| {
+            got[n] = g;
+            n += 1;
+        }
+        try testing.expect(sched.finish() == null);
+        try testing.expectEqual(c.want.len, n);
+        for (c.want, got[0..n]) |w, g| try testing.expectEqual(w, g);
+        var next: usize = 0;
+        for (got[0..n]) |g| {
+            try testing.expectEqual(next, g[0]);
+            try testing.expect(g[1] > g[0]);
+            next = g[1];
+        }
+        try testing.expectEqual(c.ready.len, next);
+    }
+}
+
+test "PLE from sources: only a solo, one-id-per-token, integer source list stands in for the leaf" {
+    try testing.expect(pleSourcesFit(4, 4, 4 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(4, 4, 4 * 2560, 2560, false));
+    try testing.expect(!pleSourcesFit(3, 4, 4 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(4, 4, 3 * 2560, 2560, true));
+    try testing.expect(!pleSourcesFit(0, 0, 0, 2560, true));
+    // a token-aligned range keeps every row's trellis head only when the table's heads divide the hash's
+    try testing.expect(pleRangesKeepHeads(16, 16));
+    try testing.expect(pleRangesKeepHeads(16, 8));
+    try testing.expect(pleRangesKeepHeads(16, 1));
+    try testing.expect(pleRangesKeepHeads(16, 0));
+    try testing.expect(!pleRangesKeepHeads(16, 48));
+    try testing.expect(!pleRangesKeepHeads(16, 3));
+    try testing.expect(pleSourceUsable(1, .int32));
+    try testing.expect(pleSourceUsable(1, .uint32));
+    try testing.expect(!pleSourceUsable(2, .int32));
+    try testing.expect(!pleSourceUsable(1, .int64));
+    try testing.expect(!pleSourceUsable(1, .float32));
+}
+
+test "PLE from sources: an id reads the same off host data, a sampler's [1, 1] and a dispatched op, int32 or uint32" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const id: i32 = 248043;
+    const host = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(host);
+    try testing.expectEqual(@as(u32, 248043), try pleSourceId(host));
+    const zero = mlx.mlx_array_new_data(&@as(i32, 0), &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(zero);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, host, zero, s));
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_reshape(&sq, sum, &[_]c_int{ 1, 1 }, 2, s));
+    var unsigned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unsigned);
+    try mlx.check(mlx.mlx_astype(&unsigned, sum, .uint32, s));
+    // handed over as a dispatched chain is: one async eval, the reads wait on its event
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ sq, unsigned }, 2);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+    for ([_]mlx.mlx_array{ sq, unsigned, sum }) |a| {
+        try testing.expect(pleSourceUsable(mlx.mlx_array_size(a), mlx.mlx_array_dtype(a)));
+        try testing.expectEqual(@as(u32, 248043), try pleSourceId(a));
+    }
+    // a negative id is no token: refused rather than wrapped
+    const neg_v: i32 = -3;
+    const neg = mlx.mlx_array_new_data(&neg_v, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(neg);
+    try testing.expectError(error.PleSourceRange, pleSourceId(neg));
 }

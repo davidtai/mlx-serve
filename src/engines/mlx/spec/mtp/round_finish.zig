@@ -515,6 +515,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.mtpTraceRoundEnd(m, m, m_lo);
         if (times_round) {
             self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+            if (self.mtpEvFixOn()) self.mtpEvFixObserve(plan, m, m);
             self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
             if (chain.lookup) self.mtpLookupObserve(m, m + 1);
@@ -621,6 +622,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     self.mtpTraceRoundEnd(m, accepted, m_lo);
     if (times_round) {
         self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+        if (self.mtpEvFixOn()) self.mtpEvFixObserve(plan, m, accepted);
         self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
     } else {
         if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);

@@ -38,6 +38,9 @@ pub const Trunk = struct {
     lm_head_b: mlx.mlx_array,
     /// A ternary 2-bit pack: its projections read the 2-bit kernels (`trunk/linear.zig` `qmatmul`).
     ternary_2bit: bool = false,
+    /// The pack's quant formats bound at load (`trunk/formats.zig`): the trunk format's linears, the expert format's
+    /// banks, the numerics.
+    formats: @import("trunk/formats.zig").Formats = .{},
     moe_layers: []MoeLayerWeights,
     /// Arrays the loader built (transposed bf16, folded hyper-connection weights): freed with the trunk.
     moe_owned_bf16: []mlx.mlx_array = &.{},
@@ -66,6 +69,12 @@ pub const Trunk = struct {
     qsa_pooled_rope: QsaPooledRope = .{},
     /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
     fwd_gen: u64 = 0,
+    /// Set while the wavefront builds a chunk: the stream the PLE layer's id read runs on (the CPU's), so it waits behind
+    /// neither half's GPU queue (`plePrepareIds`).
+    ple_ids_stream: mlx.mlx_stream = .{ .ctx = null },
+    /// A prefill chunk's stream as built up to its PLE layer, borrowed while that layer runs: `pleKickOff` starts it on the
+    /// GPU once the ids are read, so those layers run under the host gather (the PLE prefetch).
+    ple_kick: mlx.mlx_array = .{ .ctx = null },
     /// Test meter: how many times `qsaScoreBank` built or extended its transposed operand.
     qsa_score_bank_builds: usize = 0,
     /// Pipeline rank 0: the worker holding the later layers; tensor rank 0: the worker holding the other expert slices.
@@ -107,6 +116,8 @@ pub const Trunk = struct {
     /// The MTP cost profile's trunk fingerprints (homogeneous affine-4/gs-64; the oQ4e mixed layout).
     mtp_uniform_affine_trunk: bool = false,
     mtp_oqe_affine_trunk: bool = false,
+    /// The fused paths' per-layer state (`trunk/fusion.zig`).
+    fused: @import("trunk/fusion.zig").Scratch = .{},
 
     pub var qwen4_trace: ?*mtp.Qwen4Trace = null;
     pub var qsa_engaged_logged: bool = false;
@@ -192,6 +203,9 @@ pub const Trunk = struct {
     pub const pleForward = @import("ple.zig").pleForward;
     pub const pleGatherBf16 = @import("ple.zig").pleGatherBf16;
     pub const pleHostIds = @import("ple.zig").pleHostIds;
+    pub const pleKickOff = @import("ple.zig").pleKickOff;
+    pub const plePrefetchBegin = @import("ple.zig").plePrefetchBegin;
+    pub const plePrefetchEnd = @import("ple.zig").plePrefetchEnd;
     pub const plePrepareIds = @import("ple.zig").plePrepareIds;
     pub const plePrevOf = @import("ple.zig").plePrevOf;
     pub const pleSettleFromArray = @import("ple.zig").pleSettleFromArray;
@@ -221,6 +235,9 @@ pub const Trunk = struct {
     // qsa/pooled.zig
     pub const markQsaPooledRopeStale = @import("qsa/pooled.zig").markQsaPooledRopeStale;
     pub const resetQsaPooledRope = @import("qsa/pooled.zig").resetQsaPooledRope;
+    // trunk/formats.zig
+    pub const reordered = @import("trunk/formats.zig").reordered;
+    pub const armTrunkResident = @import("trunk/formats.zig").armTrunkResident;
     // trunk/linear.zig
     pub const qmatmul = @import("trunk/linear.zig").qmatmul;
     pub const lmHeadProject = @import("trunk/linear.zig").lmHeadProject;
@@ -408,5 +425,6 @@ pub const Trunk = struct {
         }
         for (self.moe_owned_bf16) |a| _ = mlx.mlx_array_free(a);
         self.allocator.free(self.moe_owned_bf16);
+        self.formats.deinit(self.allocator);
     }
 };

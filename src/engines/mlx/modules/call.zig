@@ -22,6 +22,11 @@ pub const fns = struct {
     pub const qwen4_mtp_forward = Trunk.qwen4MtpForward;
     pub const qwen4_mtp_forward_placed = Trunk.qwen4MtpForwardPlaced;
     pub const qwen4_mtp_forward_batched = Trunk.qwen4MtpForwardBatched;
+    // the fused draft pick and the head forward that reads its front
+    pub const qwen4_mtp_forward_front = Qwen4Mtp.qwen4MtpForwardFront;
+    pub const qwen4_mtp_forward_placed_front = Qwen4Mtp.qwen4MtpForwardPlacedFront;
+    pub const qwen4_draft_pick = Qwen4Mtp.qwen4DraftPick;
+    pub const qwen4_greedy_pick = Qwen4Mtp.qwen4GreedyPick;
     pub const qwen4_draft_select = Trunk.qwen4DraftSelect;
     pub const qwen4_draft_shortlist = Trunk.qwen4DraftShortlist;
     pub const qwen4_draft_select_batched = Trunk.qwen4DraftSelectBatched;
@@ -29,10 +34,14 @@ pub const fns = struct {
     pub const qwen4_build_draft_rerank = Trunk.qwen4BuildDraftRerank;
     pub const qwen4_row_axis_verify = Trunk.forwardRowAxisVerify;
     pub const qwen4_warmup_spec_verify = Trunk.warmupSpecVerify;
+    pub const qwen4_arm_trunk_resident = Trunk.armTrunkResident;
+    pub const qwen4_ple_prefetch_begin = Trunk.plePrefetchBegin;
+    pub const qwen4_ple_prefetch_end = Trunk.plePrefetchEnd;
 };
 
 const Dsv41Vision = @import("../../../plugins/deepseek_v41/vision.zig").Dsv41Vision;
 const Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
+const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig");
 
 const Entry = *const fn (args: *const anyopaque, out: *anyopaque, err: *[]const u8) callconv(.c) bool;
 
