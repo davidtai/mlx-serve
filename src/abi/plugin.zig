@@ -340,7 +340,7 @@ pub const LoadCtx = extern struct {
     settings_json: Str = .{},
     span: ?*const LayerSpan = null,
     stream: Stream = .{},
-    /// The host table (P2 step 8); opaque until it lands.
+    /// The process's host table (`host/plugin_host_impl.zig`); null outside a server.
     host: ?*const Host = null,
     /// The pack's tensors as the engine loaded them (`sdk/weights/resident.zig`); null = the plugin reads its own.
     weights: ?*const Source = null,

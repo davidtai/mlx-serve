@@ -212,6 +212,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .parsed = &b.parsed,
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
+        .host = @import("../../../host/host_table.zig").get(),
         .weights = &src,
         .stream_room = streamRoom(config),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,

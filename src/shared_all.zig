@@ -6,6 +6,8 @@ comptime {
     _ = @import("sdk/util/err_name.zig").last_tls;
     if (@import("build_options").mlx_stream) _ = @import("mlx_stream").shared_state;
     _ = @import("host/plugins/loader.zig").process;
+    _ = @import("host/plugin_host_impl.zig").process_shared;
+    _ = @import("host/host_table.zig").published;
     _ = @import("host/http/server.zig").serverState_shared;
     _ = @import("host/http/server.zig").launch_shared;
     _ = @import("host/registry/memory_ceiling.zig").overrides_shared;
