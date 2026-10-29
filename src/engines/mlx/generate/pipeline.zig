@@ -8,6 +8,8 @@ const ssmSnapshot = transformer_mod.ssmSnapshot;
 const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
 const ssmRestore = transformer_mod.ssmRestore;
 const Generator = @import("generator.zig").Generator;
+const plugin_driver = @import("../plugin/driver.zig");
+const plugin_settle = @import("../plugin/settle.zig");
 const applyPenalties = @import("../sampling/filters.zig").applyPenalties;
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 
@@ -161,14 +163,19 @@ pub const ForcedCommit = struct {
     stopped: bool,
     /// The forward's DFlash taps joined the assistant context: DFlash may keep drafting.
     dflash_synced: bool = false,
+    /// The served model's drafter committed the span itself (`NativeDrafter.commit_forced`): its rounds go on.
+    drafter_synced: bool = false,
 };
 
 /// Commit `forced` through the model as ONE multi-token forward, from any
 /// of the three inter-tick states (pipelined, spec exit, shim-seeded), and
 /// leave the generator in the shim-seeded state a regular `next()` reads.
 /// A bound DFlash drafter's taps for the span are parked (`ForcedCommit.dflash_synced`).
+/// From a DSpark round's exit, a served drafter with `commit_forced` takes the span (`commitForcedNative`).
 pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
     std.debug.assert(forced.len > 0);
+    if (self.dspark_enabled and !self.has_pending_token and !self.has_pending_logits and plugin_driver.nativeCommitForced(self.xfm) != null)
+        return commitForcedNative(self, allocator, forced);
     var emitted = std.ArrayList(u32).empty;
     errdefer emitted.deinit(allocator);
     var input = std.ArrayList(u32).empty;
@@ -240,6 +247,26 @@ pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced
     self.mtp_hidden_stale = true;
     if (dflash_live) try self.dflashPark(allocator, caps, @intCast(input.items.len));
     return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false, .dflash_synced = dflash_live };
+}
+
+/// `commitForcedTokens` through the served drafter (`NativeDrafter.commit_forced`) from a round's exit, where
+/// `next_token_id` is decided and not in the state: the drafter forwards `[t1, forced[0..n-1]]` and keeps it as a fully
+/// accepted round, and `forced[n-1]` is the next round's `t1`, decided and not in the state. Publishes what the
+/// engine's own commit publishes from a round's exit, in its order.
+fn commitForcedNative(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
+    const n = forced.len;
+    var emitted = std.ArrayList(u32).empty;
+    errdefer emitted.deinit(allocator);
+    try emitted.append(allocator, self.next_token_id);
+    try emitted.appendSlice(allocator, forced[0 .. n - 1]);
+    try plugin_settle.activate(self.xfm, &self.ctx);
+    try plugin_driver.nativeForced(self.xfm, &self.ctx, emitted.items);
+    try self.generated_ids.appendSlice(allocator, emitted.items);
+    self.advanceStep(@intCast(n));
+    self.consecutive_pad = 0;
+    self.loop_guard_start = self.generated_ids.items.len;
+    self.next_token_id = forced[n - 1];
+    return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false, .drafter_synced = true };
 }
 
 /// The ONE place a partial accept rolls recurrent state back from the verify capture:

@@ -58,6 +58,13 @@ fn sized(comptime T: type, p: ?*const anyopaque) bool {
     return @as(*const u32, @ptrCast(@alignCast(s))).* >= @sizeOf(T);
 }
 
+/// `sized` for a table whose members from `optional` on may be absent: one an older kit built ends before it, and the
+/// host reads those members only where the table's size covers them (null otherwise).
+fn sizedTo(comptime T: type, comptime optional: []const u8, p: ?*const anyopaque) bool {
+    const s = p orelse return true;
+    return @as(*const u32, @ptrCast(@alignCast(s))).* >= @offsetOf(T, optional);
+}
+
 /// The host's checks on a manifest, before any other member is read: refuses by name a manifest, table or hook table
 /// of another version or a smaller size, another MLX, or a name a plugin cannot have.
 pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
@@ -79,7 +86,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
                 !sized(model_abi.EmbedHooks, t.embed) or !sized(model_abi.DistHooks, t.dist) or
                 !sized(model_abi.SpeechHooks, t.speech))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
-            if (t.spec) |s| if (!sized(model_abi.HeadHooks, s.head) or !sized(model_abi.NativeDrafter, s.native_drafter))
+            if (t.spec) |s| if (!sized(model_abi.HeadHooks, s.head) or !sizedTo(model_abi.NativeDrafter, "commit_forced", s.native_drafter))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
             if (!sized(model_abi.AuxHooks, t.cache.aux)) return Verdict.refuse(.unsupported, "model auxiliary hook table is older than this host's");
         },

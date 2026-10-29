@@ -545,6 +545,36 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     return out.round;
 }
 
+/// The served drafter's own commit of a forced span (`NativeDrafter.commit_forced`), null without one: a table from an
+/// older kit ends before it.
+pub fn nativeCommitForced(xfm: *const Transformer) ?*const fn (m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+    const nd = nativeDrafter(xfm) orelse return null;
+    if (nd.size < @offsetOf(abi.NativeDrafter, "commit_forced") + @sizeOf(@TypeOf(nd.commit_forced))) return null;
+    return nd.commit_forced;
+}
+
+/// A forced span `span` (`t1` and every forced token but the last) committed through the served drafter at
+/// `ctx.cache.step` (`NativeDrafter.commit_forced`) and kept whole: `ctx.cache.step` and `ctx.moe_seq_offset` move
+/// past it.
+pub fn nativeForced(xfm: *Transformer, ctx: *ForwardCtx, span: []const u32) !void {
+    const b = xfm.plugin.?;
+    const commit = nativeCommitForced(xfm).?;
+    const slot_ids = [_]u32{settle.slotId(b, ctx)};
+    const pos = [_]u32{@intCast(ctx.cache.step)};
+    const f: abi.Forward = .{ .mode = .prefill, .rows = @intCast(span.len), .tokens = .of(span), .slots = .of(&slot_ids), .positions = .of(&pos) };
+    var out: abi.ForwardOut = .{};
+    intree.enter(ctx);
+    const v = commit(b.model, &f, &out);
+    intree.leave();
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: forced span not committed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    if (out.round.position != pos[0] + span.len) return error.PluginForwardFailed;
+    ctx.cache.step = @intCast(out.round.position);
+    ctx.moe_seq_offset.* = @intCast(out.round.position);
+}
+
 /// Whether the served drafter lets the engine accept a block itself (`NativeDrafter.verify` and `finish`): a sampled request.
 pub fn nativeSplit(xfm: *const Transformer) bool {
     const nd = nativeDrafter(xfm) orelse return false;

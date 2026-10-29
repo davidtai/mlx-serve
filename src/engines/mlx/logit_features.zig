@@ -46,8 +46,8 @@ pub fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     return true;
 }
 
-/// Commit `forced` through the model and publish it; an MTP or DFlash slot keeps
-/// speculating, any other decodes regular. False = the pending token stopped the slot first.
+/// Commit `forced` through the model and publish it; an MTP or DFlash slot, or a served drafter that commits it
+/// itself, keeps speculating, any other decodes regular. False = the pending token stopped the slot first.
 pub fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32, reason: generate_mod.SpecDisableReason) !bool {
     const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
@@ -61,7 +61,7 @@ pub fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: [
         finishSlot(sch, slot, gen.finish_reason);
         return false;
     }
-    if (!r.dflash_synced and !try gen.mtpResumeAfterForced(slot.allocator)) {
+    if (!r.dflash_synced and !r.drafter_synced and !try gen.mtpResumeAfterForced(slot.allocator)) {
         gen.spec_disabled_runtime = true;
         gen.spec_disable_reason = reason;
     }
