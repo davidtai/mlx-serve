@@ -448,6 +448,11 @@ pub const Forward = extern struct {
     /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
     /// empty = embed the ids.
     embeds: Array = .{},
+    /// A native drafter's round: the launch's draft-depth bounds (`--mtp-min-depth`, `--mtp-max-depth`) the engine's
+    /// own MTP rounds keep, for the plugin's planner to keep too; equal bounds pin one depth, `max_depth` 0 leaves the
+    /// cap to the plugin. A host whose `Forward` is shorter (`size`) states none.
+    min_depth: u32 = 0,
+    max_depth: u32 = 0,
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs

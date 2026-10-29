@@ -20,6 +20,7 @@ const floatDtypeTable = @import("../load/weights.zig").floatDtypeTable;
 const plugin_config = @import("config.zig");
 const Resident = @import("../../../sdk/weights/resident.zig").Resident;
 const mtp_nax_profile = @import("../spec/mtp_nax_profile.zig");
+const depth_bounds = @import("../spec/mtp_depth_bounds.zig");
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const moduleShell = @import("../modules/shell.zig").moduleShell;
@@ -1376,4 +1377,47 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     auxFree(&x, snap);
     try t.expectEqual(@as(usize, 1), fake.restores);
     try t.expectEqual(@as(usize, 1), fake.frees);
+}
+
+test "plugin driver: a native round, greedy or split, states the launch's draft-depth bounds" {
+    const t = std.testing;
+    const Rec = struct {
+        var seen: [2]u32 = .{ 0, 0 };
+        fn record(f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {
+            seen = .{ f.min_depth, f.max_depth };
+            out.round = .{ .n = 1, .rows = 1, .position = f.positions.slice()[0] + 1 };
+            out.round.tokens[0] = f.tokens.slice()[0];
+            return .ok;
+        }
+        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            return record(f, out);
+        }
+        fn verify(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            // A stand-in handle: nativeVerify only checks and returns it.
+            out.logits = .{ .ctx = &seen };
+            return record(f, out);
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .verify = &verify };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    var bound: Bound = .{ .table = &Rec.table, .model = &m };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.suppress_mask = null;
+    var kv = try KVCache.init(t.allocator, 1);
+    defer kv.deinit();
+    var off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    depth_bounds.active = .{ .min = 2, .max = 3 };
+    defer depth_bounds.active = .{};
+
+    _ = try nativeRound(&x, &ctx, 7, 4);
+    try t.expectEqual([2]u32{ 2, 3 }, Rec.seen);
+    Rec.seen = .{ 0, 0 };
+    _ = try nativeVerify(&x, &ctx, 7, 4);
+    try t.expectEqual([2]u32{ 2, 3 }, Rec.seen);
 }

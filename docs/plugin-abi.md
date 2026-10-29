@@ -530,6 +530,8 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `accept_cap` | `u32` | `0` | A native drafter's round (`NativeDrafter.step`): the most drafts it may keep, the tokens still allowed less one. |
 | `suppress_mask` | `Array` | `.{}` | The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none. |
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
+| `min_depth` | `u32` | `0` | A native drafter's round: the launch's draft-depth bounds (`--mtp-min-depth`, `--mtp-max-depth`) the engine's own MTP rounds keep, for the plugin's planner to keep too; equal bounds pin one depth, `max_depth` 0 leaves the cap to the plugin. A host whose `Forward` is shorter (`size`) states none. |
+| `max_depth` | `u32` | `0` |  |
 
 ### `Offload` (extern struct)
 
