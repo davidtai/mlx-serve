@@ -1377,3 +1377,39 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     try t.expectEqual(@as(usize, 1), fake.restores);
     try t.expectEqual(@as(usize, 1), fake.frees);
 }
+
+test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {
+    const t = std.testing;
+    const Fake = struct {
+        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .n = 3, .accepted = 2, .next_token = 9, .rows = 3, .position = f.positions.slice()[0] + 3 };
+            return .ok;
+        }
+        fn finish(_: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .position = 20 + accepted };
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .finish = &finish };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    // A recurrent model: its forward is positioned from `moe_seq_offset`.
+    var bound: Bound = .{ .table = &Fake.table, .model = &m, .positions = .hybrid };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.suppress_mask = null;
+    var kv: KVCache = undefined;
+    kv.step = 12;
+    var off: usize = 12;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const r = try nativeRound(&x, &ctx, 5, 4);
+    try t.expectEqual(@as(u64, 15), r.position);
+    try t.expectEqual(@as(usize, 15), kv.step);
+    try t.expectEqual(kv.step, off);
+    try t.expectEqual(@as(u64, 21), try nativeFinish(&x, &ctx, 1));
+    try t.expectEqual(@as(usize, 21), kv.step);
+    try t.expectEqual(kv.step, off);
+}
