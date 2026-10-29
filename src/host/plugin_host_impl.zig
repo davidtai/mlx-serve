@@ -46,6 +46,7 @@ pub const Builtin = struct {
             .counter = counter,
             .memory_ceiling = memoryCeiling,
             .gpu = &gpu_table,
+            .latch_message = latchMessage,
         } };
     }
 
@@ -130,6 +131,9 @@ fn latchCheck(_: ?*anyopaque, site: abi.CheckSite) callconv(.c) abi.Latched {
 }
 fn latchDropUnless(_: ?*anyopaque, had_error: bool) callconv(.c) void {
     mlx.dropLatchedErrorUnless(had_error);
+}
+fn latchMessage(_: ?*anyopaque, buf: [*]u8, cap: usize) callconv(.c) usize {
+    return (mlx.peekError(buf[0..cap]) orelse return 0).len;
 }
 fn gpuContextLost(_: ?*anyopaque) callconv(.c) bool {
     return mlx.gpuContextLost();

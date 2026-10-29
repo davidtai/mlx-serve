@@ -84,6 +84,11 @@ pub const Host = extern struct {
     memory_ceiling: *const fn (ctx: ?*anyopaque) callconv(.c) u64,
 
     gpu: *const HostGpu,
+
+    /// The latched MLX error's text, the latch left in place: copied into `buf` (cut at `cap`; the host keeps a
+    /// message's first 512 bytes), its length returned, 0 when nothing is latched. A recovery path reads it to tell
+    /// the failure it retries (a threadgroup size the pipeline refused) from one it leaves for the checkpoint.
+    latch_message: *const fn (ctx: ?*anyopaque, buf: [*]u8, cap: usize) callconv(.c) usize,
 };
 
 pub const gpu_version: u32 = 1;
@@ -158,9 +163,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "latch_pending", 64 },    .{ "latch_check", 72 },     .{ "latch_drop_unless", 80 },
         .{ "gpu_context_lost", 88 }, .{ "kernel", 96 },          .{ "lever", 104 },
         .{ "counter", 112 },         .{ "memory_ceiling", 120 }, .{ "gpu", 128 },
+        .{ "latch_message", 136 },
     };
     inline for (host_fields) |f| try t.expectEqual(f[1], @offsetOf(Host, f[0]));
-    try t.expectEqual(@as(usize, 136), @sizeOf(Host));
+    try t.expectEqual(@as(usize, 144), @sizeOf(Host));
     try t.expectEqual(host_fields.len, @typeInfo(Host).@"struct".field_names.len);
 
     const gpu_fields = [_]struct { []const u8, usize }{

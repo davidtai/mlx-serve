@@ -24,6 +24,8 @@ pub const FakeHost = struct {
     last_len: usize = 0,
     /// Set it to simulate an MLX failure; a check consumes it.
     latch: abi.Latched = .none,
+    /// The simulated failure's message (`latch_message`).
+    latch_text: []const u8 = "",
     context_lost: bool = false,
     counter_words: [max_counters]u64 = @splat(0),
     /// One (backend, name hash, digest) per kernel made; a handle points at its slot.
@@ -52,6 +54,7 @@ pub const FakeHost = struct {
             .counter = counter,
             .memory_ceiling = memoryCeiling,
             .gpu = &self.gpu_table,
+            .latch_message = latchMessage,
         };
     }
 
@@ -110,6 +113,13 @@ fn latchCheck(ctx: ?*anyopaque, _: abi.CheckSite) callconv(.c) abi.Latched {
 }
 fn latchDropUnless(ctx: ?*anyopaque, had_error: bool) callconv(.c) void {
     if (!had_error) self_(ctx).latch = .none;
+}
+fn latchMessage(ctx: ?*anyopaque, buf: [*]u8, cap: usize) callconv(.c) usize {
+    const self = self_(ctx);
+    if (self.latch == .none) return 0;
+    const n = @min(self.latch_text.len, cap);
+    @memcpy(buf[0..n], self.latch_text[0..n]);
+    return n;
 }
 fn gpuContextLost(ctx: ?*anyopaque) callconv(.c) bool {
     return self_(ctx).context_lost;

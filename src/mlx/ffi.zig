@@ -1386,6 +1386,16 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// The latched message copied into `buf` (cut to fit), the latch left in place; null when nothing is latched.
+pub fn peekError(buf: []u8) ?[]const u8 {
+    if (!latch().mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(latch().mlx_error_len, buf.len);
+    @memcpy(buf[0..n], latch().mlx_error_buf[0..n]);
+    return buf[0..n];
+}
+
 /// Consume the latch only when its message contains `needle`; any other error stays latched.
 pub fn takeErrorIf(needle: []const u8) bool {
     if (!latch().mlx_error_latched.load(.acquire)) return false;

@@ -1312,6 +1312,7 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `counter` | `*const fn (ctx: ?*anyopaque, name: Str) callconv(.c) ?*u64` |  | A named counter's word, added to with a relaxed atomic add; null when metrics are off or the name is unknown, so a plugin resolves it once and pays nothing per add when off. Any thread. |
 | `memory_ceiling` | `*const fn (ctx: ?*anyopaque) callconv(.c) u64` |  | Bytes the plugin may still allocate on the GPU right now: the host's ceiling less what is resident. |
 | `gpu` | `*const HostGpu` |  |  |
+| `latch_message` | `*const fn (ctx: ?*anyopaque, buf: [*]u8, cap: usize) callconv(.c) usize` |  | The latched MLX error's text, the latch left in place: copied into `buf` (cut at `cap`; the host keeps a message's first 512 bytes), its length returned, 0 when nothing is latched. A recovery path reads it to tell the failure it retries (a threadgroup size the pipeline refused) from one it leaves for the checkpoint. |
 
 ### `EventKind` (enum(u8))
 

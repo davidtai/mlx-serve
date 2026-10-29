@@ -81,6 +81,11 @@ pub const Host = struct {
         self.t.latch_drop_unless(self.t.ctx, had_error);
     }
 
+    /// The latched message, cut to `buf`, the latch left for `check`; empty when nothing is latched.
+    pub fn latchMessage(self: Host, buf: []u8) []const u8 {
+        return buf[0..self.t.latch_message(self.t.ctx, buf.ptr, buf.len)];
+    }
+
     pub fn contextLost(self: Host) bool {
         return self.t.gpu_context_lost(self.t.ctx);
     }
