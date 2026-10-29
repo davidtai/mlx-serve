@@ -273,9 +273,11 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
+    // Each Darwin test is its condition's last, comptime operand, so off Darwin the branch folds away and
+    // `nocache_reader` (whose `fd >= 0` is no comparison where `fd_t` is a HANDLE) is never compiled.
     if (opts.dsv41 and comptime builtin.os.tag.isDarwin())
         try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
-    else if (opts.trunk_format and readsPastPageCache(opts, comptime builtin.os.tag.isDarwin()))
+    else if (opts.trunk_format and readsPastPageCache(opts, true) and comptime builtin.os.tag.isDarwin())
         try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
     else
         try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
