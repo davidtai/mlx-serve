@@ -173,3 +173,15 @@ test "sdk host: a log line is formatted only when its level is on, and cut at 4 
     h.log(.warn, "{s}", .{long});
     try testing.expectEqual(@as(usize, 4096), fake.last().len);
 }
+
+test "sdk host: a latched message reads, cut to the buffer, without consuming the latch" {
+    var fake: FakeHost = undefined;
+    fake.init(.{});
+    const h = try Host.of(fake.host());
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("", h.latchMessage(&buf));
+    fake.latch = .failure;
+    fake.latch_text = "Thread group size exceeds the limit";
+    try testing.expectEqualStrings("Thread group siz", h.latchMessage(&buf));
+    try testing.expect(h.latchPending());
+}

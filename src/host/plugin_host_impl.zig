@@ -454,6 +454,26 @@ test "builtin host: the MLX error latch round-trips (pending, consume by class, 
     mlx.resetFaultChunkForTest();
 }
 
+test "builtin host: latch_message reads the latched text and leaves the latch for the checkpoint" {
+    var b: Builtin = undefined;
+    b.init(.{ .allocator = testing.allocator });
+    defer b.deinit();
+    const h = try sdk.Host.of(b.host());
+    mlx.resetFaultChunkForTest();
+    defer mlx.resetFaultChunkForTest();
+
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("", h.latchMessage(&buf));
+    const msg = "[metal::Device] Unable to build pipeline: exceeds the maximum allowed threads per threadgroup.";
+    mlx.latchErrorForTest(msg);
+    try testing.expectEqualStrings(msg, h.latchMessage(&buf));
+    var short: [8]u8 = undefined;
+    try testing.expectEqualStrings(msg[0..8], h.latchMessage(&short));
+    try testing.expect(h.latchPending());
+    try testing.expectError(error.MlxFailure, h.check(.prefill_chunk));
+    try testing.expectEqualStrings("", h.latchMessage(&buf));
+}
+
 test "builtin host: metrics are no-ops when off and reach the named counter when on" {
     var off: Builtin = undefined;
     off.init(.{ .allocator = testing.allocator });
