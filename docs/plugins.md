@@ -34,7 +34,8 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
   `scripts/fetch-zig.sh` for the pinned Zig.
 - **The CLI** (`src/host/plugins/cli.zig`): `mlx-serve plugin new <name> [--media|--quant]` copies the kit's example;
   `plugin check <dylib> [--model <pack>]` runs the conformance suite (`src/sdk/testing/conformance.zig`) on its fixture
-  and, with `--model`, checks it claims and parses that pack; `plugin fixture <dylib> <dir>` writes its tiny pack;
+  and, with `--model`, checks it claims and parses that pack (that pack alone when the plugin has no fixture);
+  `plugin fixture <dylib> <dir>` writes its tiny pack;
   `plugin install` shows the file's hash and signer (`codesign`), asks before a quarantined file (`--yes` confirms),
   and copies it into `~/.mlx-serve/plugins/` with a receipt (name, kind, version, sha256, signer, model types).
 - **Loading** (`src/host/plugins/loader.zig`): at startup, when `plugins.json` says `"enabled": true`. Each dylib must
