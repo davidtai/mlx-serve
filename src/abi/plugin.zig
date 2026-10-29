@@ -730,6 +730,12 @@ pub const NativeDrafter = extern struct {
     /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
     /// writes the model's position into `out.round.position`.
     finish: ?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// A forced span (a reasoning budget's closer, a forced tool-call opener) committed from a round's exit as a fully
+    /// accepted round: `f.tokens` are `t1` (not yet in the state, which stands at `f.positions[0]`) and every forced
+    /// token but the last, forwarded and kept whole, the drafter's own history moved with them; the last forced token
+    /// is the next round's `t1`. Writes the model's position into `out.round.position`. Null = the engine forwards the
+    /// whole span itself and the next round starts from a token it samples after it.
+    commit_forced: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

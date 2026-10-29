@@ -207,6 +207,22 @@ test "abi dylib: a model table with a hook table older than the host's is refuse
     try testing.expect(!negotiate(&m, pin).isOk());
 }
 
+test "abi dylib: a native drafter table from before commit_forced loads, and a shorter one is refused" {
+    const pin = "p";
+    var cache: model_abi.CacheHooks = .{};
+    var weights: model_abi.WeightHooks = .{};
+    var nd: model_abi.NativeDrafter = .{ .step = undefined };
+    const spec: model_abi.SpecHooks = .{ .native_drafter = &nd };
+    const t: model_abi.ModelTable = .{ .name = .of("toy"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = &weights, .spec = &spec };
+    const m: Manifest = .{ .name = .of("toy"), .kind = .model, .mlx = .of(pin), .table = &t, .fixture = noFixture, .fixture_free = noFree };
+    try testing.expect(negotiate(&m, pin).isOk());
+    // An older kit's table ends at `finish`: the host reads its `commit_forced` as null.
+    nd.size = @offsetOf(model_abi.NativeDrafter, "commit_forced");
+    try testing.expect(negotiate(&m, pin).isOk());
+    nd.size -= 1;
+    try testing.expectEqualStrings("a model hook table is older than this host's", negotiate(&m, pin).why.slice());
+}
+
 test "abi dylib: a model table without its cache or weight hook table is refused by name, never read" {
     const pin = "p";
     var cache: model_abi.CacheHooks = .{};
