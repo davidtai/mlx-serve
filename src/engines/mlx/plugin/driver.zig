@@ -36,6 +36,8 @@ const settle = @import("settle.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
+const distributed = @import("../cluster/distributed.zig");
+const weights_load = @import("../../../sdk/weights/load.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
 
@@ -181,7 +183,24 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: [
 /// plugin never sees them).
 pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, tower: ?*model.Weights) !Transformer {
     if (config.plugin == null) return error.NotPluginServed;
-    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower));
+    // A table that keeps none of the pack's tensors reads its own (`LoadCtx.weights` null). A pack the cluster serves
+    // still loads here: the load plans its split.
+    if (tower == null and !distributed.serves(model_dir) and !keepsAny(io, a, config.plugin.?, model_dir))
+        return loadTensors(io, a, config, model_dir, s, model.Weights.init(a), false);
+    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower), true);
+}
+
+/// Whether `b`'s table keeps a tensor the pack's index names (`WeightHooks.keep_key`); no hook or no index: it does.
+fn keepsAny(io: std.Io, a: std.mem.Allocator, b: *const plugin_config.Binding, model_dir: []const u8) bool {
+    const keep = b.table.weights.keep_key orelse return true;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return true;
+    defer dir.close(io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owners = weights_load.indexOwners(io, arena.allocator(), dir) orelse return true;
+    var it = owners.keyIterator();
+    while (it.next()) |k| if (keep(&b.parsed, .of(k.*))) return true;
+    return false;
 }
 
 /// `load` over a tensor map the caller prepared (renamed or converted from the pack's own), which it hands over.
@@ -191,10 +210,11 @@ pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         m.deinit();
         return error.NotPluginServed;
     }
-    return loadTensors(io, a, config, model_dir, s, map);
+    return loadTensors(io, a, config, model_dir, s, map, true);
 }
 
-fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
+/// `lend`: the plugin is handed `map` (`LoadCtx.weights`), else null.
+fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights, lend: bool) !Transformer {
     const b = config.plugin.?;
     var res = Resident.adopt(map);
     // The model holds its own references: the map's go once the plugin has read it.
@@ -215,7 +235,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
         .host = @import("../../../host/host_table.zig").get(),
-        .weights = &src,
+        .weights = if (lend) &src else null,
         .stream_room = streamRoom(config),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
