@@ -512,8 +512,8 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
-/// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state and `ctx.cache.step`
-/// move to the round's position.
+/// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
+/// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
     const b = xfm.plugin.?;
     const nd = nativeDrafter(xfm).?;
@@ -539,6 +539,8 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     }
     if (out.round.n == 0 or out.round.n > abi.max_round_tokens) return error.PluginForwardFailed;
     ctx.cache.step = @intCast(out.round.position);
+    // A recurrent model's next forward is positioned from it (`Positions`): the round's rows ran inside the plugin.
+    ctx.moe_seq_offset.* = @intCast(out.round.position);
     return out.round;
 }
 
@@ -575,7 +577,8 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
     return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx } };
 }
 
-/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` to the model's position.
+/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` and
+/// `ctx.moe_seq_offset` to the model's position.
 pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
     const b = xfm.plugin.?;
     const nd = nativeDrafter(xfm).?;
@@ -586,6 +589,7 @@ pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
         return error.PluginForwardFailed;
     }
     ctx.cache.step = @intCast(out.round.position);
+    ctx.moe_seq_offset.* = @intCast(out.round.position);
     return out.round.position;
 }
 
