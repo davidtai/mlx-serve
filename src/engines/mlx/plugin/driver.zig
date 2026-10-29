@@ -529,6 +529,8 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
         .positions = .of(&pos),
         .accept_cap = cap,
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+        .min_depth = depth_bounds.active.min,
+        .max_depth = depth_bounds.active.max,
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -559,7 +561,16 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
     const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
     const pos = [_]u32{@intCast(ctx.cache.step)};
-    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap };
+    const f: abi.Forward = .{
+        .mode = .verify,
+        .rows = 1,
+        .tokens = .of(&tokens),
+        .slots = .of(&slot_ids),
+        .positions = .of(&pos),
+        .accept_cap = cap,
+        .min_depth = depth_bounds.active.min,
+        .max_depth = depth_bounds.active.max,
+    };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
     const v = nd.verify.?(b.model, &f, &out);
