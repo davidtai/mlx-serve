@@ -1,6 +1,6 @@
 # PR #1256 results record
 
-The results record of PR #1256 (ddalcu/mlx-serve) at `d9f97e0f`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
+The results record of PR #1256 (ddalcu/mlx-serve) at `ad2720bc`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. Each run table was measured on the build its section names, not on `ad2720bc`. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
 
 ## NVFP4 pack in core
 
@@ -59,9 +59,9 @@ At 1M the whole machine's non-file memory peaked at 489.7 GB (502.0 GB at most o
 | All default-on plugin switches at the release | 52 | 29 | 15 | 6 | 0 | 2 |
 | Engine: `DSV4_DSPARK`; `DSPARK_POLICY2`, `DSPARK_POLICY2_MODELED`; MLX's own `MLX_ENABLE_TF32` | 4 | 0 | 1 | 2 | 1 | 0 |
 
-The fold adds 5 default-on switches (#1317's four and `PF_PASS_CEIL`), and renames `MOE_PAIR_SCALED` to `MOE_PAIR_FP4`. The README's switch table at the fold head lists 57 default-on, 55 classed (32 EXACT, 17 REORDER, 6 DRAFT-ONLY) and 49 with a standing test. The REORDER evidence splits 6 measured no farther from float64, 7 held to a stated bound, 2 by the commit's reasoning and 2 by the A/B's same text.
+The table above is the release's. The fold added 5 default-on switches (#1317's four and `PF_PASS_CEIL`), and renamed `MOE_PAIR_SCALED` to `MOE_PAIR_FP4`. At `ad2720bc` the counts come from the lever table, `src/plugins/deepseek_v41/levers.zig`, and the README's counts are rendered from it. Under `--precision lossless`, the default, the plugin has 56 default-on switches: 32 EXACT, 17 REORDER, 6 DRAFT-ONLY and `HEAD8`, the one accepted requantization (REQUANT). Every default-on switch but 6 has a standing test or a kernel contract case. The REORDER evidence splits 6 measured no farther from float64, 7 held to a stated bound, 2 by the commit's reasoning and 2 by the A/B's same text.
 
-6 of the 55 have no standing test against their `=0` path: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`, `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). TF32 is its own class, for MLX's own `MLX_ENABLE_TF32`: on M5 at the defaults, its TF32 matmuls round only the drafter's P·V. `FLASH_ATTN` passes: its output is nearer to float64 than the gather's. `ATTN_F16` fails: at the release's prompt spans on M5, its bf16-out l2 against float64 was 1.80e-3 to 2.31e-3, against 1.63e-3 to 1.68e-3 for the f32 chain.
+6 of the 55 have no standing test against their `=0` path: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`, `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). TF32 is its own class, for MLX's own `MLX_ENABLE_TF32`: on M5 at the defaults, its TF32 matmuls round only the drafter's P·V. `FLASH_ATTN` passes: its output is nearer to float64 than the gather's. `ATTN_F16` fails: at the release's prompt spans on M5, its bf16-out l2 against float64 was 1.80e-3 to 2.31e-3, against 1.63e-3 to 1.68e-3 for the f32 chain. `ATTN_F16` is now LOSSY and off under lossless on every GPU. Lossless no longer turns on `ATTN_F16` on non-NAX Macs; use `--precision lossy` for it.
 
 ### Release sweep
 
@@ -292,6 +292,10 @@ The `a3439c7a` cases are not independent, because that build keeps its markers a
 
 ## Prompt pass ceiling
 
+At `ad2720bc`, `PF_PASS_CEIL` caps the prompt pass's working set at `PASS_KNEE_BYTES`, 21,729 MiB (`816ed3a7`). That is the bill of the 39,680 rows measured as the 1M knee on the M5 Ultra 512 GiB. It reads no CPU brand, and `pass_ceil_plant` is removed. At the default switches on that machine, the byte cap pins exactly the passes that the 39,680-row ceiling pinned at every share, so the A/B below stands and needs no new run.
+
+Because the cap is in bytes, non-default switches pin other widths, and that is intended. `PF_INT8=3` pins 33,280 rows, `=4` 30,976 and `PF_IDX_PASS=0` 43,520; the row ceiling gave 39,680 for each.
+
 In the A/B, the NVFP4 points (128K to 512K) planned 39,168 to 39,680 rows in both arms. On `16ef822c`, which has no `PF_PASS_CEIL`, the memory-sized NVFP4 plan at 1M was already 39,680 rows, the same as the ceiling. The release `a99fc4f6` planned 44,544 rows. No NVFP4 A/B ran at 1M, so we did not measure whether the ceiling changes NVFP4 text there.
 
 Builds: `e0ea875c`, then this PR's `08a576d0`. Mac 1 ran 1M and 512K; Mac 2 ran 256K and 128K. Each point's A and B ran on one Mac. Each mean pools 4 runs: greedy and the card's settings, seeds 1234 and 4321.
@@ -327,7 +331,7 @@ The view loses about 3% at 47,360 rows. The pass's reserve does not hold the per
 
 Each run was a fresh server, with a pre-warm per arm, the 40 C cool gate, max_tokens 16,384, DSpark at its default and fans at max. `--ctx-size` was the prompt size plus 16,384. The next table has all 56 runs. One NVFP4 B run at 128K planned 39,168 rows; that width came from the load's free memory, not the switch.
 
-The pass-plan test checks the constant and the machines that get it. It also checks the pass counts (4, 7 and 14 at 128K, 256K and 512K) and the planner at 16K, 256K and 1M for both formats. It checks that an explicit width is never ceiled, that another machine keeps the memory-sized width, and that the switch is on when unset and off at `=0`. A plant that sets the ceiling 1,024 rows too high fails it.
+At #1318's head, the pass-plan test checked the row ceiling and the machines that got it. It also checked the pass counts (4, 7 and 14 at 128K, 256K and 512K) and the planner at 16K, 256K and 1M for both formats. It checked that an explicit width is never ceiled, that another machine keeps the memory-sized width, and that the switch is on when unset and off at `=0`. A plant that sets the ceiling 1,024 rows too high fails it. At `ad2720bc` (`816ed3a7`), the test checks that the cap is the bill of 39,680 rows, with no wider span fitting it. For every share from 8 to 64 GiB at 1M the plan is min(memory-sized, 39,680), and 128K, 256K and 512K run in 4, 7 and 14 passes. An explicit width is not capped, and a cap 1,024 rows high fails.
 
 ### All 56 runs
 
@@ -486,8 +490,52 @@ The plan tests (`prompt/pf_int8_plan_test.zig`) cover `CED=0`, every row's logit
 | #1317 `16ef822c` | Mac 1 | 140 of 141, 1 skipped | 5,749 of 6,178, 429 skipped |
 | #1318 `1757d34d` | Mac 2 (lint) | 140 of 141, 1 skipped | 5,767 of 6,196, 429 skipped, 0 failed |
 | #1325 `ad2affb7` | Mac 2 | 140 of 141, 1 skipped | 5,777 of 6,207, 430 skipped |
+| The fold `d9f97e0f` | Mac 2 | 140 of 141, 1 skipped | 0 failed (below) |
 
-On `1a6a360e`, lint `--strict`, the line-ending test and the `pf int8` tests (79 of 80, 1 skipped) pass. One full run on #1318's `688cfa83` stalled once between tests in one shard. A rerun of all 8 shards did not stall, and 15 earlier full runs had no stall. The folded head's first full run stalled the same way in one shard (shard 6 of 8); its cause is under investigation, and the PR body will give the result.
+On `1a6a360e`, lint `--strict`, the line-ending test and the `pf int8` tests (79 of 80, 1 skipped) pass.
+
+### `d9f97e0f`, the fold (Mac 2)
+
+| Gate | Result |
+|---|---|
+| Lint `--strict`, the line-ending test, the digest manifest | Pass |
+| The kernel contract | 140 of 141 passed, 1 skipped |
+| The folded PRs' filters | 171 of 178 passed, 7 skipped |
+| Converter smoke | Pass |
+| The full suite with `-Dslow-tests` | 0 failed. Shards 0 to 5 and 7 in the build runner: 5,054 passed, 377 skipped. Shard 6 alone, on the same binary and seed: 721 passed, 55 skipped |
+| The ReleaseFast bundle | Builds |
+| Windows link | Failed on `munmap` only |
+
+### `18de95f5` (CI)
+
+| Job | Result |
+|---|---|
+| zig, swift-app, Windows `cuda (x64)` | Passed |
+| Linux `cuda` x64 and arm64 | Failed to link on 14 `mlx_serve_shared_dsv41_*` symbols; fixed in `2b2387a2` |
+| zig-test | Passed every test, 5,332 of 6,313 with 981 skipped. It failed only in its flip-proof step, on a missing `origin/main`; fixed in `032b8465` |
+
+### `ad2720bc`, the final head
+
+The rows match the PR body's Tests table: Mac 1 ran the gate pass and Mac 2 the three links.
+
+| Gate | Result |
+|---|---|
+| Tree setup | Pass |
+| Lint `--strict` | Pass |
+| The line-ending test (`tests/test_kernel_checkout.py`) | Pass |
+| The digest manifest (`src/kernels/digests.txt`) | Pass |
+| Compile | Pass (35 of 35 steps; 39 of 39 build tests) |
+| `zig build check`, with the Windows and Linux Sema | Pass (Sema clean on macOS, `x86_64-windows-gnu` and `aarch64-linux-gnu`) |
+| units-check | Fail: 48 copied globals, as on the base (see Gaps); CI does not run it |
+| The CPU lane | Pass: 4 shards, 4,994 records |
+| The GPU lane | Pass: 32 shards, 1,332 records |
+| The serial lane | Pass: 1 shard, 16 records |
+| The kernel contract | 121 tests: 120 passed, 1 skipped, 0 failed |
+| Tests in total | 6,270 tests: 5,910 passed, 432 skipped, 0 failed |
+| The ReleaseFast bundle | Builds |
+| Windows link (`x86_64-windows-gnu`), judged against the allowlist | 0 compile errors; 283 undefined, all header-declared or reviewed; 0 not allowed |
+| Linux `x86_64` link, judged against the allowlist | 0 compile errors; 321 undefined, all header-declared or reviewed; 0 not allowed (glibc 2.39, `-Dunits=true -Dunit-groups=4`, as CI) |
+| Linux `aarch64` link, judged against the allowlist | 0 compile errors; 321 undefined, all header-declared or reviewed; 0 not allowed (glibc 2.39, `-Dunits=true -Dunit-groups=4`, as CI) |
 
 ## Smaller gaps
 
@@ -505,7 +553,9 @@ On `1a6a360e`, lint `--strict`, the line-ending test and the `pf int8` tests (79
 | Level 3 of `PF_INT8` is not measured on `16ef822c` | A level-3 A/B there |
 | `PF_INT8` under `CED=0` is not measured | A KLD and an A/B under `CED=0` |
 | `PF_INT8`'s 1M rows are one run per build, and its KLD covers 16K prompts only | The release sweep's 1M points; a KLD at a longer context |
-| One full-suite stall between tests on `688cfa83`, not reproduced; the folded head's first full run stalled in shard 6 of 8 | The investigation's result, in the PR body |
+| Closed: the full-suite stall. One full run on `688cfa83` stalled once in one shard, and `d9f97e0f`'s stalled in shard 6 of 8 while the 278 s kernel contract test ran | The kernel contract now runs as one test per area, so the 278 s test is gone |
+| units-check reports 48 copied globals (`round_cost.build_id_*` and others), already red on the base; CI does not run it | Make each one Shared or list it in `scripts/unit_globals_ok.txt` |
+| The cross-target check type-checks and links the server only. `src/tests.zig` has 45 existing non-V4.1 test-root errors on Windows (41) and Linux (4); none comes from V4.1 | A separate change fixes them and adds the test root to `zig build check` |
 | The release sweep's table does not record the Mac of each point (only 512K: Mac 1) | Record the Mac per sweep point in the release sweep's table |
 
 ## Terms
