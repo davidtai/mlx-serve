@@ -1,6 +1,6 @@
 # PR #1256 results record
 
-The results record of PR #1256 (ddalcu/mlx-serve) at `ad2720bc`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. Each run table was measured on the build its section names, not on `ad2720bc`. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
+The results record of PR #1256 (ddalcu/mlx-serve) at `f9098f18`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. Each run table was measured on the build its section names, not on `ad2720bc`. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
 
 ## NVFP4 pack in core
 
@@ -482,6 +482,159 @@ Available is the GPU memory ceiling minus what MLX holds when the request arrive
 
 The plan tests (`prompt/pf_int8_plan_test.zig`) cover `CED=0`, every row's logits, a two-Mac pair, the reservation against the built table, an unload and a perplexity window. Each fails on the code before `43add356`.
 
+## Acceptance (7343ce1e)
+
+Run on bundle ds41lev-final1256-7343ce1e (mlx-serve sha256 1f8e6768311c), on two Mac Studio M5 Ultra machines with 512 GB each. Model: DeepSeek-V4.1-Flash-1017, the default NVFP4 pack. The run followed the release-acceptance procedure.
+
+- **Stacks:**
+  - NVFP4 lossless and MXFP4 lossless: the accepted switches at their defaults. MXFP4 = `MLX_SERVE_DSV41_MXFP4_VIEW=1`.
+  - NVFP4 lossy and MXFP4 lossy: `--precision lossy`. This turns on int8 level 4, plus typical acceptance (δ 0.3 / ε 0.09) on card runs only, so the greedy runs show int8 alone.
+  - DSpark is on in every stack, as shipped (block 5, 3 stages).
+- **Method:**
+  - One fresh server per run, seeds 1234 and 4321, greedy and card (T 1.0, top-p 0.95).
+  - `--ctx-size` = N + 16,384, max_tokens 16,384, `--warmup-full`, a 40 C cool gate, fans at max.
+  - Every one of the 264 runs stopped on its own, at 514-880 output tokens.
+- **Where each size ran:** 1K-64K on machine 1. 128K, 256K and 1M on machine 2, which measures ~0.8% slower than machine 1. The stacks' 512K points ran on machine 2; the release's 512K ran on machine 1.
+- **The 1M point:** a 1,032,192-token prompt.
+- **Comparison lines:** the release is a99fc4f6 (bundle ds41lev-relfinalf-a99fc4f6). The previous MXFP4 build, a3439c7a, served the same pack through the same MXFP4 view.
+
+**Prefill, greedy, tok/s (mean of seeds 1234 and 4321; % vs the release)**
+
+| Size | Release (a99fc4f6) | Prev MXFP4 (a3439c7a) | NVFP4 lossless | MXFP4 lossless | NVFP4 lossy | MXFP4 lossy |
+|---|---|---|---|---|---|---|
+| 1K | 2,580 | 2,658 (+3.0%) | 2,571 (-0.3%) | 2,657 (+3.0%) | 2,573 (-0.3%) | 2,650 (+2.7%) |
+| 2K | 3,583 | 3,673 (+2.5%) | 3,580 (-0.1%) | 3,673 (+2.5%) | 3,864 (+7.9%) | 3,954 (+10.4%) |
+| 4K | 4,519 | 4,606 (+1.9%) | 4,517 (-0.1%) | 4,592 (+1.6%) | 4,968 (+9.9%) | 5,053 (+11.8%) |
+| 8K | 5,120 | 5,190 (+1.4%) | 5,150 (+0.6%) | 5,197 (+1.5%) | 5,697 (+11.3%) | 5,762 (+12.6%) |
+| 16K | 5,524 | 5,595 (+1.3%) | 5,566 (+0.8%) | 5,597 (+1.3%) | 6,201 (+12.3%) | 6,253 (+13.2%) |
+| 32K | 5,703 | 5,729 (+0.5%) | 5,727 (+0.4%) | 5,737 (+0.6%) | 6,304 (+10.6%) | 6,351 (+11.4%) |
+| 64K | 5,691 | 5,709 (+0.3%) | 5,717 (+0.5%) | 5,742 (+0.9%) | 6,373 (+12.0%) | 6,412 (+12.7%) |
+| 128K | 5,509 | 5,555 (+0.8%) | 5,576 (+1.2%) | 5,590 (+1.5%) | 6,255 (+13.5%) | 6,278 (+14.0%) |
+| 256K | 5,206 | 5,246 (+0.8%) | 5,276 (+1.3%) | 5,305 (+1.9%) | 5,913 (+13.6%) | 5,945 (+14.2%) |
+| 512K | 4,708 | 4,750 (+0.9%) | 4,805 (+2.1%) | 4,818 (+2.3%) | 5,325 (+13.1%) | 5,348 (+13.6%) |
+| 1M | 3,913 | 3,885 (-0.7%) | 4,059 (+3.7%) | 4,074 (+4.1%) | 4,424 (+13.1%) | 4,408 (+12.6%) |
+| Mean of sizes | 4,732 | 4,781 (+1.0%) | 4,777 (+0.9%) | 4,816 (+1.8%) | 5,263 (+11.2%) | 5,310 (+12.2%) |
+
+**Decode, greedy, tok/s (mean of seeds 1234 and 4321; % vs the release)**
+
+| Size | Release (a99fc4f6) | Prev MXFP4 (a3439c7a) | NVFP4 lossless | MXFP4 lossless | NVFP4 lossy | MXFP4 lossy |
+|---|---|---|---|---|---|---|
+| 1K | 133.6 | 135.4 (+1.3%) | 133.7 (+0.0%) | 135.4 (+1.3%) | 133.8 (+0.1%) | 135.4 (+1.3%) |
+| 2K | 129.6 | 134.9 (+4.1%) | 129.9 (+0.2%) | 135.1 (+4.2%) | 132.6 (+2.3%) | 137.0 (+5.7%) |
+| 4K | 131.9 | 135.8 (+2.9%) | 131.7 (-0.2%) | 135.7 (+2.8%) | 134.2 (+1.7%) | 138.6 (+5.1%) |
+| 8K | 131.2 | 137.6 (+4.8%) | 131.6 (+0.3%) | 138.2 (+5.3%) | 134.2 (+2.2%) | 133.9 (+2.1%) |
+| 16K | 132.8 | 133.8 (+0.8%) | 130.2 (-1.9%) | 133.6 (+0.6%) | 133.2 (+0.3%) | 138.2 (+4.1%) |
+| 32K | 130.6 | 136.4 (+4.5%) | 133.1 (+2.0%) | 136.7 (+4.7%) | 130.1 (-0.3%) | 138.4 (+6.1%) |
+| 64K | 129.0 | 135.4 (+5.0%) | 131.0 (+1.6%) | 135.5 (+5.0%) | 132.8 (+2.9%) | 134.9 (+4.6%) |
+| 128K | 128.4 | 131.7 (+2.5%) | 130.4 (+1.6%) | 132.9 (+3.5%) | 129.0 (+0.4%) | 132.1 (+2.8%) |
+| 256K | 121.7 | 125.5 (+3.1%) | 123.0 (+1.2%) | 126.5 (+4.0%) | 120.3 (-1.1%) | 127.5 (+4.8%) |
+| 512K | 119.0 | 126.7 (+6.4%) | 126.5 (+6.3%) | 129.4 (+8.7%) | 126.9 (+6.6%) | 130.9 (+10.0%) |
+| 1M | 110.7 | 112.4 (+1.5%) | 111.9 (+1.1%) | 112.9 (+2.0%) | 111.3 (+0.5%) | 116.2 (+5.0%) |
+| Mean of sizes | 127.1 | 131.4 (+3.3%) | 128.5 (+1.0%) | 132.0 (+3.8%) | 128.9 (+1.4%) | 133.0 (+4.6%) |
+
+### Wikitext-2 PPL (DSV41_PPL fixture, 287,597 tokens, 140 windows x 2,048)
+
+| Composition | PPL | SE |
+|---|---|---|
+| Reference: release a99fc4f6 | 2.9483 | 0.1039 |
+| NVFP4 lossless | 2.9484 | 0.1039 |
+| MXFP4 lossless | 2.9484 | 0.1039 |
+| NVFP4 lossy | 2.9521 | 0.1041 |
+| MXFP4 lossy | 2.9521 | 0.1041 |
+
+| Comparison | Δ log PPL | Paired SE | PPL change |
+|---|---|---|---|
+| NVFP4 / MXFP4 lossless vs reference | +0.000047 | 0.000059 | +0.0047% |
+| NVFP4 / MXFP4 lossy vs reference | +0.001280 | 0.000726 | +0.128% |
+
+- **The lossless gate passes for both lossless stacks.** The rule is |Δ vs reference| ≤ the rounding floor + 2 × paired SE. Here 0.000047 ≤ 0 + 2 × 0.000059 = 0.000117.
+- **The lossy stacks are reported only.**
+- **Coverage:** the PPL covers the prompt path on the exact gather for all arms. The fixture loads without the plugin's flash configure. The served FLASH_ATTN kernel rests on its own float64 test: 6.4e-5 against the gather's 1.8e-4.
+- **Known gap:** the floor arm (NVFP4 lossless + `FLASH_ATTN=0`) cannot measure in this fixture. It is identical in all 140 windows, so the floor term is 0, which makes the gate stricter.
+- **MXFP4 = NVFP4 in all 140 windows.** This is the view's exactness for this pack.
+
+### EvalPlus (MXFP4 lossy, the fastest stack; evalplus 0.3.1, greedy (temperature 0, seed 1234), thinking on, max_tokens 16,384)
+
+| | HumanEval | HumanEval+ | MBPP | MBPP+ |
+|---|---|---|---|---|
+| MXFP4 lossy (7343ce1e) | 0.976 (160/164) | 0.933 (153/164) | 0.974 (368/378) | 0.849 (321/378) |
+| Release a99fc4f6 (reference) | 0.982 | 0.939 | 0.968 | 0.828 |
+
+- The two builds are within noise. Most per-problem flips come from max_tokens cutoffs: 3 of the 4 HumanEval base fails ran to 16,384 tokens with no answer, and 2 MBPP problems were cut off the same way.
+- All requests were served with 0 failed and 0 watchdog kills.
+- On HumanEval, decode averaged ~107 tok/s per request, at 3.6 tokens per DSpark round.
+
+### Charts
+
+Every chart: two Mac Studio M5 Ultra, 512 GB each; the four stacks on mlx-serve `7343ce1e`, the release on `a99fc4f6`; DSpark on (block 5, 3 stages); seeds 1234 and 4321; 1M = a 1,032,192-token prompt with 16K of output. The grey dashed line is the Nov 20 starting stack, before this work: the `ds41nv` bundle, the core `deepseek_v41` runner with no plugin, serving the separate MXFP4 pack. The stacks' 512K points ran on machine 2 (~0.8% slower); the release's 512K ran on machine 1. The full caption: [caption.txt](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/caption.txt).
+
+![At 16K: the Nov 20 starting stack against now](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/montage_16k.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![The four stacks against the release and the starting stack, 1K-1M](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/cards_hero_x16x9.png)
+
+![Prefill and decode by stack](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/cards_speed_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![Each stack against the release, in percent](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/cards_gap_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![Latency and memory by stack](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/cards_latency_memory_x16x9.png)
+
+![Greedy prefill and decode tok/s against context, 1K-1M](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_speed_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![Card-sampling prefill and decode tok/s against context](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_speed_card_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![TTFT and wall time against context](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_latency_x16x9.png)
+
+![Server peak and machine non-file memory against context](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_memory_x16x9.png)
+
+![Greedy, each line against the release, in percent](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_vs_release_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+![Card sampling, each line against the release, in percent](https://raw.githubusercontent.com/davidtai/mlx-serve/fd6158f0cc454d12b59fbfa16c1a9092dc86d019/1256/o5/sweep_vs_release_card_x16x9.png)
+
+*7343ce1e's server decode figure leaves out each request's final round (~0.9% at a 546-token answer).*
+
+### The pushed head
+
+The final data is the acceptance above, on `7343ce1e`. The PR's pushed head, `f9098f18`, is `7343ce1e` plus these commits:
+
+| Commit | What it is | DeepSeek served code |
+|---|---|---|
+| `e109ad27` | Merge of `main` at `2e391c91` | Main's engine changes; the #1286 decode-time metric (below) |
+| `b330b18e` | A doc comment back on `verifyMlxStageLinux` | None |
+| `43ec931d` | `accepted-lines.txt` run conditions from `levers.zig` | None (test list) |
+| `c4ce903b` | Merge of `main` at `649a1efc`: #1146 DeepSeek-V4.1 tensor parallel, #1185, #1336, #1340 | Tensor-parallel paths; a single box takes the same paths (the bridge below) |
+| `258d263f` | Merge of `main` at `ffd8b772`: #1138, ccb72c15, #1338 | None: #1138's moe_fp4 calls resolve to this PR's (its NAX test un-skip and ubench kept); the rest are inkling2 |
+| `f9098f18` | Merge of `main` at `0502d720`: #1337 | None: inkling2 and kernel digests only |
+
+The bridge is a 16K A B B A of `c4ce903b` (B) against `7343ce1e` (A), MXFP4 lossy, greedy and card, on machine 1, n=6 runs a side. The greedy text is identical in every run.
+
+| Measure (greedy) | `7343ce1e` | `c4ce903b` |
+|---|---|---|
+| Server total request time, ms | 6,602.7 | 6,603.5 |
+| Client-measured decode, tok/s | 136.80 | 136.77 |
+
+Decode is unchanged by client timing and total request time. `7343ce1e`'s server decode figure leaves out each request's final round (about 0.9% at a 546-token answer); since #1286 (`32f0db8b`) the server counts it. The acceptance tables use the old figure for every line (the release `a99fc4f6` included), so they compare like for like.
+
+An earlier 16K check on `c4ce903b` against the acceptance build's 16K runs (P2, 4 runs each, every server's engage check passed) gave the same picture:
+
+| Stack | Greedy-mean prefill, P2 → P3 | Greedy-mean decode (server figure), P2 → P3 | Text (8 runs) |
+|---|---|---|---|
+| MXFP4 lossless | 5,596.6 → 5,599.0 (+0.04%) | 133.6 → 133.1 (-0.41%) | identical |
+| MXFP4 lossy | 6,253.1 → 6,254.4 (+0.02%) | 138.2 → 137.0 (-0.90%) | identical |
+
+Gates and PPL on 258d263f (served code identical to the head f9098f18): lint, checkout, kernel contract (192/193, 1 skip) and the full suite with slow tests (6,002 pass, 439 skip, 0 fail) pass. PPL over 286,580 tokens is identical to 7343ce1e for all six compositions (REF 2.9483, NVL/MXL/F 2.9484, NVI/MXI 2.9521); the lossless gate passes (|Δ| 0.000047 ≤ 0.000117). The NVI PPL step exited 1 because one test shard (8 import-only tests) stopped responding within the runner's 1-minute limit; no test failed, and the PPL itself completed.
+
 ## Gates on earlier heads
 
 | Head | Mac | Kernel contract | Full suite with `-Dslow-tests` |
@@ -514,9 +667,9 @@ On `1a6a360e`, lint `--strict`, the line-ending test and the `pf int8` tests (79
 | Linux `cuda` x64 and arm64 | Failed to link on 14 `mlx_serve_shared_dsv41_*` symbols; fixed in `2b2387a2` |
 | zig-test | Passed every test, 5,332 of 6,313 with 981 skipped. It failed only in its flip-proof step, on a missing `origin/main`; fixed in `032b8465` |
 
-### `ad2720bc`, the final head
+### `ad2720bc`
 
-The rows match the PR body's Tests table: Mac 1 ran the gate pass and Mac 2 the three links.
+Mac 1 ran the gate pass and Mac 2 the three links.
 
 | Gate | Result |
 |---|---|
@@ -536,6 +689,18 @@ The rows match the PR body's Tests table: Mac 1 ran the gate pass and Mac 2 the 
 | Windows link (`x86_64-windows-gnu`), judged against the allowlist | 0 compile errors; 283 undefined, all header-declared or reviewed; 0 not allowed |
 | Linux `x86_64` link, judged against the allowlist | 0 compile errors; 321 undefined, all header-declared or reviewed; 0 not allowed (glibc 2.39, `-Dunits=true -Dunit-groups=4`, as CI) |
 | Linux `aarch64` link, judged against the allowlist | 0 compile errors; 321 undefined, all header-declared or reviewed; 0 not allowed (glibc 2.39, `-Dunits=true -Dunit-groups=4`, as CI) |
+
+### `43ec931d`, `main` at `2e391c91` merged (Mac 2)
+
+| Gate | Result |
+|---|---|
+| Lint, the line-ending test, the digest manifest, compile, `check`, `check-cross` | Pass |
+| units-check | Fail: 49 copied globals, the list of `18de95f5`; CI does not run it |
+| The kernel contract | 121 tests: 120 passed, 1 skipped, 0 failed |
+| Tests in total | 6,367 tests: 6,002 passed, 437 skipped, 0 failed |
+| Windows, Linux `x86_64` and Linux `aarch64` links | 0 not allowed on each |
+
+The PR body's Tests table gives the final head, `f9098f18`.
 
 ## Smaller gaps
 
