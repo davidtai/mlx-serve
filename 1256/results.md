@@ -1,6 +1,6 @@
 # PR #1256 results record
 
-The results record of PR #1256 (ddalcu/mlx-serve) at `d01d8a5c`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. Each run table was measured on the build its section names, not on `ad2720bc`. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
+The results record of PR #1256 (ddalcu/mlx-serve) at `0afe1119`, branch `nvfp4-ds41-ab` on davidtai/mlx-serve. "We" are the authors of the `deepseek_v41` plugin. The PR body gives the summary; this page holds the run tables, the history and the smaller gaps. Each run table was measured on the build its section names, not on `ad2720bc`. The PR body's Conventions apply here: Mac 1 and Mac 2 are two M5 Ultra Macs with 512 GiB, GB means 1e9 bytes, and switch names omit `MLX_SERVE_DSV41_`.
 
 ## NVFP4 pack in core
 
@@ -606,7 +606,7 @@ Every chart: two Mac Studio M5 Ultra, 512 GB each; the four stacks on mlx-serve 
 
 ### The pushed head
 
-The final data is the acceptance above, on `7343ce1e`. The PR's pushed head, `d01d8a5c`, is `7343ce1e` plus these commits:
+The final data is the acceptance above, on `7343ce1e`. The PR's pushed head, `0afe1119`, is `7343ce1e` plus these commits:
 
 | Commit | What it is | DeepSeek served code |
 |---|---|---|
@@ -621,6 +621,9 @@ The final data is the acceptance above, on `7343ce1e`. The PR's pushed head, `d0
 | `505081c6` | The perplexity fixture runs in the serial lane | None (test plan) |
 | `1a139677` | The spawn test's inherit_files check opens no descriptor of its own (its `exec 9<&0` overwrote the handed pipe when it landed on fd 9) | None (test) |
 | `d01d8a5c` | EXACT's docs state what was measured (drafter-independent greedy text; not yet plain decode's bytes under `ENGRAM_GPU_IDS`) | None (comments and strings) |
+| `2d579127` | One kernel owner for decode ops (`decode/plan.zig`): an EXACT verify row runs its plain step's kernels, R-invariance tests, counted misses, a load refusal | Kernel selection for every decode op. Default text unchanged (`1d873762`); a standard DSpark-on A/B on machine 1: decode +0.10%, identical text on all prompts |
+| `8abaf33e` | `MLX_SERVE_DSV41_EXACT`'s doc names the kernel owner and the load refusal | None (a help string) |
+| `0afe1119` | EXACT's docs state the fixed claim: the real-pack `DSV41_VERIFY_EXACT` test at the defaults shows 0 differing verify rows at widths 1-6, and served EXACT DSpark text equals plain decode text (`edcff8fe3ea19d9f`) | None (comments and strings) |
 
 The bridge is a 16K A B B A of `c4ce903b` (B) against `7343ce1e` (A), MXFP4 lossy, greedy and card, on machine 1, n=6 runs a side. The greedy text is identical in every run.
 
@@ -638,7 +641,7 @@ An earlier 16K check on `c4ce903b` against the acceptance build's 16K runs (P2, 
 | MXFP4 lossless | 5,596.6 → 5,599.0 (+0.04%) | 133.6 → 133.1 (-0.41%) | identical |
 | MXFP4 lossy | 6,253.1 → 6,254.4 (+0.02%) | 138.2 → 137.0 (-0.90%) | identical |
 
-Gates and PPL on 258d263f (served code identical to the head f9098f18; the head d01d8a5c adds only the macOS spawn flag, the gate tooling, a test fix and docs): lint, checkout, kernel contract (192/193, 1 skip) and the full suite with slow tests (6,002 pass, 439 skip, 0 fail) pass. PPL over 286,580 tokens is identical to 7343ce1e for all six compositions (REF 2.9483, NVL/MXL/F 2.9484, NVI/MXI 2.9521); the lossless gate passes (|Δ| 0.000047 ≤ 0.000117). The NVI PPL step exited 1 because one test shard (8 import-only tests) stopped responding within the runner's 1-minute limit; no test failed, and the PPL itself completed.
+Gates and PPL on 258d263f (served code identical to the head f9098f18; the head 0afe1119 adds the macOS spawn flag, the gate tooling, a test fix, docs and the decode kernel owner (default text identical, decode +0.10% in a 3-prompt A/B)): lint, checkout, kernel contract (192/193, 1 skip) and the full suite with slow tests (6,002 pass, 439 skip, 0 fail) pass. PPL over 286,580 tokens is identical to 7343ce1e for all six compositions (REF 2.9483, NVL/MXL/F 2.9484, NVI/MXI 2.9521); the lossless gate passes (|Δ| 0.000047 ≤ 0.000117). The NVI PPL step exited 1 because one test shard (8 import-only tests) stopped responding within the runner's 1-minute limit; no test failed, and the PPL itself completed.
 
 ## Converter draft-vocab
 
@@ -727,7 +730,7 @@ Mac 1 ran the gate pass and Mac 2 the three links.
 | Tests in total | 6,367 tests: 6,002 passed, 437 skipped, 0 failed |
 | Windows, Linux `x86_64` and Linux `aarch64` links | 0 not allowed on each |
 
-The PR body's Tests table gives the final head, `d01d8a5c`.
+The PR body's Tests table gives the final head, `0afe1119`.
 
 ## Smaller gaps
 
